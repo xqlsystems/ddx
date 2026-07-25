@@ -19,7 +19,11 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/xqlsystems/ddx"
 authors = ["Alexander Merose <al@merose.com>"]
-rust-version = "1.75"
+# MSRV. Enforced by the CI `msrv` matrix entry. The floor is set by a
+# transitive build-dependency (ar_archive_writer, which uses edition 2024);
+# ddx-core's own code needs far less, but the resolved tree does not build below
+# this. Bump only with a matching CI change.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # The single load-bearing dependency of the core. Pinned exactly (see the

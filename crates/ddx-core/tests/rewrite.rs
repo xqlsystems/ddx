@@ -345,7 +345,10 @@ fn explain_reports_each_marker_and_the_rewrite() {
             &GenericDialect {},
         )
         .unwrap();
-    assert_eq!(ex.original, "SELECT grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g");
+    assert_eq!(
+        ex.original,
+        "SELECT grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g"
+    );
     assert_eq!(ex.rewritten, "SELECT (y) AS dfdx, (x) AS dfdy FROM g");
     assert_eq!(ex.steps.len(), 2);
     assert_eq!(ex.steps[0].function, "grad");

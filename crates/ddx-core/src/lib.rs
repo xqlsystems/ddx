@@ -67,5 +67,5 @@ pub mod build {
 pub use colref::{ColRef, IdentCasing, Match};
 pub use ddx::Ddx;
 pub use engine::{Rule, RuleRegistry};
-pub use rewrite::{ExplainStep, Explanation};
 pub use error::{DiffError, Result};
+pub use rewrite::{ExplainStep, Explanation};

@@ -125,7 +125,11 @@ impl fmt::Display for Explanation {
             );
         }
         let n = self.steps.len();
-        writeln!(f, "ddx rewrites {n} marker{}:", if n == 1 { "" } else { "s" })?;
+        writeln!(
+            f,
+            "ddx rewrites {n} marker{}:",
+            if n == 1 { "" } else { "s" }
+        )?;
         for step in &self.steps {
             writeln!(f, "  • {} → {}", step.marker, step.derivative)?;
         }

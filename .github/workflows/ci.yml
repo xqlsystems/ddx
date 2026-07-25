@@ -38,11 +38,24 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: tests (non-simulation)
+    name: tests (${{ matrix.rust }})
     runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel the other toolchains when one fails — a beta/nightly break
+      # shouldn't hide a stable/MSRV result.
+      fail-fast: false
+      matrix:
+        # More than stable: beta and nightly catch upcoming-compiler breakage,
+        # and "1.88" is the MSRV (must match `rust-version` in Cargo.toml).
+        rust: [stable, beta, nightly, "1.88"]
+    # Nightly is informational: a nightly regression is usually a toolchain bug,
+    # not ours, so it must not block a PR. stable, beta, and MSRV are required.
+    continue-on-error: ${{ matrix.rust == 'nightly' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       # Everything except tests/simulation.rs (the property/fuzz suite). Split
       # per target so a failure names the suite that broke.
