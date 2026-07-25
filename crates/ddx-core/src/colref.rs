@@ -106,7 +106,9 @@ impl ColRef {
     pub fn from_wrt_arg(func: &str, e: &Expr) -> Result<ColRef> {
         ColRef::from_expr(e).ok_or_else(|| {
             DiffError::InvalidMarker(format!(
-                "{func}(): the differentiation variable must be a bare column, got `{e}`"
+                "{func}(): the differentiation variable must be a bare column, but got `{e}`. \
+                 Differentiate with respect to a single column (e.g. `{func}(x * y, x)`), not an \
+                 expression like `x + y`"
             ))
         })
     }

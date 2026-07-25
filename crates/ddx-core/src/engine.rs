@@ -30,6 +30,12 @@ use crate::constructors::{
 };
 use crate::error::{DiffError, Result};
 
+/// A one-line summary of what v1 differentiates, appended to "unsupported"
+/// errors so a user reading the message learns what *is* supported and can act.
+const SUPPORTED: &str = "ddx differentiates the operators + - * /, unary calls to \
+sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs, power(...) with a \
+constant base or exponent, casts to a numeric type, and column/literal leaves";
+
 /// A differentiation rule for a unary primitive `f(u)`: given the argument
 /// expression `u`, it returns the *outer* derivative `f'(u)`. The engine
 /// multiplies by `du` (the chain rule) itself, so a user rule supplies only
@@ -245,7 +251,9 @@ fn linearize(expr: &Expr, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
         Expr::Function(f) => linearize_function(f, leaf, reg),
 
         other => Err(DiffError::NotImplemented(format!(
-            "differentiation is not implemented for this expression: `{other}`"
+            "this expression cannot be differentiated: `{other}`. {SUPPORTED}; CASE, \
+             comparisons, subqueries, window functions, and string/temporal expressions are \
+             not differentiable"
         ))),
     }
 }
@@ -273,15 +281,19 @@ fn linearize_binary(
             Ok(div(numerator, square(right.clone())))
         }
         other => Err(DiffError::NotImplemented(format!(
-            "operator `{other}` is not differentiable"
+            "the operator `{other}` is not differentiable. {SUPPORTED}"
         ))),
     }
 }
 
 /// Linearize a scalar-function call via the chain rule.
 fn linearize_function(f: &Function, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
-    let name = simple_func_name(f)
-        .ok_or_else(|| DiffError::NotImplemented(format!("unsupported function form: `{f}`")))?;
+    let name = simple_func_name(f).ok_or_else(|| {
+        DiffError::NotImplemented(format!(
+            "cannot differentiate the call `{f}`: only an unqualified function name has a \
+             differentiation rule (a schema-qualified or otherwise complex name is left alone)"
+        ))
+    })?;
     let args = positional_args(f).ok_or_else(|| {
         DiffError::NotImplemented(format!(
             "function `{name}` has non-positional arguments, which are not differentiable"
@@ -295,7 +307,8 @@ fn linearize_function(f: &Function, leaf: &Leaf, reg: &RuleRegistry) -> Result<E
 
     if args.len() != 1 {
         return Err(DiffError::NotImplemented(format!(
-            "no derivative rule for `{name}` with {} arguments",
+            "no differentiation rule for `{name}` with {} arguments: the built-in function \
+             rules are unary, and `power` is the only two-argument rule",
             args.len()
         )));
     }
@@ -305,10 +318,12 @@ fn linearize_function(f: &Function, leaf: &Leaf, reg: &RuleRegistry) -> Result<E
     if is_zero(&du) {
         return Ok(zero());
     }
-    let outer =
-        reg.lookup(&name).ok_or_else(|| {
-            DiffError::NotImplemented(format!("no derivative rule for `{name}`"))
-        })?(u)?;
+    let outer = reg.lookup(&name).ok_or_else(|| {
+        DiffError::NotImplemented(format!(
+            "no differentiation rule for function `{name}`. {SUPPORTED}. Register a custom \
+             rule with `Ddx::register(\"{name}\", ...)`"
+        ))
+    })?(u)?;
     Ok(mul(outer, du))
 }
 
@@ -359,8 +374,10 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
         }
         // General u^v — deferred (design.md §3.6 roadmap).
         (None, None) => Err(DiffError::NotImplemented(
-            "power(base, exponent) where both depend on the differentiation \
-             variable is not yet supported"
+            "cannot differentiate `power(base, exponent)` when both the base and the exponent \
+             depend on the differentiation variable; ddx handles it only when one side is a \
+             constant (e.g. `power(x, 2)` or `power(2, x)`). For the general u^v case, rewrite \
+             it as `exp(exponent * ln(base))` when the base is positive"
                 .into(),
         )),
     }

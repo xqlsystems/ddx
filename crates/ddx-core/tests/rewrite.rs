@@ -332,3 +332,61 @@ fn differentiating_wrt_a_computed_alias_is_allowed() {
     let out = rw("SELECT a + b AS s, grad(s * s, s) AS d FROM t");
     assert_eq!(out, "SELECT a + b AS s, (s + s) AS d FROM t");
 }
+
+// ---------------------------------------------------------------------------
+// explain(): inspect a rewrite before running it (PR #3 feedback)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explain_reports_each_marker_and_the_rewrite() {
+    let ex = Ddx::new()
+        .explain(
+            "SELECT grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g",
+            &GenericDialect {},
+        )
+        .unwrap();
+    assert_eq!(ex.original, "SELECT grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g");
+    assert_eq!(ex.rewritten, "SELECT (y) AS dfdx, (x) AS dfdy FROM g");
+    assert_eq!(ex.steps.len(), 2);
+    assert_eq!(ex.steps[0].function, "grad");
+    assert_eq!(ex.steps[0].marker, "grad(x * y, x)");
+    assert_eq!(ex.steps[0].derivative, "(y)");
+    assert_eq!(ex.steps[1].marker, "grad(x * y, y)");
+    assert_eq!(ex.steps[1].derivative, "(x)");
+    // The rewrite explain reports matches rewrite_sql exactly.
+    assert_eq!(ex.rewritten, rw(&ex.original));
+}
+
+#[test]
+fn explain_display_is_readable() {
+    let ex = Ddx::new()
+        .explain("SELECT jvp(sin(x), x, dx) AS t FROM g", &GenericDialect {})
+        .unwrap();
+    let shown = format!("{ex}");
+    assert_eq!(
+        shown,
+        "ddx rewrites 1 marker:\n  \
+         • jvp(sin(x), x, dx) → (cos(x) * dx)\n\n  \
+         from: SELECT jvp(sin(x), x, dx) AS t FROM g\n  \
+         into: SELECT (cos(x) * dx) AS t FROM g"
+    );
+}
+
+#[test]
+fn explain_on_marker_free_sql_has_no_steps() {
+    let sql = "SELECT a + b FROM t";
+    let ex = Ddx::new().explain(sql, &GenericDialect {}).unwrap();
+    assert!(ex.steps.is_empty());
+    assert_eq!(ex.rewritten, sql);
+    assert!(format!("{ex}").contains("unchanged"));
+}
+
+#[test]
+fn explain_surfaces_errors_like_rewrite() {
+    // An unsupported construct errors in explain just as in rewrite_sql — you
+    // find out before running, which is the point.
+    let err = Ddx::new()
+        .explain("SELECT grad(atan2(x, y), x) FROM t", &GenericDialect {})
+        .unwrap_err();
+    assert!(matches!(err, DiffError::NotImplemented(_)), "got {err:?}");
+}

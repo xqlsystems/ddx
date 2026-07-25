@@ -25,6 +25,7 @@
 //! CTE-computed-alias guard (F3/G4) lives in [`projection_guard`].
 
 use std::collections::HashSet;
+use std::fmt;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::Spanned;
@@ -64,8 +65,74 @@ fn marker_kind(f: &Function) -> Option<MarkerKind> {
     }
 }
 
+impl MarkerKind {
+    /// The marker's SQL function name, for display.
+    fn name(self) -> &'static str {
+        match self {
+            MarkerKind::Grad => "grad",
+            MarkerKind::Jvp => "jvp",
+        }
+    }
+}
+
 fn is_marker_expr(e: &Expr) -> bool {
     matches!(e, Expr::Function(f) if marker_kind(f).is_some())
+}
+
+/// The [`MarkerKind`] of an expression that is a marker call, else `None`.
+fn marker_expr_kind(e: &Expr) -> Option<MarkerKind> {
+    match e {
+        Expr::Function(f) => marker_kind(f),
+        _ => None,
+    }
+}
+
+/// A human-inspectable account of what [`crate::Ddx::rewrite_sql`] would do to a
+/// statement, produced by [`crate::Ddx::explain`] — so a user can see the
+/// derivative SQL *before* running anything. Inspect the fields directly, or
+/// print the whole thing (`Display`) for a readable summary.
+#[derive(Debug, Clone)]
+pub struct Explanation {
+    /// The original statement, unchanged.
+    pub original: String,
+    /// The statement after every `grad`/`jvp` marker is rewritten to derivative
+    /// SQL — exactly what [`crate::Ddx::rewrite_sql`] returns.
+    pub rewritten: String,
+    /// One entry per top-level marker, in source order. Empty when the statement
+    /// has no marker, or in the rare empty-span reprint fallback (where the
+    /// rewrite still appears in [`Explanation::rewritten`]).
+    pub steps: Vec<ExplainStep>,
+}
+
+/// One marker and the derivative SQL it rewrites to (part of an [`Explanation`]).
+#[derive(Debug, Clone)]
+pub struct ExplainStep {
+    /// The marker function: `"grad"` or `"jvp"`.
+    pub function: &'static str,
+    /// The original marker call, exactly as written (e.g. `grad(sin(x), x)`).
+    pub marker: String,
+    /// The derivative SQL it becomes (e.g. `(cos(x))`).
+    pub derivative: String,
+}
+
+impl fmt::Display for Explanation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.steps.is_empty() {
+            return write!(
+                f,
+                "No grad/jvp markers to rewrite; the statement is unchanged:\n  {}",
+                self.original
+            );
+        }
+        let n = self.steps.len();
+        writeln!(f, "ddx rewrites {n} marker{}:", if n == 1 { "" } else { "s" })?;
+        for step in &self.steps {
+            writeln!(f, "  • {} → {}", step.marker, step.derivative)?;
+        }
+        writeln!(f)?;
+        writeln!(f, "  from: {}", self.original)?;
+        write!(f, "  into: {}", self.rewritten)
+    }
 }
 
 /// The parse-free pre-gate: a case-insensitive scan for an *unqualified*
@@ -161,9 +228,90 @@ pub(crate) fn rewrite_sql(
     casing: IdentCasing,
     reg: &RuleRegistry,
 ) -> Result<String> {
+    match resolve_markers(sql, dialect, casing, reg)? {
+        Resolution::Verbatim => Ok(sql.to_string()),
+        Resolution::Reprinted(out) => Ok(out),
+        Resolution::Spliced(repls) => Ok(apply_splice(sql, repls)),
+    }
+}
+
+/// The public entry point behind [`crate::Ddx::explain`]: the same marker
+/// resolution as [`rewrite_sql`], but returned as inspectable structure (each
+/// marker and the derivative SQL it becomes) plus the final rewritten
+/// statement — so a user can see what will happen before running anything.
+pub(crate) fn explain_sql(
+    sql: &str,
+    dialect: &dyn Dialect,
+    casing: IdentCasing,
+    reg: &RuleRegistry,
+) -> Result<Explanation> {
+    let (rewritten, steps) = match resolve_markers(sql, dialect, casing, reg)? {
+        Resolution::Verbatim => (sql.to_string(), Vec::new()),
+        // The empty-span fallback reprints the whole statement, so per-marker
+        // byte ranges aren't available — report the rewrite without steps.
+        Resolution::Reprinted(out) => (out, Vec::new()),
+        Resolution::Spliced(repls) => {
+            let steps = repls
+                .iter()
+                .map(|r| ExplainStep {
+                    function: r.function.name(),
+                    marker: r.marker.clone(),
+                    derivative: r.derivative.clone(),
+                })
+                .collect();
+            (apply_splice(sql, repls), steps)
+        }
+    };
+    Ok(Explanation {
+        original: sql.to_string(),
+        rewritten,
+        steps,
+    })
+}
+
+/// Splice each replacement's derivative into `sql` by byte range, in reverse
+/// source order so earlier offsets stay valid.
+fn apply_splice(sql: &str, mut repls: Vec<Replacement>) -> String {
+    repls.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut out = sql.to_string();
+    for r in repls {
+        out.replace_range(r.start..r.end, &r.derivative);
+    }
+    out
+}
+
+/// One marker's resolution: the byte range it occupies, its original call text,
+/// and the derivative SQL it becomes.
+struct Replacement {
+    start: usize,
+    end: usize,
+    function: MarkerKind,
+    marker: String,
+    derivative: String,
+}
+
+/// How a statement resolves against its markers.
+enum Resolution {
+    /// No real marker — the input is returned unchanged.
+    Verbatim,
+    /// The empty-span fallback: only the fully-rewritten text is available (no
+    /// per-marker byte ranges).
+    Reprinted(String),
+    /// The normal path: one [`Replacement`] per outermost marker.
+    Spliced(Vec<Replacement>),
+}
+
+/// Run the marker pipeline (pre-gate → parse → collect → per-marker derivative)
+/// *without* splicing, so both [`rewrite_sql`] and [`explain_sql`] share it.
+fn resolve_markers(
+    sql: &str,
+    dialect: &dyn Dialect,
+    casing: IdentCasing,
+    reg: &RuleRegistry,
+) -> Result<Resolution> {
     // 1. Parse-free pre-gate: no marker syntax, no parse, byte-identical out.
     if !pre_gate_hit(sql) {
-        return Ok(sql.to_string());
+        return Ok(Resolution::Verbatim);
     }
 
     // 2. The statement (or one of them) looks like it carries a marker; parse.
@@ -184,19 +332,20 @@ pub(crate) fn rewrite_sql(
         let _ = Visit::visit(stmt, &mut collector);
     }
     // Pre-gate false positive (e.g. only qualified markers, or `grad(` inside a
-    // string literal): nothing to rewrite, return verbatim.
+    // string literal): nothing to rewrite.
     if collector.found.is_empty() {
-        return Ok(sql.to_string());
+        return Ok(Resolution::Verbatim);
     }
 
     // 5. Empty spans are documented as possible; fall back to a correct (if not
     //    byte-identical) whole-statement reprint if any marker lacks a span.
     if collector.found.iter().any(|(span, _)| is_empty_span(span)) {
-        return reprint_fallback(statements, casing, reg, &aliases);
+        return Ok(Resolution::Reprinted(reprint_fallback(
+            statements, casing, reg, &aliases,
+        )?));
     }
 
-    // 6. Compute each replacement, then splice by byte range in reverse source
-    //    order so earlier offsets stay valid.
+    // 6. Compute each replacement's byte range and derivative.
     //
     //    The marker name position (`span.start`) is reliable, but the Function's
     //    `span.end` is NOT: sqlparser under-reports it when the call's last
@@ -209,9 +358,11 @@ pub(crate) fn rewrite_sql(
         .tokenize_with_location()
         .map_err(|e| DiffError::Parse(format!("failed to tokenize SQL: {e}")))?;
 
-    let mut repls: Vec<(usize, usize, String)> = Vec::with_capacity(collector.found.len());
+    let mut repls = Vec::with_capacity(collector.found.len());
     for (span, marker_expr) in &collector.found {
-        let text = differentiate_marker_tree(marker_expr, casing, reg, &aliases)?;
+        let derivative = differentiate_marker_tree(marker_expr, casing, reg, &aliases)?;
+        let function = marker_expr_kind(marker_expr)
+            .ok_or_else(|| DiffError::Internal("outermost marker lost its kind".into()))?;
         let start = locate(sql, span.start, false)
             .ok_or_else(|| DiffError::Internal("marker span start out of range".into()))?;
         let close = marker_call_close(&tokens, span.start).ok_or_else(|| {
@@ -221,15 +372,16 @@ pub(crate) fn rewrite_sql(
         // character past it.
         let end = locate(sql, close, true)
             .ok_or_else(|| DiffError::Internal("marker span end out of range".into()))?;
-        repls.push((start, end, text));
+        let marker = sql[start..end].to_string();
+        repls.push(Replacement {
+            start,
+            end,
+            function,
+            marker,
+            derivative,
+        });
     }
-    repls.sort_by(|a, b| b.0.cmp(&a.0));
-
-    let mut out = sql.to_string();
-    for (start, end, text) in repls {
-        out.replace_range(start..end, &text);
-    }
-    Ok(out)
+    Ok(Resolution::Spliced(repls))
 }
 
 /// Differentiate one (possibly nested) marker subtree, returning the derivative

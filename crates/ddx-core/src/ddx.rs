@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 use crate::colref::{ColRef, IdentCasing};
 use crate::engine::{differentiate, jvp, Rule, RuleRegistry};
 use crate::error::{DiffError, Result};
-use crate::rewrite;
+use crate::rewrite::{self, Explanation};
 
 /// The ddx v1 differentiation engine.
 ///
@@ -101,6 +101,31 @@ impl Ddx {
     /// (`casing`) — pair them (e.g. `Ddx::for_duckdb()` with `DuckDbDialect`).
     pub fn rewrite_sql(&self, sql: &str, dialect: &dyn Dialect) -> Result<String> {
         rewrite::rewrite_sql(sql, dialect, self.casing, &self.rules)
+    }
+
+    /// Preview what [`Ddx::rewrite_sql`] would do to `sql` — every `grad`/`jvp`
+    /// marker and the derivative SQL it becomes, plus the fully rewritten
+    /// statement — *without* running anything. The returned [`Explanation`] is
+    /// inspectable field-by-field, and prints a readable summary via `Display`,
+    /// so it doubles as a quick interactive "what will this do?" for a REPL or
+    /// notebook.
+    ///
+    /// ```
+    /// use ddx_core::Ddx;
+    /// use ddx_core::sqlparser::dialect::GenericDialect;
+    ///
+    /// let ddx = Ddx::new();
+    /// let ex = ddx
+    ///     .explain("SELECT grad(sin(x), x) AS d FROM t", &GenericDialect {})
+    ///     .unwrap();
+    /// assert_eq!(ex.rewritten, "SELECT (cos(x)) AS d FROM t");
+    /// assert_eq!(ex.steps.len(), 1);
+    /// assert_eq!(ex.steps[0].marker, "grad(sin(x), x)");
+    /// assert_eq!(ex.steps[0].derivative, "(cos(x))");
+    /// println!("{ex}"); // human-readable, inspect-before-you-run summary
+    /// ```
+    pub fn explain(&self, sql: &str, dialect: &dyn Dialect) -> Result<Explanation> {
+        rewrite::explain_sql(sql, dialect, self.casing, &self.rules)
     }
 
     /// Differentiate an AST expression with respect to `wrt`. The lower-level

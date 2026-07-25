@@ -238,3 +238,44 @@ fn jvp_with_unit_seed_matches_grad() {
         .unwrap();
     assert_eq!(jvp, grad);
 }
+
+// ---------------------------------------------------------------------------
+// Ergonomic error messages: unsupported constructs state what IS supported and
+// how to proceed (PR #3 feedback).
+// ---------------------------------------------------------------------------
+
+fn err_msg(expr: &str, wrt: &str) -> String {
+    Ddx::new()
+        .differentiate_sql(expr, wrt, &GenericDialect {})
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn unsupported_function_error_names_the_supported_set_and_the_escape_hatch() {
+    // A unary function with no built-in rule (`cbrt`) surfaces the full guidance.
+    let m = err_msg("cbrt(x)", "x");
+    assert!(m.contains("cbrt"), "should name the function: {m}");
+    assert!(m.contains("sin/cos"), "should list supported functions: {m}");
+    assert!(m.contains("Ddx::register"), "should point at the custom-rule hatch: {m}");
+}
+
+#[test]
+fn unsupported_operator_error_lists_supported_operators() {
+    let m = err_msg("x % y", "x");
+    assert!(m.contains("+ - * /"), "should list differentiable operators: {m}");
+}
+
+#[test]
+fn wrt_not_a_column_error_shows_the_right_form() {
+    let m = err_msg("x * y", "x + y");
+    assert!(m.contains("bare column"), "should say a bare column is required: {m}");
+    assert!(m.contains("x + y"), "should echo the offending wrt: {m}");
+}
+
+#[test]
+fn general_power_error_suggests_the_constant_side_and_the_exp_ln_rewrite() {
+    let m = err_msg("power(x, x)", "x");
+    assert!(m.contains("power(x, 2)") || m.contains("constant"), "should suggest a constant side: {m}");
+    assert!(m.contains("exp(exponent * ln(base))"), "should suggest the u^v rewrite: {m}");
+}
