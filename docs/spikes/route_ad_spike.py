@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """De-risk spike for the Route (argmax/argmin routing) transpose rule
 (design-relational-ad.md §3.4) -- the one rule not yet checked against jax.grad
 when the first version of the design was written.

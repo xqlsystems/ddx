@@ -1,0 +1,18 @@
+[package]
+name = "ddx-datafusion"
+description = "DataFusion adapter for ddx."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# NOTE (M0 scaffold): the real adapter (M2) depends on `ddx-core` + `ddx-ad`
+# + `datafusion`. The `datafusion` dependency — and, critically, the
+# `sqlparser` version reconciliation it forces (design.md §6, G2: the Path B
+# bridge needs ddx-core and datafusion to resolve the *identical* sqlparser
+# version) — is deferred until M2 so M0's core can pin sqlparser to its
+# spike-verified 0.62 without dragging DataFusion's requirement in first.
+[dependencies]
+ddx-core = { workspace = true }

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """De-risk spike for adopting Substrait (+ custom extension-function markers) as
 ddx v2's relational IR, instead of a bespoke Rust builder graph.
 

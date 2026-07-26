@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import numpy as np, jax, jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 rng = np.random.default_rng(2)

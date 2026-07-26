@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """R1b spike: is it safe to run a query on the same DuckDB database from within
 the execution of another query (the `ddx('<sql>')` table-function pattern)?
 

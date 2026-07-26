@@ -1,0 +1,18 @@
+[package]
+name = "ddx-core"
+description = "Engine-neutral symbolic differentiation of SQL scalar expressions: `grad` & `jvp`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["sql", "autograd", "differentiation", "datafusion", "duckdb"]
+categories = ["mathematics", "database"]
+
+[dependencies]
+# ddx-core re-exports `sqlparser` (see lib.rs) so downstream adapters can't
+# accidentally link a mismatched version. This is the *only* non-trivial
+# dependency of the core, by design.
+sqlparser = { workspace = true }

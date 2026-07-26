@@ -1,0 +1,111 @@
+name: Nightly fuzz (ddx-core simulation soak)
+
+# Runs the seed-reproducible property-fuzz soak (crates/ddx-core/tests/
+# simulation.rs :: soak_continuous_property_fuzz) over three disjoint random
+# seed regions in parallel, then files/updates a single GitHub issue if any
+# property (finite-difference numeric agreement, render fidelity, higher-order
+# self-consumption) fails.
+#
+# Schedule: 08:00 America/Los_Angeles == 16:00 UTC (PST, UTC-8). GitHub cron is
+# fixed-UTC and does NOT observe daylight saving, so during PDT (roughly
+# Mar–Nov) this fires at 09:00 Pacific. Adjust the cron if you want it pinned to
+# wall-clock Pacific year-round.
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Soak wall-clock budget per region (seconds)'
+        required: false
+        default: '300'
+      base_override:
+        description: 'Base seed (optional; blank = derive a fresh one from the run id)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nightly-fuzz
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: soak region ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: rustc --version && cargo --version
+
+      - name: Build soak test binary
+        run: cargo test -p ddx-core --test simulation --release --no-run
+
+      - name: Run soak
+        run: |
+          set -o pipefail
+          SECS='${{ github.event.inputs.duration_secs || '300' }}'
+          OVERRIDE='${{ github.event.inputs.base_override }}'
+          REGION='${{ matrix.region }}'
+          # Disjoint region seed windows, monotonic across runs. run_number is a
+          # small, strictly-increasing counter — using it (not the ~10-digit
+          # run_id) keeps run_number * 1e8 far inside 64-bit range forever, and
+          # guarantees each region gets a fresh, non-overlapping seed window
+          # (a 5-min region explores < 1e7 seeds; regions are 1e7 apart, runs
+          # 1e8 apart).
+          if [ -n "$OVERRIDE" ]; then
+            BASE=$(( OVERRIDE + REGION * 10000000 ))
+          else
+            BASE=$(( GITHUB_RUN_NUMBER * 100000000 + REGION * 10000000 ))
+          fi
+          LOG="$PWD/soak-region-${REGION}.log"
+          echo "ENV rustc=$(rustc --version) os=${RUNNER_OS} sha=${GITHUB_SHA}" > "$LOG"
+          echo "Running soak: region=$REGION base=$BASE secs=$SECS"
+          # The soak asserts on failure (non-zero exit); don't let that abort the
+          # job — the report job decides what to do from the log contents.
+          set +e
+          DDX_SOAK_SECS="$SECS" DDX_SOAK_BASE="$BASE" DDX_SOAK_LOG="$LOG" \
+            cargo test -p ddx-core --test simulation --release \
+            -- --ignored --nocapture soak_continuous_property_fuzz
+          echo "soak exit code: $?"
+          set -e
+          echo "---- log tail ----"
+          tail -n 5 "$LOG" || true
+
+      - name: Upload region log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-log-${{ matrix.region }}
+          path: soak-region-${{ matrix.region }}.log
+          if-no-files-found: warn
+
+  report:
+    name: triage & file issue
+    needs: soak
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all region logs
+        uses: actions/download-artifact@v4
+        with:
+          path: logs
+
+      - name: Triage and file/update issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x .github/scripts/report_fuzz_findings.sh
+          .github/scripts/report_fuzz_findings.sh logs

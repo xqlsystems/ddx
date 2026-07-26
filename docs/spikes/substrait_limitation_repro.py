@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Reproduce the Substrait plan-round-trip limitation behind ddx's design (§3.2).
 
 The prototype's abandoned approach produced a DataFusion LogicalPlan as Substrait,

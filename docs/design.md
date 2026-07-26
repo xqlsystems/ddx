@@ -217,8 +217,12 @@ construct could otherwise produce a wrong number instead of an error):
 - **Extensible rule registry, keyed by function name.** Built-ins populate a
   registry users can extend: `registry.register("myfn", rule)`. For a unary
   `f(u)`, a user rule supplies just `f'(u)`; the engine applies the chain
-  rule automatically. A canonicalization table folds dialect spellings
-  (`ln`/`log`, `pow`/`power`) to one name before dispatch.
+  rule automatically. Dispatch case-folds the function name, and a minimal
+  canonicalization folds `pow` to `power` before dispatch. A fuller dialect
+  name-normalization *table* is deferred to the §3.6 roadmap; note that some
+  dialect spellings deliberately cannot be folded — `log` is natural log on
+  some engines but base-10 on DuckDB, so folding `ln`/`log` together would be
+  a silently-wrong derivative, exactly what this project refuses.
 - **The smart constructors — `add`/`sub`/`mul`/`div`/`neg` — own three
   correctness properties, not just algebraic simplification:**
   - *0/1-folding*, the JAX-`Zero`-tangent equivalent: drops structurally-zero
@@ -259,11 +263,18 @@ construct could otherwise produce a wrong number instead of an error):
   unqualified calls (`myschema.grad(…)` is left alone) and matched
   case-folded, so `GRAD(x,x)` is caught too `[F8]`/`[G7]`.
 - **Splice by source span, never reprint the statement.** `rewrite_sql`
-  first runs a parse-free, case-insensitive pre-gate — a regex over
-  `grad`/`jvp\(` — and returns the input verbatim if it doesn't hit, so a
-  marker-free statement is *never parsed* and can't be failed or reformatted
-  by parser coverage gaps. When the gate hits, only the marker call's byte
-  range is replaced, everything else stays byte-identical. This is a real
+  first runs a parse-free, case-insensitive pre-gate — a scan for an
+  unqualified `grad`/`jvp\(` substring — and returns the input verbatim if it
+  doesn't hit, so a statement whose text contains no such substring is *never
+  parsed* and can't be failed or reformatted by parser coverage gaps. The gate
+  is a substring filter, so it also hits on a `grad(` that appears only inside
+  a string literal or comment: such a statement *is* parsed, but with no real
+  marker it still comes back verbatim (the collector finds nothing) — a
+  false-positive costs a parse, never a wrong rewrite. The one residual is a
+  marker-free statement that both mentions the substring *and* uses syntax the
+  dialect can't parse: it would hard-error where a stricter gate wouldn't
+  (documentation-only, `[F5]`). When the gate hits a real marker, only the
+  marker call's byte range is replaced, everything else stays byte-identical. This is a real
   subsystem, not a one-liner: `sqlparser`'s `Spanned` gives line/column in
   1-based *characters*, not byte offsets, so the splice needs a
   UTF-8-aware conversion, must handle multiple and nested markers (spliced
@@ -288,8 +299,10 @@ follows) but a narrower one than first assumed: spiked against `DuckDbDialect`
 @ `sqlparser` 0.62.0, `SELECT * EXCLUDE`, `FROM`-first queries, bare `FROM t`,
 lambdas, and `t.* REPLACE (…)` all parse; the real misses are `PIVOT` and `#1`
 positional columns `[G9]`. The parse-free pre-gate and source-span splicing
-above (§3.2) mean this coverage gap only ever bounds a query that *actually
-contains* a marker, and reprint fidelity is never a separate risk.
+above (§3.2) mean this coverage gap only ever bounds a query whose text
+*contains a `grad(`/`jvp(` substring* — almost always a real marker, but also
+the rare false positive where the substring sits inside a string literal or
+comment (§3.2) — and reprint fidelity is never a separate risk.
 
 **Path B — in-engine plan rewrite, native Rust DataFusion.** A marker UDF plus
 an `AnalyzerRule` so `grad()` works bare, with no wrapper, across both the SQL
@@ -476,10 +489,11 @@ unambiguous column, it works in any query shape; otherwise a typed error at
 rewrite time, before the query runs.
 
 **Roadmap:** general `u^v` via `exp(v·ln u)`; `CASE`/`min`/`max` subgradients
-with a documented kink convention (mirroring how `abs` uses `signum`);
-`atan2`, `log(base,x)`, `cbrt`, `expm1`/`log1p`; a dialect name-normalization
-table; and a clear, permanent taxonomy of "not differentiable" (comparisons,
-string/temporal ops, window functions).
+with a documented kink convention (mirroring how `abs` pins its kink at `0`
+via a portable `CASE`-based sign); `atan2`, `log(base,x)`, `cbrt`,
+`expm1`/`log1p`; a dialect name-normalization table; and a clear, permanent
+taxonomy of "not differentiable" (comparisons, string/temporal ops, window
+functions).
 
 ### 3.7 Known limitation: symbolic expression swell
 
@@ -822,9 +836,13 @@ layered:
   must evaluate to numerically equal columns in DuckDB and DataFusion.
 - **Convention-pinning tests, not blind oracle comparison,** at every point
   where a convention genuinely differs rather than one side being wrong:
-  - *Kinks* — `abs` at 0 gives `0` from the `signum` rule; JAX's own
-    convention at the kink differs (verify the exact value). Pin the
-    convention explicitly; the same treatment Route's tie-break needs (§4.3).
+  - *Kinks* — `abs` at 0 gives `0`, pinned by emitting a portable
+    `CASE WHEN u > 0 THEN 1 WHEN u < 0 THEN -1 ELSE 0 END` rather than an
+    engine `signum`/`sign` builtin (DuckDB has only `sign`, DataFusion only
+    `signum`, and `signum(0) = 1` — so a bare builtin would be both
+    non-portable and *not* pin `0` at the kink). JAX's own convention at the
+    kink differs (verify the exact value). Pin the convention explicitly; the
+    same treatment Route's tie-break needs (§4.3).
   - *Domain-widening* — a derivative can fail where the primal doesn't
     (`sqrt(x)` is fine at 0; `1/(2*sqrt(x))` divides by zero), and engines
     disagree on the result (`inf` vs. `NULL` vs. error). Cross-engine
@@ -1096,11 +1114,15 @@ but folded and unfolded derivatives then disagree on NULL-bearing rows —
 documented and tested, not left as a quirk. → §3.2, §5.
 
 **F12 — Kinks and domain edges will make the oracle and the engines
-disagree.** `abs` at 0 (JAX's own kink convention differs from the `signum`
-rule's); derivatives that fail where the primal doesn't (`sqrt`'s derivative
+disagree.** `abs` at 0 (JAX's own kink convention differs from ddx's pinned
+`0`); derivatives that fail where the primal doesn't (`sqrt`'s derivative
 divides by zero at 0, and engines disagree on the result); `tan` near π/2,
 `ln` near 0. Fixed: pin conventions explicitly and state a domain-edge
-policy, rather than comparing blindly. → §5.
+policy, rather than comparing blindly. The `abs` kink in particular is pinned
+by emitting a portable `CASE`-based sign, not an engine `signum`/`sign`
+builtin — an early cut emitted `signum(u)`, which is non-portable (DuckDB has
+no `signum`) and evaluates to `1` at 0 on DataFusion, pinning nothing; caught
+in a later adversarial review. → §5.
 
 ### v1, round 2 (`G1`–`G9`) — a fresh pass with four independent evidence spikes
 

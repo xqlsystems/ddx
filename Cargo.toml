@@ -1,0 +1,37 @@
+# ddx — portable autograd for composable databases.
+#
+# One engine-neutral differentiation core (`ddx-core`, v1 / M0) plus thin
+# per-engine adapters. See docs/design.md §6 for the layout and the
+# dependency policy: `ddx-core` depends on `sqlparser` only; the heavy
+# per-engine dependencies (datafusion, duckdb) are quarantined in the
+# adapter crates.
+[workspace]
+resolver = "2"
+members = [
+    "crates/ddx-core",
+    "crates/ddx-ad",
+    "crates/ddx-datafusion",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/xqlsystems/ddx"
+authors = ["Alexander Merose <al@merose.com>"]
+# MSRV. Enforced by the CI `msrv` matrix entry. The floor is set by a
+# transitive build-dependency (ar_archive_writer, which uses edition 2024);
+# ddx-core's own code needs far less, but the resolved tree does not build below
+# this. Bump only with a matching CI change.
+rust-version = "1.88"
+
+[workspace.dependencies]
+# The single load-bearing dependency of the core. Pinned exactly (see the
+# `sqlparser` version policy in docs/design.md §6): a bump is a breaking
+# release of ddx-core. 0.62 is the version every M0 spike was verified
+# against (spikes/sqlparser-spike, decision-log G1/G3).
+sqlparser = { version = "=0.62.0", features = ["visitor"] }
+
+# Internal crates, referenced by path within the workspace.
+ddx-core = { path = "crates/ddx-core" }
+ddx-ad = { path = "crates/ddx-ad" }

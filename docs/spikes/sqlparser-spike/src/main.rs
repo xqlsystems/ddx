@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use sqlparser::ast::{Expr, BinaryOperator, Ident, Spanned};
 use sqlparser::tokenizer::Span;
 

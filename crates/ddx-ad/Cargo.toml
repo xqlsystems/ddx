@@ -1,0 +1,16 @@
+[package]
+name = "ddx-ad"
+description = "Query-level reverse-mode AD for ddx (v2): vjp over substrait::proto plans. Scaffold — see docs/design.md §4 and milestones M3/M4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# NOTE (M0 scaffold): v2's core will depend on `substrait` only (design.md
+# §4.2), symmetric with v1-core's `sqlparser`-only dependency. The dependency
+# is intentionally not added yet — M0 only lands the crate seam so the
+# workspace layout of §6 exists. The five transpose rules and `vjp_query`
+# arrive in M3/M4.
+[dependencies]

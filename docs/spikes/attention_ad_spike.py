@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Generality de-risk for query-level reverse-mode AD (§7.3): scaled dot-product
 attention from the SAME four transpose rules, no new primitives.
 

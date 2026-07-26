@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """De-risk spike, second half of the Route rule's Substrait feasibility question
 (design-relational-ad.md §3.4): does DuckDB's Substrait round-trip actually support
 the SQL idiom the Route rule's forward pass needs -- ROW_NUMBER() OVER (PARTITION
