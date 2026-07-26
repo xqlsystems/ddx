@@ -276,7 +276,7 @@ pub(crate) fn explain_sql(
 /// Splice each replacement's derivative into `sql` by byte range, in reverse
 /// source order so earlier offsets stay valid.
 fn apply_splice(sql: &str, mut repls: Vec<Replacement>) -> String {
-    repls.sort_by(|a, b| b.start.cmp(&a.start));
+    repls.sort_by_key(|r| std::cmp::Reverse(r.start));
     let mut out = sql.to_string();
     for r in repls {
         out.replace_range(r.start..r.end, &r.derivative);
