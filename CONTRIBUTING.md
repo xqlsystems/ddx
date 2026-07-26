@@ -195,4 +195,4 @@ Thank you for helping build differentiable databases. 🎉
 
 ## Code of Conduct
 
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md), standard to all xql.systems projects. All participants are expected to uphold it.
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md), standard to all [xql.systems](https://xql.systems) projects. All participants are expected to uphold it.
