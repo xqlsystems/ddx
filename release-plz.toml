@@ -10,13 +10,8 @@ pr_labels = ["release"]
 # public API forces a major-version bump instead of slipping out as a patch.
 semver_check = true
 
-# The scaffold crates carry `publish = false` in their Cargo.toml (so release-plz
-# already skips them); listed here as well to make the intent explicit. Flip to
-# `release = true` — and drop `publish = false` — once each has real content.
-[[package]]
-name = "ddx-ad"
-release = false
-
-[[package]]
-name = "ddx-datafusion"
-release = false
+# NOTE: the scaffold crates (ddx-ad, ddx-datafusion) are NOT listed here — they
+# carry `publish = false` in their Cargo.toml, which release-plz reads directly
+# and honors (it skips them). A `[[package]]` block here would default `publish`
+# to true and conflict with that, so per-crate config is added only when a
+# scaffold becomes publishable (drop its `publish = false` at the same time).
