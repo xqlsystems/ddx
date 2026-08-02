@@ -39,7 +39,7 @@
 //!
 //! `ddx-core`'s public API takes and returns `sqlparser::ast::Expr`, so a
 //! `sqlparser` bump is a breaking release of `ddx-core`. The version is pinned
-//! exactly (see `Cargo.toml`) and re-exported here as [`ddx_core::sqlparser`]:
+//! exactly (see `Cargo.toml`) and re-exported here as [`crate::sqlparser`]:
 //! always reach for `sqlparser` types through this re-export so your build
 //! links the same version the engine was compiled against (design.md §6, G2).
 

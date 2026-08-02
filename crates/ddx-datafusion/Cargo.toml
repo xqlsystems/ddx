@@ -2,6 +2,9 @@
 name = "ddx-datafusion"
 description = "DataFusion adapter for ddx."
 version.workspace = true
+# Scaffold — not on crates.io yet. Flip to publishable once the adapter is real
+# (M2). See docs/design.md §7 for the name-reservation question.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

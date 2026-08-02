@@ -2,6 +2,9 @@
 name = "ddx-ad"
 description = "Query-level reverse-mode AD for ddx (v2): vjp over substrait::proto plans. Scaffold — see docs/design.md §4 and milestones M3/M4."
 version.workspace = true
+# Scaffold — not on crates.io yet. Flip to publishable once it has real content
+# (M3/M4). See docs/design.md §7 for the name-reservation question.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
