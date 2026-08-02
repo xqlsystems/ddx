@@ -27,3 +27,6 @@ target
 # auto-generated from chainlink (root only — per-crate CHANGELOGs are tracked
 # and shipped, e.g. crates/ddx-core/CHANGELOG.md)
 /CHANGELOG.md
+
+# Local, uncommitted scratch notes (never shipped)
+*.local.md

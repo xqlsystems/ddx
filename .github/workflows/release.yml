@@ -21,11 +21,6 @@
 #   switch to crates.io Trusted Publishing (OIDC, no long-lived secret): add
 #   `id-token: write` to `permissions` and a `rust-lang/crates-io-auth-action@v1`
 #   step before release-plz that exports `CARGO_REGISTRY_TOKEN`.
-#
-# NOTE: the Release PR is opened with the default GITHUB_TOKEN, so the other CI
-# workflows do not run on it (GitHub suppresses token-triggered workflows). If
-# you want CI to run on the Release PR, create a PAT, store it as
-# `RELEASE_PLZ_TOKEN`, and pass it as the action's `token`.
 name: Release
 
 on:
