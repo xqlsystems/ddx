@@ -36,7 +36,7 @@ use crate::error::{DiffError, Result};
 
 /// Format a *finite, non-negative* `f64` as the digits of a SQL numeric literal,
 /// always with a decimal point (or exponent) so it reads as floating-point.
-/// Negativity is represented structurally by [`num`] (as a unary minus), not in
+/// Negativity is represented structurally by `num` (as a unary minus), not in
 /// the digits — so this never emits a leading `-`.
 fn format_f64(v: f64) -> String {
     debug_assert!(
@@ -88,7 +88,7 @@ pub(crate) fn num(v: f64) -> Expr {
 }
 
 /// A numeric literal for a value that *might not be finite* — the checked
-/// counterpart of [`num`]. Emits the literal if `v` is finite, else a typed
+/// counterpart of `num`. Emits the literal if `v` is finite, else a typed
 /// [`DiffError::NotImplemented`]: a non-finite value has no valid SQL literal
 /// (`inf`/`NaN` are not numbers), so a derivative that would carry one must fail
 /// loud, never emit invalid SQL (#33). Use this for every value derived from

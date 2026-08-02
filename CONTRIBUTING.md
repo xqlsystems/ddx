@@ -163,6 +163,32 @@ When you find a bug, the ideal contribution is: a failing test first (an
 `#[ignore]`-d "known bug" test is a fine way to record it), then the fix, then
 un-`#[ignore]` it.
 
+## Releases
+
+Releases to [crates.io](https://crates.io) are automated with
+[release-plz](https://release-plz.dev/) and follow [SemVer](https://semver.org/),
+one version per crate. You don't do anything special in a normal PR — just land
+your change with a clear description.
+
+How it works: every push to `main` updates a **Release PR** that bumps the
+changed crates' versions and appends to their `CHANGELOG.md` from the commit
+history. **Merging that PR cuts the release** — it tags the version and publishes
+to crates.io. Releases are meant to be frequent, so that PR is merged often.
+
+Two things help the automation pick the right version bump:
+
+- Write commit/PR titles that hint at the change type — a
+  [Conventional Commits](https://www.conventionalcommits.org/) prefix (`fix:`,
+  `feat:`, `feat!:`/`BREAKING CHANGE:` for a breaking API change) is ideal.
+- Every PR runs `cargo publish --dry-run`, so packaging problems surface before
+  release, not during it. `cargo-semver-checks` also runs at release time and
+  will force a major bump if a public API changed incompatibly.
+
+Maintainers only: the release workflow needs a `CARGO_REGISTRY_TOKEN` repository
+secret (a crates.io API token) — see the comments in
+[`.github/workflows/release.yml`](.github/workflows/release.yml), including the
+optional upgrade to crates.io Trusted Publishing.
+
 ## Licensing
 
 `ddx` is licensed under **Apache-2.0** and follows the

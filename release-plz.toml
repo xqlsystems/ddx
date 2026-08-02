@@ -1,0 +1,22 @@
+# Configuration for release-plz (https://release-plz.dev/), which automates the
+# crate release process: it opens a "release PR" that bumps versions and updates
+# each crate's CHANGELOG from the git history, and publishes to crates.io when
+# that PR merges. See .github/workflows/release.yml and CONTRIBUTING.md.
+
+[workspace]
+# Label the automated release PR so it's easy to find and filter.
+pr_labels = ["release"]
+# Run cargo-semver-checks before a release so an accidental breaking change to a
+# public API forces a major-version bump instead of slipping out as a patch.
+semver_check = true
+
+# The scaffold crates carry `publish = false` in their Cargo.toml (so release-plz
+# already skips them); listed here as well to make the intent explicit. Flip to
+# `release = true` — and drop `publish = false` — once each has real content.
+[[package]]
+name = "ddx-ad"
+release = false
+
+[[package]]
+name = "ddx-datafusion"
+release = false
