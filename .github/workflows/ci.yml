@@ -19,6 +19,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# CI only reads the repo — deny every write scope by default (least privilege).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -27,11 +31,12 @@ jobs:
     name: rustfmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: rustfmt (check only)
         run: cargo fmt --all --check
       - name: clippy (warnings are errors)
@@ -56,11 +61,11 @@ jobs:
     # not ours, so it must not block a PR. stable, beta, and MSRV are required.
     continue-on-error: ${{ matrix.rust == 'nightly' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Everything except tests/simulation.rs (the property/fuzz suite). Split
       # per target so a failure names the suite that broke.
       - name: unit tests
@@ -74,9 +79,11 @@ jobs:
     name: package (publish dry-run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Catch packaging/metadata breakage (missing files, bad metadata, a
       # path-dep without a version) on every PR — long before a release actually
       # tries to publish. Add publishable crates here as they come online.
