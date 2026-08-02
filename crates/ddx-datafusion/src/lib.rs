@@ -8,7 +8,7 @@
 //! arrives in M2 (design.md §3.3–§3.4, milestone M2) and exposes two paths,
 //! both driving the *same* [`ddx_core::Ddx`] engine:
 //!
-//! * **Path A — [`ddx_sql`]:** the one-liner
+//! * **Path A — `ddx_sql`:** the one-liner
 //!   `ctx.sql(&ddx.rewrite_sql(sql, dialect)?)`. This works today on top of
 //!   [`ddx_core`] and is the universal path (design.md §3.3 Path A); it is
 //!   stubbed here rather than wired to a live `SessionContext` because M0 does
