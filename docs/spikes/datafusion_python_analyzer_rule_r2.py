@@ -28,9 +28,12 @@ a missing convenience method.
 The remaining tests pin the two facts that follow from the answer:
 
   T4  a scalar UDF named `grad` sees VALUES, never the symbolic argument
-      (design.md §3.1 — the reason a UDF can't be the mechanism anywhere)
+      (design.md §3.1 — the reason a scalar UDF can't be the mechanism)
   T5  Path A (rewrite the SQL text, hand plain SQL to a stock context) works
-  T6  the seams that DO exist, recorded as future-only (design.md §8 M1 exit)
+  T6  the plan-serialization seam, recorded as future-only (design.md §8 M1 exit)
+  T7  the TABLE-function seam — which does receive an unevaluated expression,
+      and is the DataFusion analogue of DuckDB's `ddx('<sql>')` — together with
+      the two limits that stop it from being a path to bare `grad()`
 
 Run:
     python -m venv .venv && . .venv/bin/activate
@@ -117,38 +120,54 @@ line("T3  the compiled FFI capsule vocabulary (can a Rust extension do it?)")
 # attributes. The set of capsule names compiled into the extension module IS the
 # extension vocabulary: anything not named here cannot cross the boundary at all,
 # from Python or from a compiled Rust extension.
-so_path = os.path.join(os.path.dirname(datafusion.__file__), "_internal.abi3.so")
+#
+# Ask the module where it actually lives rather than guessing a filename: the
+# extension is `_internal.abi3.so` on Linux/macOS but `_internal.abi3.pyd` on
+# Windows, and a non-abi3 build yields `_internal.cpython-3XX-<plat>.so`. A
+# hardcoded name would make this test silently skip off-platform — and T3 is the
+# check that makes the whole finding durable, so a skip must be LOUD.
+import datafusion._internal as _df_internal  # noqa: E402
+
+so_path = _df_internal.__file__
 capsules = set()
-if os.path.exists(so_path):
+if so_path and os.path.exists(so_path):
     import re
 
     with open(so_path, "rb") as f:
         blob = f.read()
+    # The literals are packed contiguously in the binary, so a greedy match can
+    # span several names; re-split each hit into individual capsule names.
     for m in re.finditer(rb"__datafusion_[a-z_]+?__", blob):
-        name = m.group(0).decode()
-        # The literals are packed contiguously in the binary; split any run.
-        for part in re.findall(r"__datafusion_[a-z]+(?:_[a-z]+)*__", name):
+        for part in re.findall(
+            r"__datafusion_[a-z]+(?:_[a-z]+)*__", m.group(0).decode()
+        ):
             capsules.add(part)
     for c in sorted(capsules):
         print("   ", c)
 else:
-    print("    (compiled module not found at expected path; skipping)")
+    print(f"    compiled module not found (path={so_path!r})")
 
-if capsules:
-    check(
-        "T3 NO __datafusion_analyzer_rule__ capsule exists",
-        "__datafusion_analyzer_rule__" not in capsules,
-        "so even a compiled Rust extension cannot inject an AnalyzerRule",
-    )
-    check(
-        "T3 NO logical __datafusion_optimizer_rule__ capsule either",
-        "__datafusion_optimizer_rule__" not in capsules,
-    )
-    check(
-        "T3 __datafusion_physical_optimizer_rule__ DOES exist",
-        "__datafusion_physical_optimizer_rule__" in capsules,
-        "the only rule-injection capsule, and it is post-planning",
-    )
+# Failure, not a skip: if the capsule set can't be read, the durable part of this
+# spike did not run, and the verdict below must not claim it did.
+check(
+    "T3 the compiled extension's capsule vocabulary was readable",
+    bool(capsules),
+    f"scanned {so_path!r}" if capsules else "T3 could not run — verdict is NOT established",
+)
+check(
+    "T3 NO __datafusion_analyzer_rule__ capsule exists",
+    bool(capsules) and "__datafusion_analyzer_rule__" not in capsules,
+    "so even a compiled Rust extension cannot inject an AnalyzerRule",
+)
+check(
+    "T3 NO logical __datafusion_optimizer_rule__ capsule either",
+    bool(capsules) and "__datafusion_optimizer_rule__" not in capsules,
+)
+check(
+    "T3 __datafusion_physical_optimizer_rule__ DOES exist",
+    "__datafusion_physical_optimizer_rule__" in capsules,
+    "the only rule-injection capsule, and it is post-planning",
+)
 
 # ---------------------------------------------------------------------------
 line("T4  design.md §3.1: what does a scalar UDF named `grad` actually receive?")
@@ -177,7 +196,8 @@ got_values = seen and seen[0][1] == [1.0, 4.0, 9.0]
 check(
     "T4 the UDF received evaluated VALUES [1.0, 4.0, 9.0], not the expression x*x",
     bool(got_values),
-    "differentiation is a function of symbolic form — a UDF can never do it (§3.1)",
+    "differentiation needs symbolic form — a SCALAR UDF can never do it (§3.1). "
+    "This is specifically about scalar UDFs; T7 examines the table-function case.",
 )
 
 # ---------------------------------------------------------------------------
@@ -222,7 +242,9 @@ try:
     mem_ok = True
     mem_err = ""
 except Exception as e:  # noqa: BLE001 - reporting the error IS the result
-    mem_ok, mem_err = False, str(e).splitlines()[-1]
+    # `or [""]`: an exception with an empty message makes splitlines() return [],
+    # and an IndexError here would abort the handler whose only job is to report.
+    mem_ok, mem_err = False, (str(e).splitlines() or [""])[-1]
 check(
     "T6 SEAM LIMIT: in-memory tables fail to serialize without an extension codec",
     not mem_ok,
@@ -230,10 +252,83 @@ check(
 )
 
 # ---------------------------------------------------------------------------
+line("T7  the table-function seam — the closest analogue to DuckDB's ddx('<sql>')")
+
+# T4 shows a SCALAR UDF gets values. A *table* function is a different animal:
+# `register_udtf` hands the callable a `RawExpr`, i.e. an unevaluated expression
+# object. That is a genuine third seam and the DataFusion-native analogue of the
+# `ddx('<sql>')` table function the design already ships for DuckDB (§3.4).
+#
+# The question that decides whether it changes anything: can it carry a SYMBOLIC
+# `grad(expr, col)` over real table columns — i.e. is it a path to bare `grad()`?
+import pyarrow.dataset as pads  # noqa: E402
+from datafusion import udtf  # noqa: E402
+
+tf_seen = []
+
+
+class _ProbeTF:
+    def __init__(self, *args):
+        tf_seen.append([(type(a).__name__, str(a)) for a in args])
+
+    def __call__(self):
+        return pads.dataset(pa.table({"d": pa.array([1.0])}))
+
+
+ctx.register_udtf(udtf(_ProbeTF, name="ddx_probe"))
+
+
+def probe(sql):
+    tf_seen.clear()
+    try:
+        ctx.sql(sql).collect()
+    except Exception as e:  # noqa: BLE001 - the error IS the observation
+        return list(tf_seen), f"{type(e).__name__}: {str(e).splitlines()[0][:70]}"
+    return list(tf_seen), None
+
+
+lit_seen, _ = probe("SELECT * FROM ddx_probe('SELECT grad(x*x, x) FROM t')")
+print("   SQL-string arg  ->", lit_seen)
+check(
+    "T7 SEAM: a table function receives an unevaluated RawExpr, not a value",
+    bool(lit_seen) and "RawExpr" in lit_seen[0][0][0],
+    "the SQL text is readable off the literal — this IS the ddx('<sql>') shape",
+)
+
+fold_seen, _ = probe("SELECT * FROM ddx_probe(sin(2.0) * 3.0)")
+print("   composite arg   ->", fold_seen)
+# sin(2.0)*3.0 arrives as Float64(2.7278...): the simplifier already ran.
+check(
+    "T7 LIMIT: a composite argument arrives CONSTANT-FOLDED, not as structure",
+    bool(fold_seen) and "Float64" in fold_seen[0][0][1],
+    "so the seam does not deliver arbitrary symbolic form either",
+)
+
+col_seen, col_err = probe("SELECT * FROM ddx_probe(grad(x * x, x))")
+print("   grad over cols  ->", col_seen, "| err:", col_err)
+check(
+    "T7 LIMIT: a table-function argument cannot reference table columns at all",
+    col_err is not None and "No field named" in (col_err or ""),
+    "args resolve in an EMPTY schema — so this is not a path to bare grad()",
+)
+
+# ---------------------------------------------------------------------------
 line("VERDICT")
 
 passed = sum(1 for _, ok in results if ok)
 print(f"{passed}/{len(results)} checks passed\n")
+
+if passed != len(results):
+    # This file is a RE-VERIFICATION fixture (see docstring): it will be re-run at
+    # M2+. If a future datafusion-python adds `add_analyzer_rule` — the exact event
+    # this spike exists to detect — the checks below fail and the stale conclusion
+    # must NOT be printed as though it still held.
+    print("R2 NOT CONFIRMED — one or more checks failed. The conclusion below is")
+    print("withheld deliberately. Re-read the failures above: if an analyzer-rule")
+    print("seam has appeared upstream, design.md §3.3/§3.4 and milestone M1 need")
+    print("revisiting, and ddx-datafusion's Path B bridge is what would plug in.")
+    raise SystemExit(1)
+
 print(
     """R2 CONFIRMED (design.md §3.4, §8 M1).
 
@@ -268,7 +363,20 @@ FUTURE-ONLY SEAMS (noted, not adopted):
      cannot serve differentiation. Recorded only to document that the one
      rule seam that does exist was examined and rejected on the merits.
 
-  3. If datafusion-python ever adds an `__datafusion_analyzer_rule__` capsule,
+  3. `register_udtf` — a TABLE function, which unlike a scalar UDF receives an
+     unevaluated `RawExpr` (T7). This is the DataFusion-native analogue of the
+     `ddx('<sql>')` table function the design already ships for DuckDB (§3.4),
+     it needs no compiled extension (a plain Python callable works), and it is
+     worth adopting in M2 for surface symmetry: the same `ddx('<sql>')` spelling
+     could then work on both engines. But it is NOT a path to bare `grad()` and
+     does not weaken T4: a composite argument arrives already CONSTANT-FOLDED,
+     and a table-function argument cannot reference table columns at all (its
+     args resolve in an empty schema, so `ddx_probe(grad(x*x, x))` fails at
+     planning with "No field named x"). What it carries is a SQL *string*, which
+     ddx-core's `rewrite_sql` then handles exactly as it does under Path A —
+     making this a relocation of Path A into the engine, not a new mechanism.
+
+  4. If datafusion-python ever adds an `__datafusion_analyzer_rule__` capsule,
      `ddx-datafusion`'s Path B bridge is the thing that would plug into it —
      which is an additional reason to build Path B in M2 as designed, beyond
      its stated role as the in-engine proof."""

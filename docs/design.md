@@ -1217,20 +1217,41 @@ The single rule-injection capsule that does exist,
 `__datafusion_physical_optimizer_rule__`, is post-planning and therefore useless
 here — by the time it could see a marker, the argument is a compiled physical
 expression, not the symbolic form differentiation needs. The same spike pins
-that underlying fact independently (§3.1): a scalar UDF named `grad` registered
-on a live context receives `[1.0, 4.0, 9.0]` for `grad(x*x, x)` over
+that underlying fact independently (§3.1): a *scalar* UDF named `grad`
+registered on a live context receives `[1.0, 4.0, 9.0]` for `grad(x*x, x)` over
 `x = [1,2,3]` — the *evaluated* argument, never `x*x`.
 
-Two seams were found and deliberately **not** adopted, recorded as future-only
-per M1's exit criterion. (i) `LogicalPlan ↔ proto bytes` plus
+Three seams were found and recorded per M1's exit criterion; none displaces
+Path A for bare `grad()`, and one is worth adopting on its own merits.
+
+*(i) Plan serialization.* `LogicalPlan ↔ proto bytes` plus
 `execute_logical_plan` does permit an out-of-engine plan rewrite — but it can't
 intercept `ctx.sql()` transparently, it would make ddx manipulate DataFusion
 protobuf plan messages (a DataFusion-specific plan-interchange format, which
 §1.2 rules out), and it fails outright on in-memory tables, xarray-sql's common
-case. (ii) `add_physical_optimizer_rule` via a compiled extension, rejected on
-the merits above. Should an `__datafusion_analyzer_rule__` capsule ever appear
-upstream, `ddx-datafusion`'s Path B bridge is what would plug into it — a second
-reason to build Path B in M2 as designed. → §3.3, §3.4, §8 M1.
+case. Not adopted.
+
+*(ii) `add_physical_optimizer_rule`* via a compiled extension — post-planning,
+rejected on the merits above. Not adopted.
+
+*(iii) Table functions (`register_udtf`).* Unlike a scalar UDF, a table function
+receives an **unevaluated `RawExpr`**. This is the DataFusion-native analogue of
+the `ddx('<sql>')` table function §3.4 already ships for DuckDB, and it needs no
+compiled extension — a plain Python callable works — so it is worth taking up in
+M2 for surface symmetry, letting the same `ddx('<sql>')` spelling work on both
+engines. It is emphatically *not* a route to bare `grad()`, and does not soften
+the scalar-UDF finding: a composite argument arrives already **constant-folded**
+(`sin(2.0)*3.0` → `Float64(2.7278…)`), and a table-function argument cannot
+reference table columns at all — its arguments resolve in an empty schema, so
+`ddx(grad(x*x, x))` fails at planning with *"No field named x"*. What the seam
+carries is a SQL **string**, which `rewrite_sql` then handles exactly as under
+Path A. It relocates Path A into the engine; it does not replace it.
+
+So the structural claim is specifically about *bare* `grad()`: no seam, at any
+layer, delivers a marker's symbolic argument over real table columns. Should an
+`__datafusion_analyzer_rule__` capsule ever appear upstream, `ddx-datafusion`'s
+Path B bridge is what would plug into it — a second reason to build Path B in M2
+as designed. → §3.3, §3.4, §8 M1.
 
 ### Resolved decision points (`Q1`–`Q7`)
 
