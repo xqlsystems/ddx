@@ -33,7 +33,9 @@ The remaining tests pin the two facts that follow from the answer:
   T6  the plan-serialization seam, recorded as future-only (design.md §8 M1 exit)
   T7  the TABLE-function seam — which does receive an unevaluated expression,
       and is the DataFusion analogue of DuckDB's `ddx('<sql>')` — together with
-      the two limits that stop it from being a path to bare `grad()`
+      the limits that stop it from being a path to bare `grad()`, and the
+      precise mechanism behind them (it is schema resolution that fails, not
+      column references as such)
 
 Run:
     python -m venv .venv && . .venv/bin/activate
@@ -42,14 +44,32 @@ Run:
 """
 
 import os
+import sys
 import tempfile
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+# The spikes README points first-time readers straight at this file, so a bare
+# ModuleNotFoundError traceback is the wrong first impression: say what is
+# missing and how to get it. Exit 2 (not 1) to distinguish "couldn't run" from
+# the verdict-failure exit 1 at the bottom.
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-import datafusion
-from datafusion import SessionContext, udf
-from datafusion.plan import LogicalPlan
+    import datafusion
+    from datafusion import SessionContext, udf
+    from datafusion.plan import LogicalPlan
+except ImportError as exc:
+    # Note: sys.exit("message") prints to stderr but always exits 1, which would
+    # collide with the verdict-failure exit below. Print, then exit 2 explicitly.
+    print(
+        f"missing dependency: {exc.name}\n\n"
+        "This spike needs datafusion and pyarrow:\n"
+        "    python3 -m venv .venv && . .venv/bin/activate\n"
+        "    pip install datafusion pyarrow\n"
+        "    python docs/spikes/datafusion_python_analyzer_rule_r2.py",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 def line(t):
@@ -60,8 +80,16 @@ results = []
 
 
 def check(name, ok, detail=""):
+    """Record and print one check.
+
+    `detail` is the *reason the claim matters* — which reads as an assertion. On
+    a FAIL that is exactly wrong: printing it bare next to the word FAIL states
+    the very conclusion the check just failed to establish. So on failure it is
+    marked as the unmet expectation instead.
+    """
     results.append((name, ok))
-    print(f"{'OK  ' if ok else 'FAIL'} {name}" + (f"  — {detail}" if detail else ""))
+    suffix = f"  — {'' if ok else 'expected: '}{detail}" if detail else ""
+    print(f"{'OK  ' if ok else 'FAIL'} {name}{suffix}")
 
 
 print(f"datafusion-python version: {datafusion.__version__}")
@@ -146,13 +174,14 @@ if so_path and os.path.exists(so_path):
         print("   ", c)
 else:
     print(f"    compiled module not found (path={so_path!r})")
+    print("    T3 could not run — the durable part of this finding is NOT established")
 
 # Failure, not a skip: if the capsule set can't be read, the durable part of this
 # spike did not run, and the verdict below must not claim it did.
 check(
     "T3 the compiled extension's capsule vocabulary was readable",
     bool(capsules),
-    f"scanned {so_path!r}" if capsules else "T3 could not run — verdict is NOT established",
+    f"capsule vocabulary readable at {so_path!r}",
 )
 check(
     "T3 NO __datafusion_analyzer_rule__ capsule exists",
@@ -217,16 +246,18 @@ check(
 # ---------------------------------------------------------------------------
 line("T6  seams that DO exist — recorded as future-only (M1 exit criterion)")
 
-tmp = tempfile.mkdtemp()
-pf = os.path.join(tmp, "t.parquet")
-pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), pf)
-pctx = SessionContext()
-pctx.register_parquet("t", pf)
+# TemporaryDirectory, not mkdtemp: this file is meant to be re-run freely, and
+# mkdtemp leaks one directory per run.
+with tempfile.TemporaryDirectory() as tmp:
+    pf = os.path.join(tmp, "t.parquet")
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), pf)
+    pctx = SessionContext()
+    pctx.register_parquet("t", pf)
 
-plan = pctx.sql("SELECT x * x AS y FROM t").logical_plan()
-blob = plan.to_bytes()
-back = LogicalPlan.from_bytes(pctx, blob)
-out = pctx.execute_logical_plan(back).collect()[0].column(0).to_pylist()
+    plan = pctx.sql("SELECT x * x AS y FROM t").logical_plan()
+    blob = plan.to_bytes()
+    back = LogicalPlan.from_bytes(pctx, blob)
+    out = pctx.execute_logical_plan(back).collect()[0].column(0).to_pylist()
 print(f"   LogicalPlan -> {len(blob)} proto bytes -> LogicalPlan -> execute => {out}")
 check(
     "T6 SEAM: LogicalPlan proto round-trip + execute_logical_plan works",
@@ -307,9 +338,33 @@ check(
 col_seen, col_err = probe("SELECT * FROM ddx_probe(grad(x * x, x))")
 print("   grad over cols  ->", col_seen, "| err:", col_err)
 check(
-    "T7 LIMIT: a table-function argument cannot reference table columns at all",
+    "T7 LIMIT: grad() over table columns never reaches the table function",
     col_err is not None and "No field named" in (col_err or ""),
     "args resolve in an EMPTY schema — so this is not a path to bare grad()",
+)
+
+# Be precise about WHY, because the obvious phrasing ("a table-function argument
+# can't reference columns") is not quite what happens, and this file is an audit
+# trail. A BARE column reference does pass through — unresolved and meaningless,
+# since no table is in scope — while anything needing type resolution against a
+# schema (arithmetic, a function call) errors before the callable is reached.
+bare_seen, _bare_err = probe("SELECT * FROM ddx_probe(x)")
+arith_seen, arith_err = probe("SELECT * FROM ddx_probe(x + 1)")
+# Report only whether the callable was REACHED. When it is, execution then fails
+# on this probe's deliberately-stub return value — that error is an artifact of
+# the harness, not of DataFusion's argument handling, so printing it here would
+# be actively misleading next to "does pass through".
+print("   bare column arg -> reached callable:", bool(bare_seen), bare_seen)
+print("   column in arith -> reached callable:", bool(arith_seen), "| err:", arith_err)
+check(
+    "T7 MECHANISM: a BARE column ref does pass through, as an unresolved Expr(x)",
+    bool(bare_seen) and "Expr(x)" in bare_seen[0][0][1],
+    "so the limit is not 'columns are rejected' — it is narrower than that",
+)
+check(
+    "T7 MECHANISM: it is SCHEMA RESOLUTION that fails — x + 1 errors like grad() does",
+    arith_err is not None and "No field named" in (arith_err or ""),
+    "anything needing a schema dies at planning; only opaque leaves survive",
 )
 
 # ---------------------------------------------------------------------------
@@ -369,12 +424,17 @@ FUTURE-ONLY SEAMS (noted, not adopted):
      it needs no compiled extension (a plain Python callable works), and it is
      worth adopting in M2 for surface symmetry: the same `ddx('<sql>')` spelling
      could then work on both engines. But it is NOT a path to bare `grad()` and
-     does not weaken T4: a composite argument arrives already CONSTANT-FOLDED,
-     and a table-function argument cannot reference table columns at all (its
-     args resolve in an empty schema, so `ddx_probe(grad(x*x, x))` fails at
-     planning with "No field named x"). What it carries is a SQL *string*, which
-     ddx-core's `rewrite_sql` then handles exactly as it does under Path A —
-     making this a relocation of Path A into the engine, not a new mechanism.
+     does not weaken T4. Two limits, and the precise mechanism matters: a
+     composite argument arrives already CONSTANT-FOLDED (`sin(2.0)*3.0` ->
+     `Float64(2.7278...)`), and a table function's arguments are resolved
+     against an EMPTY schema. That second one is narrower than "columns are
+     rejected": a BARE column ref does pass through, as an unresolved and
+     meaningless `Expr(x)`. What dies at planning is anything needing type
+     resolution — `ddx_probe(x + 1)` and `ddx_probe(grad(x*x, x))` both fail
+     with "No field named x". Only opaque leaves survive, so what the seam can
+     actually carry is a SQL *string*, which ddx-core's `rewrite_sql` then
+     handles exactly as it does under Path A — making this a relocation of
+     Path A into the engine, not a new mechanism.
 
   4. If datafusion-python ever adds an `__datafusion_analyzer_rule__` capsule,
      `ddx-datafusion`'s Path B bridge is the thing that would plug into it —

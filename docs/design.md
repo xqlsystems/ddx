@@ -1240,12 +1240,17 @@ the `ddx('<sql>')` table function §3.4 already ships for DuckDB, and it needs n
 compiled extension — a plain Python callable works — so it is worth taking up in
 M2 for surface symmetry, letting the same `ddx('<sql>')` spelling work on both
 engines. It is emphatically *not* a route to bare `grad()`, and does not soften
-the scalar-UDF finding: a composite argument arrives already **constant-folded**
-(`sin(2.0)*3.0` → `Float64(2.7278…)`), and a table-function argument cannot
-reference table columns at all — its arguments resolve in an empty schema, so
-`ddx(grad(x*x, x))` fails at planning with *"No field named x"*. What the seam
-carries is a SQL **string**, which `rewrite_sql` then handles exactly as under
-Path A. It relocates Path A into the engine; it does not replace it.
+the scalar-UDF finding. Two limits close it, and the second is worth stating
+precisely rather than in the obvious-but-wrong shorthand. First, a composite
+argument arrives already **constant-folded** (`sin(2.0)*3.0` →
+`Float64(2.7278…)`), so no structure survives. Second, a table function's
+arguments are resolved against an **empty schema** — which is narrower than
+"columns are rejected": a *bare* column reference does pass through, as an
+unresolved and meaningless `Expr(x)`. What dies at planning is anything
+requiring type resolution, so both `ddx(x + 1)` and `ddx(grad(x*x, x))` fail
+with *"No field named x"*. Only opaque leaves survive, which means what the seam
+can actually carry is a SQL **string** — handled by `rewrite_sql` exactly as
+under Path A. It relocates Path A into the engine; it does not replace it.
 
 So the structural claim is specifically about *bare* `grad()`: no seam, at any
 layer, delivers a marker's symbolic argument over real table columns. Should an
