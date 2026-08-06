@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `grad`/`jvp` marker UDFs (design.md §3.1).
+//! The `grad`/`jvp` marker UDFs.
 //!
 //! These are **not** row functions. A scalar UDF only ever receives evaluated
 //! *values*, never the symbolic expression of its argument, but differentiation
@@ -14,8 +14,7 @@
 //! Registration exists for exactly one reason: to make the marker call *parse
 //! and plan*, so [`crate::analyzer::DdxAnalyzer`] can find it in the
 //! `LogicalPlan` and rewrite it away. Reaching execution is therefore always a
-//! bug, and these deliberately error there rather than returning a number
-//! (design.md §3.1, `[F-proto-3.1]`).
+//! bug, and these deliberately error there rather than returning a number.
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result};
@@ -40,8 +39,8 @@ impl Marker {
         Marker {
             name,
             // `Signature::any` accepts the arguments at whatever types they
-            // arrive in. This is the coercion-tolerance design.md §3.3 (G7)
-            // requires: `add_analyzer_rule` runs AFTER `TypeCoercion`, so a
+            // arrive in. That tolerance is required here: `add_analyzer_rule`
+            // installs the rule to run AFTER `TypeCoercion`, so a
             // stricter signature would make the planner inject casts into the
             // marker's argument before ddx ever sees it. (ddx-core does have a
             // `Cast` rule, so an injected cast is survivable — but not
@@ -64,7 +63,7 @@ impl ScalarUDFImpl for Marker {
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         // Derivatives are always emitted DOUBLE-typed: differentiation runs
         // pre-binding, so operand types are unknown, and SQL integer division
-        // truncates on some engines but not others (design.md §3.2, F4/R1b).
+        // truncates on some engines but not others.
         Ok(DataType::Float64)
     }
 
@@ -76,7 +75,7 @@ impl ScalarUDFImpl for Marker {
              Either the ddx analyzer rule is not installed on this SessionContext \
              (use `ddx_datafusion::install(&ctx)`), or the marker sits somewhere \
              the rule does not reach — in which case rewrite the SQL text instead \
-             with `ddx_datafusion::ddx_sql(&ctx, sql)` (design.md §3.3 Path A).",
+             with `ddx_datafusion::ddx_sql(&ctx, sql)`.",
             name = self.name
         )))
     }
@@ -93,8 +92,7 @@ pub fn jvp_udf() -> ScalarUDF {
 }
 
 /// Is `name` one of ddx's marker functions? Case-folded, because SQL function
-/// names are case-insensitive and `GRAD(x, x)` must be caught too (design.md
-/// §3.2, F8/G7).
+/// names are case-insensitive and `GRAD(x, x)` must be caught too.
 pub(crate) fn marker_kind(name: &str) -> Option<&'static str> {
     if name.eq_ignore_ascii_case(GRAD) {
         Some(GRAD)
@@ -126,8 +124,8 @@ mod tests {
 
     #[test]
     fn executing_a_marker_is_a_loud_error_not_a_number() {
-        // design.md §3.1: markers deliberately error if one reaches execution,
-        // rather than silently producing a value.
+        // Markers deliberately error if one reaches execution, rather than
+        // silently producing a value.
         let udf = grad_udf();
         let err = udf
             .invoke_with_args(ScalarFunctionArgs {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Path B end-to-end: bare `grad()` through the `AnalyzerRule` on a live
-//! DataFusion engine (design.md §3.3, §8 M2 exit criterion).
+//! DataFusion engine.
 //!
 //! These assert on *executed numbers*, not on rewritten SQL text. A rewrite
 //! that looks right but plans to the wrong expression is exactly the failure
@@ -36,7 +36,7 @@ async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
             .column(0)
             .as_any()
             .downcast_ref::<Float64Array>()
-            .expect("derivatives are always Float64 (design.md §3.2, F4)");
+            .expect("every derivative is emitted DOUBLE-typed");
         out.extend((0..a.len()).map(|i| a.value(i)));
     }
     Ok(out)
@@ -86,7 +86,7 @@ async fn chain_rule_through_a_function() -> Result<()> {
 
 #[tokio::test]
 async fn higher_order_falls_out_of_nesting() -> Result<()> {
-    // design.md §3.1: bottom-up rewriting gives higher-order for free.
+    // Bottom-up rewriting gives higher-order differentiation for free.
     let ctx = ctx().await?;
     assert_eq!(
         col(
@@ -112,8 +112,8 @@ async fn jvp_is_the_directional_derivative() -> Result<()> {
 
 #[tokio::test]
 async fn grad_inside_an_aggregate_is_one_descent_step() -> Result<()> {
-    // design.md §3.1/§3.6: differentiating through an aggregate is linearity,
-    // so the marker goes INSIDE — this is what makes SGD expressible in SQL.
+    // Differentiating through an aggregate is linearity, so the marker goes
+    // INSIDE it — which is what makes a gradient step expressible in SQL.
     let ctx = ctx().await?;
     let got = col(&ctx, "SELECT AVG(grad(x * x, x)) AS g FROM t").await?;
     assert_eq!(got, vec![4.0]); // mean of [2,4,6]
@@ -158,7 +158,7 @@ async fn a_query_without_markers_is_untouched() -> Result<()> {
 
 #[tokio::test]
 async fn unsupported_construct_is_a_loud_error() -> Result<()> {
-    // design principle 5: never a silently-wrong number.
+    // Never a silently-wrong number: an unsupported construct must error.
     //
     // Note where the error surfaces: `sql()` only builds the logical plan, and
     // analyzer rules run during optimization, so a ddx failure appears at
@@ -207,7 +207,7 @@ async fn unsupported_construct_is_a_loud_error() -> Result<()> {
 async fn a_marker_that_reaches_execution_errors() -> Result<()> {
     // Without install(), the UDF is unknown; register it WITHOUT the analyzer
     // rule and the marker survives planning — which must fail loudly at
-    // execution rather than return a number (design.md §3.1).
+    // execution rather than return a number.
     let ctx = SessionContext::new();
     ctx.register_udf(ddx_datafusion::grad_udf());
     ctx.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1.0)) AS v(x)")

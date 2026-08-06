@@ -14,8 +14,7 @@ rust-version.workspace = true
 
 # M2: the real adapter. `datafusion` and `ddx-core` must resolve the SAME
 # `sqlparser` version or Path B's bridge won't compile — the workspace
-# Cargo.toml documents the pin and tests/sqlparser_pin.rs enforces it in CI
-# (design.md §6, decision-log G2).
+# Cargo.toml documents the pin and tests/sqlparser_pin.rs enforces it in CI.
 #
 # `ddx-ad` is deliberately NOT a dependency yet: it's still an empty v2 scaffold
 # (M3/M4), and depending on it now would buy nothing.

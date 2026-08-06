@@ -4,23 +4,23 @@
 
 //! Turning a `ddx-core` derivative back into a DataFusion [`Expr`].
 //!
-//! This is the return leg of the Path B bridge (design.md §3.3). The outbound
+//! This is the return leg of the bridge. The outbound
 //! leg is trivial — DataFusion's `expr_to_sql` emits exactly the
 //! [`sqlparser::ast::Expr`] that `ddx-core` consumes — but coming back needs a
 //! planner, and a planner needs a [`ContextProvider`].
 //!
 //! # Why not `SessionState::create_logical_expr`
 //!
-//! design.md §3.3 names `SessionState::create_logical_expr` as the re-plan
-//! seam. It isn't reachable from where we need it: [`AnalyzerRule::analyze`]
-//! receives only `(LogicalPlan, &ConfigOptions)` — no `SessionState` — and a
-//! rule cannot hold the state it is installed into without a reference cycle.
+//! The obvious way to re-plan an expression is `SessionState::create_logical_expr`.
+//! It isn't reachable from here: [`AnalyzerRule::analyze`] receives only
+//! `(LogicalPlan, &ConfigOptions)` — no `SessionState` — and a rule cannot hold
+//! the state it is installed into without a reference cycle.
 //!
-//! So the bridge plans the expression itself with [`SqlToRel`], over the
-//! minimal [`ContextProvider`] below. This is *more* self-contained than the
-//! documented seam rather than less: the only thing a scalar expression needs
-//! from a context is function resolution, and a re-planned derivative has no
-//! table references to resolve — differentiation maps columns to columns.
+//! So the bridge plans the expression itself with [`SqlToRel`], over the minimal
+//! [`ContextProvider`] below. That is *more* self-contained rather than less:
+//! the only thing a scalar expression needs from a context is function
+//! resolution, and a re-planned derivative has no table references to resolve,
+//! because differentiation maps column references to column references.
 //!
 //! [`AnalyzerRule::analyze`]: datafusion::optimizer::AnalyzerRule::analyze
 
@@ -204,8 +204,8 @@ impl ContextProvider for ExprContext {
 
     fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
         // A derivative is a scalar expression. Aggregates in the user's query
-        // are outside the marker (design.md §3.1 puts the marker *inside* the
-        // aggregate: `AVG(grad(loss, theta))`), so the differentiated fragment
+        // are outside the marker — the marker goes *inside* the aggregate, as in
+        // `AVG(grad(loss, theta))` — so the differentiated fragment
         // never contains one.
         None
     }

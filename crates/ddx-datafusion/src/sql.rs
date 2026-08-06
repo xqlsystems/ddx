@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Path A — the SQL source-to-source rewrite (design.md §3.3).
+//! The SQL source-to-source rewrite.
 //!
 //! Rewrite every `grad`/`jvp` marker in the SQL *text* before it reaches the
 //! engine, then hand plain SQL to a stock [`SessionContext`]. This is the
@@ -19,14 +19,14 @@ use ddx_core::Ddx;
 use crate::error::to_df_err;
 
 /// Rewrite `grad`/`jvp` markers in `sql` and run the result on `ctx` — the
-/// one-liner of design.md §3.3 Path A.
+/// one-liner form of the text rewrite.
 ///
 /// The context needs no ddx setup at all: no marker UDFs, no analyzer rule. By
 /// the time the engine sees the statement the markers are gone, replaced by
 /// ordinary derivative SQL.
 ///
 /// A statement containing no marker is passed through byte-identical and is
-/// never even parsed by ddx (design.md §3.2), so wrapping every query in
+/// never even parsed by ddx, so wrapping every query in
 /// `ddx_sql` costs essentially nothing.
 ///
 /// ```
@@ -59,7 +59,7 @@ pub async fn ddx_sql_with(ctx: &SessionContext, sql: &str, ddx: &Ddx) -> Result<
 ///
 /// Useful for logging what will execute, for feeding another tool, or for the
 /// `ddxdb` Python shim, which does exactly this and then calls a stock
-/// `Context.sql()` (design.md §3.4).
+/// `Context.sql()`.
 pub fn rewrite_sql(sql: &str) -> Result<String> {
     rewrite_sql_with(sql, &Ddx::for_datafusion())
 }
@@ -69,7 +69,7 @@ pub fn rewrite_sql(sql: &str) -> Result<String> {
 /// `GenericDialect` is the parser DataFusion itself uses for SQL, and
 /// [`Ddx::for_datafusion`] supplies the matching identifier-folding policy
 /// (unquoted folds, quoted keeps case) — the two must agree or column matching
-/// silently diverges from the engine's own (design.md §3.2, F1).
+/// silently diverges from the engine's own.
 pub fn rewrite_sql_with(sql: &str, ddx: &Ddx) -> Result<String> {
     ddx.rewrite_sql(sql, &GenericDialect {}).map_err(to_df_err)
 }

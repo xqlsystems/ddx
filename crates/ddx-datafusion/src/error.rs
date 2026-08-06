@@ -12,7 +12,7 @@ use ddx_core::DiffError;
 /// [`DataFusionError::External`] rather than `Plan`: it boxes the original
 /// error instead of stringifying it, so a caller can still downcast back to
 /// [`DiffError`] and match on the variant. That matters here — the whole point
-/// of design principle 5 (*fail loud, never silently wrong*) is that callers can
+/// of ddx's *fail loud, never silently wrong* rule is that callers can
 /// tell a `NotImplemented` (this construct has no rule yet) from an
 /// `AmbiguousColumn` (your query needs qualifying) programmatically, not by
 /// grepping a message.

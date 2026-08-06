@@ -117,7 +117,7 @@ impl Var {
 // (parenthesized to fix structure), which both exercises the parser and gives
 // readable failures.
 
-/// Unary functions that have a differentiation rule (design.md §3.6).
+/// Unary functions that have a differentiation rule.
 pub const UNARY_FNS: &[&str] = &[
     "sin", "cos", "tan", "asin", "acos", "atan", "exp", "ln", "log2", "log10", "sqrt", "sinh",
     "cosh", "tanh", "abs",
@@ -384,7 +384,8 @@ fn eval_function(f: &Function, x: f64, y: f64) -> Option<(f64, f64)> {
 /// its domain boundary at `(x, y)` — `f64::INFINITY` if there are none.
 ///
 /// The derivative of a restricted-domain primitive is singular *at* the
-/// boundary even where the primal is finite (design.md §5, "domain-widening"):
+/// boundary even where the primal is finite — a derivative's domain can be
+/// narrower than its primal's:
 /// `acos`/`asin` have `±1` (`d = ∓1/√(1−u²)`), `sqrt`/`ln`/`log` have `0`
 /// (`d = 1/(2√u)`, `1/u`), and division has a `0` denominator. Near such a
 /// boundary the symbolic derivative is a `0·∞`/`∞` form that f64 evaluates to
@@ -568,7 +569,7 @@ pub fn metamorphic_mismatch(
 /// Valid SELECT-list prefixes to place before a marker. Several carry multibyte
 /// characters (in string literals / comments) *before* the marker, so the
 /// marker's character-column no longer equals its byte offset — the case a
-/// char→byte conversion (G3) must get right.
+/// char→byte conversion must get right.
 pub const STMT_PREFIXES: &[&str] = &[
     "SELECT ",
     "SELECT x, ",

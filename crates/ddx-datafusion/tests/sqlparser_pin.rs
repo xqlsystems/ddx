@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `sqlparser` single-version guard (design.md §6, decision-log G2).
+//! The `sqlparser` single-version guard.
 //!
 //! Path B's bridge hands a `sqlparser::ast::Expr` from DataFusion's unparser
 //! straight to `ddx-core`. That only type-checks while both crates resolve the
@@ -61,9 +61,9 @@ fn exactly_one_sqlparser_is_linked() {
          Fix by reconciling the pins in the workspace Cargo.toml: ddx-core pins \
          `sqlparser` exactly, and the `datafusion` version must be one whose \
          own requirement accepts that pin (54.x wants ^0.62.0; 53.x wanted \
-         ^0.61.0). If they genuinely cannot be reconciled, design.md §6 \
-         documents the fallback: degrade the bridge to a SQL string round-trip \
-         rather than break it.",
+         ^0.61.0). If they genuinely cannot be reconciled, the documented \
+         fallback is to degrade the bridge to a SQL string round-trip rather \
+         than break it.",
         n = versions.len(),
     );
 }

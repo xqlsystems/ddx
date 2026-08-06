@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Path B — the in-engine plan rewrite (design.md §3.3).
+//! The in-engine rewrite: `grad`/`jvp` markers removed from the bound plan.
 //!
 //! An [`AnalyzerRule`] that finds every `grad`/`jvp` marker in a bound
 //! [`LogicalPlan`], differentiates its argument through `ddx-core`, and splices
@@ -22,14 +22,14 @@
 //!
 //! Both hops are type-level, with no SQL string in between — which only works
 //! because `ddx-core` and `datafusion` resolve the *identical* `sqlparser`
-//! (design.md §6, decision-log G2; enforced by `tests/sqlparser_pin.rs`).
+//! version. `tests/sqlparser_pin.rs` enforces that.
 //!
 //! # Binding-awareness comes free here
 //!
 //! The plan is already bound when the rule sees it, so column references arrive
-//! qualified. That means the syntactic ambiguity guard of design.md §3.5 —
-//! which exists because a *pre-binding* text rewrite cannot tell `a.x` from
-//! `b.x` — simply never fires on this path.
+//! qualified. That means the ambiguity guard the *text* rewrite needs — which
+//! exists because a pre-binding rewrite cannot tell `a.x` from `b.x` — simply
+//! never fires on this path.
 //!
 //! The claim survived a deliberate attempt to break it, and the reason is worth
 //! stating: the obvious attack is two bound columns that unparse to the same
@@ -98,10 +98,6 @@ impl DdxAnalyzer {
     /// As [`DdxAnalyzer::with_engine`], plus extra scalar functions that may
     /// appear in a re-planned derivative.
     ///
-    /// The rule re-plans derivatives through its own function registry (it
-    /// cannot reach the session's — see [`crate::install_with`]), seeded with
-    /// DataFusion's defaults. Two things land outside that seed:
-    ///
     /// You rarely need this. A UDF from your *own marker body* is handled
     /// automatically — it is harvested from the bound expression itself, so
     /// `grad(my_udf(y) * x, x)` works with no setup regardless of when `my_udf`
@@ -123,7 +119,7 @@ impl DdxAnalyzer {
     ///
     /// Bottom-up is what makes higher-order differentiation fall out for free:
     /// the inner `grad` of `grad(grad(f, x), x)` is already an ordinary
-    /// expression by the time the outer one is differentiated (design.md §3.1).
+    /// expression by the time the outer one is differentiated.
     fn rewrite_expr(
         &self,
         expr: Expr,
@@ -168,20 +164,19 @@ impl DdxAnalyzer {
         // is absent. The resulting "No field named t.x" is true about the wrong
         // thing — the column exists, it just isn't reachable from here.
         //
-        // Failing loudly is correct (design principle 5); this only fixes what
-        // the failure blames. It is structurally loud, incidentally: the planner
+        // Failing loudly is correct — ddx never guesses a derivative. This only
+        // fixes what the failure blames. It is structurally loud, incidentally: the planner
         // creates an `OuterReferenceColumn` only when the name does *not*
         // resolve in the inner scope, so the unparsed text cannot silently
         // rebind to an inner column of the same name.
         if let Some(outer) = outer_reference_in(&args[..expected.min(args.len())]) {
             return Err(DataFusionError::Plan(format!(
                 "ddx: this `{kind}` marker is inside a correlated subquery and references \
-                 the outer column `{outer}`. Path B's bridge re-plans the derivative against \
-                 the subquery's own inputs, so an outer reference cannot be carried through \
-                 it.\n\n\
-                 Rewrite the SQL text instead with `ddx_datafusion::ddx_sql(&ctx, sql)` \
-                 (design.md §3.3 Path A), which differentiates before planning and is not \
-                 subject to this limit."
+                 the outer column `{outer}`. The derivative is re-planned against the \
+                 subquery's own inputs, where an outer column is not in scope, so a \
+                 reference to one cannot be carried through.\n\n\
+                 Use `ddx_datafusion::ddx_sql(&ctx, sql)` instead: it rewrites the SQL text \
+                 before the query is planned, so it has no such limit."
             )));
         }
 
@@ -213,9 +208,9 @@ impl DdxAnalyzer {
         //    derivative planned to a different type (`x + x` on an Int64 column
         //    is Int64), ancestors keep a stale Float64 and the optimizer's
         //    invariant check fails with an internal error.
-        // 2. Policy. design.md §3.2 (F4/R1b) says derivatives are always
-        //    emitted DOUBLE-typed, because differentiation runs pre-binding and
-        //    SQL integer division truncates on some engines but not others.
+        // 2. Policy. Derivatives are always emitted DOUBLE-typed, because
+        //    differentiation runs before binding — operand types are unknown —
+        //    and SQL integer division truncates on some engines but not others.
         //    Without this, `grad(x*x, x)` over a BIGINT column returns Int64 —
         //    quietly violating the invariant this crate documents.
         //
@@ -224,7 +219,8 @@ impl DdxAnalyzer {
         replanned.cast_to(&DataType::Float64, schema).map_err(|e| {
             DataFusionError::Plan(format!(
                 "ddx: the derivative of a `{kind}` argument could not be represented as \
-                     DOUBLE, which design.md §3.2 requires of every emitted derivative: {e}"
+                     DOUBLE. Every derivative is emitted DOUBLE-typed so that integer \
+                     division cannot silently truncate it: {e}"
             ))
         })
     }
@@ -237,7 +233,7 @@ impl AnalyzerRule for DdxAnalyzer {
 
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
         // Skip the whole walk when the plan contains no marker. Same spirit as
-        // ddx-core's parse-free pre-gate (design.md §3.2, F5): a query that
+        // ddx-core's parse-free pre-gate: a query that
         // never mentions ddx should not be touched, and must not be able to
         // fail inside ddx.
         if !plan_has_marker(&plan)? {
@@ -251,8 +247,8 @@ impl AnalyzerRule for DdxAnalyzer {
         // `add_analyzer_rule` installs this rule to run AFTER DataFusion's own
         // `TypeCoercion` pass, so the expression we splice in has never been
         // coerced — nothing runs after us. That matters because ddx-core
-        // deliberately emits DOUBLE-typed literals and casts (design.md §3.2,
-        // F4), so differentiating anything over an integer column yields
+        // deliberately emits DOUBLE-typed literals and casts, so
+        // differentiating anything over an integer column yields
         // mixed-type arithmetic: `grad(x / 2, x)` on a BIGINT column produced
         // `Float64 / Int64`, which plans fine and then dies at execution with an
         // Arrow error. Coercing here is what the engine would have done had the
@@ -396,7 +392,7 @@ fn outer_reference_in(args: &[Expr]) -> Option<String> {
 }
 
 /// Unparse a bound DataFusion expression into the `sqlparser` AST `ddx-core`
-/// consumes. This is the load-bearing type identity of design.md §6 (G2): the
+/// consumes. This is the load-bearing type identity: the
 /// output here *is* `ddx-core`'s input type, with no string in between.
 fn to_sql_ast(expr: &Expr) -> Result<sql_ast::Expr> {
     Unparser::default().expr_to_sql(expr)
@@ -413,8 +409,8 @@ fn to_sql_ast(expr: &Expr) -> Result<sql_ast::Expr> {
 /// then folds the unquoted `wrt` to lowercase and preserves the quoted
 /// occurrence's case, they compare unequal, every occurrence classifies as
 /// `Match::Not`, and the derivative comes back a silent `0` for any capitalized
-/// column — exactly the silently-wrong class design principle 5 exists to
-/// prevent, and one that hits any Parquet/CSV schema with capitalized headers.
+/// column — a silently wrong answer, which ddx must never produce, and one that
+/// hits any Parquet or CSV schema with capitalized headers.
 ///
 /// Unparsing the column keeps the qualifier the planner resolved (so this path
 /// stays binding-aware) *and* guarantees both sides share one quoting rule.

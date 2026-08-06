@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Path A end-to-end: the SQL source-to-source rewrite on a stock engine
-//! (design.md §3.3).
+//! Path A end-to-end: the SQL source-to-source rewrite on a stock engine.
 //!
 //! The interesting cases are the ones Path B *cannot* reach, which is the whole
 //! reason this path exists alongside it.
@@ -54,8 +53,8 @@ async fn grad_runs_on_a_context_with_no_ddx_setup() -> Result<()> {
 #[tokio::test]
 async fn agrees_with_path_b_on_the_same_query() -> Result<()> {
     // Both paths drive the same ddx-core engine, so they must agree
-    // numerically. This is the cheap in-repo version of the cross-engine
-    // equivalence discipline of design.md §5.
+    // numerically. This is the cheap, single-engine version of the
+    // cross-engine equivalence checks ddx aims for.
     let sql = "SELECT grad(sin(x * y), y) AS d FROM t ORDER BY x";
 
     let a_ctx = ctx().await?;
@@ -81,7 +80,7 @@ async fn agrees_with_path_b_on_the_same_query() -> Result<()> {
 #[tokio::test]
 async fn newton_iteration_in_a_recursive_cte() -> Result<()> {
     // THE case Path B cannot serve: a marker inside a recursive CTE — a whole
-    // iterative solve as one query (design.md §3.6). Newton's method for
+    // iterative solve as one query. Newton's method for
     // sqrt(2): x <- x - (x²-2)/grad(x²-2, x), which rewrites to /(x + x).
     let ctx = ctx().await?;
     // The anchor's columns are aliased explicitly rather than via the
@@ -108,7 +107,7 @@ async fn newton_iteration_in_a_recursive_cte() -> Result<()> {
 
 #[tokio::test]
 async fn a_marker_free_statement_is_returned_byte_identical() -> Result<()> {
-    // design.md §3.2 (F5): the parse-free pre-gate means a statement with no
+    // The parse-free pre-gate means a statement with no
     // marker is never parsed, so ddx can neither fail it nor reformat it.
     let sql = "SELECT   *   FROM t  /* odd  spacing preserved */";
     assert_eq!(rewrite_sql(sql)?, sql);

@@ -6,8 +6,8 @@
 //!
 //! Every one of these was invisible to reading the code and only showed up by
 //! executing a query against a live engine. Two of them were **silently wrong**
-//! rather than loud, which is the failure class design principle 5 exists to
-//! prevent — so they get permanent coverage here rather than a fix and a shrug.
+//! rather than loud — the class ddx must never produce — so they get permanent
+//! coverage here rather than a fix and a shrug.
 //!
 //! The common thread: an `AnalyzerRule` runs *after* the planner has already
 //! bound, coerced, and cached schemas, so a rewrite has to put back an
@@ -90,7 +90,7 @@ async fn derivatives_over_integer_columns_execute() -> Result<()> {
     assert_eq!(ty, DataType::Float64);
 
     // Was: Arrow "Invalid comparison operation: Int64 > Float64" — abs emits a
-    // portable CASE-based sign (design.md §5), which compares against literals.
+    // portable CASE-based sign, which compares against literals.
     let (vals, _) = col(&ctx, "SELECT grad(abs(x), x) AS d FROM ti").await?;
     assert_eq!(vals, vec![1.0, 1.0, 1.0]);
     Ok(())
@@ -107,7 +107,7 @@ async fn derivative_is_always_double_and_ancestors_agree() -> Result<()> {
     // kept a stale Float64 and the optimizer's invariant check blew up with an
     // internal error. The single-level form failed more quietly — it just
     // returned Int64, violating the "derivatives are always DOUBLE" policy
-    // (design.md §3.2, F4/R1b) that the marker's own return_type asserts.
+    // that the marker's own return_type asserts.
     let ctx = ctx().await?;
 
     let (vals, ty) = col(&ctx, "SELECT grad(x * x, x) AS d FROM ti").await?;
@@ -124,7 +124,7 @@ async fn derivative_is_always_double_and_ancestors_agree() -> Result<()> {
 
 #[tokio::test]
 async fn power_with_a_constant_exponent_survives_type_coercion() -> Result<()> {
-    // WAS A WRONG DIAGNOSIS on the flagship documented case (design.md §3.6).
+    // WAS A WRONG DIAGNOSIS on a supported, documented case.
     //
     // TypeCoercion runs before this rule, so `power(x, 3)` arrived as
     // `power(CAST(x AS DOUBLE), CAST(3 AS DOUBLE))`. ddx-core's `as_const` saw

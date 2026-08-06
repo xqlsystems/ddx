@@ -158,7 +158,7 @@ async fn seed_tables(ctx: &SessionContext, pts: &[(f64, f64)], ipts: &[(f64, f64
 /// is a SQL `NULL`, which is a value like any other here: a rewrite that turns a
 /// number into a `NULL` has changed the answer.
 ///
-/// A `d` column that is *not* `Float64` violates design.md §3.2 (F4/R1b), but
+/// A `d` column that is *not* `Float64` breaks the DOUBLE-typed guarantee, but
 /// this returns the type with an empty value list rather than an error, so a
 /// caller that skips on `Err` cannot accidentally skip that bug: the type check
 /// fires, and the empty column also trips `compare_rows`'s length check.
@@ -556,7 +556,7 @@ fn agreeing_rows(
 /// # Why the property is conditional
 ///
 /// The unconditional version — "same values, same derivative" — is *false*, for
-/// the reason design.md §3.8 records: ddx differentiates *real* arithmetic while
+/// this reason: ddx differentiates *real* arithmetic while
 /// the engine may evaluate *integer* arithmetic. On a `BIGINT` column `2 / x` is
 /// integer
 /// division, so `ln(2 / x)` at `x = 3` is `ln(0) = -inf` where the `DOUBLE`
@@ -652,7 +652,7 @@ async fn a_derivative_does_not_depend_on_the_column_storage_type() -> Result<()>
                             seed,
                             format!(
                                 "{table} returned {ty:?}, not Float64 — every derivative is \
-                                 DOUBLE (design.md §3.2, F4/R1b): {}",
+                                 DOUBLE: {}",
                                 grad_query(table)
                             ),
                         );
@@ -1120,7 +1120,7 @@ async fn jvp_equals_the_tangent_times_grad_on_the_engine() -> Result<()> {
 /// `grad(grad(f, v), v)` must equal the engine's evaluation of ddx-core's
 /// twice-differentiated expression.
 ///
-/// design.md §3.1 says higher-order "falls out for free" from rewriting
+/// Higher-order differentiation "falls out for free" from rewriting
 /// bottom-up: the inner marker is an ordinary expression by the time the outer
 /// one is differentiated. That is a claim about the *order* the walk visits
 /// expression nodes in, and it is exactly the kind of claim that holds on the

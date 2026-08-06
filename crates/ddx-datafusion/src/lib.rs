@@ -12,7 +12,7 @@
 //! ```
 //!
 //! All the calculus lives in [`ddx_core`]; this crate only connects it to an
-//! engine. It offers the same rewrite by two routes (design.md §3.3):
+//! engine. It offers the same rewrite by two routes:
 //!
 //! | | [`install`] (Path B) | [`ddx_sql`] (Path A) |
 //! |---|---|---|
@@ -25,17 +25,16 @@
 //!
 //! **Prefer [`install`].** Because it runs after binding, columns arrive
 //! already resolved, so the qualification-ambiguity errors a pre-binding text
-//! rewrite must raise (design.md §3.5) simply cannot occur.
+//! rewrite must raise simply cannot occur.
 //!
 //! **Reach for [`ddx_sql`] when a marker sits inside a correlated subquery.**
 //! That is the one query shape Path B genuinely cannot carry: the bridge
 //! re-plans the derivative against the subquery's own inputs, and an outer
 //! reference does not survive that. Path B detects it and says so.
 //!
-//! Recursive CTEs are *not* such a shape — Path B carries a marker in a
-//! recursive term perfectly well (`LogicalPlan::RecursiveQuery` is an ordinary
-//! node with ordinary inputs). This doc previously claimed otherwise, and it was
-//! never true.
+//! Recursive CTEs are *not* such a shape: `install` carries a marker in a
+//! recursive term perfectly well, because `LogicalPlan::RecursiveQuery` is an
+//! ordinary node with ordinary inputs.
 //!
 //! # Where the two paths genuinely differ
 //!
@@ -48,17 +47,17 @@
 //! ```
 //!
 //! Path A refuses this — syntactically `sum(x)` is a function call, not a bare
-//! column, and design.md §3.6 requires a bare column. Path B answers `2·sum(x)`,
+//! column, and the `wrt` must be a bare column. Path B answers `2·sum(x)`,
 //! because by the time it sees the plan the planner has already lowered the
 //! aggregate to the bound column `sum(t.x)`, and differentiating with respect to
 //! a column is exactly what it does.
 //!
 //! **Path B's `wrt` is any column of the node's input schema, including
 //! planner-derived ones** — aggregate outputs, window outputs, computed aliases.
-//! That is deliberate rather than accidental: design.md §3.5's carve-out (`G4`)
-//! already endorses differentiating with respect to a *computed alias*
-//! (`grad(s*s, s)` is `2s`, and is right), and an aggregate output is the same
-//! shape one level down. Rejecting it would contradict that carve-out.
+//! That is deliberate. Differentiating with respect to a *computed alias* is
+//! already a supported and correct operation — `grad(s*s, s)` is `2s` — and an
+//! aggregate output is the same shape one level down, so refusing it would
+//! contradict the case ddx already accepts.
 //!
 //! # Path B
 //!
@@ -84,7 +83,7 @@
 //! / inverse-trig / exp / log / hyperbolic set plus `abs`; `power` with a
 //! constant base or exponent; higher-order via nesting; through-aggregate via
 //! linearity (`AVG(grad(loss, theta))`). Anything else is a typed error, never
-//! a silently-wrong number (design principle 5). Errors from the engine arrive
+//! a silently-wrong number. Errors from the engine arrive
 //! as [`DataFusionError::External`] boxing a [`ddx_core::DiffError`], so you can
 //! downcast and match on the variant.
 //!
@@ -107,7 +106,7 @@ pub use markers::{grad_udf, jvp_udf, GRAD, JVP};
 pub use sql::{ddx_sql, ddx_sql_with, rewrite_sql, rewrite_sql_with};
 
 /// The engine this adapter drives, re-exported so downstream code links the
-/// same version — and, through it, the same `sqlparser` (design.md §6, G2).
+/// same version — and, through it, the same `sqlparser`.
 pub use ddx_core;
 
 /// Install ddx on `ctx`: register the `grad`/`jvp` marker UDFs and the analyzer
@@ -116,7 +115,7 @@ pub use ddx_core;
 /// Both halves are required and neither is useful alone. The UDFs exist only so
 /// the marker calls *parse and plan*; the analyzer rule is what actually
 /// differentiates. Registering the UDFs without the rule would let a marker
-/// reach execution, where it deliberately errors (design.md §3.1).
+/// reach execution, where it deliberately errors.
 ///
 /// ```
 /// # use datafusion::prelude::SessionContext;

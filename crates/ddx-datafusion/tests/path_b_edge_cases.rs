@@ -43,7 +43,7 @@ async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
             .column(0)
             .as_any()
             .downcast_ref::<Float64Array>()
-            .expect("derivatives are always Float64 (design.md §3.2, F4)");
+            .expect("every derivative is emitted DOUBLE-typed");
         out.extend((0..a.len()).map(|i| a.value(i)));
     }
     Ok(out)
@@ -258,12 +258,11 @@ async fn path_b_carries_a_marker_inside_a_recursive_cte() -> Result<()> {
 ///
 /// * Path B's answer is correct. `sum(x)` over `[1,2,3]` is 6, and `d/ds(s·s)`
 ///   at `s = 6` is 12.
-/// * Rejecting it would contradict design.md §3.5's carve-out (`G4`), which
-///   explicitly endorses differentiating with respect to a *computed alias* —
-///   `grad(s*s, s)` is `2s`, "and is exactly right". An aggregate output as the
-///   `wrt` is that same shape one level down.
+/// * Rejecting it would contradict a case ddx already accepts: differentiating
+///   with respect to a *computed alias* is supported and correct — `grad(s*s, s)`
+///   is `2s`. An aggregate output as the `wrt` is that same shape one level down.
 /// * Detecting "this column is planner-derived" in order to refuse it would be
-///   fragile, and would take the endorsed §3.5 case down with it.
+///   fragile, and would take the computed-alias case down with it.
 ///
 /// So the rule is stated instead: Path B's `wrt` is any column of the node's
 /// input schema, including planner-derived ones. See the "Where the two paths
@@ -298,7 +297,7 @@ async fn the_aggregate_wrt_divergence_is_pinned_and_documented() -> Result<()> {
 ///
 /// Today: `ddx_markers caused by Schema error: No field named t.x. Valid fields
 /// are u.x, u.y.` — a true statement about the wrong thing. Failing loudly is
-/// right (design principle 5); blaming the user's column is not. The message
+/// right — ddx never guesses; blaming the user's column is not. The message
 /// must name the real constraint, the way `get_table_source` in `replan.rs`
 /// already does for its own unreachable case.
 #[tokio::test]
