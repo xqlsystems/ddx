@@ -2,21 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Round-4 adversarial review of PR #49 (M2, `ddx-datafusion`).
+//! Path B across awkward plan shapes and binding edges.
 //!
-//! **Most of these tests currently FAIL.** They are the executable half of the
-//! review: each one is a claim the crate makes about itself that a live engine
-//! does not honour. They are deliberately checked in red rather than described
-//! in prose, because the whole lesson of #77 is that this rewrite's bugs are
-//! invisible to reading and only surface when a query actually runs.
+//! Each test here started as a claim the crate made about itself that a live
+//! engine did not honour. They assert on *executed numbers* rather than on
+//! rewritten SQL, because every bug this rewrite has had was invisible to
+//! reading and only surfaced when a query actually ran.
 //!
-//! One test (`path_b_carries_a_marker_inside_a_recursive_cte`) passes: it pins
-//! a capability the crate documentation says Path B does *not* have, so the
-//! documentation — not the code — is what needs to change.
-//!
-//! Chainlink issues: #79 (ANY/ALL subqueries), #80 (`DISTINCT ON`),
-//! #81 (session UDFs), #82 (recursive-CTE claim), #83 (path divergence),
-//! #84 (correlated outer references).
+//! The recurring theme, and the thing to keep in mind when editing the analyzer:
+//! an `AnalyzerRule` runs *after* the planner has bound columns, coerced types,
+//! and cached schemas, so a rewrite must hand back an expression consistent with
+//! all three — and it must reach every corner of the plan the planner filled in,
+//! including the ones that live inside expressions rather than under `inputs()`.
 
 use std::sync::Arc;
 
@@ -53,20 +50,19 @@ async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
 }
 
 // ---------------------------------------------------------------------------
-// #79 — the subquery fix of #77/F5 is incomplete.
+// Subqueries embedded in expressions, including the quantified forms.
 // ---------------------------------------------------------------------------
 
-/// `x > ALL (SELECT grad(...))` — a marker inside a quantified-comparison
-/// subquery reaches execution.
+/// A marker inside a quantified-comparison subquery — `> ALL (…)`, `= ANY (…)`,
+/// `SOME (…)`.
 ///
-/// `analyzer.rs::subquery_plan` enumerates `ScalarSubquery`, `InSubquery` and
-/// `Exists`. DataFusion's own `LogicalPlan::map_subqueries` enumerates those
-/// three **plus `Expr::SetComparison`** — `= ANY (…)`, `> ALL (…)`, `SOME (…)`.
-/// The missing arm blinds *both* the pre-gate (`plan_has_marker`, which then
-/// returns `false` and skips the rewrite entirely) and the walk.
-///
-/// Path A rewrites this query without complaint, which is the tell: the
-/// limitation is not in the query shape, it is in the hand-rolled recursion.
+/// This once reached execution. The walk hand-rolled its own recursion over the
+/// expression variants that can carry a plan, listing `ScalarSubquery`,
+/// `InSubquery` and `Exists` — three of the four DataFusion actually has. The
+/// missing `Expr::SetComparison` blinded *both* the pre-gate (which then skipped
+/// the rewrite for the whole plan) and the walk itself. Path A handled the same
+/// query fine, which was the tell: the limitation was in the recursion, not the
+/// query shape. Both now delegate to DataFusion's own traversal.
 #[tokio::test]
 async fn set_comparison_subquery_markers_are_rewritten() -> Result<()> {
     let ctx = ctx().await?;
@@ -109,19 +105,20 @@ async fn any_subquery_markers_are_rewritten() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #80 — the `names_fields` list is incomplete.
+// Nodes that derive their output field names from their expressions.
 // ---------------------------------------------------------------------------
 
-/// `SELECT DISTINCT ON (…) grad(…)` renames the output field, breaking the
-/// parent that refers to it by name.
+/// `SELECT DISTINCT ON (…) grad(…)` must not rename the output field, or the
+/// parent that refers to it by name dangles.
 ///
-/// `analyzer.rs` aliases a rewritten expression back to its original
-/// `schema_name` for `Projection | Aggregate | Window`, precisely so a parent's
-/// column reference keeps resolving. `LogicalPlan::Distinct(Distinct::On(..))`
-/// also names output fields — from its `select_expr` — and is missing from that
-/// list, so the derived field silently becomes `t.x + t.x` and the enclosing
-/// projection dangles. This is the *identical* failure mode the alias-back was
-/// introduced to fix (#11, bug 1), one node variant later.
+/// The analyzer aliases a rewritten expression back to its original
+/// `schema_name` so a parent's column reference keeps resolving. That decision
+/// was once made from a list of node variants — `Projection | Aggregate |
+/// Window` — which omitted `Distinct::On`, whose schema is also derived from its
+/// expressions. The field silently became `t.x + t.x` and the enclosing
+/// projection dangled: the identical failure mode the alias-back exists to
+/// prevent, one variant later. It is now derived from the node's own schema, so
+/// a node kind nobody anticipated is handled by construction.
 #[tokio::test]
 async fn distinct_on_preserves_derived_field_names() -> Result<()> {
     let ctx = ctx().await?;
@@ -138,8 +135,8 @@ async fn distinct_on_preserves_derived_field_names() -> Result<()> {
         "the rewrite must not rename the field it replaces"
     );
 
-    // Nested: the parent refers to the field by name, so the rename is fatal.
-    // Currently: `Schema error: No field named "grad(t.x * t.x,t.x)".`
+    // Nested: the parent refers to the field by name, so a rename is fatal —
+    // it surfaced as `Schema error: No field named "grad(t.x * t.x,t.x)"`.
     let mut got = col(
         &ctx,
         "SELECT * FROM (SELECT DISTINCT ON (x) grad(x*x, x) FROM t)",
@@ -151,7 +148,7 @@ async fn distinct_on_preserves_derived_field_names() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #81 — the re-planner cannot see the session's own functions.
+// A user's own UDF surviving into the derivative.
 // ---------------------------------------------------------------------------
 
 fn double_it() -> ScalarUDF {
@@ -173,21 +170,20 @@ fn double_it() -> ScalarUDF {
 }
 
 /// A UDF the user registered on their own `SessionContext`, appearing in the
-/// *body* of a marker as a constant coefficient, breaks the re-plan.
+/// *body* of a marker as a constant coefficient.
 ///
 /// `d/dx [f(y) · x] = f(y)`, so `double_it(y)` survives verbatim into the
-/// derivative — and `replan::ExprContext` is seeded only from
-/// `datafusion::functions::all_default_functions()`, so `SqlToRel` cannot
-/// resolve it. The failure is `Error during planning: Invalid function
-/// 'double_it'.` plus a "did you mean" guess at some unrelated built-in —
-/// attributed to the `ddx_markers` rule, naming neither the real cause nor the
-/// remedy.
+/// derivative. The re-plan registry was once seeded only from DataFusion's
+/// built-ins, so `SqlToRel` could not resolve it and planning failed with
+/// `Invalid function 'double_it'` plus a "did you mean" guess at an unrelated
+/// built-in — naming neither the cause nor the remedy. Fixed by harvesting the
+/// UDFs from the marker's own arguments, which needs no registration step and
+/// works whenever the function was registered.
 ///
-/// The escape hatch exists (`DdxAnalyzer::with_engine_and_functions`) but its
-/// doc comment says it is "Needed only when a custom rule emits a call to a UDF
-/// of your own", which this query shows is not true: no custom rule is
-/// involved. `install(&ctx)` holds the `SessionContext` and could snapshot
-/// `ctx.state().scalar_functions()` for free.
+/// `DdxAnalyzer::with_engine_and_functions` remains the escape hatch, but only
+/// for a function that appears in the derivative *without* appearing in the
+/// body — which means a UDF emitted by a custom differentiation rule. Nothing
+/// the user merely calls needs declaring.
 #[tokio::test]
 async fn a_session_registered_udf_survives_into_the_derivative() -> Result<()> {
     let ctx = ctx().await?;
@@ -207,7 +203,7 @@ async fn a_session_registered_udf_survives_into_the_derivative() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #82 — Path B's documented limitation is not real.
+// Recursive CTEs — a capability the docs once denied Path B had.
 // ---------------------------------------------------------------------------
 
 /// `lib.rs` tells users to "Reach for [`ddx_sql`] when the marker sits
@@ -243,7 +239,7 @@ async fn path_b_carries_a_marker_inside_a_recursive_cte() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #83 — the two paths do not agree on what a valid `wrt` is.
+// Where Path A and Path B legitimately disagree about a valid `wrt`.
 // ---------------------------------------------------------------------------
 
 /// `grad(sum(x)*sum(x), sum(x))`: Path B answers `12`, Path A refuses.
@@ -257,10 +253,8 @@ async fn path_b_carries_a_marker_inside_a_recursive_cte() -> Result<()> {
 /// `path_a_and_path_b_agree_on_every_regression_case` as a standing guard
 /// against exactly this drift.
 ///
-/// RESOLVED by documenting, which the issue lists as an acceptable outcome
-/// ("either resolution is fine; silence is not"). This test was originally
-/// written to assert the two paths *agree*; it now pins the divergence and the
-/// fact that it is documented, because forcing agreement is the wrong fix here:
+/// The divergence is deliberate and documented rather than reconciled. Forcing
+/// the two paths to agree would be the wrong fix:
 ///
 /// * Path B's answer is correct. `sum(x)` over `[1,2,3]` is 6, and `d/ds(s·s)`
 ///   at `s = 6` is 12.
@@ -293,7 +287,7 @@ async fn the_aggregate_wrt_divergence_is_pinned_and_documented() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #84 — a correlated outer reference is diagnosed as a missing column.
+// Correlated outer references: the one shape Path B genuinely cannot carry.
 // ---------------------------------------------------------------------------
 
 /// The bridge unparses a bound `Expr` to text and re-plans it against the

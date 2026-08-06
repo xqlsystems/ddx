@@ -468,7 +468,7 @@ pub fn central_diff(f: &Expr, x0: f64, y0: f64, wrt: Var, h: f64) -> Option<f64>
 ///
 /// These are not tolerances — they decide whether a *point* is comparable at
 /// all. Skipping an unfit point is the difference between an oracle with teeth
-/// and one that reports correct derivatives as bugs (#54).
+/// and one that reports correct derivatives as bugs.
 #[derive(Clone, Copy, Debug)]
 pub struct Conditioning {
     /// Skip points within this distance of a restricted-domain boundary.
@@ -503,8 +503,8 @@ impl Conditioning {
 
 /// Do two floats agree to within `atol + rtol · scale`?
 ///
-/// **Tolerance is relative to the computation scale, not the result** — the #54
-/// lesson. Two expressions that compute the same value by different
+/// **Tolerance is relative to the computation scale, not the result.** Two
+/// expressions that compute the same value by different
 /// *associations* agree only up to ≈ `ε · (magnitude of the intermediates)`,
 /// which explodes past a result-relative tolerance at a cancellation or
 /// near-singular point. A real bug perturbs the result by a finite fraction of
@@ -769,7 +769,8 @@ pub fn gen_adversarial_sql(rng: &mut Rng) -> String {
             s.push_str(&base[at..]);
             s
         }
-        // Odd whitespace/comments around the marker (the #52 family).
+        // Odd whitespace and comments around the marker — the shapes that
+        // stress the parse-free pre-gate's substring scan.
         6 => "SELECT grad\t(\n x , x )/* ☕ */ FROM t".to_string(),
         // A deep but valid marker payload.
         _ => {

@@ -7,10 +7,10 @@
 //! `ddx-core`'s suite already proves the *calculus* against a finite-difference
 //! oracle. Nothing here re-litigates that. What this crate adds is a **bridge**
 //! — unparse a bound `Expr`, differentiate, re-plan, coerce, splice — and every
-//! bug found in it so far (#77, #79, #80) has been a bridge bug that left the
-//! calculus untouched: a column that stopped matching after a quoting round
-//! trip, a type that stopped coercing, a field that got renamed, a plan node
-//! the walk never reached.
+//! bug found in it so far has been a bridge bug that left the calculus
+//! untouched: a column that stopped matching after a quoting round trip, a type
+//! that stopped coercing, a field that got renamed, a plan node the walk never
+//! reached.
 //!
 //! So the properties here are all of one shape: **a rewrite must be invisible
 //! except for the value it computes.** Change something that cannot matter —
@@ -23,16 +23,6 @@
 //! come from [`ddx_core::test_utils`] — the *same* ones `ddx-core` fuzzes
 //! against, so "Path A and Path B agree" is a statement about the two paths and
 //! not about two generators.
-//!
-//! # Currently failing
-//!
-//! Two properties fail, both against filed bugs. They are checked in red on
-//! purpose:
-//!
-//! * [`an_installed_marker_never_reaches_execution`] — #79, markers inside
-//!   `ANY`/`ALL` subqueries are invisible to the rewrite.
-//! * [`marker_columns_keep_their_name_across_plan_shapes`] — #80, `DISTINCT ON`
-//!   renames the field it rewrites.
 
 use datafusion::arrow::array::{Array, Float64Array};
 use datafusion::arrow::datatypes::DataType;
@@ -62,7 +52,7 @@ const SEEDS: u64 = 120;
 /// *association* — Path A hands the engine ddx-core's rendered text while Path B
 /// hands it a re-planned `Expr`, and the engine is free to fold, reassociate and
 /// coerce each differently. Agreement is therefore to within float noise at the
-/// scale of the intermediates, not at the scale of the result (the #54 lesson,
+/// scale of the intermediates, not at the scale of the result (see
 /// which `close_at_scale` encodes).
 const RTOL: f64 = 1e-9;
 const ATOL: f64 = 1e-12;
@@ -450,7 +440,7 @@ async fn the_engine_agrees_with_the_reference_interpreter() -> Result<()> {
 
 /// The derivative must not depend on what the columns are *called*.
 ///
-/// This is #77/F1 stated as a property instead of a fixture. That bug —
+/// This is a past bug stated as a property instead of a fixture:
 /// `grad("X" * "X", "X")` silently returning `0.0` because the body was quoted
 /// by the unparser while the `wrt` was not — was a *name* changing an *answer*,
 /// and it hit every Parquet or CSV file with capitalized headers. The three
@@ -557,7 +547,7 @@ fn agreeing_rows(
 /// as `DOUBLE`, `BIGINT` and `DECIMAL` must give the same derivative, always
 /// typed `Float64`.
 ///
-/// #77/F2 and F3 were both this: the rule runs *after* `TypeCoercion` and
+/// Two past bugs were both this: the rule runs *after* `TypeCoercion` and
 /// nothing runs after it, so ddx-core's DOUBLE literals met an `Int64` column
 /// and Arrow refused the op; and when the derivative did plan, it planned to
 /// `Int64` and left every ancestor holding a stale `Float64` schema. The points
@@ -565,8 +555,10 @@ fn agreeing_rows(
 ///
 /// # Why the property is conditional
 ///
-/// The unconditional version — "same values, same derivative" — is *false*, and
-/// finding out why is issue **#87**. On a `BIGINT` column `2 / x` is integer
+/// The unconditional version — "same values, same derivative" — is *false*, for
+/// the reason design.md §3.8 records: ddx differentiates *real* arithmetic while
+/// the engine may evaluate *integer* arithmetic. On a `BIGINT` column `2 / x` is
+/// integer
 /// division, so `ln(2 / x)` at `x = 3` is `ln(0) = -inf` where the `DOUBLE`
 /// column gives `-0.405`; on `DECIMAL(20, 6)` an intermediate is truncated to
 /// six places. In both cases the *primal* already means something different, so
@@ -578,7 +570,7 @@ fn agreeing_rows(
 /// That keeps the invariant honest and keeps its teeth: at every row where the
 /// primal is genuinely the same function, the derivative must be the same
 /// number. Path A and Path B agree exactly on the excluded rows, which is how
-/// #87 was identified as a model gap rather than a bridge bug.
+/// this was identified as a gap in the model rather than a bug in the bridge.
 ///
 /// # Why `DECIMAL` is type-checked but not value-checked
 ///
@@ -594,7 +586,7 @@ fn agreeing_rows(
 /// Rather than invent a tolerance that would either hide bugs or flake, the
 /// decimal column asserts only what is actually invariant: the query must
 /// **run** (a `DECIMAL` column meeting ddx-core's `DOUBLE` literals is exactly
-/// the #77/F2 coercion hazard) and the result must be **`Float64`** (#77/F3).
+/// the coercion hazard above) and the result must be **`Float64`**.
 /// `BIGINT` carries the value claim, where the values are exact and the question
 /// is genuinely about the rewrite.
 #[tokio::test]
@@ -640,7 +632,7 @@ async fn a_derivative_does_not_depend_on_the_column_storage_type() -> Result<()>
             let Ok((primal, _)) = d_column(&sim.ddx, &primal_query(table)).await else {
                 continue;
             };
-            // #87: only the rows where the primal is the same function.
+            // Only the rows where the primal is the same function.
             let keep = agreeing_rows(&sim.ipts, &[&case.f], &base_primal, &primal);
             if keep.is_empty() {
                 continue;
@@ -797,7 +789,7 @@ async fn marker_values_do_not_depend_on_plan_placement() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Property 6 — a marker must never survive to execution. (FAILS: #79)
+// Property 6 — a marker must never survive to execution.
 // ---------------------------------------------------------------------------
 
 /// Every plan shape a marker can be written into, value-bearing or not.
@@ -842,7 +834,7 @@ fn all_placements(marker: &str) -> Vec<(&'static str, String)> {
         // leaves [-1, 1]) and a value predicate would then never terminate. But
         // a two-column recursive CTE is broken in DataFusion 54 *independently
         // of ddx*: the identical query with `cos(x)` written in place of the
-        // marker fails the same way, on a context with no ddx installed (#88).
+        // marker fails the same way, on a context with no ddx installed.
         // Putting a known-broken engine shape in a property suite buys noise,
         // not coverage. Path B's recursive-CTE support is pinned by a
         // terminating single-column example in `review_r4.rs` instead.
@@ -850,7 +842,7 @@ fn all_placements(marker: &str) -> Vec<(&'static str, String)> {
     // The quantified-comparison family: `= ANY (…)`, `> ALL (…)`, `SOME (…)`.
     // DataFusion carries these as `Expr::SetComparison`, the fourth
     // expression-embedded plan carrier, and the rewrite's hand-rolled recursion
-    // knows only the first three (#79).
+    // knows only the first three.
     for op in ["ALL", "ANY", "SOME"] {
         v.push((
             match op {
@@ -864,7 +856,6 @@ fn all_placements(marker: &str) -> Vec<(&'static str, String)> {
     v
 }
 
-/// **Currently fails — #79.**
 ///
 /// With the analyzer installed, no marker may reach execution, anywhere.
 ///
@@ -918,7 +909,7 @@ async fn an_installed_marker_never_reaches_execution() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Property 7 — the rewrite must not disturb anything else. (FAILS: #80)
+// Property 7 — the rewrite must not disturb anything else.
 // ---------------------------------------------------------------------------
 
 /// Plan shapes in which an *unaliased* marker names an output field.
@@ -938,7 +929,6 @@ fn naming_shapes(marker: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// **Currently fails — #80.**
 ///
 /// Rewriting a marker must not rename the field it produces.
 ///

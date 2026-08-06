@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for the Path B correctness bugs found in review of #49.
+//! Regression tests for Path B correctness bugs.
 //!
 //! Every one of these was invisible to reading the code and only showed up by
 //! executing a query against a live engine. Two of them were **silently wrong**

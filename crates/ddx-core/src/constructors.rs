@@ -130,7 +130,7 @@ pub fn as_const(e: &Expr) -> Option<f64> {
         // `sqlparser` parses a negative literal `-2` as `UnaryOp{Minus,
         // Value("2")}`, not `Value("-2")` — so a negated constant must be seen
         // through here, or the `power` rule misclassifies a constant exponent
-        // like `-2` as variable and wrongly rejects `power(x, -2)` (#46).
+        // like `-2` as variable and wrongly rejects `power(x, -2)`.
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -151,7 +151,7 @@ pub fn as_const(e: &Expr) -> Option<f64> {
         //
         // Restricted to numeric targets on purpose: `CAST(1 AS VARCHAR)` is the
         // string `'1'`, not the number, and must not fold to a numeric constant.
-        // Same bug shape as the `UnaryOp` arm above (#46), different wrapper.
+        // Same shape as the negated-literal case above, different wrapper.
         Expr::Cast {
             expr, data_type, ..
         } if crate::engine::is_numeric_type(data_type) => as_const(expr),
