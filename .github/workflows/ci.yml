@@ -70,8 +70,13 @@ jobs:
       # per target so a failure names the suite that broke.
       - name: unit tests
         run: cargo test --workspace --lib --bins
-      - name: integration tests
+      - name: integration tests (ddx-core)
         run: cargo test -p ddx-core --test rules --test rewrite --test roundtrip
+      # The M2 adapter: both rewrite paths end-to-end on a live DataFusion
+      # engine, plus the sqlparser single-version guard that keeps Path B's
+      # bridge compiling (design.md §6, G2).
+      - name: integration tests (ddx-datafusion)
+        run: cargo test -p ddx-datafusion --test path_a --test path_b --test sqlparser_pin
       - name: doctests
         run: cargo test --workspace --doc
 

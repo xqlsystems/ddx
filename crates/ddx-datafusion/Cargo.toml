@@ -1,9 +1,10 @@
 [package]
 name = "ddx-datafusion"
-description = "DataFusion adapter for ddx."
+description = "DataFusion adapter for ddx: bare grad()/jvp() via an AnalyzerRule, plus the ddx_sql text-rewrite helper."
 version.workspace = true
-# Scaffold — not on crates.io yet. Flip to publishable once the adapter is real
-# (M2). See docs/design.md §7 for the name-reservation question.
+# Still not on crates.io: `version` is the workspace 0.0.0 placeholder, and the
+# release process only publishes ddx-core so far (see release-plz.toml). Flip
+# this — and add a real version — when this adapter is released.
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -11,11 +12,16 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# NOTE (M0 scaffold): the real adapter (M2) depends on `ddx-core` + `ddx-ad`
-# + `datafusion`. The `datafusion` dependency — and, critically, the
-# `sqlparser` version reconciliation it forces (design.md §6, G2: the Path B
-# bridge needs ddx-core and datafusion to resolve the *identical* sqlparser
-# version) — is deferred until M2 so M0's core can pin sqlparser to its
-# spike-verified 0.62 without dragging DataFusion's requirement in first.
+# M2: the real adapter. `datafusion` and `ddx-core` must resolve the SAME
+# `sqlparser` version or Path B's bridge won't compile — the workspace
+# Cargo.toml documents the pin and tests/sqlparser_pin.rs enforces it in CI
+# (design.md §6, decision-log G2).
+#
+# `ddx-ad` is deliberately NOT a dependency yet: it's still an empty v2 scaffold
+# (M3/M4), and depending on it now would buy nothing.
 [dependencies]
 ddx-core = { workspace = true }
+datafusion = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

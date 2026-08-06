@@ -326,9 +326,26 @@ columns unparse qualified, so this path is binding-aware for free — the
 ambiguity guard (§3.5) never fires here. Two practical details: DataFusion's
 `add_analyzer_rule` runs after `TypeCoercion`, so the marker's argument may
 already carry injected casts by the time the rule sees it (handled — `Cast`
-has a rule — but the marker UDF must be coercion-tolerant); and the re-plan
-step needs a function registry, the seam is `SessionState::create_logical_expr`
-`[G7]`.
+has a rule — but the marker UDF must be coercion-tolerant, which
+`Signature::any` achieves); and the re-plan step needs a function registry.
+
+**Correction, from building it (M2).** This section previously named
+`SessionState::create_logical_expr` as the re-plan seam `[G7]`. That seam is
+not reachable from where the rewrite happens: `AnalyzerRule::analyze` receives
+only `(LogicalPlan, &ConfigOptions)` — no `SessionState` — and a rule cannot
+hold the state it is installed into without a reference cycle. What the bridge
+does instead is plan the derivative itself with `SqlToRel` over a minimal
+`ContextProvider` supplying just a function registry. This is *more*
+self-contained than the seam it replaces, not a workaround: the only thing a
+scalar expression needs from a context is function resolution, and a
+differentiated expression has no table references to resolve, because
+differentiation maps column references to column references. The optimistic
+half of `[G2]` also held in practice — `expr_to_sql` emits and
+`sql_to_expr` accepts the identical `sqlparser::ast::Expr`, so the bridge is
+type-level end to end with no SQL string in between, and the documented
+degrade-to-string fallback is unused. A test asserts the single-version
+resolution so a future `datafusion` bump fails at the pin rather than
+confusingly at the bridge.
 
 ### 3.4 Per-engine integration
 
