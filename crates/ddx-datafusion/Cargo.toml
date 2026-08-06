@@ -25,3 +25,8 @@ datafusion = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# The shared simulation harness (`ddx_core::test_utils`). Deliberately the SAME
+# generator and reference interpreter ddx-core fuzzes against: a cross-crate
+# agreement test proves nothing if each side invents its own idea of "a random
+# derivable expression".
+ddx-core = { workspace = true, features = ["test-utils"] }

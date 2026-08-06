@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
 // SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -53,395 +52,18 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-use std::ops::ControlFlow;
-
-use ddx_core::sqlparser::ast::{
-    BinaryOperator, Expr, Function, ObjectNamePart, UnaryOperator, Value, Visit, Visitor,
-};
+use ddx_core::sqlparser::ast::Expr;
 use ddx_core::sqlparser::dialect::GenericDialect;
-use ddx_core::sqlparser::parser::Parser;
+use ddx_core::test_utils::{
+    central_diff, eval, gen_adversarial_sql, gen_expr, gen_expr_and_wrt, gen_marker_free_stmt,
+    gen_marker_statement, has_residual_marker, max_intermediate_mag, metamorphic_mismatch,
+    min_domain_margin, parse_expr, run_bounded, seeded, try_parse, try_parse_stmt, Rng, Var,
+};
 use ddx_core::{ColRef, Ddx, DiffError};
-
-// ---------------------------------------------------------------------------
-// A tiny deterministic PRNG (SplitMix64) — reproducible, no dependencies.
-// ---------------------------------------------------------------------------
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n
-    }
-    /// A float in `[lo, hi)`.
-    fn range(&mut self, lo: f64, hi: f64) -> f64 {
-        let u = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-        lo + u * (hi - lo)
-    }
-}
-
-/// The differentiation variable a check runs against — the generator uses two
-/// free variables `x` and `y`, and the finite-difference oracle perturbs the
-/// chosen one.
-#[derive(Clone, Copy)]
-enum Var {
-    X,
-    Y,
-}
-
-impl Var {
-    fn name(self) -> &'static str {
-        match self {
-            Var::X => "x",
-            Var::Y => "y",
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Random expression generator over the *derivable* v1 grammar.
-// ---------------------------------------------------------------------------
-//
-// Everything produced here is inside the engine's supported surface, so
-// `differentiate` never returns `NotImplemented`: vars {x, y}, numeric
-// literals, `+ - * /`, unary minus, a numeric `CAST`, the unary-rule function
-// set, and `power` with exactly one constant side. It emits SQL text
-// (parenthesized to fix structure), which both exercises the parser and gives
-// readable failures.
-
-/// Unary functions that have a differentiation rule (design.md §3.6).
-const UNARY_FNS: &[&str] = &[
-    "sin", "cos", "tan", "asin", "acos", "atan", "exp", "ln", "log2", "log10", "sqrt", "sinh",
-    "cosh", "tanh", "abs",
-];
-
-/// A *non-negative* constant, safe to place under a generated unary minus
-/// without producing a `--` line-comment in the source text. (Negative literals
-/// still appear — as `power` exponents, below — where they are direct function
-/// arguments, and via the engine's own `num()` output.)
-fn gen_const(rng: &mut Rng) -> String {
-    let choices = ["2", "3", "0.5", "1.5", "2.5"];
-    choices[rng.below(choices.len() as u64) as usize].to_string()
-}
-
-/// A constant `power` exponent, which *may* be negative — passed as a direct
-/// call argument (`power(x, -2)`), never wrapped in a unary minus, so it never
-/// forms a `--` in the generated text.
-fn gen_exponent(rng: &mut Rng) -> String {
-    let choices = ["2", "3", "0.5", "1.5", "-1", "-2", "-0.5", "2.5"];
-    choices[rng.below(choices.len() as u64) as usize].to_string()
-}
-
-fn gen_expr(rng: &mut Rng, depth: u32) -> String {
-    if depth == 0 || rng.below(100) < 30 {
-        // Leaf: a variable or a constant.
-        return match rng.below(5) {
-            0 | 1 => "x".to_string(),
-            2 => "y".to_string(),
-            _ => gen_const(rng),
-        };
-    }
-    match rng.below(11) {
-        0 => format!(
-            "({} + {})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
-        ),
-        1 => format!(
-            "({} - {})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
-        ),
-        2 => format!(
-            "({} * {})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
-        ),
-        3 => format!(
-            "({} / {})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
-        ),
-        4 => format!("(-{})", gen_expr(rng, depth - 1)),
-        5 | 6 => {
-            let f = UNARY_FNS[rng.below(UNARY_FNS.len() as u64) as usize];
-            format!("{f}({})", gen_expr(rng, depth - 1))
-        }
-        7 => format!("power({}, {})", gen_expr(rng, depth - 1), gen_exponent(rng)),
-        8 => {
-            // power(positive-const-base, variable-exponent)
-            let base = ["2", "3", "1.5", "0.5"][rng.below(4) as usize];
-            format!("power({base}, {})", gen_expr(rng, depth - 1))
-        }
-        _ => format!("CAST({} AS DOUBLE)", gen_expr(rng, depth - 1)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// A float evaluator for the emitted grammar (primal *and* derivative).
-// ---------------------------------------------------------------------------
-
-fn try_parse(text: &str) -> Result<Expr, String> {
-    Parser::new(&GenericDialect {})
-        .try_with_sql(text)
-        .and_then(|mut p| p.parse_expr())
-        .map_err(|e| e.to_string())
-}
-
-fn parse_expr(text: &str) -> Expr {
-    try_parse(text).unwrap_or_else(|e| panic!("reparse of `{text}` failed: {e}"))
-}
-
-/// Evaluate a scalar expression at `(x, y)`. Returns `None` for anything not in
-/// the numeric grammar (so an unexpected node fails a comparison loudly rather
-/// than silently returning a bogus number).
-fn eval(e: &Expr, x: f64, y: f64) -> Option<f64> {
-    eval_mag(e, x, y).map(|(v, _)| v)
-}
-
-/// The largest absolute value taken by any subexpression of `e` at `(x, y)` —
-/// the "how big did the intermediates get" probe. A point where this is huge is
-/// unfit for the finite-difference oracle: f64 can no longer resolve an O(1)
-/// perturbation against it (a huge additive term cancels the perturbation away;
-/// a huge argument to `sin`/`cos` aliases), so *neither* the finite difference
-/// *nor* the symbolic value is meaningful there — the point must be skipped.
-fn max_intermediate_mag(e: &Expr, x: f64, y: f64) -> Option<f64> {
-    eval_mag(e, x, y).map(|(_, m)| m)
-}
-
-/// Evaluate `e`, returning `(value, max_abs_intermediate)`.
-fn eval_mag(e: &Expr, x: f64, y: f64) -> Option<(f64, f64)> {
-    let here = |v: f64| Some((v, v.abs()));
-    match e {
-        Expr::Value(v) => match &v.value {
-            Value::Number(s, _) => here(s.parse::<f64>().ok()?),
-            _ => None,
-        },
-        Expr::Identifier(id) => match id.value.to_ascii_lowercase().as_str() {
-            "x" => here(x),
-            "y" => here(y),
-            _ => None,
-        },
-        Expr::CompoundIdentifier(parts) => {
-            match parts.last()?.value.to_ascii_lowercase().as_str() {
-                "x" => here(x),
-                "y" => here(y),
-                _ => None,
-            }
-        }
-        Expr::Nested(inner) => eval_mag(inner, x, y),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => {
-            let (v, m) = eval_mag(expr, x, y)?;
-            Some((-v, m.max(v.abs())))
-        }
-        Expr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr,
-        } => eval_mag(expr, x, y),
-        Expr::BinaryOp { left, op, right } => {
-            let (a, ma) = eval_mag(left, x, y)?;
-            let (b, mb) = eval_mag(right, x, y)?;
-            let r = match op {
-                BinaryOperator::Plus => a + b,
-                BinaryOperator::Minus => a - b,
-                BinaryOperator::Multiply => a * b,
-                BinaryOperator::Divide => a / b,
-                _ => return None,
-            };
-            Some((r, ma.max(mb).max(r.abs())))
-        }
-        // Numeric casts are the identity on f64.
-        Expr::Cast { expr, .. } => eval_mag(expr, x, y),
-        Expr::Function(f) => eval_function(f, x, y),
-        // The `sign` CASE (the only CASE the engine emits).
-        Expr::Case {
-            operand: None,
-            conditions,
-            else_result,
-            ..
-        } => {
-            let mut m = 0.0f64;
-            for w in conditions {
-                // Track the compared operand's magnitude too.
-                if let Expr::BinaryOp { left, .. } = &w.condition {
-                    if let Some((_, lm)) = eval_mag(left, x, y) {
-                        m = m.max(lm);
-                    }
-                }
-                if eval_bool(&w.condition, x, y)? {
-                    let (v, rm) = eval_mag(&w.result, x, y)?;
-                    return Some((v, m.max(rm)));
-                }
-            }
-            let (v, rm) = eval_mag(else_result.as_deref()?, x, y)?;
-            Some((v, m.max(rm)))
-        }
-        _ => None,
-    }
-}
-
-fn eval_bool(e: &Expr, x: f64, y: f64) -> Option<bool> {
-    if let Expr::BinaryOp { left, op, right } = e {
-        let a = eval(left, x, y)?;
-        let b = eval(right, x, y)?;
-        return match op {
-            BinaryOperator::Gt => Some(a > b),
-            BinaryOperator::Lt => Some(a < b),
-            BinaryOperator::GtEq => Some(a >= b),
-            BinaryOperator::LtEq => Some(a <= b),
-            BinaryOperator::Eq => Some(a == b),
-            BinaryOperator::NotEq => Some(a != b),
-            _ => None,
-        };
-    }
-    None
-}
-
-fn eval_function(f: &ddx_core::sqlparser::ast::Function, x: f64, y: f64) -> Option<(f64, f64)> {
-    use ddx_core::sqlparser::ast::{
-        FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart,
-    };
-    let [ObjectNamePart::Identifier(id)] = f.name.0.as_slice() else {
-        return None;
-    };
-    let name = id.value.to_ascii_lowercase();
-    let FunctionArguments::List(list) = &f.args else {
-        return None;
-    };
-    let mut args = Vec::new();
-    let mut argmag = 0.0f64;
-    for a in &list.args {
-        match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                let (v, m) = eval_mag(e, x, y)?;
-                args.push(v);
-                argmag = argmag.max(m);
-            }
-            _ => return None,
-        }
-    }
-    let a0 = *args.first()?;
-    let v = match name.as_str() {
-        "sin" => a0.sin(),
-        "cos" => a0.cos(),
-        "tan" => a0.tan(),
-        "asin" => a0.asin(),
-        "acos" => a0.acos(),
-        "atan" => a0.atan(),
-        "exp" => a0.exp(),
-        "ln" => a0.ln(),
-        "log2" => a0.log2(),
-        "log10" => a0.log10(),
-        "sqrt" => a0.sqrt(),
-        "sinh" => a0.sinh(),
-        "cosh" => a0.cosh(),
-        "tanh" => a0.tanh(),
-        "abs" => a0.abs(),
-        "power" | "pow" => {
-            let e1 = *args.get(1)?;
-            a0.powf(e1)
-        }
-        _ => return None,
-    };
-    Some((v, argmag.max(v.abs())))
-}
-
-/// The smallest distance from any *restricted-domain* function call in `e` to
-/// its domain boundary at `(x, y)` — `f64::INFINITY` if there are none.
-///
-/// The derivative of a restricted-domain primitive is singular *at* the
-/// boundary even where the primal is finite (design.md §5, "domain-widening"):
-/// `acos`/`asin` have `±1` (`d = ∓1/√(1−u²)`), `sqrt`/`ln`/`log` have `0`
-/// (`d = 1/(2√u)`, `1/u`), and division has a `0` denominator. Near such a
-/// boundary the symbolic derivative is a `0·∞`/`∞` form that f64 evaluates to
-/// garbage — e.g. `sqrt(acos(x·0.5^log2(x)))` where the argument is *identically
-/// 1*. The finite-difference oracle skips these points rather than mistake a
-/// numerically-singular (but symbolically correct) derivative for a bug.
-fn min_domain_margin(e: &Expr, x: f64, y: f64) -> Option<f64> {
-    use ddx_core::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    match e {
-        Expr::Value(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(f64::INFINITY),
-        Expr::Nested(i) => min_domain_margin(i, x, y),
-        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => min_domain_margin(expr, x, y),
-        Expr::BinaryOp { left, op, right } => {
-            let mut m = min_domain_margin(left, x, y)?.min(min_domain_margin(right, x, y)?);
-            if matches!(op, BinaryOperator::Divide) {
-                m = m.min(eval(right, x, y)?.abs());
-            }
-            Some(m)
-        }
-        Expr::Function(Function {
-            name,
-            args: FunctionArguments::List(list),
-            ..
-        }) => {
-            let mut arg_exprs = Vec::new();
-            let mut m = f64::INFINITY;
-            for a in &list.args {
-                let FunctionArg::Unnamed(FunctionArgExpr::Expr(ae)) = a else {
-                    return Some(f64::INFINITY);
-                };
-                m = m.min(min_domain_margin(ae, x, y)?);
-                arg_exprs.push(ae);
-            }
-            let fname = match name.0.as_slice() {
-                [ObjectNamePart::Identifier(id)] => id.value.to_ascii_lowercase(),
-                _ => return Some(m),
-            };
-            if let Some(a0) = arg_exprs.first() {
-                let v = eval(a0, x, y)?;
-                m = m.min(match fname.as_str() {
-                    "asin" | "acos" => 1.0 - v.abs(),
-                    "sqrt" | "ln" | "log2" | "log10" => v,
-                    _ => f64::INFINITY,
-                });
-            }
-            Some(m)
-        }
-        Expr::Case {
-            conditions,
-            else_result,
-            ..
-        } => {
-            let mut m = f64::INFINITY;
-            for w in conditions {
-                m = m.min(min_domain_margin(&w.condition, x, y)?);
-                m = m.min(min_domain_margin(&w.result, x, y)?);
-            }
-            if let Some(er) = else_result {
-                m = m.min(min_domain_margin(er, x, y)?);
-            }
-            Some(m)
-        }
-        _ => Some(f64::INFINITY),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The three property checks, as reusable helpers.
 // ---------------------------------------------------------------------------
-
-/// A central finite difference of `f` in the `wrt` direction at `(x0, y0)`,
-/// step `h`.
-fn central_diff(f: &Expr, x0: f64, y0: f64, wrt: Var, h: f64) -> Option<f64> {
-    let (fp, fm) = match wrt {
-        Var::X => (eval(f, x0 + h, y0)?, eval(f, x0 - h, y0)?),
-        Var::Y => (eval(f, x0, y0 + h)?, eval(f, x0, y0 - h)?),
-    };
-    Some((fp - fm) / (2.0 * h))
-}
 
 /// Property 1: symbolic `d` vs a central finite difference of `f` (`expr_text`)
 /// in the `wrt` direction. Returns `Some(report)` when a strong majority of
@@ -663,120 +285,10 @@ fn self_consumption_failure(ddx: &Ddx, wrt: &ColRef, original: &str) -> Option<S
 // statement must replace **only** each marker's span with `(derivative)` and
 // leave every other byte identical.
 
-/// Valid SELECT-list prefixes to place before a marker. Several carry multibyte
-/// characters (in string literals / comments) *before* the marker, so the
-/// marker's character-column no longer equals its byte offset — the case the
-/// `locate` char→byte conversion (G3) must get right.
-const STMT_PREFIXES: &[&str] = &[
-    "SELECT ",
-    "SELECT x, ",
-    "SELECT 'héllo', ",
-    "SELECT 'naïve café ☕' AS greeting, ",
-    "SELECT /* café ☕ */ ",
-    "SELECT   ",
-    "SELECT y AS why, ",
-];
-
-/// Valid statement tails (ASCII identifiers only — unicode kept to string
-/// literals/comments, since unquoted-identifier unicode support is dialect-
-/// dependent and not what this fuzz is testing).
-const STMT_SUFFIXES: &[&str] = &[
-    " FROM t",
-    " AS d FROM t",
-    " FROM data",
-    " AS d FROM t WHERE label <> 'niño'",
-    "",
-];
-
-/// Valid separators between two markers — as sibling select items (`, `) or
-/// inside one arithmetic select item (` + `, ` * `).
-const STMT_MIDS: &[&str] = &[", ", " + ", " * ", ", z, "];
-
-/// Whether the splice fuzz generates `jvp` markers. Now `true`: #57 is fixed —
-/// `rewrite_sql` splices to the call's matching close paren (found over the
-/// token stream) rather than the under-reported `Expr::span()` end, so a `jvp`
-/// with a compound/casted tangent (last-arg tail a `CAST`/`Nested`) splices
-/// correctly. The minimal repro is `splice_handles_marker_with_cast_or_nested_tail`.
-const SPLICE_FUZZ_INCLUDES_JVP: bool = true;
-
-/// Build one marker call and the exact text `rewrite_sql` must splice in its
-/// place (`(derivative)`), or `None` if the marker's derivative is undefined
-/// (in which case `rewrite_sql` must error on the whole statement).
-fn gen_marker_segment(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
-    let wrt = if rng.below(2) == 0 { "x" } else { "y" };
-    let wrt_col = ColRef::bare(wrt);
-    let depth = 2 + rng.below(2) as u32;
-    let expr_text = gen_expr(rng, depth);
-    let expr = parse_expr(&expr_text);
-
-    match rng.below(3) {
-        // Nested higher-order: grad(grad(expr, wrt), wrt).
-        0 => {
-            let marker = format!("grad(grad({expr_text}, {wrt}), {wrt})");
-            let repl = ddx
-                .differentiate(&expr, &wrt_col)
-                .and_then(|d1| ddx.differentiate(&d1, &wrt_col))
-                .ok()
-                .map(|dd| format!("({dd})"));
-            (marker, repl)
-        }
-        // jvp(expr, wrt, tangent) — only when enabled (bug #57).
-        1 if SPLICE_FUZZ_INCLUDES_JVP => {
-            let tan_depth = 1 + rng.below(2) as u32;
-            let tan_text = gen_expr(rng, tan_depth);
-            let tan = parse_expr(&tan_text);
-            let marker = format!("jvp({expr_text}, {wrt}, {tan_text})");
-            match ddx.jvp(&expr, &[(wrt_col, tan)]) {
-                Ok(v) => (marker, Some(format!("({v})"))),
-                Err(_) => (marker, None),
-            }
-        }
-        // grad(expr, wrt)
-        _ => {
-            let marker = format!("grad({expr_text}, {wrt})");
-            match ddx.differentiate(&expr, &wrt_col) {
-                Ok(d) => (marker, Some(format!("({d})"))),
-                Err(_) => (marker, None),
-            }
-        }
-    }
-}
-
 /// Property 4a: assemble a statement with 1–3 markers wrapped in random
 /// (Unicode-bearing) scaffolding and assert `rewrite_sql` splices each marker
 /// exactly, byte-for-byte, leaving all surrounding text untouched. If any
 /// marker's derivative is undefined, the whole rewrite must error instead.
-/// Assemble a random marker-bearing statement: 1–3 markers wrapped in random
-/// (Unicode-bearing) scaffolding. Returns `(input, expected)` where `expected`
-/// is the exact byte-for-byte `rewrite_sql` output, or `None` if some marker's
-/// derivative is undefined (in which case the whole rewrite must error).
-fn gen_marker_statement(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
-    let n = 1 + rng.below(3) as usize;
-    let prefix = STMT_PREFIXES[rng.below(STMT_PREFIXES.len() as u64) as usize];
-    let suffix = STMT_SUFFIXES[rng.below(STMT_SUFFIXES.len() as u64) as usize];
-
-    let mut input = String::from(prefix);
-    let mut expected = String::from(prefix);
-    let mut any_undefined = false;
-    for i in 0..n {
-        if i > 0 {
-            let mid = STMT_MIDS[rng.below(STMT_MIDS.len() as u64) as usize];
-            input.push_str(mid);
-            expected.push_str(mid);
-        }
-        let (marker, repl) = gen_marker_segment(rng, ddx);
-        input.push_str(&marker);
-        match repl {
-            Some(r) => expected.push_str(&r),
-            None => any_undefined = true,
-        }
-    }
-    input.push_str(suffix);
-    expected.push_str(suffix);
-
-    (input, if any_undefined { None } else { Some(expected) })
-}
-
 fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
     let (input, expected) = gen_marker_statement(rng, ddx);
     let got = ddx.rewrite_sql(&input, &GenericDialect {});
@@ -801,27 +313,6 @@ fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
     }
 }
 
-/// A marker-free statement — some deliberately containing a `grad(`/`jvp(`
-/// substring inside a string literal, a comment, or a *qualified* call, so the
-/// pre-gate's substring filter hits and the statement is parsed but no real
-/// marker is found. Every one must come back byte-identical.
-fn gen_marker_free_stmt(rng: &mut Rng) -> String {
-    match rng.below(6) {
-        0 => {
-            let depth = 2 + rng.below(2) as u32;
-            format!("SELECT {} FROM t", gen_expr(rng, depth))
-        }
-        1 => "SELECT 'grad(x, x)' AS s FROM t".to_string(),
-        2 => "SELECT x /* grad(y, y) */ FROM t".to_string(),
-        3 => "SELECT myschema.grad(x, x) AS d FROM t".to_string(),
-        4 => "SELECT 'jvp(sin(x), x, dx)' AS label, x FROM t".to_string(),
-        _ => format!(
-            "SELECT {} AS val FROM t WHERE label <> 'grad('",
-            gen_expr(rng, 2)
-        ),
-    }
-}
-
 /// Property 4b: a marker-free statement is returned byte-identical.
 fn marker_free_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
     let s = gen_marker_free_stmt(rng);
@@ -839,44 +330,6 @@ fn marker_free_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Additional invariants (issue #58).
 // ---------------------------------------------------------------------------
-
-/// Parse a whole statement (not just an expression).
-fn try_parse_stmt(sql: &str) -> Result<Vec<ddx_core::sqlparser::ast::Statement>, String> {
-    Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| e.to_string())
-}
-
-/// Does an AST still contain an *unqualified* `grad`/`jvp` call — a marker that
-/// should have been rewritten away?
-#[derive(Default)]
-struct MarkerScan {
-    found: bool,
-}
-impl Visitor for MarkerScan {
-    type Break = ();
-    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-        if let Expr::Function(Function { name, .. }) = e {
-            if let [ObjectNamePart::Identifier(id)] = name.0.as_slice() {
-                let n = id.value.to_ascii_lowercase();
-                if n == "grad" || n == "jvp" {
-                    self.found = true;
-                    return ControlFlow::Break(());
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-fn has_residual_marker(stmts: &[ddx_core::sqlparser::ast::Statement]) -> bool {
-    let mut scan = MarkerScan::default();
-    for s in stmts {
-        let _ = Visit::visit(s, &mut scan);
-        if scan.found {
-            return true;
-        }
-    }
-    false
-}
 
 /// Invariant 1: the SQL `rewrite_sql` emits must always re-parse and contain no
 /// residual marker. A *broad* net over the rewrite path — it needs no predicted
@@ -921,93 +374,6 @@ fn idempotence_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
         Err(e) => Some(format!(
             "[idempotence] rewrite_sql errored on its own output:\n  input = {input}\n  once  = {once}\n  error = {e}"
         )),
-    }
-}
-
-/// Adversarial / malformed inputs for the never-panic invariant.
-fn gen_adversarial_sql(rng: &mut Rng) -> String {
-    const UNI: &[&str] = &[
-        "héllo",
-        "☕🔥",
-        "naïve",
-        "Ωμέγα",
-        "🇺🇸",
-        "e\u{0301}",
-        "\u{202E}rtl",
-        "𝕏𝕐",
-    ];
-    match rng.below(8) {
-        // Malformed marker arities / shapes — must be typed errors, not panics.
-        0 => [
-            "SELECT grad() FROM t",
-            "SELECT grad(x) FROM t",
-            "SELECT grad(x, y, z) FROM t",
-            "SELECT jvp(x, x) FROM t",
-            "SELECT jvp(x) FROM t",
-            "SELECT grad(x, 1 + 2) FROM t",
-            "SELECT grad(*, x) FROM t",
-            "SELECT grad(x, ) FROM t",
-        ][rng.below(8) as usize]
-            .to_string(),
-        // A valid marker behind a Unicode-heavy prefix (stresses `locate`).
-        1 => {
-            let u = UNI[rng.below(UNI.len() as u64) as usize];
-            let depth = 2 + rng.below(2) as u32;
-            format!(
-                "SELECT '{u}' AS c, grad({}, x) FROM t",
-                gen_expr(rng, depth)
-            )
-        }
-        // Deeply nested markers.
-        2 => {
-            let k = 1 + rng.below(12) as usize;
-            let mut s = String::from("SELECT ");
-            for _ in 0..k {
-                s.push_str("grad(");
-            }
-            s.push('x');
-            for _ in 0..k {
-                s.push_str(", x)");
-            }
-            s.push_str(" FROM t");
-            s
-        }
-        // A valid marker statement truncated at a random char boundary.
-        3 => {
-            let (full, _) = ("SELECT café AS c, grad(sin(x) * y, x) FROM t", ());
-            let cut = full
-                .char_indices()
-                .nth(1 + rng.below(full.chars().count() as u64) as usize)
-                .map(|(i, _)| i)
-                .unwrap_or(full.len());
-            full[..cut].to_string()
-        }
-        // Marker with a Unicode identifier argument.
-        4 => {
-            let u = UNI[rng.below(UNI.len() as u64) as usize];
-            format!("SELECT grad({u}, x) FROM t")
-        }
-        // Unicode injected into a valid marker statement at a char boundary.
-        5 => {
-            let u = UNI[rng.below(UNI.len() as u64) as usize];
-            let base = "SELECT grad(sin(x), x) FROM t";
-            let at = base
-                .char_indices()
-                .nth(rng.below(base.chars().count() as u64) as usize)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            let mut s = String::from(&base[..at]);
-            s.push_str(u);
-            s.push_str(&base[at..]);
-            s
-        }
-        // Odd whitespace/comments around the marker (the #52 family).
-        6 => "SELECT grad\t(\n x , x )/* ☕ */ FROM t".to_string(),
-        // A deep but valid marker payload.
-        _ => {
-            let depth = 3 + rng.below(3) as u32;
-            format!("SELECT grad({}, x) FROM t", gen_expr(rng, depth))
-        }
     }
 }
 
@@ -1070,61 +436,6 @@ fn no_inf_nan_failure(text: &str, d: &Expr) -> Option<String> {
         return Some(format!(
             "[inf-nan] derivative text contains an inf/nan token:\n  d/d? {text}\n  => {rendered}"
         ));
-    }
-    None
-}
-
-/// Compare a symbolic `lhs` expression to a `rhs` value closure at random
-/// points, returning the first genuine disagreement. Used for the exact
-/// metamorphic identities (jvp↔grad, linearity) — as exact identities, not
-/// finite differences, they need no majority vote.
-///
-/// **Tolerance is relative to the computation scale, not the result** — the
-/// #54 lesson, generalized. `lhs` and `rhs` compute the same value by different
-/// *associations* (e.g. jvp distributes the tangent into each product term
-/// while `t·grad` factors it out; render→reparse turns `a·(b/c)` into `(a·b)/c`,
-/// issue #50). Those agree only up to ≈ `ε · (magnitude of the intermediates)`,
-/// which *explodes past a result-relative tolerance* at a cancellation or
-/// near-singular point (`x⁻¹ − x·x⁻² → 0`, `tan` near a pole). A real rule bug,
-/// by contrast, perturbs the result by a finite fraction of its own scale, so it
-/// still exceeds `RTOL · scale` at well-conditioned points — the check keeps its
-/// teeth while shedding the float-noise false positives.
-fn metamorphic_mismatch(
-    rng: &mut Rng,
-    gate: &[&Expr],
-    lhs: &Expr,
-    rhs: impl Fn(f64, f64) -> Option<f64>,
-) -> Option<(f64, f64, f64, f64)> {
-    const RTOL: f64 = 1e-7;
-    const ATOL: f64 = 1e-9;
-    for _ in 0..40 {
-        let x0 = rng.range(0.2, 1.8);
-        let y0 = rng.range(0.2, 1.8);
-        // Scale = the largest intermediate magnitude across every expression
-        // involved; skip the point if any is non-finite or overflowing.
-        let mut scale = 0.0f64;
-        let mut ok = true;
-        for e in gate.iter().chain(std::iter::once(&lhs)) {
-            match max_intermediate_mag(e, x0, y0) {
-                Some(m) if m.is_finite() && m < 1e300 => scale = scale.max(m),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            continue;
-        }
-        let (Some(a), Some(b)) = (eval(lhs, x0, y0), rhs(x0, y0)) else {
-            continue;
-        };
-        if !a.is_finite() || !b.is_finite() {
-            continue;
-        }
-        if (a - b).abs() > ATOL + RTOL * scale {
-            return Some((x0, y0, a, b));
-        }
     }
     None
 }
@@ -1267,7 +578,7 @@ fn finite_difference_agreement_over_random_expressions() {
     let mut tested = 0u32;
 
     for seed in 0..4000u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+        let mut rng = seeded(seed, 0);
         let depth = 2 + (seed % 3) as u32;
         let text = gen_expr(&mut rng, depth);
         let parsed = parse_expr(&text);
@@ -1310,7 +621,7 @@ fn render_reparse_is_value_preserving() {
     let mut failures: Vec<String> = Vec::new();
 
     for seed in 0..5000u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xDEAD_BEEF);
+        let mut rng = seeded(seed, 0xDEAD_BEEF);
         let depth = 2 + (seed % 4) as u32;
         let text = gen_expr(&mut rng, depth);
         let parsed = parse_expr(&text);
@@ -1343,7 +654,7 @@ fn higher_order_self_consumption_is_stable() {
     let mut failures: Vec<String> = Vec::new();
 
     for seed in 0..2000u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678);
+        let mut rng = seeded(seed, 0x1234_5678);
         let depth = 2 + (seed % 3) as u32;
         let original = gen_expr(&mut rng, depth);
         if let Some(report) = self_consumption_failure(&ddx, &wrt, &original) {
@@ -1373,7 +684,7 @@ fn rewrite_sql_splice_is_byte_faithful() {
     let mut failures: Vec<String> = Vec::new();
 
     for seed in 0..4000u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x5719_C0DE);
+        let mut rng = seeded(seed, 0x5719_C0DE);
         if let Some(report) = splice_failure(&mut rng, &ddx) {
             failures.push(report);
         }
@@ -1425,7 +736,7 @@ fn marker_free_statements_are_byte_identical() {
     let mut failures: Vec<String> = Vec::new();
 
     for seed in 0..2000u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1DE0_7175);
+        let mut rng = seeded(seed, 0x1DE0_7175);
         if let Some(report) = marker_free_failure(&mut rng, &ddx) {
             failures.push(report);
         }
@@ -1442,37 +753,6 @@ fn marker_free_statements_are_byte_identical() {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
-}
-
-/// Run a per-seed check over a fixed range, asserting no failures. Shared by the
-/// bounded tests for the #58 invariants.
-fn run_bounded<F: FnMut(&mut Rng) -> Option<String>>(label: &str, n: u64, salt: u64, mut check: F) {
-    let mut failures: Vec<String> = Vec::new();
-    for seed in 0..n {
-        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ salt);
-        if let Some(report) = check(&mut rng) {
-            failures.push(report);
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{label} found {} failure(s):\n\n{}",
-        failures.len(),
-        failures
-            .iter()
-            .take(15)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    );
-}
-
-/// A random derivable expression plus a random differentiation variable.
-fn gen_expr_and_wrt(rng: &mut Rng) -> (String, Var) {
-    let depth = 2 + rng.below(4) as u32;
-    let text = gen_expr(rng, depth);
-    let wrt = if rng.below(2) == 0 { Var::X } else { Var::Y };
-    (text, wrt)
 }
 
 #[test]
@@ -1594,7 +874,7 @@ fn soak_continuous_property_fuzz() {
 
         // A fresh, reproducible seed for this iteration.
         let seed = base.wrapping_add(iters);
-        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xA5A5_5A5A);
+        let mut rng = seeded(seed, 0xA5A5_5A5A);
         // Deeper trees than the bounded tests, to reach rarer shapes.
         let depth = 2 + (rng.below(5) as u32); // 2..=6
         let wrt = if rng.below(2) == 0 { Var::X } else { Var::Y };

@@ -19,3 +19,16 @@ categories = ["mathematics", "database"]
 # accidentally link a mismatched version. This is the *only* non-trivial
 # dependency of the core, by design.
 sqlparser = { workspace = true }
+
+[features]
+# The shared simulation harness (`ddx_core::test_utils`): generator, reference
+# interpreter, conditioning gates, failure reporter. Off by default so it never
+# ships in a normal build; enabled by every crate that fuzzes, so they all
+# generate the *same* expressions. Semver-exempt — it is test support, not API.
+test-utils = []
+
+[dev-dependencies]
+# ddx-core's own integration tests need the harness too, and an integration test
+# does not inherit its crate's features. A self dev-dependency is the standard
+# way to say "build me again, with this feature, for my own tests".
+ddx-core = { path = ".", features = ["test-utils"] }

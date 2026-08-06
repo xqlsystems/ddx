@@ -56,6 +56,15 @@ mod engine;
 mod error;
 mod rewrite;
 
+// The shared simulation harness — a random expression generator, a reference
+// interpreter, the numeric conditioning gates, and the failure reporter. Behind
+// a feature so it never ships in a normal build, but public when enabled so
+// every crate in the workspace fuzzes against the *same* generator: a
+// cross-crate agreement test proves nothing if each side invented its own idea
+// of "a random derivable expression".
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 /// Smart constructors for building derivative expressions — useful when writing
 /// a custom [`Rule`], which returns `f'(u)` as an [`sqlparser::ast::Expr`].
 pub mod build {
