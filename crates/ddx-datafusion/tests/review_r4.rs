@@ -257,21 +257,38 @@ async fn path_b_carries_a_marker_inside_a_recursive_cte() -> Result<()> {
 /// `path_a_and_path_b_agree_on_every_regression_case` as a standing guard
 /// against exactly this drift.
 ///
-/// This test asserts only the weak invariant: the two paths must both accept or
-/// both reject. Either resolution is fine; silence is not.
+/// RESOLVED by documenting, which the issue lists as an acceptable outcome
+/// ("either resolution is fine; silence is not"). This test was originally
+/// written to assert the two paths *agree*; it now pins the divergence and the
+/// fact that it is documented, because forcing agreement is the wrong fix here:
+///
+/// * Path B's answer is correct. `sum(x)` over `[1,2,3]` is 6, and `d/ds(s·s)`
+///   at `s = 6` is 12.
+/// * Rejecting it would contradict design.md §3.5's carve-out (`G4`), which
+///   explicitly endorses differentiating with respect to a *computed alias* —
+///   `grad(s*s, s)` is `2s`, "and is exactly right". An aggregate output as the
+///   `wrt` is that same shape one level down.
+/// * Detecting "this column is planner-derived" in order to refuse it would be
+///   fragile, and would take the endorsed §3.5 case down with it.
+///
+/// So the rule is stated instead: Path B's `wrt` is any column of the node's
+/// input schema, including planner-derived ones. See the "Where the two paths
+/// genuinely differ" section of `lib.rs`.
 #[tokio::test]
-async fn both_paths_agree_on_whether_an_aggregate_may_be_the_wrt() -> Result<()> {
+async fn the_aggregate_wrt_divergence_is_pinned_and_documented() -> Result<()> {
     let sql = "SELECT grad(sum(x) * sum(x), sum(x)) AS d FROM t";
     let ctx = ctx().await?;
 
+    // Path A refuses: syntactically `sum(x)` is not a bare column.
     let path_a = ddx_datafusion::rewrite_sql(sql);
-    let path_b = ctx.sql(sql).await?.collect().await;
-
-    assert_eq!(
-        path_a.is_ok(),
-        path_b.is_ok(),
-        "path A: {path_a:?}\npath B: {path_b:?}"
+    let err = path_a.expect_err("Path A must still refuse an aggregate as the wrt");
+    assert!(
+        err.to_string().contains("must be a bare column"),
+        "unexpected Path A error: {err}"
     );
+
+    // Path B accepts, and is right: sum(x) = 6, d/ds(s*s) = 2s = 12.
+    assert_eq!(col(&ctx, sql).await?, vec![12.0]);
     Ok(())
 }
 

@@ -487,7 +487,7 @@ scalar expression is legal, `grad` is legal):
 | `SELECT jvp(sin(x),x,dx) FROM g` | `(cos(x)*dx)` | ✅ forward-mode directional derivative |
 | `SELECT AVG(grad(loss, theta)) FROM batch` | `AVG( d(loss)/d(theta) )` | ✅ one gradient-descent step (linearity) |
 | `SELECT a+b AS s, grad(s*s, s) FROM t` | `…, (s + s)` | ✅ differentiate w.r.t. a computed alias |
-| `WITH RECURSIVE n AS (… x-(x*x-2)/grad(x*x-2,x) …) …` | `… /(x+x) …` | ✅ training loop in one query |
+| `WITH RECURSIVE n AS (… x-(x*x-2)/grad(x*x-2,x) …) …` | `… /(x+x) …` | ✅ training loop in one query (but see the DataFusion caveat below) |
 | `INSERT INTO p SELECT theta-lr*grad(loss,theta) FROM …` | rewritten SELECT | ✅ DML update rule |
 | `SELECT grad(sin(x),x) FROM t` in **DuckDB** | needs `SELECT * FROM ddx('…')` — bare works only in native DataFusion | ⚠️ wrapper |
 
@@ -508,6 +508,20 @@ scalar expression is legal, `grad` is legal):
 The mental model: if every function has a rule and the `wrt` is an
 unambiguous column, it works in any query shape; otherwise a typed error at
 rewrite time, before the query runs.
+
+**A DataFusion caveat on the recursive-CTE row, found at M2 and worth knowing
+before M4 leans on it.** DataFusion 54 mis-plans a recursive CTE whose *outer*
+query references only a non-leading subset of the CTE's columns: projection
+pushdown prunes the leading column and the recursive term's projection indices
+are not remapped, giving `project index N out of bounds`. It is unrelated to
+ddx — it reproduces with `cos()` in place of the marker on a context with no ddx
+installed — and it is narrower than "recursive CTEs are broken": referencing
+every column of the loop state in the outer query (`SELECT *` suffices, and a
+`WHERE` on a column counts as referencing it) avoids it entirely. The Newton
+fixture in `ddx-datafusion/tests/path_a.rs` runs a two-column loop with `grad`
+in the recursive term for exactly this reason. Same coverage-gatekeeper shape as
+`[F5]`/`[G9]`/`[S5]`: the bound is the engine's, ddx's job is to know where it
+sits and route around it.
 
 **Roadmap:** general `u^v` via `exp(v·ln u)`; `CASE`/`min`/`max` subgradients
 with a documented kink convention (mirroring how `abs` pins its kink at `0`
@@ -532,6 +546,55 @@ size/latency cliff gets measured, not guessed, by an explicit benchmark
 (§8); the eventual remedy for very heavy scalar use is a let-binding pass
 factoring shared subexpressions into projected columns. The real fix for
 anything past a handful of parameters is v2.
+
+### 3.8 Known limitation: ddx's arithmetic is real, the engine's may not be
+
+`ddx` differentiates the expression as **real-valued arithmetic**. A database
+does not always evaluate it that way, and where the two disagree the emitted
+derivative is a correct derivative *of a different function* than the one the
+engine computes. Found by the property suite
+(`ddx-datafusion/tests/simulation.rs`, "a derivative does not depend on the
+column storage type"); it affects **both** paths equally, because it is a
+property of the model rather than of any bridge.
+
+The sharp case is integer division:
+
+```sql
+-- x is BIGINT, value 3
+SELECT ln(2 / x)            FROM t   -- -inf   : 2/3 truncates to 0, ln(0) = -inf
+SELECT grad(ln(2 / x), x)   FROM t   -- -inf
+-- the same column as DOUBLE
+SELECT grad(ln(2 / x), x)   FROM t   -- -0.333 : the real-arithmetic answer
+```
+
+Under integer semantics `2 / x` is a step function: its true derivative is `0`
+almost everywhere and undefined at the steps. `ddx` emits `-2 / (x * x)`, which
+describes the real function. `DECIMAL` has the same shape and a milder
+magnitude — the derivative is right about the decimal-truncated function, which
+is not quite the function the user believes they wrote.
+
+**This is not the same thing as `[F4]`/`[R1b]`,** and the distinction is the
+whole point. That policy makes every derivative `ddx` *emits* DOUBLE-typed, so
+the derivative's own arithmetic never truncates. It says nothing about the
+arithmetic in the **primal the user wrote**, which the engine evaluates under
+its own rules before differentiation is ever involved.
+
+It is a silent divergence, which principle 5 exists to prevent, so it is stated
+rather than left as folklore. The v1 position: **the primal's arithmetic is the
+user's to declare.** Write `2.0 / x`, or cast the column, and the model and the
+engine agree. Two candidate hardenings are recorded rather than built, because
+each has a real cost:
+
+- *Detect and refuse on Path B.* Post-binding, operand types are known, so a
+  `/` with two integral operands inside a marker could be a typed error naming
+  the fix. It is unavailable to Path A by construction (differentiation there is
+  pre-binding, which is exactly why `[F4]` casts blindly), so building it would
+  introduce a new, deliberate divergence between the paths — the thing §3.3 has
+  otherwise worked to avoid.
+- *Cast the primal.* Rewriting the user's `2 / x` to `2.0 / x` would make the
+  engine compute the function `ddx` differentiates. It also silently changes the
+  meaning of the user's own query, which is a larger liberty than this project
+  should take without asking.
 
 ---
 
