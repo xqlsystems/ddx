@@ -341,7 +341,11 @@ step needs a function registry, the seam is `SessionState::create_logical_expr`
 
 **DataFusion / xarray-sql.** `datafusion-python` doesn't expose injecting an
 `AnalyzerRule` into its `SessionContext` `[R2]` — which is why the SQL rewrite
-is the path here, not a limitation being worked around. `ddxdb` wraps a `Ddx`
+is the path here, not a limitation being worked around. The gap is structural,
+not a missing convenience method: re-verified at M1 against `datafusion` 54.0.0
+(`spikes/datafusion_python_analyzer_rule_r2.py`), the *FFI capsule vocabulary*
+the bindings are built on has no analyzer-rule capsule at all, so a compiled
+Rust extension can't inject one either. `ddxdb` wraps a `Ddx`
 and exposes `rewrite_sql` plus a `Context.sql()` shim; xarray-sql pulls it in
 as an optional extra, `pip install "xarray-sql[ddx]"`, so autograd is opt-in
 and costs nothing for users who don't ask for it `[Q4]`. Native Rust
@@ -1179,6 +1183,80 @@ below once that investigation concluded.
 `FROM`-first queries, lambdas) actually parse fine; only `PIVOT` and `#1`
 positional columns genuinely fail. Refreshed the claim with a version-pinned
 spike result instead of an assumption. → §3.3.
+
+### Open research questions closed by spike (`R1`, `R1b`, `R2`)
+
+**R1 — DuckDB's stable C extension API has no optimizer, parser, or
+bound-expression hook.** Read directly off `duckdb_extension.h` (what the
+`duckdb` crate's `loadable-extension` feature binds): registration exists for
+scalar, aggregate, table, and cast functions plus replacement scans, and
+nothing deeper. Corroborated by duckdb-zarr, a mature extension using exactly
+table functions. This is what makes a native bare-`grad()` rewrite impossible
+in a *Rust* community extension and puts `ddx('<sql>')` — plus the deferred
+C++/cxx.rs hybrid — in the design instead. → §3.4.
+
+**R1b — An inner query on the same DuckDB database, run mid-execution of an
+outer one, is safe (`spikes/duckdb_reentrancy_r1b.py`).** No deadlock; reads of
+committed data work; DML works. One real consequence, and the reason the design
+routes DML training loops elsewhere: the inner connection runs in its own
+transaction, so it cannot see the *outer* connection's uncommitted writes. →
+§3.4.
+
+**R2 — `datafusion-python` cannot inject an `AnalyzerRule`
+(`spikes/datafusion_python_analyzer_rule_r2.py`).** Re-verified at M1 against
+`datafusion` 54.0.0, checked three ways from the outside in: the public
+`SessionContext` has no `add_analyzer_rule`; neither does the `_internal` PyO3
+class beneath it, which also exposes no `SessionState`/`SessionStateBuilder`
+handle (where the method lives in native Rust DataFusion); and — the check that
+makes the finding durable rather than a snapshot — the compiled FFI capsule
+vocabulary contains no `__datafusion_analyzer_rule__`, so a *compiled Rust*
+extension has no way in either. The logical optimizer is closed the same way:
+`remove_optimizer_rule` exists with no matching `add`.
+
+The single rule-injection capsule that does exist,
+`__datafusion_physical_optimizer_rule__`, is post-planning and therefore useless
+here — by the time it could see a marker, the argument is a compiled physical
+expression, not the symbolic form differentiation needs. The same spike pins
+that underlying fact independently (§3.1): a *scalar* UDF named `grad`
+registered on a live context receives `[1.0, 4.0, 9.0]` for `grad(x*x, x)` over
+`x = [1,2,3]` — the *evaluated* argument, never `x*x`.
+
+Three seams were found and recorded per M1's exit criterion; none displaces
+Path A for bare `grad()`, and one is worth adopting on its own merits.
+
+*(i) Plan serialization.* `LogicalPlan ↔ proto bytes` plus
+`execute_logical_plan` does permit an out-of-engine plan rewrite — but it can't
+intercept `ctx.sql()` transparently, it would make ddx manipulate DataFusion
+protobuf plan messages (a DataFusion-specific plan-interchange format, which
+§1.2 rules out), and it fails outright on in-memory tables, xarray-sql's common
+case. Not adopted.
+
+*(ii) `add_physical_optimizer_rule`* via a compiled extension — post-planning,
+rejected on the merits above. Not adopted.
+
+*(iii) Table functions (`register_udtf`).* Unlike a scalar UDF, a table function
+receives an **unevaluated `RawExpr`**. This is the DataFusion-native analogue of
+the `ddx('<sql>')` table function §3.4 already ships for DuckDB, and it needs no
+compiled extension — a plain Python callable works — so it is worth taking up in
+M2 for surface symmetry, letting the same `ddx('<sql>')` spelling work on both
+engines. It is emphatically *not* a route to bare `grad()`, and does not soften
+the scalar-UDF finding. Two limits close it, and the second is worth stating
+precisely rather than in the obvious-but-wrong shorthand. First, a composite
+argument arrives already **constant-folded** (`sin(2.0)*3.0` →
+`Float64(2.7278…)`), so no structure survives. Second, a table function's
+arguments are resolved against an **empty schema** — which is narrower than
+"columns are rejected": a *bare* column reference does pass through, as an
+unresolved and meaningless `Expr(x)`. What dies at planning is anything
+requiring type resolution, so both `ddx(x + 1)` and `ddx(grad(x*x, x))` fail
+with *"No field named x"*. Only opaque leaves survive, which means what the seam
+can actually carry is a SQL **string** — handled by `rewrite_sql` exactly as
+under Path A. It relocates Path A into the engine; it does not replace it.
+
+So the structural claim is specifically about *bare* `grad()`: no seam, at any
+layer, delivers a marker's symbolic argument over real table columns. Should an
+`__datafusion_analyzer_rule__` capsule ever appear upstream, `ddx-datafusion`'s
+Path B bridge is what would plug into it — a second reason to build Path B in M2
+as designed. → §3.3, §3.4, §8 M1.
 
 ### Resolved decision points (`Q1`–`Q7`)
 
