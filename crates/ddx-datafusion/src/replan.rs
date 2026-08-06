@@ -41,8 +41,14 @@ use datafusion::sql::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion::sql::TableReference;
 use ddx_core::sqlparser::ast as sql_ast;
 
-/// Everything the planner needs to turn a derivative expression back into an
-/// [`Expr`]: a function registry, config, and expression planners.
+/// The expensive half of what the planner needs to turn a derivative back into
+/// an [`Expr`]: function registries and expression planners, built once when the
+/// analyzer is constructed.
+///
+/// This is deliberately *not* a [`ContextProvider`] itself — it cannot answer
+/// `options()`, which is per-query. [`ScopedExprContext`] borrows it together
+/// with the session's config for a single re-plan, and is the only
+/// `ContextProvider` here.
 ///
 /// Scalar functions are the only interesting part. A derivative contains
 /// whatever `ddx-core` emitted — `cos`, `sin`, `exp`, `ln`, `power`, `abs`,
@@ -55,7 +61,6 @@ use ddx_core::sqlparser::ast as sql_ast;
 pub(crate) struct ExprContext {
     functions: HashMap<String, Arc<ScalarUDF>>,
     higher_order: HashMap<String, Arc<HigherOrderUDF>>,
-    options: ConfigOptions,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
 }
 
@@ -83,7 +88,6 @@ impl ExprContext {
         ExprContext {
             functions,
             higher_order,
-            options: ConfigOptions::default(),
             // Exactly the planner list a stock SessionState uses, so an
             // expression re-planned here is planned the same way the engine
             // would have planned it had the user written the derivative out by
@@ -96,11 +100,10 @@ impl ExprContext {
     /// with `local` functions layered on top.
     ///
     /// **Config.** `AnalyzerRule::analyze` is handed the session's
-    /// `&ConfigOptions`, and the derivative should be planned under those, not
-    /// under the defaults this struct was built with —
-    /// `enable_ident_normalization`, the parser dialect, and
-    /// `parse_float_as_decimal` all steer `SqlToRel`. None is known to produce a
-    /// wrong answer today (identifier normalization is masked because the
+    /// `&ConfigOptions`, and the derivative should be planned under those rather
+    /// than under defaults — `enable_ident_normalization`, the parser dialect,
+    /// and `parse_float_as_decimal` all steer `SqlToRel`. None is known to
+    /// produce a wrong answer today (identifier normalization is masked because the
     /// `Unparser` quotes anything case-sensitive, and `parse_float_as_decimal`
     /// because the replacement is cast to Float64 anyway), so this closes a
     /// latent divergence rather than a live bug.
@@ -142,48 +145,6 @@ pub(crate) struct ScopedExprContext<'a> {
 
 impl ContextProvider for ScopedExprContext<'_> {
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
-        self.inner.get_table_source(name)
-    }
-    fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.local
-            .get(&name.to_ascii_lowercase())
-            .cloned()
-            .or_else(|| self.inner.get_function_meta(name))
-    }
-    fn get_higher_order_meta(&self, name: &str) -> Option<Arc<HigherOrderUDF>> {
-        self.inner.get_higher_order_meta(name)
-    }
-    fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.inner.get_aggregate_meta(name)
-    }
-    fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.inner.get_window_meta(name)
-    }
-    fn get_variable_type(&self, names: &[String]) -> Option<DataType> {
-        self.inner.get_variable_type(names)
-    }
-    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
-        self.inner.get_expr_planners()
-    }
-    fn options(&self) -> &ConfigOptions {
-        self.options
-    }
-    fn udf_names(&self) -> Vec<String> {
-        self.inner.udf_names()
-    }
-    fn higher_order_function_names(&self) -> Vec<String> {
-        self.inner.higher_order_function_names()
-    }
-    fn udaf_names(&self) -> Vec<String> {
-        self.inner.udaf_names()
-    }
-    fn udwf_names(&self) -> Vec<String> {
-        self.inner.udwf_names()
-    }
-}
-
-impl ContextProvider for ExprContext {
-    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
         // Unreachable for a scalar expression: differentiation maps column
         // references to column references and never introduces a relation. If
         // this ever fires it is a ddx bug, not user error, so say so plainly.
@@ -195,18 +156,25 @@ impl ContextProvider for ExprContext {
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.functions.get(&name.to_ascii_lowercase()).cloned()
+        let name = name.to_ascii_lowercase();
+        self.local
+            .get(&name)
+            .or_else(|| self.inner.functions.get(&name))
+            .cloned()
     }
 
     fn get_higher_order_meta(&self, name: &str) -> Option<Arc<HigherOrderUDF>> {
-        self.higher_order.get(&name.to_ascii_lowercase()).cloned()
+        self.inner
+            .higher_order
+            .get(&name.to_ascii_lowercase())
+            .cloned()
     }
 
     fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
         // A derivative is a scalar expression. Aggregates in the user's query
         // are outside the marker — the marker goes *inside* the aggregate, as in
-        // `AVG(grad(loss, theta))` — so the differentiated fragment
-        // never contains one.
+        // `AVG(grad(loss, theta))` — so the differentiated fragment never
+        // contains one.
         None
     }
 
@@ -219,19 +187,24 @@ impl ContextProvider for ExprContext {
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
-        &self.expr_planners
+        &self.inner.expr_planners
     }
 
     fn options(&self) -> &ConfigOptions {
-        &self.options
+        self.options
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.functions.keys().cloned().collect()
+        self.inner
+            .functions
+            .keys()
+            .chain(self.local.keys())
+            .cloned()
+            .collect()
     }
 
     fn higher_order_function_names(&self) -> Vec<String> {
-        self.higher_order.keys().cloned().collect()
+        self.inner.higher_order.keys().cloned().collect()
     }
 
     fn udaf_names(&self) -> Vec<String> {

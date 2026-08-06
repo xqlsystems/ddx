@@ -23,6 +23,8 @@ use datafusion::error::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility};
 use datafusion::prelude::{create_udf, SessionContext};
 
+mod common;
+
 /// A context with ddx installed and `t(x, y)` = {(1,4), (2,5), (3,6)}.
 async fn ctx() -> Result<SessionContext> {
     let ctx = SessionContext::new();
@@ -37,16 +39,7 @@ async fn ctx() -> Result<SessionContext> {
 /// Run `sql`, returning the first column as `f64`s.
 async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
     let batches = ctx.sql(sql).await?.collect().await?;
-    let mut out = Vec::new();
-    for b in &batches {
-        let a = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("every derivative is emitted DOUBLE-typed");
-        out.extend((0..a.len()).map(|i| a.value(i)));
-    }
-    Ok(out)
+    Ok(common::f64_column(&batches))
 }
 
 // ---------------------------------------------------------------------------

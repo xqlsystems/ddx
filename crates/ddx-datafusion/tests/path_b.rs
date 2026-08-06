@@ -13,6 +13,8 @@ use datafusion::arrow::array::Float64Array;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 
+mod common;
+
 /// A context with ddx installed and a table `t(x, y)` of three rows.
 async fn ctx() -> Result<SessionContext> {
     let ctx = SessionContext::new();
@@ -30,16 +32,7 @@ async fn ctx() -> Result<SessionContext> {
 /// Run `sql` and return the first column as `f64`s.
 async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
     let batches = ctx.sql(sql).await?.collect().await?;
-    let mut out = Vec::new();
-    for b in &batches {
-        let a = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("every derivative is emitted DOUBLE-typed");
-        out.extend((0..a.len()).map(|i| a.value(i)));
-    }
-    Ok(out)
+    Ok(common::f64_column(&batches))
 }
 
 #[tokio::test]

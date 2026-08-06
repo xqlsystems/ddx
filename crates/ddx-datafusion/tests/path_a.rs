@@ -12,6 +12,8 @@ use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 use ddx_datafusion::{ddx_sql, rewrite_sql};
 
+mod common;
+
 /// A **stock** context — deliberately no `install()`. Path A needs no engine
 /// setup at all: the markers are gone before the engine sees the statement.
 async fn ctx() -> Result<SessionContext> {
@@ -28,16 +30,7 @@ async fn ctx() -> Result<SessionContext> {
 
 async fn col(ctx: &SessionContext, sql: &str) -> Result<Vec<f64>> {
     let batches = ddx_sql(ctx, sql).await?.collect().await?;
-    let mut out = Vec::new();
-    for b in &batches {
-        let a = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("derivatives are always Float64");
-        out.extend((0..a.len()).map(|i| a.value(i)));
-    }
-    Ok(out)
+    Ok(common::f64_column(&batches))
 }
 
 #[tokio::test]

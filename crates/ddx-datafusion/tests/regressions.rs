@@ -18,6 +18,8 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 
+mod common;
+
 async fn ctx() -> Result<SessionContext> {
     let ctx = SessionContext::new();
     ddx_datafusion::install(&ctx);
@@ -38,17 +40,7 @@ async fn ctx() -> Result<SessionContext> {
 /// Run `sql`, returning the first column as `f64` plus its Arrow type.
 async fn col(ctx: &SessionContext, sql: &str) -> Result<(Vec<f64>, DataType)> {
     let batches = ctx.sql(sql).await?.collect().await?;
-    let ty = batches[0].schema().field(0).data_type().clone();
-    let mut out = Vec::new();
-    for b in &batches {
-        let a = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("every derivative must be Float64");
-        out.extend((0..a.len()).map(|i| a.value(i)));
-    }
-    Ok((out, ty))
+    Ok((common::f64_column(&batches), common::column_type(&batches)))
 }
 
 #[tokio::test]
