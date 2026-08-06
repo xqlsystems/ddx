@@ -76,7 +76,7 @@ jobs:
       # engine, plus the sqlparser single-version guard that keeps Path B's
       # bridge compiling (design.md §6, G2).
       - name: integration tests (ddx-datafusion)
-        run: cargo test -p ddx-datafusion --test path_a --test path_b --test sqlparser_pin
+        run: cargo test -p ddx-datafusion --test path_a --test path_b --test regressions --test sqlparser_pin
       - name: doctests
         run: cargo test --workspace --doc
 

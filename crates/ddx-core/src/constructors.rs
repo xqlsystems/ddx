@@ -139,6 +139,22 @@ pub fn as_const(e: &Expr) -> Option<f64> {
             op: UnaryOperator::Plus,
             expr,
         } => as_const(expr),
+        // A cast of a constant to a *numeric* type is still that constant.
+        //
+        // This is not a hypothetical tidiness: an engine's own type coercion
+        // injects these. DataFusion's `TypeCoercion` runs before ddx's analyzer
+        // rule sees the marker, so `power(x, 3)` arrives as
+        // `power(CAST(x AS DOUBLE), CAST(3 AS DOUBLE))`. Without this arm the
+        // exponent reads as variable, and the flagship `power(x, 3)` case is
+        // rejected with a message claiming the exponent depends on the
+        // differentiation variable — a wrong diagnosis for a supported case.
+        //
+        // Restricted to numeric targets on purpose: `CAST(1 AS VARCHAR)` is the
+        // string `'1'`, not the number, and must not fold to a numeric constant.
+        // Same bug shape as the `UnaryOp` arm above (#46), different wrapper.
+        Expr::Cast {
+            expr, data_type, ..
+        } if crate::engine::is_numeric_type(data_type) => as_const(expr),
         _ => None,
     }
 }
@@ -368,6 +384,32 @@ pub fn func1(name: &str, x: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn as_const_sees_through_a_numeric_cast() {
+        // An engine's own type coercion wraps literals in casts before ddx ever
+        // sees the expression — DataFusion turns `power(x, 3)` into
+        // `power(CAST(x AS DOUBLE), CAST(3 AS DOUBLE))`. If `as_const` misses
+        // that, the `power` rule misreads a constant exponent as variable and
+        // rejects a supported case with a wrong diagnosis.
+        assert_eq!(as_const(&cast_double(num(3.0))), Some(3.0));
+        // Nested inside the cast, and negated, still constant.
+        assert_eq!(as_const(&cast_double(neg(num(2.0)))), Some(-2.0));
+    }
+
+    #[test]
+    fn as_const_refuses_a_non_numeric_cast() {
+        // `CAST(1 AS VARCHAR)` is the string '1', not the number — folding it to
+        // a numeric constant would be a silent type confusion.
+        let to_text = Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(num(1.0)),
+            data_type: DataType::Varchar(None),
+            array: false,
+            format: None,
+        };
+        assert_eq!(as_const(&to_text), None);
+    }
 
     #[test]
     fn folds_additive_zero() {

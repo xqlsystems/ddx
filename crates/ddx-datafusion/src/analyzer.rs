@@ -33,11 +33,13 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema};
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, ScalarUDF};
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::sql::unparser::Unparser;
 use ddx_core::sqlparser::ast as sql_ast;
@@ -109,6 +111,15 @@ impl DdxAnalyzer {
     /// expression by the time the outer one is differentiated (design.md §3.1).
     fn rewrite_expr(&self, expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         expr.transform_up(|e| {
+            // A subquery embedded in an expression carries its own
+            // `LogicalPlan`, and `LogicalPlan::map_children` does NOT descend
+            // into those — it visits only direct relational inputs. Without
+            // this, a marker inside `WHERE x > (SELECT AVG(grad(y*y, y)) ...)`
+            // is never rewritten and survives to execution.
+            if let Some(sub) = subquery_plan(&e) {
+                let rewritten = self.rewrite_plan(sub.as_ref().clone())?;
+                return Ok(Transformed::yes(with_subquery_plan(e, Arc::new(rewritten))));
+            }
             let Expr::ScalarFunction(call) = &e else {
                 return Ok(Transformed::no(e));
             };
@@ -147,7 +158,32 @@ impl DdxAnalyzer {
             }
         };
 
-        replan(&self.exprs, derivative, schema)
+        let replanned = replan(&self.exprs, derivative, schema)?;
+
+        // Force the replacement to the type the marker UDF declared
+        // (`Marker::return_type` → Float64). Two reasons, one of them a bug:
+        //
+        // 1. Correctness. The marker's declared type is already baked into
+        //    every ancestor node's cached schema. `LogicalPlan::map_children`
+        //    preserves a parent's `schema` field while swapping its input, so
+        //    only the rewritten node gets `recompute_schema` — if the
+        //    derivative planned to a different type (`x + x` on an Int64 column
+        //    is Int64), ancestors keep a stale Float64 and the optimizer's
+        //    invariant check fails with an internal error.
+        // 2. Policy. design.md §3.2 (F4/R1b) says derivatives are always
+        //    emitted DOUBLE-typed, because differentiation runs pre-binding and
+        //    SQL integer division truncates on some engines but not others.
+        //    Without this, `grad(x*x, x)` over a BIGINT column returns Int64 —
+        //    quietly violating the invariant this crate documents.
+        //
+        // `cast_to` is a no-op when the type already matches, which is the
+        // common case.
+        replanned.cast_to(&DataType::Float64, schema).map_err(|e| {
+            DataFusionError::Plan(format!(
+                "ddx: the derivative of a `{kind}` argument could not be represented as \
+                     DOUBLE, which design.md §3.2 requires of every emitted derivative: {e}"
+            ))
+        })
     }
 }
 
@@ -156,7 +192,7 @@ impl AnalyzerRule for DdxAnalyzer {
         "ddx_markers"
     }
 
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
         // Skip the whole walk when the plan contains no marker. Same spirit as
         // ddx-core's parse-free pre-gate (design.md §3.2, F5): a query that
         // never mentions ddx should not be touched, and must not be able to
@@ -165,6 +201,28 @@ impl AnalyzerRule for DdxAnalyzer {
             return Ok(plan);
         }
 
+        let plan = self.rewrite_plan(plan)?;
+
+        // Re-run type coercion over the rewritten plan.
+        //
+        // `add_analyzer_rule` installs this rule to run AFTER DataFusion's own
+        // `TypeCoercion` pass, so the expression we splice in has never been
+        // coerced — nothing runs after us. That matters because ddx-core
+        // deliberately emits DOUBLE-typed literals and casts (design.md §3.2,
+        // F4), so differentiating anything over an integer column yields
+        // mixed-type arithmetic: `grad(x / 2, x)` on a BIGINT column produced
+        // `Float64 / Int64`, which plans fine and then dies at execution with an
+        // Arrow error. Coercing here is what the engine would have done had the
+        // derivative been written by hand.
+        TypeCoercion::new().analyze(plan, config)
+    }
+}
+
+impl DdxAnalyzer {
+    /// Rewrite every marker in one plan (and in any plan embedded in its
+    /// expressions). No pre-gate and no type coercion — [`AnalyzerRule::analyze`]
+    /// wraps those around the outermost call.
+    fn rewrite_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         plan.transform_up(|node| {
             // A node's expressions are resolved against its *inputs*, not its
             // own output schema — that is what binds the derivative's columns
@@ -198,14 +256,43 @@ impl AnalyzerRule for DdxAnalyzer {
             })?;
 
             if rewrote {
-                // The replacement has a different type than the marker call it
-                // replaced, so the node's schema must be rebuilt.
+                // Field *names* can change even when the type doesn't, so the
+                // node's schema is rebuilt regardless.
                 node.map_data(|plan| plan.recompute_schema())
             } else {
                 Ok(node)
             }
         })
         .map(|t| t.data)
+    }
+}
+
+/// The embedded plan of a subquery expression, if `e` is one.
+fn subquery_plan(e: &Expr) -> Option<&Arc<LogicalPlan>> {
+    match e {
+        Expr::ScalarSubquery(sq) => Some(&sq.subquery),
+        Expr::InSubquery(is) => Some(&is.subquery.subquery),
+        Expr::Exists(ex) => Some(&ex.subquery.subquery),
+        _ => None,
+    }
+}
+
+/// Put `plan` back into a subquery expression produced by [`subquery_plan`].
+fn with_subquery_plan(e: Expr, plan: Arc<LogicalPlan>) -> Expr {
+    match e {
+        Expr::ScalarSubquery(mut sq) => {
+            sq.subquery = plan;
+            Expr::ScalarSubquery(sq)
+        }
+        Expr::InSubquery(mut is) => {
+            is.subquery.subquery = plan;
+            Expr::InSubquery(is)
+        }
+        Expr::Exists(mut ex) => {
+            ex.subquery.subquery = plan;
+            Expr::Exists(ex)
+        }
+        other => other,
     }
 }
 
@@ -222,7 +309,11 @@ fn merged_input_schema(plan: &LogicalPlan) -> Result<DFSchema> {
     Ok(merged)
 }
 
-/// Does this plan contain a ddx marker anywhere?
+/// Does this plan contain a ddx marker anywhere — including inside a plan
+/// embedded in one of its expressions?
+///
+/// The subquery case matters: this is a *gate*, so a false negative here means
+/// the rewrite is skipped entirely and the marker survives to execution.
 fn plan_has_marker(plan: &LogicalPlan) -> Result<bool> {
     let mut found = false;
     plan.apply(|node| {
@@ -230,6 +321,12 @@ fn plan_has_marker(plan: &LogicalPlan) -> Result<bool> {
             expr.apply(|e| {
                 if let Expr::ScalarFunction(call) = e {
                     if marker_kind(call.func.name()).is_some() {
+                        found = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                if let Some(sub) = subquery_plan(e) {
+                    if plan_has_marker(sub)? {
                         found = true;
                         return Ok(TreeNodeRecursion::Stop);
                     }
@@ -255,22 +352,21 @@ fn to_sql_ast(expr: &Expr) -> Result<sql_ast::Expr> {
 
 /// Read the differentiation variable off the marker's second argument.
 ///
-/// Taken straight from the bound [`Column`] rather than unparsed text, so the
-/// qualifier is whatever the planner resolved — the reason this path is
-/// binding-aware for free.
+/// **The `wrt` must go through the same unparser as the body.** It is tempting
+/// to build the `ColRef` directly from the bound [`Column`]'s `relation`/`name`
+/// strings, since the planner already resolved them — but that produces
+/// *unquoted* idents, while the body's occurrences of the very same column are
+/// unparsed by `Unparser`, whose `DefaultDialect` quotes any identifier
+/// containing an uppercase letter (or a keyword). `IdentCasing::FoldUnquoted`
+/// then folds the unquoted `wrt` to lowercase and preserves the quoted
+/// occurrence's case, they compare unequal, every occurrence classifies as
+/// `Match::Not`, and the derivative comes back a silent `0` for any capitalized
+/// column — exactly the silently-wrong class design principle 5 exists to
+/// prevent, and one that hits any Parquet/CSV schema with capitalized headers.
+///
+/// Unparsing the column keeps the qualifier the planner resolved (so this path
+/// stays binding-aware) *and* guarantees both sides share one quoting rule.
 fn wrt_colref(kind: &str, arg: &Expr) -> Result<ColRef> {
-    match arg {
-        Expr::Column(Column { relation, name, .. }) => Ok(ColRef {
-            qualifier: relation
-                .as_ref()
-                .map(|r| sql_ast::Ident::new(r.table().to_string())),
-            name: sql_ast::Ident::new(name.clone()),
-        }),
-        other => {
-            // Not a column: produce ddx-core's own error, so the message is
-            // identical whichever path the user came in on.
-            let unparsed = to_sql_ast(other)?;
-            ColRef::from_wrt_arg(kind, &unparsed).map_err(to_df_err)
-        }
-    }
+    let unparsed = to_sql_ast(arg)?;
+    ColRef::from_wrt_arg(kind, &unparsed).map_err(to_df_err)
 }

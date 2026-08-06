@@ -418,7 +418,7 @@ pub(crate) fn positional_args(f: &Function) -> Option<Vec<&Expr>> {
 /// linear (and so differentiable). The list is exhaustive for the pinned
 /// `sqlparser` version; a `sqlparser` bump is already a breaking release of
 /// `ddx-core` (design.md §6, G2), at which point this is re-checked.
-fn is_numeric_type(dt: &DataType) -> bool {
+pub(crate) fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
         dt,
         // Floating-point / fixed-point.
