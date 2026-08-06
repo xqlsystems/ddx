@@ -793,13 +793,14 @@ struct MarkerScan {
 impl Visitor for MarkerScan {
     type Break = ();
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-        if let Expr::Function(Function { name, .. }) = e {
-            if let [ObjectNamePart::Identifier(id)] = name.0.as_slice() {
-                let n = id.value.to_ascii_lowercase();
-                if n == "grad" || n == "jvp" {
-                    self.found = true;
-                    return ControlFlow::Break(());
-                }
+        // Deliberately the *rewriter's own* definition of a marker, not a copy
+        // of it. This scan is the oracle for "the rewrite left nothing behind",
+        // so if the rewriter's notion of what counts as a marker ever changes,
+        // the oracle has to follow it or it quietly stops checking the new case.
+        if let Expr::Function(f) = e {
+            if crate::rewrite::marker_kind(f).is_some() {
+                self.found = true;
+                return ControlFlow::Break(());
             }
         }
         ControlFlow::Continue(())

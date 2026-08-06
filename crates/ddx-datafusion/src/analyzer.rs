@@ -38,7 +38,6 @@
 //! guarantee rests on the planner having already refused the ambiguous cases,
 //! not merely on qualifiers being present.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
@@ -46,6 +45,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::utils::{find_out_reference_exprs, merge_schema};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, ScalarUDF};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::optimizer::AnalyzerRule;
@@ -54,7 +54,7 @@ use ddx_core::sqlparser::ast as sql_ast;
 use ddx_core::{ColRef, Ddx};
 
 use crate::error::to_df_err;
-use crate::markers::{marker_kind, GRAD};
+use crate::markers::{marker_kind, GRAD, JVP};
 use crate::replan::{functions_in, replan, ExprContext};
 
 /// The ddx analyzer rule: rewrites `grad`/`jvp` markers away before execution.
@@ -146,14 +146,22 @@ impl DdxAnalyzer {
         schema: &DFSchema,
         options: &ConfigOptions,
     ) -> Result<Expr> {
-        let expected = if kind == GRAD { 2 } else { 3 };
-        if args.len() != expected {
-            return Err(DataFusionError::Plan(format!(
-                "ddx: `{kind}` takes {expected} arguments, got {}. \
-                 Write `grad(expr, column)` or `jvp(expr, column, tangent)`.",
-                args.len()
-            )));
-        }
+        // One destructure carries the arity, so it is not restated as a count and
+        // there is no positional indexing below. DataFusion's own signature check
+        // (`Signature::any(2)` / `any(3)` on the marker UDFs) rejects a wrong
+        // arity during planning, before this rule runs, so the error here is a
+        // backstop rather than the message a user normally sees.
+        let (body_arg, wrt_arg, tangent_arg) = match (kind, args) {
+            (GRAD, [body, wrt]) => (body, wrt, None),
+            (JVP, [body, wrt, tangent]) => (body, wrt, Some(tangent)),
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "ddx: `{kind}` was called with {} arguments. \
+                     Write `grad(expr, column)` or `jvp(expr, column, tangent)`.",
+                    args.len()
+                )))
+            }
+        };
 
         // Reject a correlated outer reference *before* unparsing, so the user
         // gets the real constraint instead of a lie about their schema.
@@ -169,7 +177,7 @@ impl DdxAnalyzer {
         // creates an `OuterReferenceColumn` only when the name does *not*
         // resolve in the inner scope, so the unparsed text cannot silently
         // rebind to an inner column of the same name.
-        if let Some(outer) = outer_reference_in(&args[..expected.min(args.len())]) {
+        if let Some(outer) = outer_reference_in(args) {
             return Err(DataFusionError::Plan(format!(
                 "ddx: this `{kind}` marker is inside a correlated subquery and references \
                  the outer column `{outer}`. The derivative is re-planned against the \
@@ -180,13 +188,13 @@ impl DdxAnalyzer {
             )));
         }
 
-        let body = to_sql_ast(&args[0])?;
-        let wrt = wrt_colref(kind, &args[1])?;
+        let body = to_sql_ast(body_arg)?;
+        let wrt = wrt_colref(kind, wrt_arg)?;
 
-        let derivative: sql_ast::Expr = match kind {
-            GRAD => self.ddx.differentiate(&body, &wrt).map_err(to_df_err)?,
-            _ => {
-                let tangent = to_sql_ast(&args[2])?;
+        let derivative: sql_ast::Expr = match tangent_arg {
+            None => self.ddx.differentiate(&body, &wrt).map_err(to_df_err)?,
+            Some(tangent) => {
+                let tangent = to_sql_ast(tangent)?;
                 self.ddx.jvp(&body, &[(wrt, tangent)]).map_err(to_df_err)?
             }
         };
@@ -274,7 +282,7 @@ impl DdxAnalyzer {
             // own output schema — that is what binds the derivative's columns
             // to the same columns the original expression used. Leaf nodes
             // (which have no inputs) fall back to their own schema.
-            let schema = merged_input_schema(&node)?;
+            let schema = merged_input_schema(&node);
 
             // Which names this node publishes to its parents, read off the
             // node's own schema *before* the rewrite.
@@ -288,39 +296,31 @@ impl DdxAnalyzer {
             // worst harmful (an alias around a join key can defeat equijoin
             // recognition).
             //
-            // This asks the plan rather than matching on node variants. The
-            // variant list was `Projection | Aggregate | Window` and was missing
-            // `Distinct::On`, which also derives its schema from its
-            // expressions — the same staleness that bit the subquery walk above.
-            // A schema lookup cannot go stale, because any node that publishes a
-            // name necessarily has it in its schema.
-            let published: HashSet<String> = node
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
+            // This asks the plan rather than matching on node variants. Upstream
+            // ships a `NamePreserver` for the same job, but it decides from an
+            // exclusion list of `LogicalPlan` variants; a schema lookup cannot go
+            // stale, because any node that publishes a name necessarily has that
+            // name in its schema.
+            let out_schema = Arc::clone(node.schema());
 
-            let mut rewrote = false;
             let node = node.map_expressions(|expr| {
                 let original_name = expr.schema_name().to_string();
                 let out = self.rewrite_expr(expr, &schema, options)?;
-                rewrote |= out.transformed;
-                Ok(out.update_data(|e| {
-                    if published.contains(&original_name)
-                        && e.schema_name().to_string() != original_name
-                    {
-                        e.alias(original_name)
-                    } else {
-                        e
-                    }
-                }))
+                // Only a rewritten expression can have changed its name, so an
+                // untouched one skips the check entirely.
+                if !out.transformed || !out_schema.has_column_with_unqualified_name(&original_name)
+                {
+                    return Ok(out);
+                }
+                out.map_data(|e| e.alias_if_changed(original_name))
             })?;
 
-            if rewrote {
+            // `map_expressions` already ORs the per-expression transformed flags,
+            // so this is exactly "did any marker rewrite happen in this node".
+            if node.transformed {
                 // Field *names* can change even when the type doesn't, so the
                 // node's schema is rebuilt regardless.
-                node.map_data(|plan| plan.recompute_schema())
+                node.map_data(LogicalPlan::recompute_schema)
             } else {
                 Ok(node)
             }
@@ -330,16 +330,19 @@ impl DdxAnalyzer {
 }
 
 /// The schema a node's expressions resolve against: all of its inputs merged.
-fn merged_input_schema(plan: &LogicalPlan) -> Result<DFSchema> {
+///
+/// The merge itself is upstream's — it is what DataFusion's own analyzer rules
+/// use, and it has a single-input fast path that skips the rebuild. Only the
+/// leaf case is ours: a node with no inputs (a `Values`, say) resolves its
+/// expressions against its own schema, where upstream would hand back an empty
+/// one.
+fn merged_input_schema(plan: &LogicalPlan) -> DFSchema {
     let inputs = plan.inputs();
     if inputs.is_empty() {
-        return Ok(plan.schema().as_ref().clone());
+        plan.schema().as_ref().clone()
+    } else {
+        merge_schema(&inputs)
     }
-    let mut merged = DFSchema::empty();
-    for input in inputs {
-        merged.merge(input.schema());
-    }
-    Ok(merged)
 }
 
 /// Does this plan contain a ddx marker anywhere — including inside a plan
@@ -375,20 +378,12 @@ fn plan_has_marker(plan: &LogicalPlan) -> Result<bool> {
 
 /// The first correlated outer reference anywhere in `args`, if there is one.
 fn outer_reference_in(args: &[Expr]) -> Option<String> {
-    let mut found = None;
-    for arg in args {
-        let _ = arg.apply(|e| {
-            if let Expr::OuterReferenceColumn(_, col) = e {
-                found = Some(col.flat_name());
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        if found.is_some() {
-            break;
-        }
-    }
-    found
+    args.iter()
+        .flat_map(find_out_reference_exprs)
+        .find_map(|e| match e {
+            Expr::OuterReferenceColumn(_, col) => Some(col.flat_name()),
+            _ => None,
+        })
 }
 
 /// Unparse a bound DataFusion expression into the `sqlparser` AST `ddx-core`

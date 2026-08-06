@@ -13,7 +13,6 @@
 //! bound, coerced, and cached schemas, so a rewrite has to put back an
 //! expression that is consistent with all three.
 
-use datafusion::arrow::array::Float64Array;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
@@ -177,12 +176,7 @@ async fn path_a_and_path_b_agree_on_every_regression_case() -> Result<()> {
             .await?
             .collect()
             .await?;
-        let arr = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap_or_else(|| panic!("Path A returned a non-Float64 column for: {sql}"));
-        let via_a: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+        let via_a = common::f64_column(&batches);
         assert_eq!(via_a, via_b, "paths disagree on: {sql}");
     }
     Ok(())

@@ -7,7 +7,6 @@
 //! The interesting cases are the ones Path B *cannot* reach, which is the whole
 //! reason this path exists alongside it.
 
-use datafusion::arrow::array::Float64Array;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 use ddx_datafusion::{ddx_sql, rewrite_sql};
@@ -56,12 +55,7 @@ async fn agrees_with_path_b_on_the_same_query() -> Result<()> {
     let b_ctx = ctx().await?;
     ddx_datafusion::install(&b_ctx);
     let batches = b_ctx.sql(sql).await?.collect().await?;
-    let arr = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    let via_b: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+    let via_b = common::f64_column(&batches);
 
     assert_eq!(via_a.len(), via_b.len());
     for (a, b) in via_a.iter().zip(&via_b) {

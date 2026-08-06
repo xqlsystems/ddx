@@ -68,18 +68,19 @@ impl ExprContext {
     /// Seed with the same defaults a stock `SessionState` gets, then layer
     /// `extra` on top (later entries win, so a caller can override a built-in).
     pub(crate) fn new(extra: impl IntoIterator<Item = Arc<ScalarUDF>>) -> Self {
-        let mut functions = HashMap::new();
         // `SessionStateDefaults::default_scalar_functions()`, not
         // `functions::all_default_functions()`: the former is the latter *plus*
         // the nested-expression functions, under the default-on
         // `nested_expressions` feature. Taking only the first half would leave
         // this registry quietly narrower than the session's.
-        for f in SessionStateDefaults::default_scalar_functions() {
-            functions.insert(f.name().to_ascii_lowercase(), f);
-        }
-        for f in extra {
-            functions.insert(f.name().to_ascii_lowercase(), f);
-        }
+        //
+        // `collect` keeps the last entry for a duplicate key, so `extra` chained
+        // on the end preserves "a caller can override a built-in".
+        let functions = SessionStateDefaults::default_scalar_functions()
+            .into_iter()
+            .chain(extra)
+            .map(|f| (f.name().to_ascii_lowercase(), f))
+            .collect();
         let higher_order = SessionStateDefaults::default_higher_order_functions()
             .into_iter()
             .map(|f| (f.name().to_ascii_lowercase(), f))

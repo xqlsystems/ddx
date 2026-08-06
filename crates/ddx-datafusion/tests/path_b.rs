@@ -9,7 +9,6 @@
 //! that looks right but plans to the wrong expression is exactly the failure
 //! mode this milestone exists to rule out.
 
-use datafusion::arrow::array::Float64Array;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 
@@ -127,15 +126,7 @@ async fn works_through_the_dataframe_api_too() -> Result<()> {
         .sort(vec![c("d").sort(true, false)])?;
 
     let batches = df.collect().await?;
-    let a = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    assert_eq!(
-        (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>(),
-        vec![2.0, 4.0, 6.0]
-    );
+    assert_eq!(common::f64_column(&batches), vec![2.0, 4.0, 6.0]);
     Ok(())
 }
 
