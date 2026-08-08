@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.1...ddx-core-v0.1.2) - 2026-08-08
+
+### Fixed
+
+- *(ddx-core)* parenthesize a right operand that binds as tightly as its parent ([#53](https://github.com/xqlsystems/ddx/pull/53))
+
 ## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.0...ddx-core-v0.1.1) - 2026-08-08
 
 ### Added
