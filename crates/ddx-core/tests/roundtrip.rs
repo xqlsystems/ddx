@@ -96,6 +96,38 @@ fn negative_literal_derivatives_round_trip() {
     assert_roundtrips("cos(x) * x", "x"); // -sin(x) * x + cos(x)
 }
 
+/// A right-hand operand that binds *as tightly* as its parent must keep its
+/// parentheses, or reprinting silently re-associates the tree.
+///
+/// Every case here once failed. They are the shapes where the chain and
+/// quotient rules build a product or quotient whose right operand is itself a
+/// product or quotient — `mul(a, div(b, c))` rendering as `a * b / c`, which
+/// reparses as `(a * b) / c`.
+///
+/// The `*`-with-`*` version of this was known and dismissed as harmless, on the
+/// grounds that multiplication is associative up to float rounding. That
+/// reasoning does not extend to the `*`-with-`/` version, which is the same
+/// re-association: `a * (b / c)` and `(a * b) / c` agree in exact arithmetic but
+/// diverge without bound as `c` approaches zero. A continuous fuzz found it as a
+/// value change of twenty-four orders of magnitude.
+#[test]
+fn same_precedence_right_operands_keep_their_parentheses() {
+    // Chain rule over a product: builds mul(cos(..), mul(y, z)).
+    assert_roundtrips("sin(x * y * x)", "x");
+    assert_roundtrips("sin(x) * cos(x) * tan(x)", "x");
+    // Quotient rule feeding a product, and nested quotients.
+    assert_roundtrips("x * y / x", "x");
+    assert_roundtrips("x / y / x", "x");
+    assert_roundtrips("1.5 / power(((y / (y / x)) - x), 1.5)", "y");
+    assert_roundtrips(
+        "((y / x) / ((-(y / x)) / 1.5)) / log2(tanh(power(3, 2.5)))",
+        "y",
+    );
+    // The additive twin: sub(a, sub(b, c)) must not reprint as `a - b - c`.
+    assert_roundtrips("x - y - x", "x");
+    assert_roundtrips("x + y - x", "x");
+}
+
 #[test]
 fn strip_nested_actually_normalizes() {
     // Sanity: the normalizer collapses parentheses, so an unparenthesized and a

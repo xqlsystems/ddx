@@ -912,6 +912,18 @@ layered:
   that only checks the output parses sails right past the precedence bug
   §3.2 found (`(a+b)*c` reparses fine, just wrong). Fuzz small random trees
   per dialect.
+
+  The invariant is *exact*, and holding it to that standard is what makes it
+  worth having. It was briefly weakened to "modulo `Nested` and associativity,"
+  on the reasoning that a right-associated product reprinting left-associated is
+  harmless because multiplication associates. That reasoning does not survive
+  the operator sharing a precedence level with division: `a * (b / c)`
+  reprinting as `a * b / c` reparses as `(a * b) / c`, which agrees in exact
+  arithmetic and diverges without bound as `c` approaches zero. The continuous
+  fuzz found it as a value change of twenty-four orders of magnitude. The fix
+  belonged in the *renderer* — parenthesize a right operand that binds as
+  tightly as its parent — not in a laxer comparison, and with it the exact
+  invariant holds.
 - **Numeric agreement against JAX** — the natural oracle, since the whole
   design mirrors JAX's forward/reverse structure for the same seed/cotangent
   semantics. Keep finite-difference as a cheap independent cross-check where
