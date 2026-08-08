@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.2...ddx-core-v0.1.3) - 2026-08-08
+
+### Other
+
+- *(ddx-core)* skip points where a divisor has cancelled to rounding noise ([#56](https://github.com/xqlsystems/ddx/pull/56))
+
 ## [0.1.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.1...ddx-core-v0.1.2) - 2026-08-08
 
 ### Fixed
