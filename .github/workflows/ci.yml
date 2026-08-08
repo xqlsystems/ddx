@@ -66,12 +66,20 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # Everything except tests/simulation.rs (the property/fuzz suite). Split
-      # per target so a failure names the suite that broke.
-      - name: unit tests
-        run: cargo test --workspace --lib --bins
-      - name: integration tests
-        run: cargo test -p ddx-core --test rules --test rewrite --test roundtrip
+      # Everything, discovered rather than enumerated.
+      #
+      # This used to be a hand-maintained allowlist of `--test` targets, which
+      # meant a new tests/*.rs file was a silent no-op in CI until somebody
+      # remembered to edit this workflow. It had already gone stale: the list
+      # skipped crates/ddx-core/tests/simulation.rs entirely, so its thirteen
+      # bounded property tests were not running on any PR — only the long-running
+      # soak in that file was meant to be excluded, and that one already carries
+      # `#[ignore]`, so plain `cargo test` skips it on its own.
+      #
+      # `--no-fail-fast` so one red suite doesn't hide the state of the others.
+      # The nightly soak job runs the ignored tests explicitly.
+      - name: tests
+        run: cargo test --workspace --no-fail-fast
       - name: doctests
         run: cargo test --workspace --doc
 

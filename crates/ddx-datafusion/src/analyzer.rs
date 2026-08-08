@@ -1,0 +1,415 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! The in-engine rewrite: `grad`/`jvp` markers removed from the bound plan.
+//!
+//! An [`AnalyzerRule`] that finds every `grad`/`jvp` marker in a bound
+//! [`LogicalPlan`], differentiates its argument through `ddx-core`, and splices
+//! the result back as a real DataFusion [`Expr`]. This is what makes bare
+//! `grad()` work with no wrapper, across both the SQL and DataFrame APIs.
+//!
+//! **It is a bridge, not a second rule engine.** All the calculus lives in
+//! `ddx-core`; this module only moves expressions across the boundary:
+//!
+//! ```text
+//!   DataFusion Expr --expr_to_sql--> sqlparser::ast::Expr   (same crate version!)
+//!                                          |
+//!                                    ddx-core differentiate
+//!                                          |
+//!   DataFusion Expr <----replan----- sqlparser::ast::Expr
+//! ```
+//!
+//! Both hops are type-level, with no SQL string in between — which only works
+//! because `ddx-core` and `datafusion` resolve the *identical* `sqlparser`
+//! version. `tests/sqlparser_pin.rs` enforces that.
+//!
+//! # Binding-awareness comes free here
+//!
+//! The plan is already bound when the rule sees it, so column references arrive
+//! qualified. That means the ambiguity guard the *text* rewrite needs — which
+//! exists because a pre-binding rewrite cannot tell `a.x` from `b.x` — simply
+//! never fires on this path.
+//!
+//! The claim survived a deliberate attempt to break it, and the reason is worth
+//! stating: the obvious attack is two bound columns that unparse to the same
+//! text, which needs an unaliased self-join — and DataFusion rejects that as
+//! ambiguous during planning, before this rule is ever handed the plan. So the
+//! guarantee rests on the planner having already refused the ambiguous cases,
+//! not merely on qualifiers being present.
+
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::DFSchema;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::utils::{find_out_reference_exprs, merge_schema};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, ScalarUDF};
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+use datafusion::optimizer::AnalyzerRule;
+use datafusion::sql::unparser::Unparser;
+use ddx_core::sqlparser::ast as sql_ast;
+use ddx_core::{ColRef, Ddx};
+
+use crate::error::to_df_err;
+use crate::markers::{marker_kind, GRAD, JVP};
+use crate::replan::{functions_in, replan, ExprContext};
+
+/// The ddx analyzer rule: rewrites `grad`/`jvp` markers away before execution.
+///
+/// Install it with [`crate::install`], which also registers the marker UDFs so
+/// the calls parse in the first place.
+pub struct DdxAnalyzer {
+    ddx: Ddx,
+    exprs: ExprContext,
+}
+
+// `AnalyzerRule` requires `Debug`, but `Ddx` holds a rule registry of function
+// pointers and is deliberately not `Debug` itself. Print what is actually
+// useful in a plan dump — which rule this is — rather than nothing.
+impl std::fmt::Debug for DdxAnalyzer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DdxAnalyzer")
+            .field("rule", &"ddx_markers")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DdxAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DdxAnalyzer {
+    /// A rule driving the built-in rule set.
+    pub fn new() -> Self {
+        Self::with_engine(Ddx::for_datafusion())
+    }
+
+    /// A rule driving a caller-supplied engine — use this to pick up custom
+    /// differentiation rules registered via [`Ddx::register`].
+    pub fn with_engine(ddx: Ddx) -> Self {
+        Self::with_engine_and_functions(ddx, [])
+    }
+
+    /// As [`DdxAnalyzer::with_engine`], plus extra scalar functions that may
+    /// appear in a re-planned derivative.
+    ///
+    /// You rarely need this. A UDF from your *own marker body* is handled
+    /// automatically — it is harvested from the bound expression itself, so
+    /// `grad(my_udf(y) * x, x)` works with no setup regardless of when `my_udf`
+    /// was registered. What lands outside that is a UDF **emitted by a custom
+    /// differentiation rule** you registered with [`Ddx::register`]: that
+    /// function appears only in the *output*, so it cannot be harvested from the
+    /// input and must be declared here.
+    pub fn with_engine_and_functions(
+        ddx: Ddx,
+        functions: impl IntoIterator<Item = Arc<ScalarUDF>>,
+    ) -> Self {
+        DdxAnalyzer {
+            ddx,
+            exprs: ExprContext::new(functions),
+        }
+    }
+
+    /// Rewrite every marker in one expression, bottom-up.
+    ///
+    /// Bottom-up is what makes higher-order differentiation fall out for free:
+    /// the inner `grad` of `grad(grad(f, x), x)` is already an ordinary
+    /// expression by the time the outer one is differentiated.
+    fn rewrite_expr(
+        &self,
+        expr: Expr,
+        schema: &DFSchema,
+        options: &ConfigOptions,
+    ) -> Result<Transformed<Expr>> {
+        expr.transform_up(|e| {
+            let Expr::ScalarFunction(call) = &e else {
+                return Ok(Transformed::no(e));
+            };
+            let Some(kind) = marker_kind(call.func.name()) else {
+                return Ok(Transformed::no(e));
+            };
+            let derivative = self.differentiate_call(kind, &call.args, schema, options)?;
+            Ok(Transformed::yes(derivative))
+        })
+    }
+
+    /// Differentiate one marker call and return the replacement expression.
+    fn differentiate_call(
+        &self,
+        kind: &'static str,
+        args: &[Expr],
+        schema: &DFSchema,
+        options: &ConfigOptions,
+    ) -> Result<Expr> {
+        // One destructure carries the arity, so it is not restated as a count and
+        // there is no positional indexing below. DataFusion's own signature check
+        // (`Signature::any(2)` / `any(3)` on the marker UDFs) rejects a wrong
+        // arity during planning, before this rule runs, so the error here is a
+        // backstop rather than the message a user normally sees.
+        let (body_arg, wrt_arg, tangent_arg) = match (kind, args) {
+            (GRAD, [body, wrt]) => (body, wrt, None),
+            (JVP, [body, wrt, tangent]) => (body, wrt, Some(tangent)),
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "ddx: `{kind}` was called with {} arguments. \
+                     Write `grad(expr, column)` or `jvp(expr, column, tangent)`.",
+                    args.len()
+                )))
+            }
+        };
+
+        // Reject a correlated outer reference *before* unparsing, so the user
+        // gets the real constraint instead of a lie about their schema.
+        //
+        // `Expr::OuterReferenceColumn` does not survive the bridge: it unparses
+        // to an ordinary qualified column, and the derivative is then re-planned
+        // against the *inner* node's inputs, where by construction that column
+        // is absent. The resulting "No field named t.x" is true about the wrong
+        // thing — the column exists, it just isn't reachable from here.
+        //
+        // Failing loudly is correct — ddx never guesses a derivative. This only
+        // fixes what the failure blames. It is structurally loud, incidentally: the planner
+        // creates an `OuterReferenceColumn` only when the name does *not*
+        // resolve in the inner scope, so the unparsed text cannot silently
+        // rebind to an inner column of the same name.
+        if let Some(outer) = outer_reference_in(args) {
+            return Err(DataFusionError::Plan(format!(
+                "ddx: this `{kind}` marker is inside a correlated subquery and references \
+                 the outer column `{outer}`. The derivative is re-planned against the \
+                 subquery's own inputs, where an outer column is not in scope, so a \
+                 reference to one cannot be carried through.\n\n\
+                 Use `ddx_datafusion::ddx_sql(&ctx, sql)` instead: it rewrites the SQL text \
+                 before the query is planned, so it has no such limit."
+            )));
+        }
+
+        let body = to_sql_ast(body_arg)?;
+        let wrt = wrt_colref(kind, wrt_arg)?;
+
+        let derivative: sql_ast::Expr = match tangent_arg {
+            None => self.ddx.differentiate(&body, &wrt).map_err(to_df_err)?,
+            Some(tangent) => {
+                let tangent = to_sql_ast(tangent)?;
+                self.ddx.jvp(&body, &[(wrt, tangent)]).map_err(to_df_err)?
+            }
+        };
+
+        // Functions the user called are harvested from the marker's own body:
+        // anything that survives differentiation was necessarily in there, and
+        // a bound Expr carries the ScalarUDF itself. That is why a session UDF
+        // works here without the analyzer ever reaching the session registry.
+        let local = functions_in(args);
+        let replanned = replan(&self.exprs, options, local, derivative, schema)?;
+
+        // Force the replacement to the type the marker UDF declared
+        // (`Marker::return_type` → Float64). Two reasons, one of them a bug:
+        //
+        // 1. Correctness. The marker's declared type is already baked into
+        //    every ancestor node's cached schema. `LogicalPlan::map_children`
+        //    preserves a parent's `schema` field while swapping its input, so
+        //    only the rewritten node gets `recompute_schema` — if the
+        //    derivative planned to a different type (`x + x` on an Int64 column
+        //    is Int64), ancestors keep a stale Float64 and the optimizer's
+        //    invariant check fails with an internal error.
+        // 2. Policy. Derivatives are always emitted DOUBLE-typed, because
+        //    differentiation runs before binding — operand types are unknown —
+        //    and SQL integer division truncates on some engines but not others.
+        //    Without this, `grad(x*x, x)` over a BIGINT column returns Int64 —
+        //    quietly violating the invariant this crate documents.
+        //
+        // `cast_to` is a no-op when the type already matches, which is the
+        // common case.
+        replanned.cast_to(&DataType::Float64, schema).map_err(|e| {
+            DataFusionError::Plan(format!(
+                "ddx: the derivative of a `{kind}` argument could not be represented as \
+                     DOUBLE. Every derivative is emitted DOUBLE-typed so that integer \
+                     division cannot silently truncate it: {e}"
+            ))
+        })
+    }
+}
+
+impl AnalyzerRule for DdxAnalyzer {
+    fn name(&self) -> &str {
+        "ddx_markers"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        // Skip the whole walk when the plan contains no marker. Same spirit as
+        // ddx-core's parse-free pre-gate: a query that
+        // never mentions ddx should not be touched, and must not be able to
+        // fail inside ddx.
+        if !plan_has_marker(&plan)? {
+            return Ok(plan);
+        }
+
+        let plan = self.rewrite_plan(plan, config)?;
+
+        // Re-run type coercion over the rewritten plan.
+        //
+        // `add_analyzer_rule` installs this rule to run AFTER DataFusion's own
+        // `TypeCoercion` pass, so the expression we splice in has never been
+        // coerced — nothing runs after us. That matters because ddx-core
+        // deliberately emits DOUBLE-typed literals and casts, so
+        // differentiating anything over an integer column yields
+        // mixed-type arithmetic: `grad(x / 2, x)` on a BIGINT column produced
+        // `Float64 / Int64`, which plans fine and then dies at execution with an
+        // Arrow error. Coercing here is what the engine would have done had the
+        // derivative been written by hand.
+        TypeCoercion::new().analyze(plan, config)
+    }
+}
+
+impl DdxAnalyzer {
+    /// Rewrite every marker in one plan (and in any plan embedded in its
+    /// expressions). No pre-gate and no type coercion — [`AnalyzerRule::analyze`]
+    /// wraps those around the outermost call.
+    fn rewrite_plan(&self, plan: LogicalPlan, options: &ConfigOptions) -> Result<LogicalPlan> {
+        // `transform_up_with_subqueries`, not `transform_up`: a subquery carries
+        // its own `LogicalPlan` inside an *expression*, and the plain walk
+        // visits only direct relational inputs. DataFusion already knows every
+        // expression variant that can carry one, so this delegates rather than
+        // re-deriving the list — a hand-rolled match over an upstream enum has
+        // to be re-audited on every bump, and ours was already one arm short
+        // (`Expr::SetComparison`, i.e. ANY/ALL/SOME, reached execution).
+        plan.transform_up_with_subqueries(|node| {
+            // A node's expressions are resolved against its *inputs*, not its
+            // own output schema — that is what binds the derivative's columns
+            // to the same columns the original expression used. Leaf nodes
+            // (which have no inputs) fall back to their own schema.
+            let schema = merged_input_schema(&node);
+
+            // Which names this node publishes to its parents, read off the
+            // node's own schema *before* the rewrite.
+            //
+            // A rewritten expression must keep its name only where a parent can
+            // refer to it by that name: an unaliased `AVG(grad(x*x, x))` derives
+            // the field `avg(grad(t.x * t.x,t.x))`, and the projection above it
+            // refers to exactly that string, so renaming it underneath leaves
+            // the parent dangling. Predicates, sort keys, and join conditions
+            // name nothing, and aliasing those would be at best noise and at
+            // worst harmful (an alias around a join key can defeat equijoin
+            // recognition).
+            //
+            // This asks the plan rather than matching on node variants. Upstream
+            // ships a `NamePreserver` for the same job, but it decides from an
+            // exclusion list of `LogicalPlan` variants; a schema lookup cannot go
+            // stale, because any node that publishes a name necessarily has that
+            // name in its schema.
+            let out_schema = Arc::clone(node.schema());
+
+            let node = node.map_expressions(|expr| {
+                let original_name = expr.schema_name().to_string();
+                let out = self.rewrite_expr(expr, &schema, options)?;
+                // Only a rewritten expression can have changed its name, so an
+                // untouched one skips the check entirely.
+                if !out.transformed || !out_schema.has_column_with_unqualified_name(&original_name)
+                {
+                    return Ok(out);
+                }
+                out.map_data(|e| e.alias_if_changed(original_name))
+            })?;
+
+            // `map_expressions` already ORs the per-expression transformed flags,
+            // so this is exactly "did any marker rewrite happen in this node".
+            if node.transformed {
+                // Field *names* can change even when the type doesn't, so the
+                // node's schema is rebuilt regardless.
+                node.map_data(LogicalPlan::recompute_schema)
+            } else {
+                Ok(node)
+            }
+        })
+        .map(|t| t.data)
+    }
+}
+
+/// The schema a node's expressions resolve against: all of its inputs merged.
+///
+/// The merge itself is upstream's — it is what DataFusion's own analyzer rules
+/// use, and it has a single-input fast path that skips the rebuild. Only the
+/// leaf case is ours: a node with no inputs (a `Values`, say) resolves its
+/// expressions against its own schema, where upstream would hand back an empty
+/// one.
+fn merged_input_schema(plan: &LogicalPlan) -> DFSchema {
+    let inputs = plan.inputs();
+    if inputs.is_empty() {
+        plan.schema().as_ref().clone()
+    } else {
+        merge_schema(&inputs)
+    }
+}
+
+/// Does this plan contain a ddx marker anywhere — including inside a plan
+/// embedded in one of its expressions?
+///
+/// This is a *gate*: a false negative skips the rewrite for the whole plan and
+/// the marker survives to execution. So it walks with `apply_with_subqueries`,
+/// the mirror of the `transform_up_with_subqueries` used for the rewrite — the
+/// two must agree on what "anywhere" means, and delegating to DataFusion is the
+/// only way to keep them agreeing across upstream changes.
+fn plan_has_marker(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let Expr::ScalarFunction(call) = e {
+                    if marker_kind(call.func.name()).is_some() {
+                        found = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(found)
+}
+
+/// The first correlated outer reference anywhere in `args`, if there is one.
+fn outer_reference_in(args: &[Expr]) -> Option<String> {
+    args.iter()
+        .flat_map(find_out_reference_exprs)
+        .find_map(|e| match e {
+            Expr::OuterReferenceColumn(_, col) => Some(col.flat_name()),
+            _ => None,
+        })
+}
+
+/// Unparse a bound DataFusion expression into the `sqlparser` AST `ddx-core`
+/// consumes. This is the load-bearing type identity: the
+/// output here *is* `ddx-core`'s input type, with no string in between.
+fn to_sql_ast(expr: &Expr) -> Result<sql_ast::Expr> {
+    Unparser::default().expr_to_sql(expr)
+}
+
+/// Read the differentiation variable off the marker's second argument.
+///
+/// **The `wrt` must go through the same unparser as the body.** It is tempting
+/// to build the `ColRef` directly from the bound [`Column`]'s `relation`/`name`
+/// strings, since the planner already resolved them — but that produces
+/// *unquoted* idents, while the body's occurrences of the very same column are
+/// unparsed by `Unparser`, whose `DefaultDialect` quotes any identifier
+/// containing an uppercase letter (or a keyword). `IdentCasing::FoldUnquoted`
+/// then folds the unquoted `wrt` to lowercase and preserves the quoted
+/// occurrence's case, they compare unequal, every occurrence classifies as
+/// `Match::Not`, and the derivative comes back a silent `0` for any capitalized
+/// column — a silently wrong answer, which ddx must never produce, and one that
+/// hits any Parquet or CSV schema with capitalized headers.
+///
+/// Unparsing the column keeps the qualifier the planner resolved (so this path
+/// stays binding-aware) *and* guarantees both sides share one quoting rule.
+fn wrt_colref(kind: &str, arg: &Expr) -> Result<ColRef> {
+    let unparsed = to_sql_ast(arg)?;
+    ColRef::from_wrt_arg(kind, &unparsed).map_err(to_df_err)
+}

@@ -2,34 +2,139 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx-datafusion` — the DataFusion adapter for ddx.
+//! `ddx-datafusion` — the DataFusion adapter for [ddx](https://github.com/xqlsystems/ddx).
 //!
-//! **Status: scaffold.** M0 lands only the crate seam. The real adapter
-//! arrives in M2 (design.md §3.3–§3.4, milestone M2) and exposes two paths,
-//! both driving the *same* [`ddx_core::Ddx`] engine:
+//! Write calculus directly in SQL and let DataFusion evaluate the derivative
+//! per row — the relational equivalent of `jax.vmap(jax.grad(f))`:
 //!
-//! * **Path A — `ddx_sql`:** the one-liner
-//!   `ctx.sql(&ddx.rewrite_sql(sql, dialect)?)`. This works today on top of
-//!   [`ddx_core`] and is the universal path (design.md §3.3 Path A); it is
-//!   stubbed here rather than wired to a live `SessionContext` because M0 does
-//!   not take a `datafusion` dependency.
-//! * **Path B — marker UDFs + an `AnalyzerRule` bridge:** makes bare `grad()`
-//!   work across the SQL and DataFrame APIs by unparsing the marker's argument
-//!   with DataFusion's `expr_to_sql` (which emits exactly `ddx-core`'s
-//!   `sqlparser::ast::Expr` input type), differentiating via `ddx-core`, and
-//!   re-planning back to a DataFusion `Expr` (design.md §3.3 Path B). This is
-//!   the reference proof that `ddx-core` can drive an *in-engine* rewrite.
+//! ```sql
+//! SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
+//! ```
 //!
-//! Path B carries two documented implementation constraints to honor in M2:
-//! `add_analyzer_rule` runs after `TypeCoercion` (so the marker UDF must be
-//! coercion-tolerant and there must be a `Cast` rule — there is), and the
-//! re-plan seam is `SessionState::create_logical_expr`.
+//! All the calculus lives in [`ddx_core`]; this crate only connects it to an
+//! engine. It offers the same rewrite by two routes:
+//!
+//! | | [`install`] (Path B) | [`ddx_sql`] (Path A) |
+//! |---|---|---|
+//! | How | in-engine `AnalyzerRule` on the bound plan | rewrite the SQL text first |
+//! | Call style | bare `grad()`, anywhere | `ddx_sql(&ctx, sql)` |
+//! | Works with | SQL **and** the DataFrame API | SQL strings |
+//! | Column identity | resolved by the planner | syntactic (guards may fire) |
+//! | Correlated subqueries | ✗ (loud error) | ✓ |
+//! | Errors surface at | `collect()` | the `ddx_sql` call |
+//!
+//! **Prefer [`install`].** Because it runs after binding, columns arrive
+//! already resolved, so the qualification-ambiguity errors a pre-binding text
+//! rewrite must raise simply cannot occur.
+//!
+//! **Reach for [`ddx_sql`] when a marker sits inside a correlated subquery.**
+//! That is the one query shape Path B genuinely cannot carry: the bridge
+//! re-plans the derivative against the subquery's own inputs, and an outer
+//! reference does not survive that. Path B detects it and says so.
+//!
+//! Recursive CTEs are *not* such a shape: `install` carries a marker in a
+//! recursive term perfectly well, because `LogicalPlan::RecursiveQuery` is an
+//! ordinary node with ordinary inputs.
+//!
+//! # Where the two paths genuinely differ
+//!
+//! They drive the same [`ddx_core`] engine, so they agree on the calculus. They
+//! do not always agree on **what may be the `wrt`**, because they disagree about
+//! what a "column" is:
+//!
+//! ```sql
+//! SELECT grad(sum(x) * sum(x), sum(x)) AS d FROM t
+//! ```
+//!
+//! Path A refuses this — syntactically `sum(x)` is a function call, not a bare
+//! column, and the `wrt` must be a bare column. Path B answers `2·sum(x)`,
+//! because by the time it sees the plan the planner has already lowered the
+//! aggregate to the bound column `sum(t.x)`, and differentiating with respect to
+//! a column is exactly what it does.
+//!
+//! **Path B's `wrt` is any column of the node's input schema, including
+//! planner-derived ones** — aggregate outputs, window outputs, computed aliases.
+//! That is deliberate. Differentiating with respect to a *computed alias* is
+//! already a supported and correct operation — `grad(s*s, s)` is `2s` — and an
+//! aggregate output is the same shape one level down, so refusing it would
+//! contradict the case ddx already accepts.
+//!
+//! # Path B
+//!
+//! ```
+//! # use datafusion::prelude::SessionContext;
+//! # #[tokio::main]
+//! # async fn main() -> datafusion::error::Result<()> {
+//! let ctx = SessionContext::new();
+//! ddx_datafusion::install(&ctx);
+//!
+//! ctx.sql("CREATE TABLE t AS VALUES (1.0), (2.0), (3.0)").await?.collect().await?;
+//!
+//! // bare grad() — no wrapper
+//! let df = ctx.sql("SELECT grad(column1 * column1, column1) AS d FROM t").await?;
+//! # let _ = df.collect().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # What it supports
+//!
+//! Whatever [`ddx_core`] supports: `+ - * /`; the unary chain rule for the trig
+//! / inverse-trig / exp / log / hyperbolic set plus `abs`; `power` with a
+//! constant base or exponent; higher-order via nesting; through-aggregate via
+//! linearity (`AVG(grad(loss, theta))`). Anything else is a typed error, never
+//! a silently-wrong number. Errors from the engine arrive
+//! as [`DataFusionError::External`] boxing a [`ddx_core::DiffError`], so you can
+//! downcast and match on the variant.
+//!
+//! [`DataFusionError::External`]: datafusion::error::DataFusionError::External
 
 #![forbid(unsafe_code)]
 
-/// Milestone marker: the DataFusion adapter is not implemented in M0.
-pub const STATUS: &str = "scaffold: DataFusion Path A + Path B land in M2";
+mod analyzer;
+mod error;
+mod markers;
+mod replan;
+mod sql;
 
-// Re-exported so downstream code and docs can name the engine this adapter
-// will drive, even while the adapter itself is a stub.
+use std::sync::Arc;
+
+use datafusion::prelude::SessionContext;
+
+pub use analyzer::DdxAnalyzer;
+pub use markers::{grad_udf, jvp_udf, GRAD, JVP};
+pub use sql::{ddx_sql, ddx_sql_with, rewrite_sql, rewrite_sql_with};
+
+/// The engine this adapter drives, re-exported so downstream code links the
+/// same version — and, through it, the same `sqlparser`.
 pub use ddx_core;
+
+/// Install ddx on `ctx`: register the `grad`/`jvp` marker UDFs and the analyzer
+/// rule that rewrites them away (Path B).
+///
+/// Both halves are required and neither is useful alone. The UDFs exist only so
+/// the marker calls *parse and plan*; the analyzer rule is what actually
+/// differentiates. Registering the UDFs without the rule would let a marker
+/// reach execution, where it deliberately errors.
+///
+/// ```
+/// # use datafusion::prelude::SessionContext;
+/// let ctx = SessionContext::new();
+/// ddx_datafusion::install(&ctx);
+/// ```
+pub fn install(ctx: &SessionContext) {
+    install_with(ctx, DdxAnalyzer::new());
+}
+
+/// [`install`] with a caller-configured analyzer — use this to pick up custom
+/// differentiation rules (see [`DdxAnalyzer::with_engine`]).
+///
+/// Your own UDFs need no registration with ddx: a function called inside a
+/// marker is read off the bound expression when the derivative is re-planned,
+/// so `grad(my_udf(y) * x, x)` works whenever `my_udf` was registered, before or
+/// after this call.
+pub fn install_with(ctx: &SessionContext, analyzer: DdxAnalyzer) {
+    ctx.register_udf(grad_udf());
+    ctx.register_udf(jvp_udf());
+    ctx.add_analyzer_rule(Arc::new(analyzer));
+}

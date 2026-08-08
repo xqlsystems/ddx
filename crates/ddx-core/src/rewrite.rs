@@ -43,7 +43,7 @@ use crate::error::{DiffError, Result};
 
 /// Which marker a function call is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarkerKind {
+pub(crate) enum MarkerKind {
     Grad,
     Jvp,
 }
@@ -51,7 +51,7 @@ enum MarkerKind {
 /// Classify a function call as a marker — but only an **unqualified**,
 /// case-folded `grad`/`jvp` (design.md §3.2, F8). `myschema.grad(...)` and a
 /// user's own multi-part function are left alone.
-fn marker_kind(f: &Function) -> Option<MarkerKind> {
+pub(crate) fn marker_kind(f: &Function) -> Option<MarkerKind> {
     if f.name.0.len() != 1 {
         return None;
     }

@@ -32,6 +32,20 @@ rust-version = "1.88"
 # against (spikes/sqlparser-spike, decision-log G1/G3).
 sqlparser = { version = "=0.62.0", features = ["visitor"] }
 
+# The DataFusion adapter's engine dependency (M2), quarantined to
+# `ddx-datafusion` — neither core crate may depend on it.
+#
+# The version is load-bearing for Path B, not incidental. The bridge unparses a
+# bound DataFusion `Expr` into a `sqlparser::ast::Expr` and hands it to
+# ddx-core, so the two crates MUST resolve the *identical* `sqlparser` — a
+# mismatch makes them two unrelated Rust types and the bridge stops compiling
+# datafusion 54.x requires `sqlparser ^0.62.0`,
+# which unifies with the exact `=0.62.0` pin above; 53.x wanted ^0.61 and would
+# NOT. `crates/ddx-datafusion/tests/sqlparser_pin.rs` asserts the resolved tree
+# still has exactly one `sqlparser`, so a future bump fails loudly at the pin
+# instead of confusingly at the bridge.
+datafusion = { version = "54" }
+
 # Internal crates, referenced by path within the workspace.
 ddx-core = { path = "crates/ddx-core" }
 ddx-ad = { path = "crates/ddx-ad" }
