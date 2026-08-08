@@ -9,6 +9,33 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.0...ddx-core-v0.1.1) - 2026-08-08
+
+### Added
+
+- `power` with a constant base or exponent now accepts one written as a *cast*
+  literal — `power(x, CAST(3 AS DOUBLE))` differentiates where it previously
+  returned `NotImplemented`. A cast to a numeric type is recognised as the
+  constant it wraps, which matters because query engines inject these: type
+  coercion rewrites `power(x, 3)` over a `DOUBLE` column into
+  `power(CAST(x AS DOUBLE), CAST(3 AS DOUBLE))` before ddx ever sees it. Casts
+  to non-numeric types are still not constants (`CAST(1 AS VARCHAR)` is the
+  string `'1'`).
+- `ddx_core::test_utils`, behind the off-by-default `test-utils` feature: the
+  expression generator, reference interpreter, numeric conditioning gates and
+  failure reporter that `ddx-core`'s own property suite runs on. Exposed so that
+  crates building on `ddx-core` can fuzz against the *same* generator rather
+  than inventing their own. Test support, not API — **semver-exempt**, and
+  compiled only when you turn the feature on, so a default build of `ddx-core`
+  is byte-for-byte unaffected by it.
+
+### Notes
+
+- The engine itself is unchanged: no differentiation rule was added, removed or
+  altered, and every derivative `ddx-core` emitted at 0.1.0 it still emits.
+- This release accompanies the first real `ddx-datafusion` adapter
+  ([#49](https://github.com/xqlsystems/ddx/pull/49)), which is not yet published.
+
 ## [0.1.0] - 2026-07-26
 
 ### Added
