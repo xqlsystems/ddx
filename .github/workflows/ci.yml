@@ -83,6 +83,34 @@ jobs:
       - name: doctests
         run: cargo test --workspace --doc
 
+  # The Python wheel is its own Cargo workspace (pyo3 links libpython, which the
+  # Rust jobs above have no reason to need), so it gets its own job rather than
+  # riding along with `cargo test --workspace`.
+  wheel:
+    name: ddxdb wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: python/ddxdb
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: build and install the wheel
+        working-directory: python/ddxdb
+        run: |
+          pip install maturin
+          maturin develop
+      - name: tests (rewrite, DataFusion shim, DuckDB path)
+        working-directory: python/ddxdb
+        run: |
+          pip install '.[test]'
+          python -m pytest tests/ -q
+
   package:
     name: package (publish dry-run)
     runs-on: ubuntu-latest

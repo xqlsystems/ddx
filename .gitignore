@@ -35,3 +35,7 @@ __pycache__/
 
 # Local, uncommitted scratch notes (never shipped)
 *.local.md
+
+# maturin / ddxdb wheel build
+python/ddxdb/target/
+*.so

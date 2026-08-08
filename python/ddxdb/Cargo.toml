@@ -1,0 +1,32 @@
+[package]
+name = "ddxdb"
+description = "Python bindings for ddx: SQL-portable autograd."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/xqlsystems/ddx"
+authors = ["Alexander Merose <al@merose.com>"]
+rust-version = "1.88"
+# The wheel is published to PyPI by maturin, not to crates.io by release-plz.
+publish = false
+
+# Deliberately its own workspace, not a member of the repo's. `pyo3` links
+# against libpython, so folding this in would make every `cargo build` and
+# `cargo test --workspace` in the repo depend on a Python interpreter being
+# present and correctly configured — for a crate that only the wheel build
+# needs. CI builds it as a separate step instead.
+[workspace]
+
+[lib]
+# maturin loads the extension module by this name; it must match the `#[pymodule]`
+# function and the `module-name` in pyproject.toml.
+name = "_ddxdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+ddx-core = { path = "../../crates/ddx-core" }
+
+# `abi3-py39` builds a single wheel that works on CPython 3.9+ rather than one
+# wheel per interpreter version. The cost is being limited to the stable ABI,
+# which this binding does not strain — it passes strings across and nothing else.
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
