@@ -192,9 +192,7 @@ fn precedence(e: &Expr) -> u8 {
 }
 
 /// Wrap `e` in `Expr::Nested` iff its precedence is below `threshold`
-/// (`strict`) or at-or-below it (`!strict`, for the right operand of a
-/// non-commutative operator, where equal precedence still needs parentheses:
-/// `a - (b - c)` ≠ `a - b - c`).
+/// (`strict`) or at-or-below it (`!strict`).
 fn wrap(e: Expr, threshold: u8, strict: bool) -> Expr {
     let needs = if strict {
         precedence(&e) < threshold
@@ -209,16 +207,38 @@ fn wrap(e: Expr, threshold: u8, strict: bool) -> Expr {
 }
 
 /// `left op right`, parenthesizing operands only where precedence demands it.
+///
+/// The two sides are not symmetric, because every operator here is **left**
+/// associative:
+///
+/// * *Left* operand — parenthesize only when it binds strictly looser. An equal
+///   precedence needs nothing, because that is the direction the parser already
+///   associates: `(a / b) * c` reprints as `a / b * c` and reparses unchanged.
+/// * *Right* operand — parenthesize whenever it binds as tightly **or** looser.
+///   At equal precedence, dropping the parentheses re-associates the tree:
+///   `a * (b / c)` reprints as `a * b / c`, which reparses as `(a * b) / c`.
+///
+/// The right-hand rule deliberately does not care whether `op` commutes. That
+/// was the earlier test, and it was the wrong question: `*` commutes, but
+/// `a * (b / c)` still re-associates, because what re-associates it is the
+/// *other* operator sharing its precedence level. Commutativity would only
+/// matter if the reparse produced the same operands under the same operator.
+///
+/// The consequence is real rather than cosmetic. `a * (b / c)` and `(a * b) / c`
+/// agree in exact arithmetic but not in floating point, and they diverge without
+/// limit where `c` is near zero — so a dropped pair of parentheses turns into a
+/// wrong number in valid SQL, which is exactly what this function exists to
+/// prevent. It costs a few redundant parentheses on same-precedence chains
+/// (`a * (b * c)`), which is the right trade.
 fn binary(left: Expr, op: BinaryOperator, right: Expr) -> Expr {
     let p = match op {
         BinaryOperator::Plus | BinaryOperator::Minus => 10,
         _ => 20,
     };
-    let non_commutative = matches!(op, BinaryOperator::Minus | BinaryOperator::Divide);
     Expr::BinaryOp {
         left: Box::new(wrap(left, p, true)),
         op,
-        right: Box::new(wrap(right, p, !non_commutative)),
+        right: Box::new(wrap(right, p, false)),
     }
 }
 
@@ -409,6 +429,32 @@ mod tests {
             format: None,
         };
         assert_eq!(as_const(&to_text), None);
+    }
+
+    #[test]
+    fn right_operand_of_equal_precedence_is_parenthesized() {
+        // The rendered text must re-associate to the *same* tree. `*` and `/`
+        // share a precedence level and associate left, so a `/` on the right of
+        // a `*` needs parentheses even though `*` itself commutes.
+        let a = || Expr::Identifier(Ident::new("a"));
+        let b = || Expr::Identifier(Ident::new("b"));
+        let c = || Expr::Identifier(Ident::new("c"));
+
+        assert_eq!(
+            mul(a(), div(b(), c())).to_string(),
+            "a * (CAST(b AS DOUBLE) / c)"
+        );
+        assert_eq!(mul(a(), mul(b(), c())).to_string(), "a * (b * c)");
+        assert_eq!(add(a(), sub(b(), c())).to_string(), "a + (b - c)");
+        assert_eq!(sub(a(), sub(b(), c())).to_string(), "a - (b - c)");
+
+        // The left side is the direction the parser already associates, so it
+        // needs nothing added — and must not grow spurious parentheses.
+        assert_eq!(mul(mul(a(), b()), c()).to_string(), "a * b * c");
+        assert_eq!(sub(sub(a(), b()), c()).to_string(), "a - b - c");
+
+        // A looser-binding right operand still gets wrapped, as before.
+        assert_eq!(mul(a(), add(b(), c())).to_string(), "a * (b + c)");
     }
 
     #[test]

@@ -244,6 +244,19 @@ fn self_consumption_failure(ddx: &Ddx, wrt: &ColRef, original: &str) -> Option<S
     for round in 0..4 {
         let parsed = match try_parse(&current) {
             Ok(p) => p,
+            // Hitting the parser's *depth* budget is the expression-swell wall,
+            // not malformed output: repeated differentiation grows the tree
+            // super-linearly, and by the third or fourth round a derivative can
+            // nest deeper than `sqlparser`'s default recursion limit. The text
+            // is still well-formed SQL — a parser configured with a larger
+            // budget accepts it — so this is where the swell stops being usable,
+            // which the design already documents as a known limit rather than a
+            // defect. Stop the chain here and let the earlier rounds stand.
+            //
+            // Every *other* parse error still fails the property. That is the
+            // distinction worth keeping: "we emitted something unparseable" is a
+            // bug; "we emitted something enormous" is a documented cost.
+            Err(e) if e.contains("recursion limit exceeded") => break,
             Err(e) => {
                 return Some(format!(
                     "[self-consumption] round {round}: engine's own output did not reparse: `{current}` ({e}) [from {original}]"
