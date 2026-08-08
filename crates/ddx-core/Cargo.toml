@@ -4,7 +4,7 @@ description = "Engine-neutral symbolic differentiation of SQL scalar expressions
 # Versioned independently of the workspace (the scaffold crates stay at the
 # workspace 0.0.0). This is the first publishable crate; release-plz manages
 # bumps from here (SemVer). See CONTRIBUTING.md → Releases.
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

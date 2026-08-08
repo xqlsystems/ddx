@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.0...ddx-core-v0.1.1) - 2026-08-08
+
+### Added
+
+- *(ddx-datafusion)* bare grad() via an AnalyzerRule, plus the ddx_sql helper ([#49](https://github.com/xqlsystems/ddx/pull/49))
+
 ## [0.1.0] - 2026-07-26
 
 ### Added
