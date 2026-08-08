@@ -13,7 +13,24 @@ Entries below the first release are maintained automatically by
 
 ### Fixed
 
-- *(ddx-core)* parenthesize a right operand that binds as tightly as its parent ([#53](https://github.com/xqlsystems/ddx/pull/53))
+- **Rendering a derivative could re-associate it, producing a wrong number in
+  valid SQL.** A derivative whose right operand bound as tightly as its parent
+  lost its parentheses: `a * (b / c)` was written as `a * b / c`, which reads
+  back as `(a * b) / c`. The two agree in exact arithmetic and diverge without
+  bound as `c` approaches zero, so a result could be off by any amount — the
+  continuous fuzz caught one wrong by twenty-four orders of magnitude
+  ([#53](https://github.com/xqlsystems/ddx/pull/53)).
+
+  **Who is affected.** Anyone who takes the *text* of a derivative and reparses
+  it — `differentiate_sql`, or `rewrite_sql` output fed to an engine, which is
+  the normal path. Derivatives consumed as an `Expr` in memory were never
+  affected, because nothing reparsed them. The trigger needs a quotient inside a
+  product or a nested quotient, which the quotient and chain rules build
+  routinely, so upgrading is worthwhile even if you have not seen a bad value:
+  the error is silent and only large where a denominator is near zero.
+
+  Emitted SQL now carries a few more parentheses on same-precedence chains.
+  Nothing else about the derivatives changed.
 
 ## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.0...ddx-core-v0.1.1) - 2026-08-08
 
