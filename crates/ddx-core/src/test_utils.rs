@@ -516,6 +516,61 @@ pub fn close_at_scale(a: f64, b: f64, scale: f64, rtol: f64, atol: f64) -> bool 
     (a - b).abs() <= atol + rtol * scale.abs().max(1.0)
 }
 
+/// Does some division in `e` amplify rounding noise beyond `rtol` at `(x, y)`?
+///
+/// A subtraction can annihilate its operands — `sqrt(power(x, -1)) - power(x,
+/// -0.5)` is identically zero, and `tan(x) - sin(x)/cos(x)` likewise — leaving a
+/// residue of a few machine epsilons whose sign and digits are pure rounding.
+/// Divide by that and the noise is scaled up by the reciprocal, which is
+/// unbounded. Two spellings of the *same* derivative then disagree wildly while
+/// both being correct, because neither is computing anything meaningful.
+///
+/// This is not overflow, so the existing magnitude screen does not see it: the
+/// operands are well-behaved and the intermediates are small. What is lost is
+/// *significance*, and it is lost in a composite the generator assembled — each
+/// operand is perfectly conditioned on its own, and only their difference
+/// cancels.
+///
+/// The threshold is derived from the tolerance rather than picked: a denominator
+/// carries absolute error about `ε · scale`, so dividing inflates the result's
+/// relative error by `ε · scale / |den|`. Requiring that to stay under `rtol`
+/// gives `|den| > ε · scale / rtol`. Above that bound a mismatch means a real
+/// disagreement; below it, the comparison has nothing left to compare.
+pub fn divides_by_noise(e: &Expr, x: f64, y: f64, rtol: f64) -> bool {
+    struct Scan {
+        x: f64,
+        y: f64,
+        rtol: f64,
+        found: bool,
+    }
+    impl Visitor for Scan {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if let Expr::BinaryOp {
+                op: BinaryOperator::Divide,
+                right,
+                ..
+            } = e
+            {
+                if let Some((den, scale)) = eval_mag(right, self.x, self.y) {
+                    if den.abs() <= f64::EPSILON * scale / self.rtol {
+                        self.found = true;
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut scan = Scan {
+        x,
+        y,
+        rtol,
+        found: false,
+    };
+    let _ = e.visit(&mut scan);
+    scan.found
+}
 /// Compare a symbolic `lhs` expression to a `rhs` value closure at random
 /// well-conditioned points, returning the first genuine disagreement as
 /// `(x, y, lhs_value, rhs_value)`.
@@ -547,6 +602,16 @@ pub fn metamorphic_mismatch(
             }
         }
         if !ok {
+            continue;
+        }
+        // Skip a point where any division has cancelled its denominator down to
+        // rounding noise. Both sides are then computing garbage, and comparing
+        // two garbages is not a test of anything.
+        if gate
+            .iter()
+            .chain(std::iter::once(&lhs))
+            .any(|e| divides_by_noise(e, x0, y0, RTOL))
+        {
             continue;
         }
         let (Some(a), Some(b)) = (eval(lhs, x0, y0), rhs(x0, y0)) else {

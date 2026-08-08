@@ -55,9 +55,10 @@ use std::io::Write as _;
 use ddx_core::sqlparser::ast::Expr;
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::test_utils::{
-    central_diff, eval, gen_adversarial_sql, gen_expr, gen_expr_and_wrt, gen_marker_free_stmt,
-    gen_marker_statement, has_residual_marker, max_intermediate_mag, metamorphic_mismatch,
-    min_domain_margin, parse_expr, run_bounded, seeded, try_parse, try_parse_stmt, Rng, Var,
+    central_diff, divides_by_noise, eval, gen_adversarial_sql, gen_expr, gen_expr_and_wrt,
+    gen_marker_free_stmt, gen_marker_statement, has_residual_marker, max_intermediate_mag,
+    metamorphic_mismatch, min_domain_margin, parse_expr, run_bounded, seeded, try_parse,
+    try_parse_stmt, Rng, Var,
 };
 use ddx_core::{ColRef, Ddx, DiffError};
 
@@ -835,6 +836,40 @@ fn differentiation_is_linear_and_obeys_the_product_rule() {
 // ---------------------------------------------------------------------------
 // Soak test — long-running, #[ignore]-d, driven by env vars (see module docs).
 // ---------------------------------------------------------------------------
+
+/// The divisor-conditioning gate must be narrow: it exists to skip points where
+/// a denominator has cancelled to rounding noise, and nothing else.
+///
+/// Both directions matter. If it never fires, the properties keep comparing
+/// meaningless garbage and reporting it as a defect. If it fires too eagerly, it
+/// silently blinds every property that uses it — a far worse outcome, because
+/// the suite would still look green.
+#[test]
+fn divisor_gate_skips_only_annihilated_denominators() {
+    // `sqrt(1/x) - x^-0.5` is identically zero, so the denominator here is pure
+    // rounding residue and the quotient is meaningless.
+    let annihilated = parse_expr("power(y, -0.5) / (sqrt(power(x, -1)) - power(x, -0.5))");
+    assert!(
+        divides_by_noise(&annihilated, 0.9299, 0.8170, 1e-7),
+        "a denominator that cancels to zero must be gated out"
+    );
+
+    // Ordinary divisions must not be gated, including one whose denominator is
+    // genuinely small but carries full significance.
+    for healthy in [
+        "x / y",
+        "1.0 / (x + y)",
+        "sin(x) / (x * x)",
+        "x / 0.0001",
+        "x / (y - 0.19)", // small at y≈0.2, but not a cancellation
+    ] {
+        let e = parse_expr(healthy);
+        assert!(
+            !divides_by_noise(&e, 0.9299, 0.8170, 1e-7),
+            "`{healthy}` is well-conditioned and must not be gated out"
+        );
+    }
+}
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
