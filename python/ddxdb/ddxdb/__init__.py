@@ -29,6 +29,8 @@ you wrote, ``AmbiguousColumn`` means your query needs a qualifier. Catch the one
 you can act on rather than matching on message text.
 """
 
+from importlib import metadata as _metadata
+
 from ._ddxdb import (  # noqa: F401  (re-exported)
     AmbiguousColumn,
     DdxError,
@@ -40,7 +42,11 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     rewrite_sql,
 )
 
-__version__ = "0.1.0"
+# Single-sourced from the installed distribution metadata, which maturin fills
+# from pyproject.toml. Hardcoding it here would be a third copy of the version
+# (pyproject, Cargo.toml, here) with nothing keeping them equal, and the one
+# most likely to be forgotten is the one users read.
+__version__ = _metadata.version("ddxdb")
 
 __all__ = [
     "rewrite_sql",

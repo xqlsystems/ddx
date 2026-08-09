@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Cross-platform build check for the `ddxdb` wheel.
+#
+# Separate from `ci.yml` because it answers a different question. `ci.yml`'s
+# `wheel` job asks "does it work?" — it builds on Linux and runs the tests, on
+# the floor interpreter and the current one. This asks "does it *build* on the
+# platforms we ship to?", which is where a `pyo3`/linker problem shows up, and
+# which no amount of Linux testing catches.
+#
+# Build only, no tests: the behaviour is platform-independent (the binding
+# passes strings across and nothing else), so running the suite four more times
+# would buy nothing for the runtime.
+name: ci-wheel
+
+on:
+  pull_request:
+    paths:
+      - 'python/ddxdb/**'
+      - 'crates/ddx-core/**'
+      - '.github/workflows/ci-wheel.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'python/ddxdb/**'
+      - 'crates/ddx-core/**'
+      - '.github/workflows/ci-wheel.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-wheel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.platform.runner }} / ${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+          - runner: macos-latest
+            target: aarch64
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # 3.10 is the floor `requires-python` claims. Because the crate is abi3
+      # (see python/ddxdb/Cargo.toml), building against the floor produces the
+      # single wheel that serves every later interpreter — so this is both the
+      # strictest build and the one we actually ship.
+      - name: Build the wheel
+        working-directory: python/ddxdb
+        shell: bash
+        run: |
+          uv venv --python 3.10
+          uv pip install maturin
+          uv run maturin build --out dist
+          ls -l dist

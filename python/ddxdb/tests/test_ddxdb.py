@@ -31,6 +31,20 @@ def test_marker_free_sql_is_returned_byte_identical():
     assert ddxdb.rewrite_sql(sql) == sql
 
 
+def test_version_is_single_sourced_from_package_metadata():
+    # __version__ reads the installed distribution's metadata rather than
+    # restating the number, so pyproject.toml is the only place it lives on the
+    # Python side. Cargo.toml carries its own copy that maturin does not use for
+    # the wheel; this asserts they have not drifted anyway, since a mismatch
+    # would be confusing rather than harmful.
+    import re
+    from pathlib import Path
+
+    cargo = (Path(__file__).parent.parent / "Cargo.toml").read_text()
+    cargo_version = re.search(r'^version = "([^"]+)"', cargo, re.M).group(1)
+    assert ddxdb.__version__ == cargo_version
+
+
 def test_differentiate_sql_is_the_escape_hatch():
     assert ddxdb.differentiate_sql("x * y", "x") == "y"
 
