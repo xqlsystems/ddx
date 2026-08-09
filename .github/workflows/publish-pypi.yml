@@ -1,0 +1,212 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Publish the `ddxdb` wheel to PyPI.
+#
+# TRIGGER: a `ddxdb-v*` tag, deliberately not `on: release`. release-plz cuts a
+# GitHub Release for every crate it publishes (see release.yml), so a release
+# trigger would fire this workflow on `ddx-core-v0.1.3` and try to publish a
+# Python package that did not change. The tag prefix keeps the two release
+# trains independent, which they are: crates.io is automated by release-plz,
+# PyPI is cut by tagging.
+#
+#   git tag ddxdb-v0.1.0 && git push origin ddxdb-v0.1.0
+#
+# `workflow_dispatch` builds and verifies everything *without* publishing, so
+# the whole pipeline can be exercised before a real release depends on it.
+#
+# AUTHENTICATION: PyPI Trusted Publishing (OIDC), not an API token. GitHub mints
+# a short-lived credential scoped to this repository, this workflow file and the
+# `pypi` environment; nothing long-lived is stored in repository secrets, so
+# there is no token to leak, rotate, or accidentally grant to a fork. It also
+# lets PyPI attach PEP 740 provenance attestations, which a token cannot.
+#
+# One-time setup on PyPI (Manage project → Publishing → Add a pending publisher):
+#   Owner: xqlsystems   Repository: ddx
+#   Workflow: publish-pypi.yml   Environment: pypi
+name: Publish ddxdb to PyPI
+
+on:
+  push:
+    tags: ['ddxdb-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-windows:
+    name: wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # `toolchain:` is required because the action is SHA-pinned. This action
+      # reads the toolchain from its *ref* — `@stable` literally means "install
+      # stable" — so pinning to a commit removes that input and the run dies in
+      # its "parse toolchain version" step. The ref here is a version pin *and*
+      # an argument; only one of those survives pinning.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Configure sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+      - name: Build wheel
+        working-directory: python/ddxdb
+        shell: bash
+        run: |
+          uv venv --python 3.10
+          uv pip install maturin
+          uv run maturin build --release --strip --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: python/ddxdb/dist/*
+
+  manylinux:
+    name: wheel (manylinux ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build manylinux wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        env:
+          RUST_BACKTRACE: 1
+        with:
+          rust-toolchain: stable
+          target: ${{ matrix.target }}
+          manylinux: 2_28
+          working-directory: python/ddxdb
+          sccache: 'true'
+          # abi3 (see python/ddxdb/Cargo.toml) yields one wheel for every
+          # CPython >= 3.10, so building against the floor interpreter is enough.
+          args: --release --strip --out dist -i python3.10
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-manylinux-${{ matrix.target }}
+          path: python/ddxdb/dist/*
+
+  sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          # `sdist`, not `build --sdist`. The latter also builds a wheel *from*
+          # the sdist — that is what the flag is for — and this runner's wheel
+          # would then be uploaded alongside the real matrix-built ones. The
+          # `sdist` subcommand packages the source and stops.
+          command: sdist
+          rust-toolchain: stable
+          working-directory: python/ddxdb
+          # No `manylinux:` — an sdist is platform-independent.
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-sdist
+          path: python/ddxdb/dist/*
+
+  verify:
+    name: verify (${{ matrix.os }})
+    needs: [macos-windows, manylinux, sdist]
+    # One runner per wheel we built. `uv pip install` resolves whichever wheel
+    # matches the host, so verifying on a single runner would exercise exactly
+    # one of the five and publish the rest having only compiled them — and a
+    # wheel that links but cannot be imported is a normal PyO3 failure.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      # Install the artifact that is about to be published and use it, rather
+      # than trusting that a build which succeeded also works. This is the last
+      # point where a broken wheel is still cheap to fix: a bad PyPI release
+      # cannot be replaced, only yanked and superseded.
+      #
+      # `--no-index` keeps this honest: the wheel must come from `dist`, so the
+      # step cannot quietly pass by installing an older ddxdb from PyPI.
+      - name: Install the built wheel and exercise it
+        shell: bash
+        run: |
+          ls -l dist
+          uv venv --python 3.10
+          uv pip install --no-index --find-links dist ddxdb
+          uv run python -c "
+          import ddxdb
+          assert ddxdb.rewrite_sql('SELECT grad(sin(x), x) AS d FROM t') == 'SELECT (cos(x)) AS d FROM t'
+          assert ddxdb.rewrite_sql('SELECT 1') == 'SELECT 1'
+          try:
+              ddxdb.rewrite_sql('SELECT grad(atan2(x,y), x) FROM t')
+              raise SystemExit('an unsupported construct must raise')
+          except ddxdb.UnsupportedExpression:
+              pass
+          print('ddxdb', ddxdb.__version__, 'OK')
+          "
+
+      - name: The tag must match the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#ddxdb-v}"
+          PKG=$(uv run python -c "import ddxdb; print(ddxdb.__version__)")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag ddxdb-v$TAG does not match packaged version $PKG" >&2
+            exit 1
+          fi
+          echo "tag and package agree on $PKG"
+
+  publish:
+    name: publish to PyPI
+    needs: verify
+    runs-on: ubuntu-latest
+    # Only a tag publishes. `workflow_dispatch` stops after `verify`, so the
+    # pipeline can be run end to end without releasing anything.
+    if: startsWith(github.ref, 'refs/tags/ddxdb-v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ddxdb
+    permissions:
+      # The OIDC token Trusted Publishing exchanges for a short-lived PyPI
+      # credential. This is the only job that gets it.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          # PEP 740 provenance: PyPI records which workflow, at which commit,
+          # built each file. Available only via Trusted Publishing.
+          attestations: true

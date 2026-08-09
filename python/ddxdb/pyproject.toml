@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ddxdb"
+version = "0.1.0"
+description = "SQL-portable autograd: write calculus in SQL, get derivatives back as columns."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Alexander Merose", email = "al@merose.com" }]
+requires-python = ">=3.10"  # 3.9 reached EOL 2025-10-31; matches xarray-sql.
+keywords = ["sql", "autograd", "derivatives", "datafusion", "duckdb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+# No runtime dependencies on purpose. `rewrite_sql` is pure text in, text out —
+# it needs no engine at all, which is what makes it usable from any of them.
+# `Context` subclasses a DataFusion type, so it lives in the `ddxdb.datafusion`
+# submodule and is imported on first access; that keeps `import ddxdb` free of an
+# engine and lets xarray-sql depend on this as an optional extra that costs
+# nothing when unused.
+dependencies = []
+
+[project.optional-dependencies]
+datafusion = ["datafusion>=45"]
+duckdb = ["duckdb>=1.0"]
+test = ["pytest>=7", "datafusion>=45", "duckdb>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/xqlsystems/ddx"
+Repository = "https://github.com/xqlsystems/ddx"
+
+[tool.maturin]
+# Mixed layout: Python package in `ddxdb/`, the compiled extension imported as
+# `ddxdb._ddxdb`.
+python-source = "."
+module-name = "ddxdb._ddxdb"
+features = ["pyo3/extension-module"]
