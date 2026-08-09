@@ -132,12 +132,23 @@ jobs:
       # Deterministic despite being generated: every suite seeds its own RNG, so
       # a failure here reproduces exactly rather than being a soak finding. That
       # is what makes it a blocking PR gate, unlike the Rust fuzz suite.
+      #
+      # `ddxdb` is a path dependency of tests/pyproject.toml, so `uv sync` builds
+      # it from this checkout through maturin's build backend — there is no
+      # separate develop step that could install into a different virtualenv than
+      # the one pytest runs in.
+      #
+      # `--locked` fails if tests/uv.lock has drifted from tests/pyproject.toml,
+      # so the environment CI resolves is the one committed.
+      #
+      # `--reinstall-package ddxdb` is not redundant with a fresh checkout: the
+      # uv cache is restored across runs, and a cached wheel keyed on the Python
+      # package would not notice a change under crates/. Rebuilding it every time
+      # costs a minute and removes the possibility of grading a stale engine.
       - name: check ddx against jax.grad on DuckDB and DataFusion
         run: |
-          uv venv --python 3.12
-          uv pip install maturin -r tests/requirements.txt
-          (cd python/ddxdb && uv run maturin develop --uv)
-          uv run pytest tests/ -q
+          uv sync --project tests --locked --reinstall-package ddxdb
+          uv run --project tests pytest tests/ -q
 
   package:
     name: package (publish dry-run)

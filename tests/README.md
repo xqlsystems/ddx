@@ -10,14 +10,39 @@ disagreement is a finding on one side or the other, not a units mismatch.
 ## Running it
 
 ```sh
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install maturin -r tests/requirements.txt
-(cd python/ddxdb && maturin develop --uv)   # builds ddxdb from the local crate
-pytest tests/ -q
+uv sync --project tests --reinstall-package ddxdb
+uv run --project tests pytest tests/ -q
+```
+
+`ddxdb` is a path dependency in `pyproject.toml`, so `uv sync` builds the wheel
+from this repo's own crates through maturin's build backend. There is no separate
+`maturin develop` step to forget, run from the wrong directory, or point at the
+wrong virtualenv.
+
+**`--reinstall-package ddxdb` is the load-bearing part.** A plain `uv sync` sees
+that `ddxdb` is already installed and audits it in milliseconds — including after
+you have edited `crates/ddx-core`, because uv is watching the Python package and
+the Rust source is not in it. The suite would then pass against the engine you
+had *before* your change, which is the most expensive kind of green. Verified,
+not assumed:
+
+```
+$ uv sync                            # after editing the cos rule
+Audited 17 packages in 2ms
+>>> ddxdb.rewrite_sql("SELECT grad(cos(x), x) ...")   # the OLD rule
+'SELECT (-sin(x)) AS d FROM t'
+
+$ uv sync --reinstall-package ddxdb
+'SELECT (sin(x)) AS d FROM t'                          # the edited one
 ```
 
 Every suite skips cleanly if `jax` or `ddxdb` is missing, so a partial
 environment reports "skipped" rather than failing for the wrong reason.
+
+`uv.lock` is committed, so CI resolves the environment this file describes. That
+also means a JAX release cannot silently change the oracle underneath us — run
+`uv lock --upgrade --project tests` deliberately, and let `test_conventions.py`
+tell you whether anything JAX promises has moved.
 
 ## How it avoids testing itself
 

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# The environment the cross-engine oracle suite runs in, managed by uv.
+#
+# `ddxdb` is a path dependency, so `uv sync` builds the wheel from this repo's
+# own crates through maturin's build backend. There is no separate
+# `maturin develop` step to forget, run in the wrong directory, or point at the
+# wrong virtualenv — the thing under test is a dependency like any other, and
+# uv resolves, builds and installs it with the rest.
+[project]
+name = "ddx-oracle-tests"
+version = "0"
+description = "Numeric-agreement suites: ddx against jax.grad, on DuckDB and DataFusion."
+requires-python = ">=3.10"
+dependencies = [
+    "ddxdb",           # the thing under test, built from ../python/ddxdb
+    "jax>=0.4",        # the oracle, and the jaxpr IR the harness interprets
+    "duckdb>=1.0",     # the two engines the rewrite is checked on
+    "datafusion>=45",
+    "pyarrow>=14",     # how row fixtures reach both engines with identical dtypes
+    "numpy>=1.24",
+    "pytest>=7",
+]
+
+[tool.uv]
+# These tests are not distributed — they exercise ddx against other people's
+# engines — so this file exists to pin an environment, not to describe a package.
+package = false
+
+[tool.uv.sources]
+ddxdb = { path = "../python/ddxdb" }
