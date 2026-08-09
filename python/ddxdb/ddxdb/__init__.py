@@ -41,6 +41,7 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     UnsupportedExpression,
     differentiate_sql,
     rewrite_sql,
+    supported_functions,
 )
 
 # Single-sourced from the installed distribution metadata, which maturin fills
@@ -58,6 +59,7 @@ __version__ = _metadata.version("ddxdb")
 __all__ = [
     "rewrite_sql",
     "differentiate_sql",
+    "supported_functions",
     "DdxError",
     "UnsupportedExpression",
     "InvalidMarker",

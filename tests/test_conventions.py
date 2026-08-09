@@ -19,6 +19,7 @@ inheriting the change.
 from __future__ import annotations
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 from engines import ENGINES
@@ -122,18 +123,66 @@ def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside(engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES, ids=str)
-def test_a_null_input_stays_null_rather_than_becoming_zero(engine):
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x * x",      # plain arithmetic: NULL propagates for free
+        "abs(x)",     # a CASE, where it does not propagate for free
+        "sqrt(x)",    # a quotient
+        "sin(x)",     # a chain-rule factor
+    ],
+)
+def test_a_null_input_stays_null_rather_than_becoming_zero(engine, body):
     """A missing value propagates through the derivative as it does the primal.
 
-    A derivative of `NULL` that came back `0` would be indistinguishable from a
+    A derivative of NULL that came back `0` would be indistinguishable from a
     genuine zero gradient — the difference between "no data here" and "this
-    parameter does not move".
+    parameter does not move". In a training loop the second is a converged
+    weight and the first is a hole in the batch.
+
+    `abs` is the case that made this worth parametrizing. Its derivative is a
+    CASE, and comparisons against NULL are NULL rather than false, so a row with
+    no value answers none of the branches and lands in `ELSE`. An `ELSE 0.0`
+    therefore reported a confident zero gradient for missing data, on every
+    engine. The rule now states `u = 0` as its own branch and leaves `ELSE` to
+    mean only "no answer".
     """
-    xs = np.array([1.0, np.nan, 3.0])
-    ys = np.zeros_like(xs)
-    sql = ddxdb.rewrite_sql(
-        "SELECT grad(x * x, x) AS d FROM t ORDER BY i", engine.dialect
+    # `None`, not `np.nan`: `pa.array([1.0, np.nan, 3.0])` has null_count 0,
+    # because NaN is a float value in Arrow and not a null. A fixture built that
+    # way tests NaN propagation while appearing to test this.
+    xs = pa.array([1.0, None, 3.0], type=pa.float64())
+    assert xs.null_count == 1, "the fixture must actually contain a NULL"
+    assert pa.array(np.array([1.0, np.nan, 3.0])).null_count == 0, (
+        "...and NaN is not one, which is why this is built from Arrow"
     )
-    got = engine.column(sql, xs, ys)
-    assert got[0] == 2.0 and got[2] == 6.0
-    assert np.isnan(got[1]), f"{engine.name}: expected a missing value, got {got[1]!r}"
+    ys = pa.array([0.0, 0.0, 0.0], type=pa.float64())
+
+    sql = ddxdb.rewrite_sql(
+        f"SELECT grad({body}, x) AS d FROM t ORDER BY i", engine.dialect
+    )
+    assert list(engine.nulls(sql, xs, ys)) == [False, True, False], (
+        f"{engine.name}: d/dx {body} did not keep the missing row missing\n"
+        f"  rewritten: {sql}\n"
+        f"  returned : {engine.values(sql, xs, ys)}"
+    )
+
+
+@pytest.mark.parametrize("engine", ENGINES, ids=str)
+def test_the_derivative_of_abs_is_a_double_not_a_decimal(engine):
+    """The sign CASE must not come back in a type of its own.
+
+    Its branches are bare literals, which DuckDB reads as `DECIMAL(2,1)` — so
+    without a typed branch this one derivative would arrive in a different type
+    from every other one ddx emits, with different arithmetic under it. The
+    typed NULL in `ELSE` fixes the whole CASE at DOUBLE, which is the same
+    branch that carries missingness.
+    """
+    sql = ddxdb.rewrite_sql(
+        "SELECT grad(abs(x), x) AS d FROM t ORDER BY i", engine.dialect
+    )
+    values = engine.values(sql, np.array([2.0, -2.0, 0.0]), np.zeros(3))
+    assert [type(v) for v in values] == [float, float, float], (
+        f"{engine.name}: expected float64, got {[type(v).__name__ for v in values]} "
+        f"from {sql}"
+    )
+    assert values == [1.0, -1.0, 0.0]

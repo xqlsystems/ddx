@@ -80,6 +80,15 @@ impl Ddx {
         }
     }
 
+    /// The unary function names this engine can differentiate, sorted.
+    ///
+    /// Read from the rule registry, so it reflects what is implemented rather
+    /// than a list kept in step by hand — and it includes anything registered
+    /// through [`Ddx::register`].
+    pub fn unary_rule_names(&self) -> Vec<String> {
+        self.rules.unary_names()
+    }
+
     /// The identifier-folding policy this engine compares columns under.
     pub fn casing(&self) -> IdentCasing {
         self.casing

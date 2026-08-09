@@ -25,58 +25,67 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import oracle
-from engines import ENGINES
-
+# Before `import oracle`, which imports jax at module scope: an importorskip
+# placed after it never runs, and collection dies with ImportError instead of
+# skipping. The engines module has no such dependency.
 jax = pytest.importorskip("jax", reason="the JAX oracle needs jax installed")
 ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
 
+import oracle  # noqa: E402  (must follow the skip guards above)
+from engines import ENGINES  # noqa: E402
+
 jnp = jax.numpy
 
-# (SQL body, the same function for JAX, a sampling interval inside its domain).
-# The interval is the derivative's domain, which is the stricter one: `sqrt` is
-# defined at 0 and `1/(2*sqrt(x))` is not.
+# (rule covered, SQL body, the same function for JAX, a sampling interval).
+#
+# The rule name is stated rather than inferred from the SQL: matching `"sin("`
+# against the body finds it inside `"asin(x)"`, so a coverage guard built that
+# way reports full coverage after the `sin` row is deleted. `None` marks a row
+# that exercises an operator or a composition rather than one named rule.
+#
+# The interval is the *derivative's* domain, the stricter one: `sqrt` is defined
+# at 0 and `1/(2*sqrt(x))` is not.
 RULES = [
-    ("x + y", lambda x, y: x + y, (-3.0, 3.0)),
-    ("x - y", lambda x, y: x - y, (-3.0, 3.0)),
-    ("x * y", lambda x, y: x * y, (-3.0, 3.0)),
-    ("x / y", lambda x, y: x / y, (0.5, 3.0)),
-    ("sin(x)", lambda x, y: jnp.sin(x), (-3.0, 3.0)),
-    ("cos(x)", lambda x, y: jnp.cos(x), (-3.0, 3.0)),
-    ("tan(x)", lambda x, y: jnp.tan(x), (-1.2, 1.2)),
-    ("asin(x)", lambda x, y: jnp.arcsin(x), (-0.9, 0.9)),
-    ("acos(x)", lambda x, y: jnp.arccos(x), (-0.9, 0.9)),
-    ("atan(x)", lambda x, y: jnp.arctan(x), (-3.0, 3.0)),
-    ("exp(x)", lambda x, y: jnp.exp(x), (-3.0, 3.0)),
-    ("ln(x)", lambda x, y: jnp.log(x), (0.3, 3.0)),
-    ("log2(x)", lambda x, y: jnp.log2(x), (0.3, 3.0)),
-    ("log10(x)", lambda x, y: jnp.log10(x), (0.3, 3.0)),
-    ("sqrt(x)", lambda x, y: jnp.sqrt(x), (0.3, 3.0)),
-    ("sinh(x)", lambda x, y: jnp.sinh(x), (-3.0, 3.0)),
-    ("cosh(x)", lambda x, y: jnp.cosh(x), (-3.0, 3.0)),
-    ("tanh(x)", lambda x, y: jnp.tanh(x), (-3.0, 3.0)),
+    (None, "x + y", lambda x, y: x + y, (-3.0, 3.0)),
+    (None, "x - y", lambda x, y: x - y, (-3.0, 3.0)),
+    (None, "x * y", lambda x, y: x * y, (-3.0, 3.0)),
+    (None, "x / y", lambda x, y: x / y, (0.5, 3.0)),
+    ("sin", "sin(x)", lambda x, y: jnp.sin(x), (-3.0, 3.0)),
+    ("cos", "cos(x)", lambda x, y: jnp.cos(x), (-3.0, 3.0)),
+    ("tan", "tan(x)", lambda x, y: jnp.tan(x), (-1.2, 1.2)),
+    ("asin", "asin(x)", lambda x, y: jnp.arcsin(x), (-0.9, 0.9)),
+    ("acos", "acos(x)", lambda x, y: jnp.arccos(x), (-0.9, 0.9)),
+    ("atan", "atan(x)", lambda x, y: jnp.arctan(x), (-3.0, 3.0)),
+    ("exp", "exp(x)", lambda x, y: jnp.exp(x), (-3.0, 3.0)),
+    ("ln", "ln(x)", lambda x, y: jnp.log(x), (0.3, 3.0)),
+    ("log2", "log2(x)", lambda x, y: jnp.log2(x), (0.3, 3.0)),
+    ("log10", "log10(x)", lambda x, y: jnp.log10(x), (0.3, 3.0)),
+    ("sqrt", "sqrt(x)", lambda x, y: jnp.sqrt(x), (0.3, 3.0)),
+    ("sinh", "sinh(x)", lambda x, y: jnp.sinh(x), (-3.0, 3.0)),
+    ("cosh", "cosh(x)", lambda x, y: jnp.cosh(x), (-3.0, 3.0)),
+    ("tanh", "tanh(x)", lambda x, y: jnp.tanh(x), (-3.0, 3.0)),
     # `abs` away from its kink; the kink itself is a pinned convention where ddx
     # and JAX deliberately differ (see test_conventions.py).
-    ("abs(x)", lambda x, y: jnp.abs(x), (0.5, 3.0)),
-    ("power(x, 3)", lambda x, y: x**3, (-3.0, 3.0)),
-    ("power(x, -2)", lambda x, y: x**-2, (0.5, 3.0)),
-    ("power(x, 1.5)", lambda x, y: x**1.5, (0.3, 3.0)),
-    ("power(2.0, x)", lambda x, y: 2.0**x, (-3.0, 3.0)),
+    ("abs", "abs(x)", lambda x, y: jnp.abs(x), (0.5, 3.0)),
+    (None, "power(x, 3)", lambda x, y: x**3, (-3.0, 3.0)),
+    (None, "power(x, -2)", lambda x, y: x**-2, (0.5, 3.0)),
+    (None, "power(x, 1.5)", lambda x, y: x**1.5, (0.3, 3.0)),
+    (None, "power(2.0, x)", lambda x, y: 2.0**x, (-3.0, 3.0)),
     # Compositions that exercise the chain rule against a nested restricted
     # domain, where a rule that forgot the inner derivative would still look
     # plausible at a single point.
-    ("sin(x * y)", lambda x, y: jnp.sin(x * y), (-2.0, 2.0)),
-    ("ln(x * x + 1.0)", lambda x, y: jnp.log(x * x + 1.0), (-3.0, 3.0)),
-    ("sqrt(exp(x))", lambda x, y: jnp.sqrt(jnp.exp(x)), (-3.0, 2.0)),
+    (None, "sin(x * y)", lambda x, y: jnp.sin(x * y), (-2.0, 2.0)),
+    (None, "ln(x * x + 1.0)", lambda x, y: jnp.log(x * x + 1.0), (-3.0, 3.0)),
+    (None, "sqrt(exp(x))", lambda x, y: jnp.sqrt(jnp.exp(x)), (-3.0, 2.0)),
 ]
 
 POINTS = 16
 
 
 @pytest.mark.parametrize("engine", ENGINES, ids=str)
-@pytest.mark.parametrize("body, fn, domain", RULES, ids=[r[0] for r in RULES])
+@pytest.mark.parametrize("rule, body, fn, domain", RULES, ids=[r[1] for r in RULES])
 @pytest.mark.parametrize("wrt", ["x", "y"])
-def test_rule_agrees_with_jax(engine, body, fn, domain, wrt):
+def test_rule_agrees_with_jax(engine, rule, body, fn, domain, wrt):
     """ddx's derivative of `body` matches `jax.grad` across the rule's domain.
 
     Differentiating with respect to `y` as well as `x` is not padding: most of
@@ -108,14 +117,12 @@ def test_rule_agrees_with_jax(engine, body, fn, domain, wrt):
 def test_every_rule_the_engine_implements_has_a_case_here():
     """The rule table must not fall behind the rule set it claims to cover.
 
-    ddx's built-in unary rules are the list below. Adding a rule to the engine
-    without adding it here would leave it untested while every existing test
-    still passed, so the omission is asserted against rather than noticed.
+    The implemented list is read out of ddx's own rule registry, not restated
+    here. A second hand-maintained copy would make this assertion compare one
+    list against another and pass while the engine grew a rule neither knew
+    about — which is the failure it exists to prevent.
     """
-    implemented = {
-        "sin", "cos", "tan", "asin", "acos", "atan",
-        "exp", "ln", "log2", "log10", "sqrt",
-        "sinh", "cosh", "tanh", "abs",
-    }
-    covered = {name for name in implemented if f"{name}(" in " ".join(r[0] for r in RULES)}
-    assert covered == implemented, f"no case for: {sorted(implemented - covered)}"
+    implemented = set(ddxdb.supported_functions())
+    assert implemented, "the engine reported no rules at all"
+    covered = {rule for rule, *_ in RULES if rule is not None}
+    assert implemented <= covered, f"no case for: {sorted(implemented - covered)}"

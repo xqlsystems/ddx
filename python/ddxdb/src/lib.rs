@@ -207,10 +207,22 @@ fn differentiate_sql(expr: &str, wrt: &str, dialect: &str) -> PyResult<String> {
         .map_err(to_py_err)
 }
 
+/// The unary function names ddx can differentiate, sorted.
+///
+/// Read out of the engine's rule registry rather than restated here, so it
+/// cannot fall behind what is implemented. Useful for deciding whether to hand
+/// ddx an expression at all, and for a test asking "is every rule covered?" to
+/// ask the engine instead of a second list someone has to remember to update.
+#[pyfunction]
+fn supported_functions() -> Vec<String> {
+    Ddx::new().unary_rule_names()
+}
+
 #[pymodule]
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rewrite_sql, m)?)?;
     m.add_function(wrap_pyfunction!(differentiate_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(

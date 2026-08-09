@@ -122,6 +122,18 @@ impl RuleRegistry {
         RuleRegistry { unary }
     }
 
+    /// The unary function names this registry has a rule for, sorted.
+    ///
+    /// Read out of the registry rather than restated, so it cannot fall behind
+    /// what is implemented — and so a test asking "is every rule covered?" is
+    /// asking the engine instead of a second list that has to be maintained
+    /// alongside the first. Includes rules a caller registered.
+    pub fn unary_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.unary.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Register (or override) a unary differentiation rule under `name`. The
     /// name is matched case-insensitively.
     pub fn register(&mut self, name: &str, rule: Rule) {

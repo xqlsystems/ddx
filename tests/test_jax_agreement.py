@@ -25,12 +25,15 @@ import random
 import numpy as np
 import pytest
 
-import oracle
-from engines import ENGINES
-from oracle import candidate, sample_points, trace
-
+# Before `import oracle`, which imports jax at module scope: an importorskip
+# placed after it never runs, and collection dies with ImportError instead of
+# skipping. The engines module has no such dependency.
 jax = pytest.importorskip("jax", reason="the JAX oracle needs jax installed")
 ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
+
+import oracle  # noqa: E402  (must follow the skip guards above)
+from engines import ENGINES  # noqa: E402
+from oracle import candidate, sample_points, trace  # noqa: E402
 
 SEED = 20260809
 EXPRESSIONS = 120
@@ -185,11 +188,23 @@ def test_second_derivative_agrees_with_nested_jax_grad(engine):
 
         # A second derivative squares the conditioning problem: its intermediates
         # are the first derivative's, differentiated again. Points merely adequate
-        # for one order need not be for two, so drop rows where either side has
-        # left the finite range rather than comparing infinities.
-        keep = np.isfinite(want) & np.isfinite(got)
+        # for one order need not be for two, so rows where the *oracle* has left
+        # the finite range are dropped — there is nothing to compare against.
+        #
+        # The mask is JAX's alone, deliberately. Masking on `got` as well would
+        # discard exactly the rows worth seeing: where JAX has a finite second
+        # derivative and ddx returns NULL or an infinity, that is a regression,
+        # and a symmetric mask would file it as "nothing to compare" and pass.
+        keep = np.isfinite(want)
         if keep.sum() < MIN_POINTS:
             continue
+        assert np.isfinite(got[keep]).all(), (
+            f"{engine.name}: ddx returned a non-finite second derivative where "
+            f"JAX has a finite one\n"
+            f"  expression: {cand.sql}   wrt {cand.wrt}\n"
+            f"  rewritten : {sql}\n"
+            f"  ddx       : {got[keep][~np.isfinite(got[keep])]}"
+        )
 
         _judge(cand, got[keep], xs[keep], ys[keep], want[keep], sql, engine.name)
         judged += 1
@@ -224,6 +239,7 @@ def test_finite_differences_cross_check_the_oracle(engine):
         )
         got = engine.column(sql, xs, ys)
 
+        compared = 0
         for i, (x, y) in enumerate(zip(xs, ys)):
             x, y = float(x), float(y)
             hx, hy = (h, 0.0) if cand.wrt == "x" else (0.0, h)
@@ -246,7 +262,13 @@ def test_finite_differences_cross_check_the_oracle(engine):
                 f"  at x={x!r}, y={y!r}\n"
                 f"  ddx={float(got[i])!r}  finite-difference={approx!r}"
             )
-        judged += 1
+            compared += 1
+        # Counted only if something was actually compared. The step gate above
+        # can reject every point of an expression, and counting it regardless
+        # would let the retention floor be satisfied by expressions that
+        # compared nothing at all.
+        if compared:
+            judged += 1
 
     assert judged / EXPRESSIONS >= MIN_RETENTION
 

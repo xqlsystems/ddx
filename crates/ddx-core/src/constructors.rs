@@ -366,8 +366,26 @@ pub fn sign(u: Expr) -> Expr {
                 condition: compare(BinaryOperator::Lt),
                 result: num(-1.0),
             },
+            // The kink, stated as its own condition rather than left to `ELSE`.
+            // `ELSE` is reached by anything the comparisons did not answer, and
+            // for a NULL input all three-valued comparisons are NULL — so an
+            // `ELSE 0.0` hands back a *zero derivative* for a row that has no
+            // value at all, which is indistinguishable from a parameter that
+            // genuinely does not move. Naming `u = 0` leaves `ELSE` to mean only
+            // "no answer", which is what NULL is.
+            CaseWhen {
+                condition: compare(BinaryOperator::Eq),
+                result: zero(),
+            },
         ],
-        else_result: Some(Box::new(zero())),
+        // Typed, and load-bearing twice over: it propagates the missing value,
+        // and it is what fixes the CASE's result type at DOUBLE. Without it the
+        // branches are bare decimal literals, and DuckDB types the whole
+        // expression `DECIMAL(2,1)` — so a gradient column would come back in a
+        // different type from every other derivative ddx emits.
+        else_result: Some(Box::new(cast_double(Expr::Value(
+            Value::Null.with_empty_span(),
+        )))),
     }
 }
 
