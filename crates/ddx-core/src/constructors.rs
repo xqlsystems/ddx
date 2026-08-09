@@ -338,15 +338,35 @@ pub fn square(e: Expr) -> Expr {
     mul(e.clone(), e)
 }
 
-/// The mathematical sign of `u` as a portable `CASE`, pinning `sign(0) = 0` on
-/// every engine: `CASE WHEN u > 0 THEN 1.0 WHEN u < 0 THEN -1.0 ELSE 0.0 END`.
+/// The mathematical sign of `u`, as a `CASE` that behaves identically on every
+/// engine:
 ///
-/// This is the derivative factor for `abs` (`d/du |u| = sign(u)`). It avoids the
-/// engine-specific builtins — DuckDB has only `sign`, DataFusion only `signum`,
-/// and the two disagree at `0` (`signum(0) = 1`) — so the emitted derivative is
-/// both portable across the target engines and *actually* pins the documented
-/// kink convention `abs'(0) = 0` (design.md §5, F12), which a bare `signum(u)`
-/// call did not.
+/// ```text
+/// CASE WHEN u > 0 THEN 1.0
+///      WHEN u < 0 THEN -1.0
+///      WHEN u = 0 THEN 0.0
+///      ELSE CAST(NULL AS DOUBLE) END
+/// ```
+///
+/// This is the derivative factor for `abs` (`d/du |u| = sign(u)`), and every
+/// part of the shape is doing work:
+///
+/// * **Not an engine builtin.** DuckDB offers only `sign`, DataFusion only
+///   `signum`, so neither name is portable — and both answer `1` at zero, where
+///   ddx pins `abs'(0) = 0`. `|u|` has no derivative at `0`; the symmetric point
+///   is chosen because it is the only one that keeps `sign` odd, as `abs` is
+///   even. A builtin would silently break that pin on whichever engine had it.
+/// * **`u = 0` is a stated branch, not the `ELSE`.** SQL comparisons are
+///   three-valued: against NULL they are NULL, not false. A NULL input therefore
+///   answers none of the comparisons, so an `ELSE 0.0` would report a *zero
+///   derivative* for a row that has no value — indistinguishable from a
+///   parameter that genuinely does not move, which for a gradient is the
+///   difference between a gap in the data and a converged weight.
+/// * **The `ELSE` is a typed NULL,** which carries the missing value through and
+///   also fixes the expression's result type at `DOUBLE`. Left as bare literals
+///   the branches are decimals, and DuckDB types the whole `CASE`
+///   `DECIMAL(2,1)` — so this one derivative would arrive in a different type,
+///   with different arithmetic under it, from every other derivative ddx emits.
 pub fn sign(u: Expr) -> Expr {
     let compare = |op: BinaryOperator| Expr::BinaryOp {
         left: Box::new(u.clone()),
@@ -366,8 +386,17 @@ pub fn sign(u: Expr) -> Expr {
                 condition: compare(BinaryOperator::Lt),
                 result: num(-1.0),
             },
+            // The kink, stated rather than left to `ELSE`. See the doc comment:
+            // this is what keeps `ELSE` meaning "no comparison answered".
+            CaseWhen {
+                condition: compare(BinaryOperator::Eq),
+                result: zero(),
+            },
         ],
-        else_result: Some(Box::new(zero())),
+        // Reached only by a NULL input, and typed so the CASE is DOUBLE.
+        else_result: Some(Box::new(cast_double(Expr::Value(
+            Value::Null.with_empty_span(),
+        )))),
     }
 }
 

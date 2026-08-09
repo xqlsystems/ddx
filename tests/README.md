@@ -1,30 +1,161 @@
 # Cross-engine tests (vs JAX)
 
-This directory holds the **cross-engine numeric-agreement suites** (design.md
-§5, §6): the same `grad`/`jvp` expression, rewritten per-dialect by `ddx-core`,
-must evaluate to numerically equal columns in DuckDB and DataFusion — checked
-against **JAX** (`jax.grad`) as the oracle, since the whole design mirrors JAX's
-forward/reverse structure and the same seed/cotangent semantics.
+The **numeric-agreement suites**: the same function, rewritten by ddx and
+evaluated on DuckDB and DataFusion, must produce the numbers `jax.grad` produces.
 
-**Status: scaffold.** The minimal JAX-oracle harness is pulled forward into M2
-(its exit gate — "xarray-sql green on `ddx-core` vs. JAX, no regressions" —
-depends on it); the broader suites land in M6 (design.md §8). Planned coverage:
+JAX is the natural oracle rather than a convenient one — ddx mirrors its
+forward/reverse structure and the same seed/cotangent semantics — so a
+disagreement is a finding on one side or the other, not a units mismatch.
 
-- **Numeric agreement vs JAX** for every rule, with finite-difference as a
-  cheap independent cross-check where a JAX equivalent is awkward.
-- **Cross-engine equivalence**: DuckDB vs DataFusion on the identical
-  per-dialect rewrite.
-- **Convention-pinning tests** (not blind oracle comparison) where a convention
-  genuinely differs rather than one side being wrong (design.md §5):
-  - *Kinks* — `abs` at 0 gives `0` from the `signum` rule; pin the value.
-  - *Domain-widening* — a derivative can fail where the primal doesn't
-    (`sqrt(x)` fine at 0, `1/(2*sqrt(x))` divides by zero); sample away from
-    edges or pin per-engine behavior.
-  - *NULL/folding* — folded and unfolded derivatives agree everywhere except
-    the documented NULL-row cases (the JAX-`Zero`-tangent convention, F11).
+If you are here to change something: **"How it avoids testing itself"** below is
+the one section worth reading before editing `oracle.py`, and **"Conventions, not
+comparisons"** explains why a handful of cases are pinned instead of compared.
 
-The Rust unit and integration tests for the engine itself live with the crate,
-in [`../crates/ddx-core/tests`](../crates/ddx-core/tests) (the ported rule
-tests, span splicing, the guards, identifier folding, and the semantic
-round-trip property test). The runnable spikes that back each design claim are
-in [`../spikes`](../spikes).
+## Running it
+
+```sh
+uv sync --project tests --reinstall-package ddxdb
+uv run --project tests pytest tests/ -q
+```
+
+`ddxdb` is a path dependency in `pyproject.toml`, so `uv sync` builds the wheel
+from this repo's own crates through maturin's build backend. There is no separate
+`maturin develop` step to forget, run from the wrong directory, or point at the
+wrong virtualenv.
+
+**`--reinstall-package ddxdb` is the load-bearing part.** A plain `uv sync` sees
+that `ddxdb` is already installed and audits it in milliseconds — including after
+you have edited `crates/ddx-core`, because uv is watching the Python package and
+the Rust source is not in it. The suite would then pass against the engine you
+had *before* your change, which is the most expensive kind of green. Verified,
+not assumed:
+
+```
+$ uv sync                            # after editing the cos rule
+Audited 17 packages in 2ms
+>>> ddxdb.rewrite_sql("SELECT grad(cos(x), x) ...")   # the OLD rule
+'SELECT (-sin(x)) AS d FROM t'
+
+$ uv sync --reinstall-package ddxdb
+'SELECT (sin(x)) AS d FROM t'                          # the edited one
+```
+
+Every suite skips cleanly if `jax` or `ddxdb` is missing, so a partial
+environment reports "skipped" rather than failing for the wrong reason.
+
+`uv.lock` is committed, so CI resolves the environment this file describes. That
+also means a JAX release cannot change the oracle without anyone noticing:
+upgrading is a deliberate `uv lock --upgrade --project tests`, and
+`test_conventions.py` is what reports whether anything JAX promises has moved.
+
+## How it avoids testing itself
+
+The failure to design against is not a wrong answer but a **false agreement**. If
+the SQL handed to ddx and the function handed to JAX were rendered separately
+from some shared description, the two could drift apart — or share a
+misconception — and the suite would compare two different functions while
+reporting whatever it found as a fact about ddx.
+
+So there is only one function. A generated Python callable is traced by JAX into
+a **jaxpr**, its own let-bound IR of primitives, and everything downstream is an
+interpreter over that single object:
+
+| interpreter | produces | written by |
+|---|---|---|
+| `jax.grad` / `jax.jvp` | the oracle | JAX |
+| `oracle.to_sql` | the SQL ddx rewrites | this repo |
+| `oracle.trace` | intermediates for the conditioning gates | this repo |
+
+`to_sql` is the only hand-written translation, and a bug in it *cannot* cause a
+false pass: rendering the wrong expression makes the engine compute something JAX
+did not differentiate, which is a mismatch, which is a failure. The dangerous
+direction is closed by construction.
+
+Reusing JAX's IR costs one thing, stated rather than hidden: a jaxpr is already
+lowered, so rules JAX does not keep as primitives are unreachable. `jnp.log2`
+traces to `log(x)/log(2)`, so no generated expression will ever render SQL's
+`log2`. Those rules are covered by name in `test_rules.py`.
+
+## The files
+
+- **`oracle.py`** — the jaxpr interpreters, the conditioning gates, the generator.
+- **`engines.py`** — runs a statement on DuckDB or DataFusion and returns the
+  column. Rows arrive as Arrow, not as a `VALUES` literal, because DuckDB reads a
+  bare `1.5` as `DECIMAL(2,1)` and the two engines would otherwise be handed
+  different types for the same fixture.
+- **`test_jax_agreement.py`** — generated: `grad` vs `jax.vmap(jax.grad)`, `jvp`
+  vs `jax.jvp`, second derivatives vs nested `jax.grad`, and central differences
+  as an independent cross-check. JAX and ddx share a structure, so a misconception
+  common to both would be invisible between them; a finite difference shares
+  nothing with either, because it only ever evaluates the primal.
+- **`test_rules.py`** — every v1 rule by name, so a failure names the rule rather
+  than a seed, and so `log2`/`log10`/constant-base `power` are covered at all.
+- **`test_conventions.py`** — the places ddx and JAX differ *on purpose*, pinned
+  from both sides rather than compared.
+
+## Why points get skipped, and why the rate is asserted
+
+A generated expression is often in-domain almost nowhere, and at a
+near-cancellation point two correct computations of the same derivative disagree
+in every digit. Comparing there would report correct code as broken, so points
+are screened: domain margin, a magnitude cap, and a divide-by-noise threshold
+derived from the tolerance rather than picked.
+
+Screening is also how an oracle loses its teeth, so the retention rate is
+**asserted** — a suite that quietly began rejecting everything would otherwise
+keep passing while testing nothing. `test_jax_agreement.py` asserts *rule
+coverage* for the same reason: the generator's weights are tuned for admissible
+points, not for coverage, and the two can drift apart in silence.
+
+## Conventions, not comparisons
+
+At a kink the derivative does not exist, so every autodiff system picks a value
+and none is more correct. Comparing there would report a deliberate decision as a
+bug — and worse, would let a change to that decision pass unnoticed as long as it
+still matched JAX. So both sides are pinned:
+
+- **`abs` at 0** — ddx gives `0`, JAX gives `1`. ddx emits a portable `CASE`
+  rather than an engine `signum`/`sign` builtin, which is what makes the pin hold
+  everywhere: DuckDB has only `sign`, DataFusion only `signum`, and `signum(0)`
+  is `1`.
+- **The second derivative of `abs`** — refused with a typed error, not answered
+  with `0`. Its first derivative is a `CASE`, and ddx does not differentiate
+  `CASE`. JAX takes the other branch and returns `0`.
+- **Domain widening** — `sqrt(x)` is defined at 0 and `1/(2*sqrt(x))` is not, so
+  the derivative must not come back as a finite number.
+- **NULL** — a missing input stays missing rather than becoming `0`, which would
+  be indistinguishable from a genuine zero gradient. This is the one on the list
+  that is easy to get wrong and hard to notice: three-valued logic means
+  comparisons against NULL are NULL rather than false, so a row with no value
+  answers *no* branch of a `CASE` and lands in `ELSE`. The sign rule therefore
+  states `u = 0` as its own branch and reserves `ELSE` for "none of the
+  comparisons answered", which is exactly what NULL is.
+- **The type of a `CASE`** — `abs`'s derivative must come back as DOUBLE like
+  every other derivative. Its branches are bare literals, which DuckDB reads as
+  `DECIMAL(2,1)`, so the typed NULL in `ELSE` is what fixes the whole expression
+  at DOUBLE. The same branch carries both properties.
+
+## What this suite does not cover
+
+**Cross-engine equivalence as its own axis.** Every check here compares one
+engine against JAX; none compares DuckDB against DataFusion directly. Agreement
+with a common oracle implies agreement with each other *at the points both were
+admitted*, and the interesting disagreements are likely to be at the domain edges
+the conditioning gates deliberately screen out. Tracked as GitHub issue #30.
+
+**Identifier folding beyond these two engines.** ddx maps each SQL dialect to a
+case-folding rule, and only DuckDB and DataFusion are asserted against a running
+engine; the rest (Snowflake and Oracle fold unquoted identifiers to *upper* case,
+ClickHouse folds nothing) come from their documented semantics. Also GitHub #30.
+
+**A soak.** Every suite here is seeded, so it explores the same expressions every
+run and will not find something new by running longer. That is deliberate — it is
+a blocking pull-request gate, and a gate has to be reproducible — but it means
+this is a fixed sample rather than a search. The unbounded random exploration
+lives on the Rust side, in `crates/ddx-core/tests/simulation.rs`.
+
+The Rust unit and integration tests for the engine itself live with the crate in
+[`../crates/ddx-core/tests`](../crates/ddx-core/tests): the ported rule tests,
+span splicing, the guards, identifier folding, and the semantic round-trip
+property test. The runnable spikes behind each design claim are in
+[`../docs/spikes`](../docs/spikes).
