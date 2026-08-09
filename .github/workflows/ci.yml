@@ -164,3 +164,5 @@ jobs:
       # tries to publish. Add publishable crates here as they come online.
       - name: cargo publish --dry-run (ddx-core)
         run: cargo publish --dry-run -p ddx-core
+      - name: cargo publish --dry-run (ddx-datafusion)
+        run: cargo publish --dry-run -p ddx-datafusion

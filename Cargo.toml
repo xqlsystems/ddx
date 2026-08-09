@@ -47,5 +47,12 @@ sqlparser = { version = "=0.62.0", features = ["visitor"] }
 datafusion = { version = "54" }
 
 # Internal crates, referenced by path within the workspace.
-ddx-core = { path = "crates/ddx-core" }
+#
+# `ddx-core` carries a `version` as well as a `path`: cargo uses the path for
+# workspace builds and the version for what it writes into a published
+# dependent's manifest, and it refuses to publish a crate whose path dependency
+# has no version. The floor is 0.2.1 rather than 0.2 because `grad(abs(u), x)`
+# returned a zero gradient for a NULL row in 0.2.0, and an adapter that resolved
+# to it would hand users that bug.
+ddx-core = { path = "crates/ddx-core", version = "0.2.1" }
 ddx-ad = { path = "crates/ddx-ad" }

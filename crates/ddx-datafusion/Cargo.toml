@@ -1,11 +1,13 @@
 [package]
 name = "ddx-datafusion"
 description = "DataFusion adapter for ddx: bare grad()/jvp() via an AnalyzerRule, plus the ddx_sql text-rewrite helper."
-version.workspace = true
-# Still not on crates.io: `version` is the workspace 0.0.0 placeholder, and the
-# release process only publishes ddx-core so far (see release-plz.toml). Flip
-# this — and add a real version — when this adapter is released.
-publish = false
+# Versioned independently of ddx-core: the two publish on their own cadence, and
+# an adapter that had to move whenever the engine did would force a release for
+# changes that do not touch it.
+version = "0.1.0"
+readme = "README.md"
+keywords = ["sql", "autograd", "differentiation", "datafusion", "dataframe"]
+categories = ["mathematics", "database"]
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
