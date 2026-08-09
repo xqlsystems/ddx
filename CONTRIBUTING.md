@@ -107,7 +107,7 @@ builds the wheel through maturin's build backend. There is no separate
 `maturin develop` step to run in the wrong directory or point at the wrong
 virtualenv.
 
-> **`--reinstall-package ddxdb` is load-bearing, not defensive.** A plain
+> **`--reinstall-package ddxdb` is necessary, not defensive.** A plain
 > `uv sync` sees `ddxdb` already installed and audits it in milliseconds —
 > *including after you have edited `crates/ddx-core`*, because uv watches the
 > Python package and the Rust source is not in it. Leave it off and the suite
@@ -126,26 +126,16 @@ That also means a JAX release cannot change the oracle underneath a green build:
 upgrading is a deliberate `uv lock --upgrade --project tests`, and
 `tests/test_conventions.py` is what reports whether anything JAX promises moved.
 
-### How the oracle suite is built, and why it matters when editing it
+### Editing the oracle suite
 
-Read [`tests/README.md`](tests/README.md) before changing `tests/oracle.py`. The
-short version: a generated Python function is traced by JAX into a **jaxpr**, and
-that *one* object is then interpreted three ways — `jax.grad` for the oracle,
-`to_sql` for the SQL ddx rewrites, and `trace` for the numeric conditioning
-gates. Rendering the SQL and the oracle function separately would let the two
-drift apart and compare *different* functions while reporting the result as a
-fact about ddx. Keep that property.
+Read [`tests/README.md`](tests/README.md) first — it explains why the suite is
+shaped the way it is, and the property to preserve when changing `oracle.py`.
 
-Two conventions to know before a failure confuses you:
-
-- **Skipped points are normal.** A generated expression is often in-domain almost
-  nowhere, and at a near-cancellation point two correct computations of the same
-  derivative disagree in every digit. Points are screened; the *retention rate*
-  is asserted, so a suite that quietly began rejecting everything fails rather
-  than passing vacuously.
-- **Some cases are pinned, not compared.** Where ddx and JAX differ on purpose —
-  `abs` at its kink, missing values, domain edges — both sides are asserted, so
-  changing either is visible. Do not "fix" those by making ddx match JAX.
+Two things that would otherwise make a failure confusing: skipped points are
+normal (the retention rate is asserted, so a suite that began rejecting
+everything fails rather than passing vacuously), and a handful of cases are
+*pinned* rather than compared, because ddx and JAX differ there on purpose —
+don't "fix" those by making ddx match JAX.
 
 ### Python conventions
 
@@ -222,25 +212,8 @@ DDX_SOAK_SECS=120 cargo test -p ddx-core --test simulation --release \
 - Write a description that says *what* changed and *why*, and links the issue it
   closes. If the change is subtle, say what could have gone wrong and how the
   tests cover it.
-- **CI must be green.** The pull-request checks are:
-  - **`rustfmt + clippy`** — `cargo fmt --all --check` and
-    `cargo clippy --workspace --all-targets -- -D warnings`.
-  - **`tests (…)`** — the deterministic test suite (unit + integration +
-    doctests, excluding the property fuzz) run on **stable, beta, nightly, and
-    the MSRV (1.88)**. `nightly` is informational; stable, beta, and MSRV must
-    pass. (The property/fuzz *soak* runs on a nightly schedule, not on every PR.)
-  - **`ddxdb wheel (py3.10 / py3.12)`** — builds the wheel and runs its tests on
-    the `requires-python` floor and the current version, so the floor is tested
-    rather than asserted.
-  - **`JAX numeric-agreement oracle`** — the `tests/` suite against DuckDB and
-    DataFusion. Generated, but seeded, so a failure reproduces exactly — which is
-    what makes it a blocking gate rather than a soak finding.
-  - **`package (publish dry-run)`** — `cargo publish --dry-run` for each
-    publishable crate, so packaging breakage surfaces on a PR instead of when a
-    release first tries to upload.
-  - **`ci-wheel`** (path-filtered, runs only when `python/` or `crates/ddx-core/`
-    changes) — builds the wheel on all five platforms we ship to. This is where a
-    `pyo3`/linker problem shows up, and no amount of Linux testing catches it.
+- **CI must be green.** `nightly` is informational; everything else must pass.
+  (The property-fuzz *soak* runs on a schedule, not on every PR.)
 
 Maintainers merge; you don't need to (and can't) push to protected branches.
 
@@ -312,9 +285,7 @@ Maintainers only:
   — see the comments in
   [`.github/workflows/release.yml`](.github/workflows/release.yml), including the
   optional upgrade to crates.io Trusted Publishing.
-- PyPI uses **Trusted Publishing (OIDC)**, so there is no token to leak or
-  rotate. It needs a one-time pending publisher on PyPI; the exact values are in
-  the header of `publish-pypi.yml`.
+- PyPI uses **Trusted Publishing (OIDC)**, so there is no token to manage.
 - **Read the changelog entry release-plz generates before merging its PR.** It is
   derived from the squashed commit subject, which is the pull-request title — so
   a PR titled for one package can produce a changelog entry describing that

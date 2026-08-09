@@ -65,8 +65,13 @@ planner rather than syntactically.
 ## Status
 
 **M2 landed and released.** The scalar engine, the DataFusion adapter and the
-Python wheel are all published; ddx runs on DataFusion and DuckDB, and its
-derivatives are checked against `jax.grad` on both.
+Python wheel are all published.
+
+**DataFusion is the engine with native support**: `ddx-datafusion` installs an
+`AnalyzerRule`, so bare `grad()` works in ordinary SQL and through the DataFrame
+API. Every other engine — DuckDB included — goes through `rewrite_sql` today: you
+rewrite the text and hand the result to your own connection. A native DuckDB
+extension, with `grad()` understood in-database, comes eventually (M5).
 
 | | | |
 |---|---|---|
@@ -87,10 +92,10 @@ a plausible number. What backs that up:
 
 - **A JAX oracle.** [`tests/`](tests) generates a function, traces it to a jaxpr,
   and hands that *one* object to both sides — rendered as SQL for ddx,
-  differentiated by JAX for the oracle — then compares the columns DuckDB and
-  DataFusion actually produce. Central differences cross-check independently,
-  since JAX and ddx share a structure and a common misconception would be
-  invisible between them.
+  differentiated by JAX for the oracle — then compares the columns DataFusion and
+  DuckDB actually produce. Central differences cross-check independently, since
+  JAX and ddx share a structure and a common misconception would be invisible
+  between them.
 - **A property suite** over randomly generated expressions, with conditioning
   gates so float noise is not mistaken for a bug, plus a soak that runs nightly.
 - **Pinned conventions** where ddx and JAX differ on purpose rather than one
