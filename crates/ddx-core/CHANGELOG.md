@@ -9,6 +9,58 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.0...ddx-core-v0.2.1) - 2026-08-09
+
+### Fixed
+
+- **`grad(abs(u), x)` reported a zero gradient for a row whose value was NULL.**
+  The derivative of `abs` is emitted as a `CASE` on the sign of `u`, and SQL
+  comparisons are three-valued: against NULL they are NULL, not false. A row with
+  no value therefore answered *none* of the branches and fell through to `ELSE`,
+  which returned `0`:
+
+  ```
+  x = [1.0, NULL, 3.0]   grad(abs(x), x)  ->  [1.0, 0.0, 1.0]
+  ```
+
+  **Who is affected.** Anyone differentiating an expression containing `abs` over
+  data that has gaps — on any engine; this was not engine-specific. The failure
+  is silent and the value is plausible, which is what makes it worth upgrading
+  for: a zero gradient is indistinguishable from a parameter that genuinely does
+  not move, so in a training loop a hole in the batch reads as a converged
+  weight. Expressions without `abs` were never affected, because arithmetic
+  propagates NULL on its own.
+
+  **What changed in the output.** The emitted `CASE` now states the kink as its
+  own condition and reserves `ELSE` for "no comparison answered":
+
+  ```sql
+  -- before
+  CASE WHEN u > 0 THEN 1.0 WHEN u < 0 THEN -1.0 ELSE 0.0 END
+  -- after
+  CASE WHEN u > 0 THEN 1.0 WHEN u < 0 THEN -1.0 WHEN u = 0 THEN 0.0
+       ELSE CAST(NULL AS DOUBLE) END
+  ```
+
+  The pinned convention `abs'(0) = 0` is unchanged, and every non-NULL input
+  gives the same answer as before ([#60](https://github.com/xqlsystems/ddx/pull/60)).
+
+- **The same `CASE` came back as `DECIMAL` on DuckDB.** Its branches were bare
+  literals, which DuckDB types `DECIMAL(2,1)`, so `grad(abs(x), x)` was the one
+  derivative arriving in a different type — with different arithmetic under it —
+  from everything else ddx emits. The typed `ELSE` above fixes the whole
+  expression at `DOUBLE` ([#60](https://github.com/xqlsystems/ddx/pull/60)).
+
+### Added
+
+- `Ddx::unary_rule_names()` and `RuleRegistry::unary_names()` — the unary
+  function names the engine can differentiate, read from the rule registry and
+  including any added with `register`. Useful for deciding whether to hand ddx an
+  expression at all; note that a name being present does not by itself make an
+  *expression* differentiable, since the surrounding constructs matter too, so
+  catching the typed error remains the general answer. **Requires 0.2.1**
+  ([#60](https://github.com/xqlsystems/ddx/pull/60)).
+
 ## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.3...ddx-core-v0.2.0) - 2026-08-09
 
 ### Added
