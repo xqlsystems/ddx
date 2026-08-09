@@ -140,12 +140,14 @@ def test_a_null_input_stays_null_rather_than_becoming_zero(engine, body):
     parameter does not move". In a training loop the second is a converged
     weight and the first is a hole in the batch.
 
-    `abs` is the case that made this worth parametrizing. Its derivative is a
-    CASE, and comparisons against NULL are NULL rather than false, so a row with
-    no value answers none of the branches and lands in `ELSE`. An `ELSE 0.0`
-    therefore reported a confident zero gradient for missing data, on every
-    engine. The rule now states `u = 0` as its own branch and leaves `ELSE` to
-    mean only "no answer".
+    Most rules propagate NULL for free, because arithmetic does. `abs` is the
+    exception worth parametrizing over: its derivative is a `CASE`, and under
+    three-valued logic a comparison against NULL is NULL rather than false — so a
+    row with no value answers none of the branches and falls into `ELSE`. A rule
+    written with `ELSE 0.0` therefore hands back a confident zero gradient for
+    missing data, on every engine, while looking perfectly reasonable. The sign
+    rule states `u = 0` as its own branch so that `ELSE` means only "none of the
+    comparisons answered".
     """
     # `None`, not `np.nan`: `pa.array([1.0, np.nan, 3.0])` has null_count 0,
     # because NaN is a float value in Arrow and not a null. A fixture built that

@@ -7,6 +7,10 @@ JAX is the natural oracle rather than a convenient one — ddx mirrors its
 forward/reverse structure and the same seed/cotangent semantics — so a
 disagreement is a finding on one side or the other, not a units mismatch.
 
+If you are here to change something: **"How it avoids testing itself"** below is
+the one section worth reading before editing `oracle.py`, and **"Conventions, not
+comparisons"** explains why a handful of cases are pinned instead of compared.
+
 ## Running it
 
 ```sh
@@ -40,9 +44,9 @@ Every suite skips cleanly if `jax` or `ddxdb` is missing, so a partial
 environment reports "skipped" rather than failing for the wrong reason.
 
 `uv.lock` is committed, so CI resolves the environment this file describes. That
-also means a JAX release cannot silently change the oracle underneath us — run
-`uv lock --upgrade --project tests` deliberately, and let `test_conventions.py`
-tell you whether anything JAX promises has moved.
+also means a JAX release cannot change the oracle without anyone noticing:
+upgrading is a deliberate `uv lock --upgrade --project tests`, and
+`test_conventions.py` is what reports whether anything JAX promises has moved.
 
 ## How it avoids testing itself
 
@@ -120,13 +124,35 @@ still matched JAX. So both sides are pinned:
 - **Domain widening** — `sqrt(x)` is defined at 0 and `1/(2*sqrt(x))` is not, so
   the derivative must not come back as a finite number.
 - **NULL** — a missing input stays missing rather than becoming `0`, which would
-  be indistinguishable from a genuine zero gradient.
+  be indistinguishable from a genuine zero gradient. This is the one on the list
+  that is easy to get wrong and hard to notice: three-valued logic means
+  comparisons against NULL are NULL rather than false, so a row with no value
+  answers *no* branch of a `CASE` and lands in `ELSE`. The sign rule therefore
+  states `u = 0` as its own branch and reserves `ELSE` for "none of the
+  comparisons answered", which is exactly what NULL is.
+- **The type of a `CASE`** — `abs`'s derivative must come back as DOUBLE like
+  every other derivative. Its branches are bare literals, which DuckDB reads as
+  `DECIMAL(2,1)`, so the typed NULL in `ELSE` is what fixes the whole expression
+  at DOUBLE. The same branch carries both properties.
 
-## Still to come
+## What this suite does not cover
 
-Cross-engine *equivalence* as its own axis — DuckDB against DataFusion directly
-rather than each against JAX (GitHub #30) — and the NULL/folding agreement cases
-(#32).
+**Cross-engine equivalence as its own axis.** Every check here compares one
+engine against JAX; none compares DuckDB against DataFusion directly. Agreement
+with a common oracle implies agreement with each other *at the points both were
+admitted*, and the interesting disagreements are likely to be at the domain edges
+the conditioning gates deliberately screen out. Tracked as GitHub issue #30.
+
+**Identifier folding beyond these two engines.** ddx maps each SQL dialect to a
+case-folding rule, and only DuckDB and DataFusion are asserted against a running
+engine; the rest (Snowflake and Oracle fold unquoted identifiers to *upper* case,
+ClickHouse folds nothing) come from their documented semantics. Also GitHub #30.
+
+**A soak.** Every suite here is seeded, so it explores the same expressions every
+run and will not find something new by running longer. That is deliberate — it is
+a blocking pull-request gate, and a gate has to be reproducible — but it means
+this is a fixed sample rather than a search. The unbounded random exploration
+lives on the Rust side, in `crates/ddx-core/tests/simulation.rs`.
 
 The Rust unit and integration tests for the engine itself live with the crate in
 [`../crates/ddx-core/tests`](../crates/ddx-core/tests): the ported rule tests,
