@@ -160,3 +160,8 @@ pip install maturin pytest
 maturin develop --uv
 python -m pytest tests/
 ```
+
+## License
+
+Licensed under [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0), the
+same as the rest of [ddx](https://github.com/xqlsystems/ddx).
