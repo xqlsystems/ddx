@@ -58,9 +58,9 @@ Getting this wrong does not raise. `grad("X" * "X", X)` is `2X` on Snowflake and
 rather than a default, and refuses a dialect whose rule it has not established.
 
 Because the rewrite happens in *your* process, on *your* connection, it sees
-your temp tables, session settings, and open transaction. DuckDB's in-database
-`ddx('<sql>')` table function cannot: it executes on a separate inner
-connection.
+your temp tables, session settings and open transaction — anything the query
+itself could see. A rewrite performed *inside* the database, on a connection of
+its own, would not.
 
 ## `Context`, for DataFusion
 
@@ -97,7 +97,7 @@ A marker rewrites in place, so it is legal anywhere a scalar expression is —
 including inside a recursive CTE, which is how a whole training loop fits in one
 query.
 
-## One other function
+## Two other functions
 
 ```python
 ddxdb.differentiate_sql("x * y", "x")     # 'y' — the derivative as text
@@ -106,6 +106,15 @@ ddxdb.differentiate_sql("x * y", "x")     # 'y' — the derivative as text
 The escape hatch, for assembling SQL where a marker cannot reach — inside a
 recursive term you are building programmatically, or a query some other tool
 emits. Everything else should use `rewrite_sql`.
+
+```python
+ddxdb.supported_functions()               # ['abs', 'acos', 'asin', ...]
+```
+
+The unary functions ddx has a rule for, read from the engine rather than
+restated. Note that a name being present does not by itself make an *expression*
+differentiable — the surrounding constructs matter too — so catching the typed
+error below remains the general answer to "can ddx handle this?".
 
 ## Errors are typed
 
