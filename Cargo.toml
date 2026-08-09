@@ -54,5 +54,5 @@ datafusion = { version = "54" }
 # has no version. The floor is 0.2.1 rather than 0.2 because `grad(abs(u), x)`
 # returned a zero gradient for a NULL row in 0.2.0, and an adapter that resolved
 # to it would hand users that bug.
-ddx-core = { path = "crates/ddx-core", version = "0.2" }
+ddx-core = { path = "crates/ddx-core", version = "0.2.1" }
 ddx-ad = { path = "crates/ddx-ad" }
