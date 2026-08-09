@@ -13,6 +13,13 @@ import pytest
 
 import ddxdb
 
+# Each engine is gated by the fixture that needs it, never by a module-level
+# `importorskip`. `importorskip` raises during collection, so it skips
+# *everything below it* in the file: a missing `datafusion` would have taken the
+# DuckDB tests with it, and — worse — the test asserting ddxdb works with no
+# engine installed, which is the one test that only means anything in exactly
+# the environment where that gate fires.
+
 # --------------------------------------------------------------------------
 # The pure-text surface. No engine, no imports beyond ddxdb itself.
 # --------------------------------------------------------------------------
@@ -51,26 +58,54 @@ def test_differentiate_sql_is_the_escape_hatch():
 
 @pytest.mark.parametrize(
     "dialect",
-    ["datafusion", "generic", "duckdb", "postgres", "mysql", "sqlite",
-     "snowflake", "bigquery", "spark", "clickhouse", "ansi"],
+    ["generic", "datafusion", "postgres", "postgresql", "ansi",
+     "snowflake", "oracle", "duckdb", "mysql", "sqlite", "bigquery",
+     "redshift", "hive", "spark", "sparksql", "databricks", "mssql",
+     "teradata", "clickhouse"],
 )
-def test_every_dialect_sqlparser_knows_is_accepted(dialect):
-    # Dialect selection is delegated to sqlparser rather than enumerated here,
-    # so a dialect it gains upstream works without a change to ddx.
+def test_every_dialect_sqlparser_parses_has_an_established_folding_rule(dialect):
+    # Parsing is delegated to sqlparser; folding is ddx's own knowledge, and its
+    # table is exhaustive over what sqlparser parses rather than a list of
+    # exceptions to a default. A dialect added upstream therefore cannot
+    # silently inherit Postgres semantics — it is refused until someone
+    # establishes its rule. This is every name sqlparser accepts today.
     assert ddxdb.rewrite_sql("SELECT grad(x*x, x) AS d FROM t", dialect) == (
         "SELECT (x + x) AS d FROM t"
     )
 
 
-def test_duckdb_dialect_folds_quoted_identifiers():
-    # The one thing sqlparser cannot tell us. DuckDB is case-insensitive even
-    # for quoted identifiers; DataFusion is not. Picking the wrong policy does
-    # not raise — it silently differentiates to zero, because the wrt stops
-    # matching its own occurrences. Hence the folding policy travels with the
-    # dialect rather than being a separate argument.
-    assert ddxdb.rewrite_sql('SELECT grad("X" * "X", "X") AS d FROM t', "duckdb") == (
-        'SELECT ("X" + "X") AS d FROM t'
-    )
+@pytest.mark.parametrize(
+    "dialect, sql, expected",
+    [
+        # Unquoted folds to lowercase, so bare X is "x" and never "X".
+        ("postgres", 'grad("x" * "x", X)', '("x" + "x")'),
+        ("postgres", 'grad("X" * "X", X)', "(0.0)"),
+        ("datafusion", 'grad("x" * "x", X)', '("x" + "x")'),
+        # Unquoted folds to UPPERCASE: the same query resolves the other way.
+        ("snowflake", 'grad("X" * "X", X)', '("X" + "X")'),
+        ("snowflake", 'grad("x" * "x", X)', "(0.0)"),
+        ("oracle", 'grad("X" * "X", X)', '("X" + "X")'),
+        # Case-insensitive throughout: quoting does not pin anything.
+        ("duckdb", 'grad("X" * "X", X)', '("X" + "X")'),
+        ("spark", "grad(`X` * `X`, x)", "(`X` + `X`)"),
+        ("mysql", "grad(`X` * `X`, x)", "(`X` + `X`)"),
+        # Case-sensitive throughout: X and x really are different columns, so
+        # zero is the right answer here rather than a missed match.
+        ("clickhouse", "grad(X * X, x)", "(0.0)"),
+        ("clickhouse", "grad(X * X, X)", "(X + X)"),
+    ],
+)
+def test_identifier_folding_follows_the_engine_not_a_default(dialect, sql, expected):
+    # The one thing sqlparser cannot tell us, and the reason the folding policy
+    # travels with the dialect rather than being a separate argument. Engines
+    # disagree three ways about which column an identifier names, and picking
+    # the wrong rule does not raise: it silently differentiates with respect to
+    # a column the user did not name — zero if nothing matches, and a confident
+    # wrong answer if the *other* column does.
+    got = ddxdb.rewrite_sql(f"SELECT {sql} AS d FROM t", dialect)
+    assert got == f"SELECT {expected} AS d FROM t"
+
+
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +144,46 @@ def test_every_ddx_error_shares_one_base():
         assert issubclass(cls, ddxdb.DdxError)
 
 
+def test_ddxdb_is_usable_with_no_engine_installed():
+    # rewrite_sql is text in, text out. Context subclasses SessionContext, so it
+    # is built lazily on first access rather than at import — and `import *`
+    # does not reach it either, which is why Context is absent from __all__.
+    #
+    # The engines are blocked at the import system rather than merely assumed
+    # absent: CI installs both extras, so a subprocess that simply imports ddxdb
+    # would pass no matter what this module does at import time. Blocking makes
+    # the claim testable in the environment the tests actually run in.
+    import subprocess
+    import sys
+
+    script = """
+import sys
+
+class NoEngines:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in ("datafusion", "duckdb"):
+            raise ImportError(f"blocked for this test: {fullname}")
+        return None
+
+sys.meta_path.insert(0, NoEngines())
+
+from ddxdb import *
+assert rewrite_sql("SELECT grad(x*x, x) AS d FROM t") == "SELECT (x + x) AS d FROM t"
+
+# ...and the lazy attribute still reports the missing extra usefully.
+import ddxdb
+try:
+    ddxdb.Context
+except ImportError as e:
+    assert "ddxdb[datafusion]" in str(e), e
+else:
+    raise SystemExit("Context must raise ImportError when DataFusion is absent")
+"""
+    subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True
+    )
+
+
 def test_an_unknown_dialect_is_a_value_error_naming_the_options():
     # "oracle" used to land here; it is a real sqlparser dialect and now works,
     # which is the delegation doing its job. Only a genuine non-dialect fails.
@@ -121,11 +196,10 @@ def test_an_unknown_dialect_is_a_value_error_naming_the_options():
 # The DataFusion shim, on a live engine.
 # --------------------------------------------------------------------------
 
-datafusion = pytest.importorskip("datafusion", reason="needs the datafusion extra")
-
 
 @pytest.fixture
 def ctx():
+    pytest.importorskip("datafusion", reason="needs the datafusion extra")
     c = ddxdb.Context()
     c.sql(
         "CREATE TABLE t AS SELECT * FROM (VALUES (1.0,4.0),(2.0,5.0),(3.0,6.0)) AS v(x,y)"
@@ -191,33 +265,38 @@ def test_newton_iteration_in_a_recursive_cte(ctx):
 def test_context_is_a_real_session_context(ctx):
     # A subclass, not a proxy — so it is accepted anywhere a SessionContext is,
     # and every inherited method works without being forwarded by hand.
+    import datafusion
+
     assert isinstance(ctx, datafusion.SessionContext)
     assert ctx.table("t") is not None
     assert callable(ctx.register_udf)
     assert "t" in ctx.catalog().schema().names()
 
 
-def test_importing_ddxdb_does_not_require_an_engine():
-    # rewrite_sql is text in, text out. Context subclasses SessionContext, so it
-    # is built lazily on first access rather than at import.
-    import subprocess
-    import sys
+def test_context_is_an_ordinary_class_at_a_real_location(ctx):
+    # It is defined in a submodule, not manufactured by a factory closure on
+    # first access. A class built inside a function has a __qualname__ like
+    # `_build.<locals>.Context`, which names nothing importable: pickle cannot
+    # find it, and neither can autodoc, mypy or an IDE. Deferring the *import*
+    # buys the same laziness with none of that.
+    import ddxdb.datafusion
 
-    subprocess.run(
-        [sys.executable, "-c", "import ddxdb; ddxdb.rewrite_sql('SELECT 1')"],
-        check=True,
-        capture_output=True,
-    )
+    assert type(ctx).__module__ == "ddxdb.datafusion"
+    assert type(ctx).__qualname__ == "Context"
+    assert ddxdb.Context is ddxdb.datafusion.Context
 
 
 # --------------------------------------------------------------------------
 # The DuckDB client-side path.
 # --------------------------------------------------------------------------
 
-duckdb = pytest.importorskip("duckdb", reason="needs the duckdb extra")
+
+@pytest.fixture
+def duckdb():
+    return pytest.importorskip("duckdb", reason="needs the duckdb extra")
 
 
-def test_any_engine_works_through_plain_rewrite_sql():
+def test_any_engine_works_through_plain_rewrite_sql(duckdb):
     # There is no DuckDB helper, and deliberately so: rewrite_sql is text in,
     # text out, so every engine is one line and none of them needs code here
     # that could rot. This is the same line a Polars or Spark user writes.
@@ -227,7 +306,7 @@ def test_any_engine_works_through_plain_rewrite_sql():
     assert [float(r[0]) for r in con.sql(sql).fetchall()] == [2.0, 4.0, 6.0]
 
 
-def test_rewriting_client_side_sees_connection_scoped_state():
+def test_rewriting_client_side_sees_connection_scoped_state(duckdb):
     # Why the text interface is the right one: the rewrite happens on the
     # caller's own connection, so temp tables, session settings and an open
     # transaction are all visible. DuckDB's in-database `ddx('<sql>')` table

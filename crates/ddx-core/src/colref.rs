@@ -18,25 +18,53 @@ use crate::error::{DiffError, Result};
 /// * [`IdentCasing::FoldUnquoted`] — unquoted identifiers fold to lowercase;
 ///   quoted identifiers keep their case. (DataFusion, Postgres, the generic
 ///   dialect.)
-/// * [`IdentCasing::FoldAll`] — *all* identifiers fold to lowercase, quoted
-///   included. (DuckDB, which is fully case-insensitive.)
+/// * [`IdentCasing::FoldUnquotedUpper`] — the same rule with the opposite
+///   target case: unquoted identifiers fold to *uppercase*. (Snowflake, Oracle.)
+/// * [`IdentCasing::FoldAll`] — *all* identifiers fold, quoted included, so
+///   case never distinguishes two columns. (DuckDB, Spark, MySQL.)
+/// * [`IdentCasing::FoldNone`] — no identifier folds; `x` and `X` are simply
+///   different columns. (ClickHouse.)
+///
+/// The two unquoted-only policies are not interchangeable, and the difference is
+/// visible rather than cosmetic: `X` matches `"X"` under `FoldUnquotedUpper` and
+/// `"x"` under `FoldUnquoted`. Applying the wrong one to Snowflake does not just
+/// miss — it can match the *other* column and return a confidently wrong
+/// nonzero derivative.
+// More engines than these three families exist, and each one found is a new
+// variant. Marking the enum non-exhaustive makes that an additive change for
+// anyone matching on it downstream, instead of a breaking release per engine.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentCasing {
-    /// Fold unquoted identifiers only (DataFusion / Postgres / generic).
+    /// Fold unquoted identifiers to lowercase (DataFusion / Postgres / generic).
     FoldUnquoted,
-    /// Fold every identifier, quoted included (DuckDB).
+    /// Fold unquoted identifiers to uppercase (Snowflake / Oracle).
+    FoldUnquotedUpper,
+    /// Fold every identifier, quoted included (DuckDB / Spark / MySQL).
     FoldAll,
+    /// Fold nothing; identifiers are compared as written (ClickHouse).
+    FoldNone,
 }
 
 impl IdentCasing {
     /// The comparison key for a single identifier under this policy.
+    ///
+    /// Only equality of the returned keys is meaningful — which case they fold
+    /// *to* is arbitrary, so long as an unquoted identifier and a quoted one
+    /// land on the same key exactly when the engine would resolve them to the
+    /// same column.
     pub fn fold(self, id: &Ident) -> String {
-        match (id.quote_style, self) {
-            // Unquoted: always case-folded.
-            (None, _) => id.value.to_ascii_lowercase(),
-            // Quoted: folded only for DuckDB.
-            (Some(_), IdentCasing::FoldAll) => id.value.to_ascii_lowercase(),
-            (Some(_), IdentCasing::FoldUnquoted) => id.value.clone(),
+        match (self, id.quote_style) {
+            // Case-insensitive throughout: quoting changes nothing.
+            (IdentCasing::FoldAll, _) => id.value.to_ascii_lowercase(),
+            // Case-sensitive throughout: nothing folds, quoted or not.
+            (IdentCasing::FoldNone, _) => id.value.clone(),
+            // Quoting pins the case exactly; an unquoted identifier folds to
+            // whichever case the engine normalizes to, and that choice is what
+            // decides which quoted identifiers it then collides with.
+            (_, Some(_)) => id.value.clone(),
+            (IdentCasing::FoldUnquoted, None) => id.value.to_ascii_lowercase(),
+            (IdentCasing::FoldUnquotedUpper, None) => id.value.to_ascii_uppercase(),
         }
     }
 }
@@ -172,6 +200,35 @@ mod tests {
         assert_eq!(
             IdentCasing::FoldAll.fold(&id("Temp")),
             IdentCasing::FoldAll.fold(&id("temp"))
+        );
+        assert_eq!(
+            IdentCasing::FoldUnquotedUpper.fold(&id("Temp")),
+            IdentCasing::FoldUnquotedUpper.fold(&id("temp"))
+        );
+    }
+
+    #[test]
+    fn an_unquoted_identifier_matches_the_quoting_its_engine_normalizes_to() {
+        // The whole reason FoldUnquotedUpper exists. Postgres resolves bare `X`
+        // to "x"; Snowflake resolves it to "X". Using one engine's rule on the
+        // other does not merely fail to match — it matches the *opposite*
+        // column, which is a wrong nonzero derivative rather than a zero.
+        assert_eq!(
+            IdentCasing::FoldUnquoted.fold(&id("X")),
+            IdentCasing::FoldUnquoted.fold(&quoted("x"))
+        );
+        assert_ne!(
+            IdentCasing::FoldUnquoted.fold(&id("X")),
+            IdentCasing::FoldUnquoted.fold(&quoted("X"))
+        );
+
+        assert_eq!(
+            IdentCasing::FoldUnquotedUpper.fold(&id("X")),
+            IdentCasing::FoldUnquotedUpper.fold(&quoted("X"))
+        );
+        assert_ne!(
+            IdentCasing::FoldUnquotedUpper.fold(&id("X")),
+            IdentCasing::FoldUnquotedUpper.fold(&quoted("x"))
         );
     }
 

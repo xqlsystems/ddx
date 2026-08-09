@@ -26,9 +26,10 @@ classifiers = [
 ]
 # No runtime dependencies on purpose. `rewrite_sql` is pure text in, text out —
 # it needs no engine at all, which is what makes it usable from any of them.
-# `Context` subclasses a DataFusion type, so it is built on first access rather
-# than at import; that keeps `import ddxdb` free of an engine and lets xarray-sql
-# depend on this as an optional extra that costs nothing when unused.
+# `Context` subclasses a DataFusion type, so it lives in the `ddxdb.datafusion`
+# submodule and is imported on first access; that keeps `import ddxdb` free of an
+# engine and lets xarray-sql depend on this as an optional extra that costs
+# nothing when unused.
 dependencies = []
 
 [project.optional-dependencies]

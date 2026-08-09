@@ -114,28 +114,32 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
+          # `sdist`, not `build --sdist`. The latter also builds a wheel *from*
+          # the sdist — that is what the flag is for — and this runner's wheel
+          # would then be uploaded alongside the real matrix-built ones. The
+          # `sdist` subcommand packages the source and stops.
+          command: sdist
           rust-toolchain: stable
           working-directory: python/ddxdb
-          # No `manylinux:` — an sdist is platform-independent, and maturin
-          # verifies it by building a wheel from it, which needs an interpreter
-          # the manylinux container does not have.
-          args: --release --sdist --out dist
-      - name: Assert the sdist build produced no wheels
-        working-directory: python/ddxdb
-        run: |
-          if ls dist/*.whl >/dev/null 2>&1; then
-            echo "sdist job produced wheels; they would shadow the real ones" >&2
-            exit 1
-          fi
+          # No `manylinux:` — an sdist is platform-independent.
+          args: --out dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-sdist
           path: python/ddxdb/dist/*
 
   verify:
-    name: verify the artifacts
+    name: verify (${{ matrix.os }})
     needs: [macos-windows, manylinux, sdist]
-    runs-on: ubuntu-latest
+    # One runner per wheel we built. `uv pip install` resolves whichever wheel
+    # matches the host, so verifying on a single runner would exercise exactly
+    # one of the five and publish the rest having only compiled them — and a
+    # wheel that links but cannot be imported is a normal PyO3 failure.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -148,7 +152,11 @@ jobs:
       # than trusting that a build which succeeded also works. This is the last
       # point where a broken wheel is still cheap to fix: a bad PyPI release
       # cannot be replaced, only yanked and superseded.
+      #
+      # `--no-index` keeps this honest: the wheel must come from `dist`, so the
+      # step cannot quietly pass by installing an older ddxdb from PyPI.
       - name: Install the built wheel and exercise it
+        shell: bash
         run: |
           ls -l dist
           uv venv --python 3.10
@@ -167,6 +175,7 @@ jobs:
 
       - name: The tag must match the package version
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: |
           TAG="${GITHUB_REF_NAME#ddxdb-v}"
           PKG=$(uv run python -c "import ddxdb; print(ddxdb.__version__)")

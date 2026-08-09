@@ -38,16 +38,24 @@ session.sql(ddxdb.rewrite_sql(q, "spark"))     # Spark
 ctx.sql(ddxdb.rewrite_sql(q))                  # DataFusion
 ```
 
-Any dialect [`sqlparser`](https://docs.rs/sqlparser/) knows is accepted —
-`generic`, `datafusion`, `duckdb`, `postgres`, `mysql`, `sqlite`, `snowflake`,
-`bigquery`, `redshift`, `clickhouse`, `mssql`, `hive`, `spark`, `databricks`,
-`ansi`, `oracle`, `teradata`. Dialect selection is delegated rather than
-enumerated here, so one added upstream works without a release of ddx.
+Accepted dialects: `generic`, `datafusion`, `postgres`, `ansi`, `snowflake`,
+`oracle`, `duckdb`, `mysql`, `sqlite`, `bigquery`, `redshift`, `hive`, `spark`,
+`databricks`, `mssql`, `teradata`, `clickhouse`.
 
-Pick the dialect that matches the engine you will run on, not just the one that
-parses. It also selects how identifiers fold, and DuckDB folds quoted
-identifiers where the others don't — getting that wrong doesn't raise, it
-silently differentiates to zero.
+Pick the one that matches the engine you will run on, not just the one that
+parses your SQL. The dialect also decides which column an identifier *names*,
+and engines disagree three ways:
+
+| | unquoted `X` means | so `"X"` is |
+|---|---|---|
+| Postgres, DataFusion, generic, ansi | `"x"` | a different column |
+| Snowflake, Oracle | `"X"` | the same column |
+| DuckDB, Spark, MySQL, SQLite, BigQuery, Redshift, Hive, Databricks, SQL Server, Teradata | any casing | the same column |
+| ClickHouse | `X` exactly | the same column, and `"x"` is not |
+
+Getting this wrong does not raise. `grad("X" * "X", X)` is `2X` on Snowflake and
+`0` on Postgres — both correct, for different engines — so ddx keeps a table
+rather than a default, and refuses a dialect whose rule it has not established.
 
 Because the rewrite happens in *your* process, on *your* connection, it sees
 your temp tables, session settings, and open transaction. DuckDB's in-database
@@ -63,6 +71,11 @@ method, property and constructor argument works unchanged:
 ctx = ddxdb.Context()
 ctx.sql("SELECT grad(x * x, x) AS d FROM t").collect()      # → 2x
 ```
+
+It lives in `ddxdb.datafusion` (a subclass needs its base class at import time,
+so it cannot sit beside `rewrite_sql` without dragging DataFusion in) and is
+re-exported as `ddxdb.Context`, imported on first use. `import ddxdb` still needs
+no engine.
 
 There is sugar for DataFusion and not for other engines because DataFusion is
 ddx's integration target. Everything else uses the one-liner above, which is why
