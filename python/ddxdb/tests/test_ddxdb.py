@@ -35,17 +35,25 @@ def test_differentiate_sql_is_the_escape_hatch():
     assert ddxdb.differentiate_sql("x * y", "x") == "y"
 
 
-def test_explain_shows_each_marker_without_running_anything():
-    ex = ddxdb.explain("SELECT grad(x*x,x) AS a, grad(sin(y),y) AS b FROM t")
-    assert ex["rewritten"] == "SELECT (x + x) AS a, (cos(y)) AS b FROM t"
-    assert [s["marker"] for s in ex["steps"]] == ["grad(x*x,x)", "grad(sin(y),y)"]
-    assert [s["derivative"] for s in ex["steps"]] == ["(x + x)", "(cos(y))"]
+@pytest.mark.parametrize(
+    "dialect",
+    ["datafusion", "generic", "duckdb", "postgres", "mysql", "sqlite",
+     "snowflake", "bigquery", "spark", "clickhouse", "ansi"],
+)
+def test_every_dialect_sqlparser_knows_is_accepted(dialect):
+    # Dialect selection is delegated to sqlparser rather than enumerated here,
+    # so a dialect it gains upstream works without a change to ddx.
+    assert ddxdb.rewrite_sql("SELECT grad(x*x, x) AS d FROM t", dialect) == (
+        "SELECT (x + x) AS d FROM t"
+    )
 
 
 def test_duckdb_dialect_folds_quoted_identifiers():
-    # DuckDB is case-insensitive even for quoted identifiers, DataFusion is not.
-    # Picking the wrong dialect here would silently differentiate to zero rather
-    # than fail, which is why the dialect selects the folding policy too.
+    # The one thing sqlparser cannot tell us. DuckDB is case-insensitive even
+    # for quoted identifiers; DataFusion is not. Picking the wrong policy does
+    # not raise — it silently differentiates to zero, because the wrt stops
+    # matching its own occurrences. Hence the folding policy travels with the
+    # dialect rather than being a separate argument.
     assert ddxdb.rewrite_sql('SELECT grad("X" * "X", "X") AS d FROM t', "duckdb") == (
         'SELECT ("X" + "X") AS d FROM t'
     )
@@ -88,8 +96,10 @@ def test_every_ddx_error_shares_one_base():
 
 
 def test_an_unknown_dialect_is_a_value_error_naming_the_options():
+    # "oracle" used to land here; it is a real sqlparser dialect and now works,
+    # which is the delegation doing its job. Only a genuine non-dialect fails.
     with pytest.raises(ValueError) as e:
-        ddxdb.rewrite_sql("SELECT 1", "oracle")
+        ddxdb.rewrite_sql("SELECT 1", "klingon")
     assert "duckdb" in str(e.value)
 
 
@@ -164,23 +174,26 @@ def test_newton_iteration_in_a_recursive_cte(ctx):
     assert got == pytest.approx([2**0.5], abs=1e-12)
 
 
-def test_context_wraps_an_existing_session_context():
-    inner = datafusion.SessionContext()
-    inner.sql("CREATE TABLE u AS SELECT * FROM (VALUES (3.0)) AS v(x)").collect()
-    wrapped = ddxdb.Context(inner)
-    assert col(wrapped, "SELECT grad(x*x, x) AS d FROM u") == [6.0]
-    assert wrapped.inner is inner
-
-
-def test_context_forwards_unknown_attributes(ctx):
-    # It has to stand in for a SessionContext anywhere one is expected.
+def test_context_is_a_real_session_context(ctx):
+    # A subclass, not a proxy — so it is accepted anywhere a SessionContext is,
+    # and every inherited method works without being forwarded by hand.
+    assert isinstance(ctx, datafusion.SessionContext)
     assert ctx.table("t") is not None
     assert callable(ctx.register_udf)
+    assert "t" in ctx.catalog().schema().names()
 
 
-def test_context_rejects_ambiguous_construction():
-    with pytest.raises(TypeError):
-        ddxdb.Context(datafusion.SessionContext(), some_kwarg=1)
+def test_importing_ddxdb_does_not_require_an_engine():
+    # rewrite_sql is text in, text out. Context subclasses SessionContext, so it
+    # is built lazily on first access rather than at import.
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [sys.executable, "-c", "import ddxdb; ddxdb.rewrite_sql('SELECT 1')"],
+        check=True,
+        capture_output=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -190,19 +203,22 @@ def test_context_rejects_ambiguous_construction():
 duckdb = pytest.importorskip("duckdb", reason="needs the duckdb extra")
 
 
-def test_duckdb_sql_runs_on_your_own_connection():
+def test_any_engine_works_through_plain_rewrite_sql():
+    # There is no DuckDB helper, and deliberately so: rewrite_sql is text in,
+    # text out, so every engine is one line and none of them needs code here
+    # that could rot. This is the same line a Polars or Spark user writes.
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE t AS SELECT * FROM (VALUES (1.0),(2.0),(3.0)) AS v(x)")
-    got = [float(r[0]) for r in ddxdb.duckdb_sql("SELECT grad(x*x,x) AS d FROM t ORDER BY x", con).fetchall()]
-    assert got == [2.0, 4.0, 6.0]
+    sql = ddxdb.rewrite_sql("SELECT grad(x*x,x) AS d FROM t ORDER BY x", "duckdb")
+    assert [float(r[0]) for r in con.sql(sql).fetchall()] == [2.0, 4.0, 6.0]
 
 
-def test_duckdb_path_sees_connection_scoped_state():
-    # The point of rewriting client-side: it runs on the caller's connection, so
-    # temp tables, session settings and an open transaction are all visible. The
-    # in-database `ddx('<sql>')` table function executes on a separate inner
-    # connection and cannot see any of them.
+def test_rewriting_client_side_sees_connection_scoped_state():
+    # Why the text interface is the right one: the rewrite happens on the
+    # caller's own connection, so temp tables, session settings and an open
+    # transaction are all visible. DuckDB's in-database `ddx('<sql>')` table
+    # function executes on a separate inner connection and cannot see any.
     con = duckdb.connect(":memory:")
     con.execute("CREATE TEMP TABLE tmp AS SELECT 5.0 AS x")
-    got = [float(r[0]) for r in ddxdb.duckdb_sql("SELECT grad(x*x,x) AS d FROM tmp", con).fetchall()]
-    assert got == [10.0]
+    sql = ddxdb.rewrite_sql("SELECT grad(x*x,x) AS d FROM tmp", "duckdb")
+    assert [float(r[0]) for r in con.sql(sql).fetchall()] == [10.0]

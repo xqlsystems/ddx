@@ -21,9 +21,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 # No runtime dependencies on purpose. `rewrite_sql` is pure text in, text out —
-# it needs no engine. The `Context` shim and the DuckDB helper import their
-# engine lazily, so installing ddxdb never drags in an engine you don't use, and
-# xarray-sql can depend on it as an optional extra that costs nothing when unused.
+# it needs no engine at all, which is what makes it usable from any of them.
+# `Context` subclasses a DataFusion type, so it is built on first access rather
+# than at import; that keeps `import ddxdb` free of an engine and lets xarray-sql
+# depend on this as an optional extra that costs nothing when unused.
 dependencies = []
 
 [project.optional-dependencies]

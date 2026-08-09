@@ -18,45 +18,55 @@ thin wrapper over the `ddx-core` engine.
 ## Install
 
 ```bash
-pip install ddxdb                  # the rewrite, no engine
-pip install "ddxdb[datafusion]"    # + DataFusion
-pip install "ddxdb[duckdb]"        # + DuckDB
+pip install ddxdb                  # everything below except Context
+pip install "ddxdb[datafusion]"    # + the DataFusion Context
 ```
 
-There are no required runtime dependencies. `rewrite_sql` is text in, text out,
-and the engine wrappers import their engine lazily — so installing `ddxdb` never
-pulls in an engine you don't use.
+## `rewrite_sql` is the whole library
 
-## Three ways in
-
-**Just the rewrite.** Works with any engine, because the output is only SQL:
+Text in, text out — so it works with **any** engine that accepts SQL. Pass the
+result wherever you would have passed the original:
 
 ```python
 import ddxdb
 
 ddxdb.rewrite_sql("SELECT grad(sin(x), x) AS d FROM t")
 # 'SELECT (cos(x)) AS d FROM t'
+
+con.sql(ddxdb.rewrite_sql(q, "duckdb"))        # DuckDB
+session.sql(ddxdb.rewrite_sql(q, "spark"))     # Spark
+ctx.sql(ddxdb.rewrite_sql(q))                  # DataFusion
 ```
 
-**DataFusion**, via a drop-in `SessionContext` wrapper whose `.sql()` rewrites
-first. Every other attribute is forwarded, so it stands in for a
-`SessionContext` anywhere one is expected:
+Any dialect [`sqlparser`](https://docs.rs/sqlparser/) knows is accepted —
+`generic`, `datafusion`, `duckdb`, `postgres`, `mysql`, `sqlite`, `snowflake`,
+`bigquery`, `redshift`, `clickhouse`, `mssql`, `hive`, `spark`, `databricks`,
+`ansi`, `oracle`, `teradata`. Dialect selection is delegated rather than
+enumerated here, so one added upstream works without a release of ddx.
+
+Pick the dialect that matches the engine you will run on, not just the one that
+parses. It also selects how identifiers fold, and DuckDB folds quoted
+identifiers where the others don't — getting that wrong doesn't raise, it
+silently differentiates to zero.
+
+Because the rewrite happens in *your* process, on *your* connection, it sees
+your temp tables, session settings, and open transaction. DuckDB's in-database
+`ddx('<sql>')` table function cannot: it executes on a separate inner
+connection.
+
+## `Context`, for DataFusion
+
+A real `SessionContext` subclass whose `.sql()` rewrites first — every inherited
+method, property and constructor argument works unchanged:
 
 ```python
 ctx = ddxdb.Context()
 ctx.sql("SELECT grad(x * x, x) AS d FROM t").collect()      # → 2x
-ctx = ddxdb.Context(existing_session_context)               # or wrap your own
 ```
 
-**DuckDB**, client-side — no extension needed:
-
-```python
-ddxdb.duckdb_sql("SELECT grad(sin(x), x) AS d FROM t", con).fetchall()
-```
-
-Because the rewrite happens on *your* connection, this sees your temp tables,
-session settings, and open transaction. The in-database `ddx('<sql>')` table
-function cannot: it executes on a separate inner connection.
+There is sugar for DataFusion and not for other engines because DataFusion is
+ddx's integration target. Everything else uses the one-liner above, which is why
+there are no per-engine helpers here to drift out of date.
 
 ## What you can write
 
@@ -74,15 +84,15 @@ A marker rewrites in place, so it is legal anywhere a scalar expression is —
 including inside a recursive CTE, which is how a whole training loop fits in one
 query.
 
-## Two other functions
+## One other function
 
 ```python
 ddxdb.differentiate_sql("x * y", "x")     # 'y' — the derivative as text
-ddxdb.explain(sql)                        # what the rewrite would do, without running it
 ```
 
-`explain` returns the rewritten statement plus one entry per marker, giving the
-marker as written and the derivative it becomes.
+The escape hatch, for assembling SQL where a marker cannot reach — inside a
+recursive term you are building programmatically, or a query some other tool
+emits. Everything else should use `rewrite_sql`.
 
 ## Errors are typed
 

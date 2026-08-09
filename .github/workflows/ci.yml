@@ -97,19 +97,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: python/ddxdb
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
-      - name: build and install the wheel
+          enable-cache: true
+      - name: build and test the wheel
         working-directory: python/ddxdb
         run: |
-          pip install maturin
-          maturin develop
-      - name: tests (rewrite, DataFusion shim, DuckDB path)
-        working-directory: python/ddxdb
-        run: |
-          pip install '.[test]'
-          python -m pytest tests/ -q
+          uv venv --python 3.12
+          uv pip install maturin '.[test]'
+          uv run maturin develop --uv
+          uv run pytest tests/ -q
 
   package:
     name: package (publish dry-run)

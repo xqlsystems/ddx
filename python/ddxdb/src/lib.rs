@@ -9,12 +9,11 @@
 //! Python caller can actually branch on. Nothing here decides anything about
 //! differentiation, and nothing here should grow to.
 
-use ddx_core::sqlparser::dialect::{Dialect, DuckDbDialect, GenericDialect};
+use ddx_core::sqlparser::dialect::{dialect_from_str, Dialect};
 use ddx_core::{Ddx, DiffError};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 
 create_exception!(
     _ddxdb,
@@ -73,23 +72,56 @@ fn to_py_err(e: DiffError) -> PyErr {
     }
 }
 
-/// The engine and parser dialect for a dialect name.
+/// Dialects that fold **quoted** identifiers, not just unquoted ones.
 ///
-/// The two must be chosen together: the identifier-folding policy has to match
-/// the engine that will run the SQL, or column matching silently diverges from
-/// the engine's own. DuckDB folds quoted identifiers; DataFusion and Postgres
-/// do not.
+/// This is the one thing `sqlparser` does not tell us, and it cannot be
+/// guessed: SQL folds unquoted identifiers everywhere, but whether `"X"` and
+/// `"x"` are the same column is per-engine. DuckDB says yes; Postgres,
+/// DataFusion and the rest say no. Getting it wrong does not raise — it
+/// silently differentiates to zero, because the `wrt` stops matching its own
+/// occurrences.
+///
+/// Deliberately an exception list of one rather than an enumeration of all
+/// dialects: everything else takes the standard rule, so a dialect `sqlparser`
+/// adds tomorrow is handled correctly without touching this file. Add an entry
+/// only for another fully case-insensitive engine.
+const FOLDS_QUOTED_IDENTIFIERS: &[&str] = &["duckdb"];
+
+/// The engine and parser for a dialect name.
+///
+/// Parser selection is delegated wholesale to `sqlparser::dialect_from_str`, so
+/// every dialect it knows works here — `snowflake`, `bigquery`, `mysql`,
+/// `spark`, and the rest — and a dialect added upstream needs no change here.
+/// `"datafusion"` is the one alias ddx adds, since DataFusion has no dialect of
+/// its own and parses as generic SQL.
+///
+/// The identifier-folding policy is chosen alongside the parser rather than
+/// separately, because the two must agree with the engine that will actually
+/// run the SQL.
 fn engine_for(dialect: &str) -> PyResult<(Ddx, Box<dyn Dialect>)> {
-    match dialect.to_ascii_lowercase().as_str() {
-        "datafusion" | "generic" | "postgres" | "postgresql" => {
-            Ok((Ddx::for_datafusion(), Box::new(GenericDialect {})))
-        }
-        "duckdb" => Ok((Ddx::for_duckdb(), Box::new(DuckDbDialect {}))),
-        other => Err(PyValueError::new_err(format!(
-            "unknown dialect {other:?}; expected one of \
-             'datafusion', 'duckdb', 'postgres', 'generic'"
-        ))),
-    }
+    let name = dialect.to_ascii_lowercase();
+    // DataFusion parses as generic SQL and has no `sqlparser` dialect of its own.
+    let lookup = if name == "datafusion" {
+        "generic"
+    } else {
+        &name
+    };
+
+    let parser = dialect_from_str(lookup).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown SQL dialect {dialect:?}. Accepts any dialect sqlparser \
+             knows — generic, datafusion, duckdb, postgres, mysql, sqlite, \
+             snowflake, bigquery, redshift, clickhouse, mssql, hive, spark, \
+             databricks, ansi, oracle, teradata"
+        ))
+    })?;
+
+    let engine = if FOLDS_QUOTED_IDENTIFIERS.contains(&name.as_str()) {
+        Ddx::for_duckdb()
+    } else {
+        Ddx::for_datafusion()
+    };
+    Ok((engine, parser))
 }
 
 /// Rewrite every `grad`/`jvp` marker in `sql` to derivative SQL.
@@ -116,35 +148,10 @@ fn differentiate_sql(expr: &str, wrt: &str, dialect: &str) -> PyResult<String> {
         .map_err(to_py_err)
 }
 
-/// Preview what [`rewrite_sql`] would do, without running anything.
-///
-/// Returns the rewritten statement plus one entry per marker, each giving the
-/// marker as written and the derivative it becomes — for logging, for a
-/// notebook, or for understanding why a result looks the way it does.
-#[pyfunction]
-#[pyo3(signature = (sql, dialect = "datafusion"))]
-fn explain<'py>(py: Python<'py>, sql: &str, dialect: &str) -> PyResult<Bound<'py, PyDict>> {
-    let (ddx, d) = engine_for(dialect)?;
-    let ex = ddx.explain(sql, d.as_ref()).map_err(to_py_err)?;
-
-    let steps = PyList::empty(py);
-    for step in &ex.steps {
-        let entry = PyDict::new(py);
-        entry.set_item("marker", &step.marker)?;
-        entry.set_item("derivative", &step.derivative)?;
-        steps.append(entry)?;
-    }
-    let out = PyDict::new(py);
-    out.set_item("rewritten", &ex.rewritten)?;
-    out.set_item("steps", steps)?;
-    Ok(out)
-}
-
 #[pymodule]
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rewrite_sql, m)?)?;
     m.add_function(wrap_pyfunction!(differentiate_sql, m)?)?;
-    m.add_function(wrap_pyfunction!(explain, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(
