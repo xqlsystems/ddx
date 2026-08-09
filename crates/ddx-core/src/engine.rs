@@ -492,3 +492,44 @@ pub(crate) fn is_numeric_type(dt: &DataType) -> bool {
             | DataType::UnsignedInteger
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_error_message_lists_exactly_the_rules_that_exist() {
+        // `SUPPORTED` is prose, and it is the only description of ddx's rule set
+        // most users will ever read — it is appended to every "cannot
+        // differentiate this" error. Nothing about a `HashMap` insert forces it
+        // to stay true, so adding a rule to `RuleRegistry::new` while leaving
+        // the sentence alone makes the engine's own error messages misreport
+        // what it supports, in the exact situation where the user is relying on
+        // them to decide what to do next.
+        //
+        // Kept as a constant rather than assembled at runtime because an error
+        // message is easier to read, grep and translate when it is one fixed
+        // string. This test is what makes the constant safe.
+        let registry = RuleRegistry::new();
+        let listed: Vec<String> = SUPPORTED
+            .split("unary calls to ")
+            .nth(1)
+            .expect("SUPPORTED must describe the unary rules")
+            .split(',')
+            .next()
+            .expect("the unary list is comma-delimited from the rest")
+            .split('/')
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        let mut expected = registry.unary_names();
+        expected.sort();
+        let mut actual = listed;
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "the rule set and the sentence users are shown have diverged; \
+             update SUPPORTED in this file to match the registry"
+        );
+    }
+}
