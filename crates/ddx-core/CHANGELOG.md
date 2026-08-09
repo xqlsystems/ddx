@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.0...ddx-core-v0.2.1) - 2026-08-09
+
+### Fixed
+
+- *(ddx-core)* grad(abs(x), x) returned a zero gradient for a NULL row ([#60](https://github.com/xqlsystems/ddx/pull/60))
+
 ## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.3...ddx-core-v0.2.0) - 2026-08-09
 
 ### Added
