@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.3...ddx-core-v0.2.0) - 2026-08-09
+
+### Added
+
+- *(ddxdb)* the Python wheel — rewrite_sql, a Context shim, a DuckDB path ([#58](https://github.com/xqlsystems/ddx/pull/58))
+
 ## [0.1.3](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.2...ddx-core-v0.1.3) - 2026-08-08
 
 ### Other
