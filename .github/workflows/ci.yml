@@ -115,6 +115,30 @@ jobs:
           uv run maturin develop --uv
           uv run pytest tests/ -q
 
+  oracle:
+    name: JAX numeric-agreement oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: python/ddxdb
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+      # Deterministic despite being generated: every suite seeds its own RNG, so
+      # a failure here reproduces exactly rather than being a soak finding. That
+      # is what makes it a blocking PR gate, unlike the Rust fuzz suite.
+      - name: check ddx against jax.grad on DuckDB and DataFusion
+        run: |
+          uv venv --python 3.12
+          uv pip install maturin -r tests/requirements.txt
+          (cd python/ddxdb && uv run maturin develop --uv)
+          uv run pytest tests/ -q
+
   package:
     name: package (publish dry-run)
     runs-on: ubuntu-latest
