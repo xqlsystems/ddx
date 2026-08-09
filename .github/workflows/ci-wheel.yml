@@ -56,7 +56,14 @@ jobs:
             target: x64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # `toolchain:` is required because the action is SHA-pinned. This action
+      # reads the toolchain from its *ref* — `@stable` literally means "install
+      # stable" — so pinning to a commit removes that input and the run dies in
+      # its "parse toolchain version" step. The ref here is a version pin *and*
+      # an argument; only one of those survives pinning.
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
