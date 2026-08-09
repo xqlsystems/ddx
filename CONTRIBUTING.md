@@ -47,25 +47,106 @@ rustup component add rustfmt clippy
 git clone https://github.com/xqlsystems/ddx
 cd ddx
 cargo build --workspace
-cargo test  --workspace              # runs every test, including the fuzz suite
+cargo test  --workspace              # the deterministic suite (the soak is #[ignore]-d)
 ```
 
 ### Repository layout
 
 ```
 crates/
-  ddx-core/          # the v1 engine — implemented. sqlparser only. Start here.
+  ddx-core/          # the v1 engine — sqlparser only. Start here.
+  ddx-datafusion/    # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql
   ddx-ad/            # v2 query-level reverse-mode AD — scaffold (M3/M4)
-  ddx-datafusion/    # DataFusion adapter — scaffold (M2)
-python/ddxdb/        # PyO3/maturin wheel — scaffold (M2)
+python/ddxdb/        # PyO3/maturin wheel: rewrite_sql + a DataFusion Context
+tests/               # cross-engine numeric-agreement suites (vs JAX)
 docs/design.md       # the design (source of truth)
 docs/spikes/         # runnable evidence behind the design
-tests/               # cross-engine numeric-agreement suites (vs JAX) — scaffold
 .github/workflows/   # CI (PR gates) + the nightly property-fuzz soak
 ```
 
-`ddx-core` is where nearly all current work happens. The other crates are
-honest, compile-checked scaffolds (no hidden stubs) awaiting their milestone.
+`ddx-core` is where most work happens; everything else is a thin layer over it.
+`ddx-ad` is an honest, compile-checked scaffold (no hidden stubs) awaiting its
+milestone.
+
+## Working on the Python code
+
+There are two Python surfaces, and they are separate environments on purpose.
+
+| | what it is | where |
+|---|---|---|
+| **`ddxdb`** | the wheel published to PyPI — a thin PyO3 binding over `ddx-core` | `python/ddxdb` |
+| **the oracle suite** | ddx's derivatives checked against `jax.grad` on real engines | `tests/` |
+
+Both need [`uv`](https://docs.astral.sh/uv/) and a Rust toolchain, because both
+build the extension module from this repo's own crates.
+
+### The wheel
+
+```bash
+cd python/ddxdb
+uv venv --python 3.12
+uv pip install maturin '.[test]'
+uv run maturin develop --uv        # compiles ddx-core + the binding into the venv
+uv run pytest tests/ -q
+```
+
+`python/ddxdb` is **deliberately its own cargo workspace**, not a member of the
+repo's. `pyo3` links against libpython, so folding it in would make every
+`cargo build` at the repo root require a correctly configured Python interpreter
+— for a crate only the wheel build needs.
+
+### The oracle suite
+
+```bash
+uv sync --project tests --reinstall-package ddxdb
+uv run --project tests pytest tests/ -q
+```
+
+`tests/` is a `uv` project with `ddxdb` as a *path dependency*, so `uv sync`
+builds the wheel through maturin's build backend. There is no separate
+`maturin develop` step to run in the wrong directory or point at the wrong
+virtualenv.
+
+> **`--reinstall-package ddxdb` is necessary, not defensive.** A plain
+> `uv sync` sees `ddxdb` already installed and audits it in milliseconds —
+> *including after you have edited `crates/ddx-core`*, because uv watches the
+> Python package and the Rust source is not in it. Leave it off and the suite
+> passes against the engine you had **before** your change, which is the most
+> expensive kind of green. Measured, not hypothetical:
+>
+> ```
+> $ uv sync                             # after editing the cos rule
+> Audited 17 packages in 2ms
+> >>> ddxdb.rewrite_sql("SELECT grad(cos(x), x) ...")
+> 'SELECT (-sin(x)) AS d FROM t'        # the OLD rule
+> ```
+
+`tests/uv.lock` is committed, so CI resolves the environment the repo describes.
+That also means a JAX release cannot change the oracle underneath a green build:
+upgrading is a deliberate `uv lock --upgrade --project tests`, and
+`tests/test_conventions.py` is what reports whether anything JAX promises moved.
+
+### Editing the oracle suite
+
+Read [`tests/README.md`](tests/README.md) first — it explains why the suite is
+shaped the way it is, and the property to preserve when changing `oracle.py`.
+
+Two things that would otherwise make a failure confusing: skipped points are
+normal (the retention rate is asserted, so a suite that began rejecting
+everything fails rather than passing vacuously), and a handful of cases are
+*pinned* rather than compared, because ddx and JAX differ there on purpose —
+don't "fix" those by making ddx match JAX.
+
+### Python conventions
+
+- Every new `.py` file needs an SPDX header (see [Licensing](#licensing)).
+- Tests assert on **executed numbers** wherever an engine is involved, not on
+  rewritten SQL text. A rewrite that looks right but plans to the wrong
+  expression is the failure worth catching, and a string comparison cannot see
+  it.
+- Gate an engine-dependent test with the fixture that needs it, never a
+  module-level `pytest.importorskip`: that raises during collection and silently
+  skips *everything below it in the file*.
 
 ## The dependency policy (important)
 
@@ -131,13 +212,8 @@ DDX_SOAK_SECS=120 cargo test -p ddx-core --test simulation --release \
 - Write a description that says *what* changed and *why*, and links the issue it
   closes. If the change is subtle, say what could have gone wrong and how the
   tests cover it.
-- **CI must be green.** The pull-request checks are:
-  - **`rustfmt + clippy`** — `cargo fmt --all --check` and
-    `cargo clippy --workspace --all-targets -- -D warnings`.
-  - **`tests (…)`** — the deterministic test suite (unit + integration +
-    doctests, excluding the property fuzz) run on **stable, beta, nightly, and
-    the MSRV (1.88)**. `nightly` is informational; stable, beta, and MSRV must
-    pass. (The property/fuzz *soak* runs on a nightly schedule, not on every PR.)
+- **CI must be green.** `nightly` is informational; everything else must pass.
+  (The property-fuzz *soak* runs on a schedule, not on every PR.)
 
 Maintainers merge; you don't need to (and can't) push to protected branches.
 
@@ -184,10 +260,37 @@ Two things help the automation pick the right version bump:
   release, not during it. `cargo-semver-checks` also runs at release time and
   will force a major bump if a public API changed incompatibly.
 
-Maintainers only: the release workflow needs a `CARGO_REGISTRY_TOKEN` repository
-secret (a crates.io API token) — see the comments in
-[`.github/workflows/release.yml`](.github/workflows/release.yml), including the
-optional upgrade to crates.io Trusted Publishing.
+### The Python wheel
+
+`ddxdb` ships to [PyPI](https://pypi.org/project/ddxdb/) on a **separate train**,
+cut by pushing a tag:
+
+```bash
+git tag ddxdb-v0.1.0 && git push origin ddxdb-v0.1.0
+```
+
+It is deliberately not `on: release`. release-plz cuts a GitHub Release for every
+crate it publishes, so a release trigger would fire on `ddx-core-v0.2.1` and try
+to publish a Python package that had not changed.
+
+Before tagging, run [`publish-pypi.yml`](.github/workflows/publish-pypi.yml) via
+**`workflow_dispatch`**. That builds every wheel and the sdist, installs each one
+and exercises it, then stops — publishing is gated on the tag — so the whole
+pipeline can be checked while a mistake is still free. A bad PyPI release can
+only be yanked, never replaced.
+
+Maintainers only:
+
+- The crates.io release workflow needs a `CARGO_REGISTRY_TOKEN` repository secret
+  — see the comments in
+  [`.github/workflows/release.yml`](.github/workflows/release.yml), including the
+  optional upgrade to crates.io Trusted Publishing.
+- PyPI uses **Trusted Publishing (OIDC)**, so there is no token to manage.
+- **Read the changelog entry release-plz generates before merging its PR.** It is
+  derived from the squashed commit subject, which is the pull-request title — so
+  a PR titled for one package can produce a changelog entry describing that
+  package in a *different* crate's `CHANGELOG.md`. This has happened. Scoping the
+  PR title (`fix(ddx-core): …`) prevents it; reading the entry catches the rest.
 
 ## Licensing
 

@@ -307,10 +307,11 @@ def test_any_engine_works_through_plain_rewrite_sql(duckdb):
 
 
 def test_rewriting_client_side_sees_connection_scoped_state(duckdb):
-    # Why the text interface is the right one: the rewrite happens on the
-    # caller's own connection, so temp tables, session settings and an open
-    # transaction are all visible. DuckDB's in-database `ddx('<sql>')` table
-    # function executes on a separate inner connection and cannot see any.
+    # Why the text interface is the right one: the rewrite runs in the caller's
+    # process against the caller's own connection, so a temp table — which
+    # exists only on that connection — is visible to it. A rewrite performed
+    # inside the database, on a connection of its own, could not see this table
+    # at all.
     con = duckdb.connect(":memory:")
     con.execute("CREATE TEMP TABLE tmp AS SELECT 5.0 AS x")
     sql = ddxdb.rewrite_sql("SELECT grad(x*x,x) AS d FROM tmp", "duckdb")
