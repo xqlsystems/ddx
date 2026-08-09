@@ -2,6 +2,7 @@
 _[JAX](https://docs.jax.dev/en/latest/)-style [automatic differentiation](https://docs.jax.dev/en/latest/automatic-differentiation.html) in SQL_
 
 [![crates.io](https://img.shields.io/crates/v/ddx-core.svg?label=ddx-core)](https://crates.io/crates/ddx-core)
+[![crates.io](https://img.shields.io/crates/v/ddx-datafusion.svg?label=ddx-datafusion)](https://crates.io/crates/ddx-datafusion)
 [![PyPI](https://img.shields.io/pypi/v/ddxdb.svg?label=ddxdb)](https://pypi.org/project/ddxdb/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -63,14 +64,15 @@ planner rather than syntactically.
 
 ## Status
 
-**M2 landed.** The scalar engine is released, it runs on DataFusion and DuckDB,
-and its derivatives are checked against `jax.grad` on both.
+**M2 landed and released.** The scalar engine, the DataFusion adapter and the
+Python wheel are all published; ddx runs on DataFusion and DuckDB, and its
+derivatives are checked against `jax.grad` on both.
 
 | | | |
 |---|---|---|
 | [`ddx-core`](crates/ddx-core) | the v1 engine | [crates.io](https://crates.io/crates/ddx-core) |
 | [`ddxdb`](python/ddxdb) | Python wheel — `rewrite_sql` + a DataFusion `Context` | [PyPI](https://pypi.org/project/ddxdb/) |
-| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `AnalyzerRule` + `ddx_sql` | publishable |
+| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `AnalyzerRule` + `ddx_sql` | [crates.io](https://crates.io/crates/ddx-datafusion) |
 | [`ddx-ad`](crates/ddx-ad) | v2 — query-level reverse-mode AD over Substrait | M3/M4 |
 | `ddx-duckdb` | DuckDB community extension | M5 |
 
