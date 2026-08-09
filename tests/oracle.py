@@ -311,7 +311,15 @@ def trace(closed: ClosedJaxpr, x: float, y: float) -> Trace:
 
             # Domain constraints, stated on the derivative rather than the
             # primal wherever the two differ.
-            if name in ("sqrt", "log"):
+            #
+            # An operand that has already left the finite range is out of every
+            # domain, and asking is not merely pointless but unsafe: `math.cos`
+            # raises on infinity rather than returning NaN, so a constraint
+            # evaluated on a blown-up intermediate would take the harness down
+            # instead of rejecting the point.
+            if not all(math.isfinite(v) for v in values):
+                margin = -math.inf
+            elif name in ("sqrt", "log"):
                 margin = min(margin, values[0])
             elif name in ("asin", "acos"):
                 margin = min(margin, 1.0 - abs(values[0]))
@@ -506,7 +514,14 @@ def candidate(rng: random.Random, depth: int = 3) -> Optional[Candidate]:
     how a suite stops testing without anyone noticing.
     """
     fn = gen(rng, depth)
-    closed = jax.make_jaxpr(fn)(1.0, 1.0)
+    try:
+        closed = jax.make_jaxpr(fn)(1.0, 1.0)
+    except ArithmeticError:
+        # A wholly constant subtree is folded eagerly at trace time, in Python,
+        # where `0.0 ** -1` raises instead of returning an infinity. SQL would
+        # answer `power(0.0, -1)` one way or another, but the function never
+        # reaches a jaxpr, so there is nothing here to compare.
+        return None
     if not is_real(closed):
         return None
     invars = closed.jaxpr.invars
