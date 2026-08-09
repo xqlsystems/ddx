@@ -87,8 +87,15 @@ jobs:
   # Rust jobs above have no reason to need), so it gets its own job rather than
   # riding along with `cargo test --workspace`.
   wheel:
-    name: ddxdb wheel
+    name: ddxdb wheel (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # 3.10 is the floor `requires-python` claims — tested rather than
+      # asserted, the same way the Rust jobs test the MSRV. 3.12 is the version
+      # normal development targets.
+      matrix:
+        python: ['3.10', '3.12']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -103,7 +110,7 @@ jobs:
       - name: build and test the wheel
         working-directory: python/ddxdb
         run: |
-          uv venv --python 3.12
+          uv venv --python ${{ matrix.python }}
           uv pip install maturin '.[test]'
           uv run maturin develop --uv
           uv run pytest tests/ -q

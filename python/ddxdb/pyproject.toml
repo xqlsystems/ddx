@@ -9,13 +9,17 @@ description = "SQL-portable autograd: write calculus in SQL, get derivatives bac
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Alexander Merose", email = "al@merose.com" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"  # 3.9 reached EOL 2025-10-31; matches xarray-sql.
 keywords = ["sql", "autograd", "derivatives", "datafusion", "duckdb"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Mathematics",
