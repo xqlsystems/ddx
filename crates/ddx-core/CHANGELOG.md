@@ -9,6 +9,55 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.3...ddx-core-v0.2.0) - 2026-08-09
+
+### Added
+
+- **`IdentCasing` gained two policies, for engines the existing two describe
+  incorrectly.** `IdentCasing` says how a dialect folds identifiers before ddx
+  compares them, and it offered only "fold unquoted to lowercase, quoted keeps
+  case" (Postgres, DataFusion) and "fold everything" (DuckDB). Two families of
+  engine fit neither:
+
+  - `IdentCasing::FoldUnquotedUpper` — unquoted identifiers fold to *uppercase*,
+    quoted keep case (Snowflake, Oracle). The same shape as `FoldUnquoted` with
+    the opposite target, which is not a cosmetic difference: bare `X` names the
+    column `"X"` here and `"x"` there.
+  - `IdentCasing::FoldNone` — nothing folds; `x` and `X` are different columns
+    (ClickHouse).
+
+  **Who is affected.** Anyone differentiating SQL aimed at Snowflake, Oracle or
+  ClickHouse while passing `FoldUnquoted`, which was the closest available
+  choice. The consequence was silent: the `wrt` column stopped matching its own
+  occurrences and the derivative came back `0`, or — worse, on the upper-folding
+  engines — matched the *other* column and returned a confident wrong nonzero
+  value. Nothing changes for existing `FoldUnquoted` or `FoldAll` callers; the
+  keys those two produce are unchanged ([#58](https://github.com/xqlsystems/ddx/pull/58)).
+
+### Changed
+
+- **BREAKING: `IdentCasing` is now `#[non_exhaustive]`.** Code outside this crate
+  that matches on it exhaustively must add a wildcard arm:
+
+  ```rust
+  match casing {
+      IdentCasing::FoldUnquoted => ...,
+      IdentCasing::FoldAll => ...,
+      _ => ...,               // now required
+  }
+  ```
+
+  Constructing and comparing variants is unaffected. More engines than these
+  four families exist, and each one found is another variant — marking the enum
+  non-exhaustive now makes those additive rather than a breaking release per
+  engine ([#58](https://github.com/xqlsystems/ddx/pull/58)).
+
+- **BREAKING: `IdentCasing::FoldAll`'s discriminant moved from 1 to 2**, because
+  `FoldUnquotedUpper` was inserted before it to keep the variants grouped by
+  family. This affects only code casting the enum to an integer (`as isize`);
+  the enum has no `#[repr]`, so those values were never guaranteed
+  ([#58](https://github.com/xqlsystems/ddx/pull/58)).
+
 ## [0.1.3](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.1.2...ddx-core-v0.1.3) - 2026-08-08
 
 ### Other
