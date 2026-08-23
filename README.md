@@ -132,3 +132,12 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+11  crates/ddx-core/tests/simulation.rs
+ 7  crates/ddx-core/tests/rules.rs
+ 4  crates/ddx-core/tests/rewrite.rs
+ 3  crates/ddx-core/src/rewrite.rs
+ 3  crates/ddx-core/src/engine.rs
+ 3  crates/ddx-core/src/constructors.rs
+ 2  crates/ddx-core/tests/roundtrip.rs
+ 2  docs/spikes/README.md
