@@ -1,9 +1,9 @@
 [package]
 name = "ddx-ad"
-description = "Query-level reverse-mode AD for ddx (v2): vjp over substrait::proto plans. Scaffold — see docs/design.md §4 and milestones M3/M4."
+description = "Query-level reverse-mode AD for ddx (v2): vjp over substrait::proto plans. Work in progress — see docs/design.md §4 and milestones M3/M4."
 version.workspace = true
-# Scaffold — not on crates.io yet. Flip to publishable once it has real content
-# (M3/M4). See docs/design.md §7 for the name-reservation question.
+# Not on crates.io yet. Flip to publishable once `vjp_query` exists (M4). See
+# docs/design.md §7 for the name-reservation question.
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,15 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# NOTE (M0 scaffold): v2's core will depend on `substrait` only (design.md
-# §4.2), symmetric with v1-core's `sqlparser`-only dependency. The dependency
-# is intentionally not added yet — M0 only lands the crate seam so the
-# workspace layout of §6 exists. The five transpose rules and `vjp_query`
-# arrive in M3/M4.
+# v2's core depends on `substrait` and nothing engine-specific (design.md §4.2),
+# symmetric with `ddx-core`'s `sqlparser`-only dependency.
+#
+# The version is load-bearing, exactly as `sqlparser`'s is for v1 (design.md §6):
+# `datafusion-substrait` 54 builds on `substrait` 0.63, and `ddx-ad`'s `Plan` must
+# be the *same* Rust type DataFusion produces and consumes, or the tape (§4.4)
+# can't hand a plan to the engine. A `datafusion` bump moves this pin with it.
+#
+# `substrait` compiles its protobuf definitions at build time, so building this
+# crate needs `protoc` on the PATH (see CONTRIBUTING.md).
 [dependencies]
+substrait = "0.63"

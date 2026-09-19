@@ -4,23 +4,23 @@
 
 //! `ddx-ad` — query-level reverse-mode automatic differentiation (ddx v2).
 //!
-//! **Status: scaffold.** This crate is the home for the v2 engine described in
+//! **Status: work in progress (M3).** This crate is the home for the v2 engine described in
 //! [`docs/design.md`](../../../docs/design.md) §4: differentiating whole
 //! queries (not scalar expressions) by applying one transpose rule per
 //! relational primitive — contraction, elementwise, reduce, route,
 //! stop-gradient — over `substrait::proto` plans tagged with
 //! extension-function markers.
 //!
-//! Nothing here is implemented yet. M0 (the current milestone) delivers only
-//! the scalar core, [`ddx-core`](../ddx_core/index.html), which becomes the
-//! *elementwise leaf* of this engine (design.md §4.3). The public surface
-//! sketched below is the M3/M4 target and exists here as a compile-checked
-//! seam, not a working API.
+//! So far this crate has only its seams: the [`substrait`] dependency, a typed
+//! [`AdError`], and the [`PlanIndex`] the backward walk schedules itself with.
+//! The markers, the transpose rules and `vjp_query` land over M3/M4. The scalar
+//! core, [`ddx-core`](../ddx_core/index.html), becomes the *elementwise leaf* of
+//! this engine (design.md §4.3).
 //!
 //! Planned surface (design.md §4.4):
 //!
 //! ```ignore
-//! pub fn vjp_query(plan: &Plan, wrt: &[RelRef]) -> Result<BackwardProgram, DiffError>;
+//! pub fn vjp_query(plan: &Plan, wrt: &[RelRef]) -> Result<BackwardProgram, AdError>;
 //!
 //! pub struct BackwardProgram {
 //!     pub forward_steps: Vec<(Ident, Plan)>,
@@ -36,7 +36,13 @@
 
 #![forbid(unsafe_code)]
 
-/// Milestone marker: v2 (`ddx-ad`) is not implemented in M0.
-///
-/// See [`docs/design.md`](../../../docs/design.md) §4 and milestones M3/M4.
-pub const STATUS: &str = "scaffold: query-level reverse-mode AD lands in M3/M4";
+mod error;
+mod index;
+
+/// Re-exported so a downstream crate can't accidentally link a different
+/// `substrait` than the one `ddx-ad`'s API is written against (the same reason
+/// `ddx-core` re-exports `sqlparser`, design.md §6).
+pub use substrait;
+
+pub use error::{AdError, Result};
+pub use index::{Node, NodeId, NodeKind, PlanIndex, RelRef};
