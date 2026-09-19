@@ -62,7 +62,7 @@ direnv allow               # once; the environment then loads on `cd`
 ```
 
 The shell also sets `UV_PYTHON_DOWNLOADS=never` / `UV_PYTHON_PREFERENCE=only-system`
-(uv's downloaded Pythons don't run on NixOS) and puts `libstdc++` on
+(uv's downloaded Pythons don't run on NixOS) and appends `libstdc++` to
 `LD_LIBRARY_PATH` so PyPI wheels such as JAX import. The commands in the rest of
 this guide then work unchanged. CI does not use Nix; this is a dev shell only.
 

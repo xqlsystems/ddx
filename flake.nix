@@ -12,7 +12,7 @@
 
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
@@ -44,9 +44,10 @@
 
           # PyPI wheels (jax, numpy, duckdb, datafusion, ...) are manylinux
           # binaries that expect libstdc++ on the loader path, which NixOS does
-          # not provide globally.
-          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux
-            (pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib ]);
+          # not provide globally. Appended, so an existing value is preserved.
+          shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '';
         };
       });
 

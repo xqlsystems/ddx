@@ -42,4 +42,5 @@ python/ddxdb/target/
 
 # direnv / nix
 .direnv/
-result
+/result
+/result-*
