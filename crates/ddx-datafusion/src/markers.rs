@@ -103,6 +103,62 @@ pub(crate) fn marker_kind(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The query-level (v2) markers, as written in SQL: `ddx_contract_mark`,
+/// `ddx_reduce_mark`, `ddx_route_mark`, `ddx_stop_gradient`.
+///
+/// The names are `ddx_ad::Marker`'s, restated rather than imported so this
+/// crate stays publishable while `ddx-ad` isn't yet; a test holds the two lists
+/// together.
+pub const AD_MARKERS: [&str; 4] = [
+    "ddx_contract_mark",
+    "ddx_reduce_mark",
+    "ddx_route_mark",
+    "ddx_stop_gradient",
+];
+
+/// A v2 marker UDF: the identity function.
+///
+/// Unlike `grad`/`jvp`, a v2 marker is *meant* to execute. It tags an operation
+/// in the forward query — `SUM(ddx_contract_mark(a.val * b.val))` — so the
+/// backward pass can read what the operation is off the plan (design.md §4.2),
+/// and the forward query itself must still run and return the unmarked answer.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct AdMarker {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AdMarker {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        Ok(args.args.swap_remove(0))
+    }
+}
+
+/// The four v2 marker UDFs (see [`AD_MARKERS`]).
+pub fn ad_marker_udfs() -> Vec<ScalarUDF> {
+    AD_MARKERS
+        .into_iter()
+        .map(|name| {
+            ScalarUDF::new_from_impl(AdMarker {
+                name,
+                signature: Signature::any(1, Volatility::Immutable),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

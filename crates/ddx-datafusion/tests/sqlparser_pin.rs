@@ -14,37 +14,13 @@
 //! It is a test rather than a `just` recipe so CI enforces it on every PR
 //! without anyone having to remember.
 
-use std::path::PathBuf;
+mod common;
 
-/// Every `sqlparser` version present in the workspace lockfile.
-fn locked_sqlparser_versions() -> Vec<String> {
-    let lock = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../Cargo.lock")
-        .canonicalize()
-        .expect("workspace Cargo.lock must exist");
-    let text = std::fs::read_to_string(&lock).expect("Cargo.lock must be readable");
-
-    let mut versions = Vec::new();
-    let mut in_sqlparser = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line == "[[package]]" {
-            in_sqlparser = false;
-        } else if line == r#"name = "sqlparser""# {
-            in_sqlparser = true;
-        } else if in_sqlparser {
-            if let Some(v) = line.strip_prefix("version = ") {
-                versions.push(v.trim_matches('"').to_string());
-                in_sqlparser = false;
-            }
-        }
-    }
-    versions
-}
+use common::locked_versions;
 
 #[test]
 fn exactly_one_sqlparser_is_linked() {
-    let versions = locked_sqlparser_versions();
+    let versions = locked_versions("sqlparser");
     assert!(
         !versions.is_empty(),
         "no `sqlparser` in Cargo.lock — did the dependency graph change?"
