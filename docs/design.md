@@ -3,7 +3,7 @@
 _author_: Alex Merose
 _co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
 _status_: Design — iterating toward implementation
-_last updated_: 2026-07-20
+_last updated_: 2026-09-19
 
 ---
 
@@ -807,9 +807,26 @@ pub fn vjp_query(
     &self,
     plan: &Plan,              // a substrait::proto::Plan, already containing
                                // ddx's marker functions — recognized, not built
-    wrt: &[RelRef],            // which Source relations to differentiate w.r.t.
-) -> Result<BackwardProgram, DiffError>;
+    wrt: &[Param],             // which table columns to differentiate w.r.t.,
+                               // e.g. weight.val, bias.val
+) -> Result<BackwardProgram, AdError>;
 ```
+
+**Which columns carry gradient is derived, not declared per relation `[S6]`.**
+Every rule needs to know which columns are values (they get a cotangent) and
+which are coordinates or constants (the backward pass joins on them, or ignores
+them). The user names only the parameters, `wrt`; ddx runs standard AD
+*activity analysis* over the plan. A column is **active** when it is *varied*
+(depends on a parameter outside any `ddx_stop_gradient`) and *useful* (reaches
+the output through a value position, not only through a join condition,
+filter, grouping key or sort). A naming convention (`val` is the value, the rest
+are dims) was rejected: `nn.py` itself breaks it (`fwd0` carries both `z` and
+`val`; `pixels` calls its value `images`), and breaking it is a wrong gradient,
+not an error. Activity analysis also makes *tag, don't infer* checkable: an
+untagged `SUM`, or a `MAX`, over an active column is refused with an error
+naming the marker to use, while the same aggregate over data alone needs no tag.
+Softmax's shift falls out of this: `MAX(z)` wrapped in `ddx_stop_gradient` at
+its use is varied but not useful, so it needs no rule at all.
 
 `vjp_query` first walks the plan once to locate every ddx marker anchor and
 build a lightweight annotated-node index (which aggregates are contractions
@@ -821,9 +838,15 @@ rule and accumulating cotangents.
 
 **Fan-in accumulation is real, not hypothetical.** When a relation feeds more
 than one consumer — attention's `X` feeding `Wq`, `Wk`, and `Wv` — each
-consumer's contribution is summed via an ordinary elementwise-add step,
-verified in `attention_ad_spike.py` (`Xbar = Xq + Xk + Xv`, matching
-`jax.grad` to 1e-16). This is why the walk must process a node only once
+consumer's contribution is summed, verified in `attention_ad_spike.py`
+(`Xbar = Xq + Xk + Xv`, matching `jax.grad` to 1e-16). In relational form the
+sum must be `UNION ALL` then `GROUP BY` the keys, **not** an inner join of the
+contributions followed by an elementwise add: cotangents are sparse (a row
+absent from a cotangent relation is a zero), and a filter or Route produces
+exactly such gaps. `nn.py`'s `weight` is read once per layer under
+`w.layer = 0/1/2`, so each contribution covers only its own layer's rows — an
+inner join of the three matches no row at all, and the gradient comes back
+empty with no error `[S8]`. This is why the walk must process a node only once
 every one of its consumers has contributed — the standard reverse-mode-AD
 scheduling discipline, applied to a relational-node graph instead of a
 tensor-op graph.
@@ -1118,7 +1141,8 @@ breadth, not de-risking.
 This is the audit trail behind the design above: findings from two rounds of
 adversarial review on v1 (`F1`–`F12`, `G1`–`G9`), the spikes that resolved
 open research questions (`R1`, `R1b`, `R2`), the answered decision points
-(`Q1`–`Q7`), and the v2 pivot from a bespoke IR to Substrait (`S1`–`S5`). Each
+(`Q1`–`Q7`), and the v2 pivot from a bespoke IR to Substrait and what building
+it settled (`S1`–`S8`). Each
 entry is referenced from the main text where it applies; nothing here changes
 the design as stated above — it's the evidence for why it's stated that way.
 
@@ -1430,6 +1454,33 @@ first concrete instance; more rules (LayerNorm, conv) will likely surface
 more. The resolution pattern each time: spike the forward idiom against
 both engines before trusting a rule, and prefer a verified workaround over
 waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
+
+**S6 — Values vs. coordinates: activity analysis from `wrt`, not a naming
+convention.** Settled at the start of M3. The rules need every column
+classified as gradient-carrying or not; the two candidates were a convention
+(one value column named `val` per relation) and deriving it from the
+parameters the user names. The convention was rejected because `nn.py` breaks
+it in three places and a break is silent. Implemented as varied ∧ useful
+activity analysis over the Substrait plan, erring towards "varied": a false
+positive costs a typed error from a rule, a false negative a dropped gradient.
+→ §4.4.
+
+**S7 — Markers are recognized by name; there is no URN to read.** Checked
+against DataFusion 54's producer while building the recognizer: every
+function, built-in and marker alike, is declared with a bare name and
+`extension_urn_reference = u32::MAX` (Substrait 0.63 moved from URIs to URNs;
+DataFusion fills in neither). This confirms `[S2]`'s nuance and settles the
+recognizer: case-folded name match, ignoring any `:signature` suffix. It also
+means the backward emitter must declare the functions it calls under each
+engine's own names — a per-engine name table, one layer down from v1's
+dialect-normalization table. → §4.2.
+
+**S8 — Fan-in must be `UNION ALL` + `GROUP BY`, not an elementwise add.** The
+original text of §4.4 said contributions are summed by an "ordinary
+elementwise-add step". Relationally that is an inner join of the
+contributions, which silently drops every row missing from any of them — and
+sparse cotangents are the norm (filters, Route, and `nn.py`'s per-layer
+`weight` reads). Corrected in §4.4 before the emitter was written.
 
 ---
 
