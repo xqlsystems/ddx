@@ -32,6 +32,8 @@
             python312
             # pyo3 and the crates' build scripts need a C compiler and pkg-config.
             pkg-config
+            # `substrait` (ddx-ad) compiles its protos at build time.
+            protobuf
           ];
 
           # Lets rust-analyzer find the standard library sources.
