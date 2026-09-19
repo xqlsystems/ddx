@@ -39,3 +39,8 @@ __pycache__/
 # maturin / ddxdb wheel build
 python/ddxdb/target/
 *.so
+
+# direnv / nix
+.direnv/
+/result
+/result-*
