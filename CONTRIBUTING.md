@@ -175,7 +175,8 @@ The differentiation cores are deliberately minimal so any engine can drive them:
 
 - **`ddx-core` depends on `sqlparser` only** — no `datafusion`, no `duckdb`, no
   `protoc`. Please don't add dependencies to it. (`ddx-ad` is the symmetric case
-  for v2: `substrait` plus `ddx-core`, and nothing engine-specific.) Heavy, engine-specific
+  for v2: `substrait` and nothing engine-specific — it will also take `ddx-core`
+  as the elementwise leaf once that rule lands.) Heavy, engine-specific
   dependencies belong in the adapter crates (`ddx-datafusion`, `ddx-duckdb`,
   …), which quarantine them.
 - `sqlparser` is **pinned exactly** (`=0.62.0`) and re-exported as

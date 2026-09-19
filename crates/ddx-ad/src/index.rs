@@ -126,7 +126,7 @@ impl PlanIndex {
         .ok_or_else(|| AdError::InvalidPlan("the root relation has no input".into()))?;
 
         let mut nodes = Vec::new();
-        visit(root, None, &mut nodes)?;
+        visit(root, None, 0, &mut nodes)?;
         Ok(PlanIndex { nodes })
     }
 
@@ -166,7 +166,22 @@ impl PlanIndex {
     }
 }
 
-fn visit(rel: &Rel, consumer: Option<NodeId>, nodes: &mut Vec<Node>) -> Result<NodeId> {
+/// How deep a plan may nest. Plans arrive as protobuf, whose own decoder stops
+/// at 100 levels, so a plan deeper than this can only have been built in
+/// memory; refusing it keeps the recursion below from overflowing the stack.
+const MAX_DEPTH: usize = 128;
+
+fn visit(
+    rel: &Rel,
+    consumer: Option<NodeId>,
+    depth: usize,
+    nodes: &mut Vec<Node>,
+) -> Result<NodeId> {
+    if depth > MAX_DEPTH {
+        return Err(AdError::InvalidPlan(format!(
+            "plan nests deeper than {MAX_DEPTH} relations"
+        )));
+    }
     let inputs: Vec<Option<&Rel>>;
     let kind = match rel.rel_type.as_ref() {
         Some(RelType::Read(r)) => {
@@ -226,7 +241,7 @@ fn visit(rel: &Rel, consumer: Option<NodeId>, nodes: &mut Vec<Node>) -> Result<N
         let input = input.ok_or_else(|| {
             AdError::InvalidPlan(format!("relation {id} is missing a required input"))
         })?;
-        ids.push(visit(input, Some(id), nodes)?);
+        ids.push(visit(input, Some(id), depth + 1, nodes)?);
     }
     nodes[id.0].inputs = ids;
     Ok(id)
@@ -364,6 +379,18 @@ mod tests {
             err,
             AdError::NotImplemented("relation `Set` has no place in a differentiated plan".into())
         );
+    }
+
+    #[test]
+    fn refuses_a_plan_nested_too_deeply() {
+        let mut r = read("t");
+        for _ in 0..=MAX_DEPTH {
+            r = aggregate(r);
+        }
+        assert!(matches!(
+            PlanIndex::build(&plan(r)),
+            Err(AdError::InvalidPlan(_))
+        ));
     }
 
     #[test]
