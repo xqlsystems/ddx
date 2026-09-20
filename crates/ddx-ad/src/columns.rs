@@ -41,7 +41,12 @@ pub struct Field(usize);
 
 impl Col {
     /// The column at index `i`.
-    pub const fn new(i: usize) -> Self {
+    ///
+    /// Crate-private on purpose: a `Col` is only meaningful for the node it came
+    /// from, and the accessors that take one index into that node's columns
+    /// directly. Callers get theirs from [`Columns::cols`], which can only yield
+    /// valid ones.
+    pub(crate) const fn new(i: usize) -> Self {
         Col(i)
     }
 
@@ -52,8 +57,9 @@ impl Col {
 }
 
 impl Field {
-    /// The input-row position at index `i`.
-    pub const fn new(i: usize) -> Self {
+    /// The input-row position at index `i`. Crate-private for the same reason as
+    /// [`Col::new`].
+    pub(crate) const fn new(i: usize) -> Self {
         Field(i)
     }
 
@@ -112,6 +118,9 @@ impl<'a> Columns<'a> {
     }
 
     /// The output columns of `node`, indexed by [`Col`].
+    ///
+    /// Panics if `node` is not a node of the analysed plan; every [`NodeId`] the
+    /// crate hands out is.
     pub fn of(&self, node: NodeId) -> &[ColumnDef<'a>] {
         &self.per_node[node.index()]
     }

@@ -6,8 +6,17 @@
 //!
 //! Hand-built plans (ddx-ad's unit tests) show the analysis does what it says;
 //! these show it survives a real producer — the `Project`/`emit` layers, masked
-//! reads and function naming DataFusion uses. The queries are `nn.py`'s
-//! (xarray-sql#196), changed only by the markers.
+//! reads and function naming DataFusion uses.
+//!
+//! The queries are a small MLP's forward pass over long/tidy tables — the shape
+//! design.md §4.5 works through — with one marker added per contraction and
+//! nothing else changed:
+//!
+//! - `pixels(sample, height, width, images)` is the input, one row per pixel;
+//! - `weight(layer, inp, out, val)` and `bias(layer, out, val)` are the
+//!   parameters, one row per matrix entry, all layers in one table;
+//! - a layer is a contraction (`JOIN` on the shared index + grouped `SUM`), then
+//!   a bias term (`JOIN` on `out`), then an activation.
 
 mod common;
 
@@ -18,8 +27,8 @@ use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::Plan;
 use ddx_ad::{AdError, Analysis, ColumnRef, Marker, TableRef};
 
-/// A context with `nn.py`'s tables — 2×2 images, one hidden layer of width 2 —
-/// and the v2 markers registered.
+/// A context with the tables above — 2×2 images, two units per layer — and the
+/// v2 markers registered.
 async fn nn_context() -> SessionContext {
     let ctx = SessionContext::new();
     ddx_datafusion::register_ad_markers(&ctx);
@@ -28,11 +37,14 @@ async fn nn_context() -> SessionContext {
         "INSERT INTO pixels VALUES
            (0, 0, 0, 0.5), (0, 0, 1, -1.0), (0, 1, 0, 2.0), (0, 1, 1, 0.25),
            (1, 0, 0, 1.5), (1, 0, 1, 0.0),  (1, 1, 0, -0.5), (1, 1, 1, 1.0)",
-        "CREATE TABLE weight (layer BIGINT, inp BIGINT, out BIGINT, val DOUBLE)",
+        // `fval` is deliberately REAL: summing it makes DataFusion coerce, which
+        // is how a cast ends up wrapped around a marker.
+        "CREATE TABLE weight (layer BIGINT, inp BIGINT, out BIGINT, val DOUBLE, fval REAL)",
         "INSERT INTO weight VALUES
-           (0, 0, 0, 0.1), (0, 0, 1, -0.2), (0, 1, 0, 0.3), (0, 1, 1, 0.4),
-           (0, 2, 0, -0.5), (0, 2, 1, 0.6), (0, 3, 0, 0.7), (0, 3, 1, -0.8),
-           (1, 0, 0, 0.9), (1, 0, 1, -1.0), (1, 1, 0, 1.1), (1, 1, 1, 1.2)",
+           (0, 0, 0, 0.1, 0.1), (0, 0, 1, -0.2, -0.2), (0, 1, 0, 0.3, 0.3),
+           (0, 1, 1, 0.4, 0.4), (0, 2, 0, -0.5, -0.5), (0, 2, 1, 0.6, 0.6),
+           (0, 3, 0, 0.7, 0.7), (0, 3, 1, -0.8, -0.8), (1, 0, 0, 0.9, 0.9),
+           (1, 0, 1, -1.0, -1.0), (1, 1, 0, 1.1, 1.1), (1, 1, 1, 1.2, 1.2)",
         "CREATE TABLE bias (layer BIGINT, out BIGINT, val DOUBLE)",
         "INSERT INTO bias VALUES (0, 0, 0.01), (0, 1, -0.02), (1, 0, 0.03), (1, 1, 0.04)",
     ] {
@@ -41,7 +53,7 @@ async fn nn_context() -> SessionContext {
     ctx
 }
 
-/// `nn.py`'s first layer, with the contraction tagged.
+/// The first layer, with its contraction tagged.
 const FWD0: &str = "
 WITH c AS (
   SELECT a.sample, w.out AS out, SUM(ddx_contract_mark(a.val * w.val)) AS z
@@ -59,7 +71,7 @@ async fn substrait(ctx: &SessionContext, sql: &str) -> Plan {
     *to_substrait_plan(&plan, &ctx.state()).unwrap()
 }
 
-/// `nn.py`'s parameters: the weight and bias value columns.
+/// The parameters: the weight and bias value columns.
 fn wrt() -> Vec<ColumnRef> {
     vec![
         ColumnRef::new(TableRef::new(["weight"]), "val"),
@@ -188,8 +200,9 @@ async fn an_untagged_contraction_is_refused() {
     );
 }
 
-/// `nn.py`'s softmax shift: `exp(z - max(z))`. With the max stopped it needs no
-/// rule; without, it is refused and the error says what to do.
+/// The softmax stability shift, `exp(z - max(z))`, which is a no-op for the
+/// gradient. With the max stopped it needs no rule; without, it is refused and
+/// the error says what to do.
 #[tokio::test]
 async fn softmax_shift_needs_stop_gradient() {
     let ctx = nn_context().await;
@@ -250,8 +263,9 @@ async fn route_idiom() {
     assert_eq!(active_outputs(&a), ["val"]);
 }
 
-/// `nn.py`'s `delta2` restricts to the train split with `WHERE sample IN (…)`,
-/// which DataFusion plans as a semi-join: a mask over one side.
+/// Restricting the backward pass to a subset of rows — a train/test split, say —
+/// reads as `WHERE sample IN (…)`, which DataFusion plans as a semi-join: a mask
+/// over one side.
 #[tokio::test]
 async fn an_in_subquery_is_a_mask() {
     let ctx = nn_context().await;
@@ -262,4 +276,95 @@ async fn an_in_subquery_is_a_mask() {
     let plan = substrait(&ctx, &sql).await;
     let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(active_outputs(&a), ["val"]);
+}
+
+/// A `REAL` value column makes DataFusion coerce the sum to `Float64`, wrapping
+/// the marker in a cast — `sum(CAST(ddx_reduce_mark(fval) AS Float64))`. The
+/// marker is then not the syntactic root of the measure's argument even though
+/// the user wrote it there, so placement must see through the cast.
+#[tokio::test]
+async fn a_coerced_marker_is_still_the_whole_argument() {
+    let ctx = nn_context().await;
+    let plan = substrait(
+        &ctx,
+        "SELECT layer, SUM(ddx_reduce_mark(fval)) AS val FROM weight GROUP BY layer",
+    )
+    .await;
+    let a = Analysis::new(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "fval")]).unwrap();
+    assert_eq!(active_outputs(&a), ["val"]);
+    assert_eq!(tags(&a), [Marker::Reduce]);
+}
+
+/// A value that reaches the output *only* through a window's `ORDER BY` is not
+/// useful by §4.4's definition, so it carries no gradient and needs no tag. This
+/// is the expression form of a window, which is what DataFusion emits.
+#[tokio::test]
+async fn a_value_used_only_as_a_sort_key_is_not_active() {
+    let ctx = nn_context().await;
+    let plan = substrait(
+        &ctx,
+        "WITH s AS (SELECT inp, SUM(val) AS total FROM weight GROUP BY inp)
+         SELECT inp, ROW_NUMBER() OVER (ORDER BY total) AS rk FROM s",
+    )
+    .await;
+    let a = Analysis::new(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "val")]);
+    // `total` orders rows and nothing else, so the SUM needs no marker — but no
+    // gradient reaches the output either, which is what is refused.
+    let err = a.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, AdError::InvalidWrt(ref m) if m.contains("no gradient can reach")),
+        "{err}"
+    );
+}
+
+/// `COUNT` counts rows, so its derivative is zero and it needs no tag — which is
+/// what makes §4.3's "SUM then divide by the count" recipe expressible.
+#[tokio::test]
+async fn a_count_needs_no_tag() {
+    let ctx = nn_context().await;
+    let plan = substrait(
+        &ctx,
+        "SELECT SUM(ddx_reduce_mark(val)) / COUNT(val) AS mean FROM weight",
+    )
+    .await;
+    let a = Analysis::new(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "val")]).unwrap();
+    assert_eq!(active_outputs(&a), ["mean"]);
+    assert_eq!(tags(&a), [Marker::Reduce]);
+}
+
+/// An outer join NULL-extends unmatched rows, and a missing cotangent row means
+/// *zero*, not NULL. No transpose rule covers the difference, so a gradient
+/// through the nullable side is refused rather than assumed.
+#[tokio::test]
+async fn an_outer_join_over_a_gradient_carrying_column_is_refused() {
+    let ctx = nn_context().await;
+    let plan = substrait(
+        &ctx,
+        "SELECT b.out, SUM(ddx_reduce_mark(w.val)) AS val
+         FROM bias b LEFT JOIN weight w ON b.out = w.out GROUP BY b.out",
+    )
+    .await;
+    let err = refusal(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "val")]);
+    assert!(
+        matches!(err, AdError::NotImplemented(ref m) if m.contains("unmatched row")),
+        "{err}"
+    );
+}
+
+/// A stop-gradient in a condition or key cuts nothing, because no cotangent
+/// flows there. Silently doing nothing is what this marker exists to prevent.
+#[tokio::test]
+async fn a_stop_gradient_that_cuts_nothing_is_refused() {
+    let ctx = nn_context().await;
+    let plan = substrait(
+        &ctx,
+        "SELECT SUM(ddx_reduce_mark(val)) AS val FROM weight
+         WHERE ddx_stop_gradient(val) > 0",
+    )
+    .await;
+    let err = refusal(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "val")]);
+    assert!(
+        matches!(err, AdError::InvalidMarker(ref m) if m.contains("ddx_stop_gradient")),
+        "{err}"
+    );
 }

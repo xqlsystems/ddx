@@ -8,7 +8,7 @@
 //! *values*, never the symbolic expression of its argument, but differentiation
 //! is a function of the symbolic form — so `grad` cannot be computed at
 //! runtime. (Empirically pinned on a live engine in
-//! `docs/spikes/datafusion_python_analyzer_rule_r2.py`, T4: a `grad` UDF given
+//! `docs/spikes/datafusion_python_analyzer_rule_r2.py`: a `grad` UDF given
 //! `grad(x*x, x)` over `x = [1,2,3]` receives `[1.0, 4.0, 9.0]`.)
 //!
 //! Registration exists for exactly one reason: to make the marker call *parse

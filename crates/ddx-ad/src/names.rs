@@ -28,7 +28,7 @@ pub enum AggKind {
     /// the contraction and reduce markers must sit inside (design.md §4.3).
     Sum,
     /// A mean. Deliberately *not* a transposable primitive: design.md §4.3 has
-    /// `SUM` then an elementwise divide, following `nn.py`.
+    /// `SUM` then an elementwise divide.
     Mean,
     /// Maximum or minimum. Differentiable only as Route's argmax idiom, or
     /// removable with `ddx_stop_gradient` (softmax's shift).
@@ -49,6 +49,9 @@ impl AggKind {
     pub fn from_name(name: &str) -> Option<AggKind> {
         let base = base_name(name);
         for (kind, spellings) in [
+            // `sum0` differs from `sum` only on empty input (0 rather than
+            // NULL), which no transpose rule can distinguish: the derivative of
+            // a sum over no rows is empty either way.
             (AggKind::Sum, &["sum", "sum0"][..]),
             (AggKind::Mean, &["avg", "mean"][..]),
             (AggKind::Extremum, &["max", "min"][..]),

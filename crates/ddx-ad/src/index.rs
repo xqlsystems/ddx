@@ -30,8 +30,9 @@ use crate::error::{AdError, Result};
 /// doc follows the code.)
 ///
 /// Substrait plans are trees, so a table read twice appears as two `Read` nodes;
-/// `TableRef` is what joins them back together. That is where fan-in shows up —
-/// `nn.py`'s `weight` is read once per layer (design.md §4.4).
+/// `TableRef` is what joins them back together. That is where fan-in shows up: a
+/// parameter table read once per layer of a model, say, contributes a gradient
+/// term per read, and they must be summed (design.md §4.4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableRef(Vec<String>);
 
@@ -64,7 +65,12 @@ pub struct NodeId(pub(crate) usize);
 
 impl NodeId {
     /// The node at pre-order position `i`.
-    pub const fn new(i: usize) -> Self {
+    ///
+    /// Test-only: a `NodeId` indexes one analysed plan, so callers — including
+    /// ddx's own rules — take theirs from [`PlanIndex::nodes`] or [`Node::inputs`]
+    /// rather than building one that may not exist.
+    #[cfg(test)]
+    pub(crate) const fn new(i: usize) -> Self {
         NodeId(i)
     }
 
@@ -192,10 +198,13 @@ impl<'a> PlanIndex<'a> {
     /// This is where **all** fan-in lives. A Substrait plan is a tree, so every
     /// node has exactly one consumer and no relation is shared between two of
     /// them; the only way one relation feeds several is by being read more than
-    /// once. design.md §4.4 describes the general DAG discipline ("process a
+    /// once. That tree property is not inherent to Substrait — it holds because
+    /// [`Self::build`] refuses a plan with several roots and any relation that
+    /// references another (`ReferenceRel`). Relaxing either, to support shared
+    /// CTE subtrees, would make [`Self::backward_order`] an invalid schedule. design.md §4.4 describes the general DAG discipline ("process a
     /// node only once every consumer has contributed"); on a tree that reduces
-    /// to summing across a table's reads, which is what attention's `X` and
-    /// `nn.py`'s per-layer `weight` actually need.
+    /// to summing across a table's reads, which is what a parameter table read
+    /// once per layer, or an input read by several projections, actually needs.
     pub fn sources(&self) -> BTreeMap<&TableRef, Vec<NodeId>> {
         let mut out: BTreeMap<&TableRef, Vec<NodeId>> = BTreeMap::new();
         for n in &self.nodes {
@@ -207,9 +216,14 @@ impl<'a> PlanIndex<'a> {
     }
 }
 
-/// How deep a plan may nest. Plans arrive as protobuf, whose own decoder stops
-/// at 100 levels, so a plan deeper than this can only have been built in
-/// memory; refusing it keeps the recursion below from overflowing the stack.
+/// How deep a plan may nest, as a guard on the recursion below: a plan deeper
+/// than this is refused rather than risking the stack.
+///
+/// The bound is arbitrary and generous, not derived. (Decoding gives a smaller
+/// one for free — prost stops at 100 nested *messages*, and a Substrait relation
+/// is several messages deep, so a decoded plan bottoms out well before this —
+/// but an in-memory plan never went through the decoder, which is the case this
+/// guard exists for.)
 pub(crate) const MAX_DEPTH: usize = 128;
 
 fn visit<'a>(
@@ -270,7 +284,10 @@ fn visit<'a>(
 /// drift from the `substrait` version the crate is pinned to.
 fn rel_name(t: &RelType) -> String {
     let dbg = format!("{t:?}");
-    dbg.split('(').next().unwrap_or(&dbg).to_string()
+    match dbg.split_once('(') {
+        Some((name, _)) => name.to_string(),
+        None => dbg,
+    }
 }
 
 #[cfg(test)]

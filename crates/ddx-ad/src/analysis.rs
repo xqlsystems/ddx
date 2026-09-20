@@ -16,13 +16,14 @@ use std::collections::HashMap;
 use substrait::proto::aggregate_function::AggregationInvocation;
 use substrait::proto::aggregate_rel::Measure;
 use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Plan, Rel};
 
 use crate::activity::{Activity, ColumnRef};
 use crate::columns::{Col, ColumnDef, Columns};
 use crate::error::{AdError, Result};
-use crate::expr::{value_args, walk, Event};
+use crate::expr::{agg_value_exprs, peel_casts, value_args, walk, Event};
 use crate::index::{NodeId, PlanIndex};
 use crate::markers::{Functions, Marker};
 use crate::names::AggKind;
@@ -44,7 +45,10 @@ impl<'a> Analysis<'a> {
         let functions = Functions::from_plan(plan)?;
         let columns = Columns::build(&index)?;
         check_marker_placement(&index, &functions)?;
+        check_one_name_per_table(&index)?;
         let activity = Activity::analyze(&index, &columns, &functions, wrt)?;
+        check_differentiable_shape(&index, &columns, &activity)?;
+        activity.check_reachable(&index, &columns, wrt)?;
         let measures = classify_measures(&index, &columns, &functions, &activity)?;
         Ok(Analysis {
             index,
@@ -113,7 +117,12 @@ fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> 
                 let placed = match marker {
                     Marker::Contraction | Marker::Reduce => at_root && slot == Slot::MeasureArg,
                     Marker::Route => at_root && slot == Slot::Projected,
-                    Marker::StopGradient => true,
+                    // Anywhere inside a value, at any depth — that is the point
+                    // of it. But a condition, key or sort key is not a value
+                    // position, so no cotangent flows there for it to cut: a
+                    // stop-gradient there is a no-op, and silently doing nothing
+                    // is what this marker exists to prevent.
+                    Marker::StopGradient => slot != Slot::Other,
                 };
                 if placed {
                     return Ok(());
@@ -127,7 +136,13 @@ fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> 
                         "the whole argument of a SUM, as in \
                                        SUM(ddx_reduce_mark(val))"
                     }
-                    _ => "a whole projected value, as in SELECT ddx_route_mark(val) AS val",
+                    Marker::Route => {
+                        "a whole projected value, as in SELECT ddx_route_mark(val) AS val"
+                    }
+                    Marker::StopGradient => {
+                        "inside a value — a projected expression or an aggregate's \
+                         argument — where a cotangent would otherwise flow"
+                    }
                 };
                 let found = if at_root {
                     format!("in {}", slot.describe())
@@ -159,7 +174,10 @@ fn slotted_expressions<'a>(rel: &'a Rel) -> Vec<(&'a Expression, Slot)> {
             push(r.best_effort_filter.as_deref(), Other);
         }
         Some(RelType::Filter(f)) => push(f.condition.as_deref(), Other),
-        Some(RelType::Project(p)) => p.expressions.iter().for_each(|e| push(Some(e), Projected)),
+        Some(RelType::Project(p)) => p
+            .expressions
+            .iter()
+            .for_each(|e| push(Some(peel_casts(e)), Projected)),
         Some(RelType::Join(j)) => {
             push(j.expression.as_deref(), Other);
             push(j.post_join_filter.as_deref(), Other);
@@ -177,9 +195,9 @@ fn slotted_expressions<'a>(rel: &'a Rel) -> Vec<(&'a Expression, Slot)> {
             for m in &a.measures {
                 push(m.filter.as_ref(), Other);
                 if let Some(f) = &m.measure {
-                    value_args(&f.arguments)
+                    agg_value_exprs(f)
                         .into_iter()
-                        .for_each(|e| push(Some(e), MeasureArg));
+                        .for_each(|e| push(Some(peel_casts(e)), MeasureArg));
                     f.sorts.iter().for_each(|s| push(s.expr.as_ref(), Other));
                 }
             }
@@ -236,8 +254,8 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
         .ok_or_else(|| AdError::InvalidPlan("an aggregate measure has no function".into()))?;
     let name = fns.base_name(f.function_reference)?;
     let agg = AggKind::from_name(&name);
-    let marker = match value_args(&f.arguments).as_slice() {
-        [arg] => match &arg.rex_type {
+    let marker = match agg_value_exprs(f).as_slice() {
+        [arg] => match &peel_casts(arg).rex_type {
             Some(substrait::proto::expression::RexType::ScalarFunction(call)) => {
                 fns.marker(call.function_reference)?
             }
@@ -278,6 +296,11 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
              SUM(ddx_reduce_mark(val)) for a reduction"
                 .into(),
         )),
+        (Some(AggKind::Mean), _) => Err(AdError::Untagged(format!(
+            "`{name}` over a gradient-carrying column has no transpose rule: take a SUM and \
+             divide by the count as a separate elementwise step, tagging the SUM with \
+             ddx_reduce_mark or ddx_contract_mark (design.md §4.3)"
+        ))),
         (Some(AggKind::Extremum), _) => Err(AdError::Untagged(format!(
             "`{name}` over a gradient-carrying column has no transpose rule. If it is a \
              numerical-stability shift (softmax's max), wrap its use in ddx_stop_gradient; \
@@ -287,6 +310,105 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
             "aggregate `{name}` over a gradient-carrying column"
         ))),
     }
+}
+
+/// Two reads of the same physical table must not be spelled differently.
+///
+/// [`PlanIndex::sources`] groups reads by their `NamedTable.names`, and every
+/// gradient is accumulated per group. If one read says `w` and another
+/// `public.w`, they become two tables: the wrt column matches one spelling, the
+/// other contributes nothing, and the gradient comes back quietly halved — the
+/// failure mode fan-in accumulation exists to prevent. DataFusion is internally
+/// consistent within a plan, so this guards against a producer that isn't, and
+/// against a hand-assembled plan.
+fn check_one_name_per_table(index: &PlanIndex<'_>) -> Result<()> {
+    let sources = index.sources();
+    for a in sources.keys() {
+        for b in sources.keys() {
+            if a < b && a.names().last() == b.names().last() {
+                return Err(AdError::InvalidPlan(format!(
+                    "the plan reads `{a}` and `{b}`, whose last name part is the same. If they \
+                     are the same table, every read must spell it the same way, or each \
+                     spelling is differentiated as a separate table and the gradient is split"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the plan shapes no transpose rule covers, now that activity is known.
+///
+/// Both are cases where the columns line up but the *gradient* doesn't, so
+/// nothing downstream would notice: they have to be refused here or not at all.
+fn check_differentiable_shape(
+    index: &PlanIndex<'_>,
+    columns: &Columns<'_>,
+    activity: &Activity,
+) -> Result<()> {
+    for node in index.nodes() {
+        // Grouping by a gradient-carrying value: the key is a dim of the output,
+        // and gradient can't flow into a coordinate.
+        for c in columns.cols(node.id) {
+            if matches!(columns.of(node.id)[c.index()], ColumnDef::GroupKey(_))
+                && activity.is_varied(node.id, c)
+                && activity.is_useful(node.id, c)
+            {
+                return Err(AdError::NotImplemented(format!(
+                    "relation {} groups by {c}, which depends on a wrt column; a grouping key \
+                     is a dim, and gradient can't flow through one",
+                    node.id
+                )));
+            }
+        }
+
+        // An outer join's unmatched rows hold NULL in the value columns of the
+        // side that didn't match. A missing cotangent row means *zero*, and
+        // NULL is not zero — SUM skips it, arithmetic propagates it — so
+        // forward and backward would disagree about an unmatched row. No rule
+        // covers that yet; refuse rather than assume inner-join semantics.
+        if let Some(RelType::Join(j)) = node.rel.rel_type.as_ref() {
+            let nullable = match j.r#type() {
+                JoinType::Left => Nullable::Right,
+                JoinType::Right => Nullable::Left,
+                JoinType::Outer => Nullable::Both,
+                _ => Nullable::Neither,
+            };
+            if nullable != Nullable::Neither {
+                let left_width = columns.of(node.inputs[0]).len();
+                for c in columns.cols(node.id) {
+                    let from_nullable_side = match columns.of(node.id)[c.index()] {
+                        ColumnDef::Input(f) => match nullable {
+                            Nullable::Left => f.index() < left_width,
+                            Nullable::Right => f.index() >= left_width,
+                            _ => true,
+                        },
+                        _ => false,
+                    };
+                    if from_nullable_side && activity.is_active(node.id, c) {
+                        return Err(AdError::NotImplemented(format!(
+                            "relation {} is a {} whose {c} carries gradient. An unmatched row \
+                             holds NULL there, and a missing cotangent means zero, so the \
+                             forward and backward passes would disagree about it. Restrict the \
+                             join to matching rows, or wrap the column in ddx_stop_gradient",
+                            node.id,
+                            j.r#type().as_str_name()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which side of an outer join may be NULL-extended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nullable {
+    Neither,
+    Left,
+    Right,
+    Both,
 }
 
 #[cfg(test)]
@@ -495,6 +617,9 @@ mod tests {
         // SELECT val FROM w WHERE k … — `w.k` is a real column, but only filters.
         let p = with_fns(emit(filter(read("w", &["k", "val"]), field(0)), &[1]));
         let err = Analysis::new(&p, &wrt("w", "k")).unwrap_err();
-        assert!(matches!(err, AdError::InvalidWrt(ref m) if m.contains("doesn't depend")));
+        assert!(
+            matches!(err, AdError::InvalidWrt(ref m) if m.contains("no gradient can reach")),
+            "{err}"
+        );
     }
 }

@@ -97,7 +97,10 @@ impl Marker {
 
 /// A function name without its Substrait signature suffix: `add:i64_i64` → `add`.
 pub(crate) fn base_name(name: &str) -> &str {
-    name.split(':').next().unwrap_or(name)
+    match name.split_once(':') {
+        Some((base, _signature)) => base,
+        None => name,
+    }
 }
 
 /// The plan's scalar/aggregate/window function declarations, by anchor.

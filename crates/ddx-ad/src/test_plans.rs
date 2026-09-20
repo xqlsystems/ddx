@@ -11,7 +11,8 @@ use substrait::proto::expression::literal::LiteralType;
 use substrait::proto::expression::mask_expression::{StructItem, StructSelect};
 use substrait::proto::expression::reference_segment::{self, StructField};
 use substrait::proto::expression::{
-    FieldReference, Literal, MaskExpression, ReferenceSegment, RexType, ScalarFunction,
+    if_then, FieldReference, IfThen, Literal, MaskExpression, ReferenceSegment, RexType,
+    ScalarFunction,
 };
 use substrait::proto::extensions::simple_extension_declaration::{ExtensionFunction, MappingType};
 use substrait::proto::extensions::SimpleExtensionDeclaration;
@@ -206,6 +207,19 @@ pub fn call(anchor: u32, args: Vec<Expression>) -> Expression {
             arguments: args.into_iter().map(value_arg).collect(),
             ..Default::default()
         })),
+    }
+}
+
+/// `CASE WHEN cond THEN then ELSE els END`.
+pub fn if_then(cond: Expression, then: Expression, els: Expression) -> Expression {
+    Expression {
+        rex_type: Some(RexType::IfThen(Box::new(IfThen {
+            ifs: vec![if_then::IfClause {
+                r#if: Some(cond),
+                then: Some(then),
+            }],
+            r#else: Some(Box::new(els)),
+        }))),
     }
 }
 
