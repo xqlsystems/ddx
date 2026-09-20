@@ -75,6 +75,21 @@ enum Slot {
     Other,
 }
 
+impl Slot {
+    /// How to describe this slot to someone whose SQL didn't obviously put a
+    /// marker here. The plan is what ddx sees, and an engine may move a marker
+    /// somewhere the SQL didn't suggest: DataFusion plans `SUM(DISTINCT x)` as a
+    /// *grouping* on `x` feeding an outer sum, so a marker written inside that
+    /// SUM arrives in a grouping key.
+    fn describe(self) -> &'static str {
+        match self {
+            Slot::MeasureArg => "an aggregate's argument",
+            Slot::Projected => "a projected value",
+            Slot::Other => "a condition, grouping key or sort key",
+        }
+    }
+}
+
 fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> {
     for node in index.nodes() {
         for (e, slot) in slotted_expressions(node.rel) {
@@ -103,23 +118,26 @@ fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> 
                 if placed {
                     return Ok(());
                 }
-                Err(AdError::InvalidMarker(match marker {
-                    Marker::Contraction => format!(
-                        "`{}` must be the whole argument of a SUM, as in \
-                         SUM(ddx_contract_mark(a.val * b.val))",
-                        marker.name()
-                    ),
-                    Marker::Reduce => format!(
-                        "`{}` must be the whole argument of a SUM, as in \
-                         SUM(ddx_reduce_mark(val))",
-                        marker.name()
-                    ),
-                    _ => format!(
-                        "`{}` must be a whole projected value, as in \
-                         SELECT ddx_route_mark(val) AS val",
-                        marker.name()
-                    ),
-                }))
+                let wanted = match marker {
+                    Marker::Contraction => {
+                        "the whole argument of a SUM, as in \
+                                            SUM(ddx_contract_mark(a.val * b.val))"
+                    }
+                    Marker::Reduce => {
+                        "the whole argument of a SUM, as in \
+                                       SUM(ddx_reduce_mark(val))"
+                    }
+                    _ => "a whole projected value, as in SELECT ddx_route_mark(val) AS val",
+                };
+                let found = if at_root {
+                    format!("in {}", slot.describe())
+                } else {
+                    format!("nested inside a larger expression in {}", slot.describe())
+                };
+                Err(AdError::InvalidMarker(format!(
+                    "`{}` must be {wanted}; the plan has it {found}",
+                    marker.name()
+                )))
             })?;
         }
     }
@@ -241,10 +259,16 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
             }
             Ok(mk)
         }
-        (_, Some(mk @ (Marker::Contraction | Marker::Reduce))) => {
+        (Some(AggKind::Mean), Some(mk @ (Marker::Contraction | Marker::Reduce))) => {
             Err(AdError::InvalidMarker(format!(
                 "`{}` must be summed, but it sits inside `{name}`; for a mean, SUM and then \
-                 divide as a separate elementwise step",
+                 divide by the count as a separate elementwise step (design.md §4.3)",
+                mk.name()
+            )))
+        }
+        (_, Some(mk @ (Marker::Contraction | Marker::Reduce))) => {
+            Err(AdError::InvalidMarker(format!(
+                "`{}` must be the whole argument of a SUM, but it sits inside `{name}`",
                 mk.name()
             )))
         }

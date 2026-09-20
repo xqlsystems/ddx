@@ -225,7 +225,8 @@ fn useful(
     if !useful[root.index()].contains(&true) {
         return Err(AdError::InvalidWrt(
             "the query's output doesn't depend on any of the wrt columns, so every gradient \
-             would be zero"
+             would be zero — check the wrt columns, and any ddx_stop_gradient between them \
+             and the output"
                 .into(),
         ));
     }
