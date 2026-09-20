@@ -19,12 +19,13 @@ use substrait::proto::fetch_rel::{CountMode, OffsetMode};
 use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Plan, Rel};
 
-use crate::activity::{Activity, Param};
-use crate::columns::{ColumnDef, Columns};
+use crate::activity::{Activity, ColumnRef};
+use crate::columns::{Col, ColumnDef, Columns};
 use crate::error::{AdError, Result};
 use crate::expr::{value_args, walk, Event};
 use crate::index::{NodeId, PlanIndex};
 use crate::markers::{Functions, Marker};
+use crate::names::AggKind;
 
 /// A plan, analysed with respect to a set of parameters.
 #[derive(Debug, Clone)]
@@ -33,12 +34,12 @@ pub struct Analysis<'a> {
     pub functions: Functions,
     pub columns: Columns<'a>,
     pub activity: Activity,
-    measures: HashMap<(NodeId, usize), Marker>,
+    measures: HashMap<(NodeId, Col), Marker>,
 }
 
 impl<'a> Analysis<'a> {
     /// Analyse `plan` with respect to `wrt`.
-    pub fn new(plan: &'a Plan, wrt: &[Param]) -> Result<Self> {
+    pub fn new(plan: &'a Plan, wrt: &[ColumnRef]) -> Result<Self> {
         let index = PlanIndex::build(plan)?;
         let functions = Functions::from_plan(plan)?;
         let columns = Columns::build(&index)?;
@@ -55,9 +56,9 @@ impl<'a> Analysis<'a> {
     }
 
     /// For an aggregate output column that carries gradient, the marker it was
-    /// tagged with: [`Marker::Contract`] or [`Marker::Reduce`]. `None` for a
+    /// tagged with: [`Marker::Contraction`] or [`Marker::Reduce`]. `None` for a
     /// column that isn't a gradient-carrying measure.
-    pub fn measure_marker(&self, node: NodeId, col: usize) -> Option<Marker> {
+    pub fn measure_marker(&self, node: NodeId, col: Col) -> Option<Marker> {
         self.measures.get(&(node, col)).copied()
     }
 }
@@ -89,21 +90,21 @@ fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> 
                 #[allow(deprecated)]
                 let arity = value_args(&call.arguments).len() + call.args.len();
                 if arity != 1 {
-                    return Err(AdError::Marker(format!(
+                    return Err(AdError::InvalidMarker(format!(
                         "`{}` takes exactly one argument, got {arity}",
                         marker.name()
                     )));
                 }
                 let placed = match marker {
-                    Marker::Contract | Marker::Reduce => at_root && slot == Slot::MeasureArg,
+                    Marker::Contraction | Marker::Reduce => at_root && slot == Slot::MeasureArg,
                     Marker::Route => at_root && slot == Slot::Projected,
                     Marker::StopGradient => true,
                 };
                 if placed {
                     return Ok(());
                 }
-                Err(AdError::Marker(match marker {
-                    Marker::Contract => format!(
+                Err(AdError::InvalidMarker(match marker {
+                    Marker::Contraction => format!(
                         "`{}` must be the whole argument of a SUM, as in \
                          SUM(ddx_contract_mark(a.val * b.val))",
                         marker.name()
@@ -196,11 +197,11 @@ fn classify_measures(
     columns: &Columns<'_>,
     fns: &Functions,
     activity: &Activity,
-) -> Result<HashMap<(NodeId, usize), Marker>> {
+) -> Result<HashMap<(NodeId, Col), Marker>> {
     let mut out = HashMap::new();
     for node in index.nodes() {
-        for (c, def) in columns.of(node.id).iter().enumerate() {
-            if let ColumnDef::Measure(m) = def {
+        for c in columns.cols(node.id) {
+            if let ColumnDef::Measure(m) = columns.def(node.id, c)? {
                 if activity.is_active(node.id, c) {
                     out.insert((node.id, c), measure_marker(m, fns)?);
                 }
@@ -216,6 +217,7 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
         .as_ref()
         .ok_or_else(|| AdError::InvalidPlan("an aggregate measure has no function".into()))?;
     let name = fns.base_name(f.function_reference)?;
+    let agg = AggKind::from_name(&name);
     let marker = match value_args(&f.arguments).as_slice() {
         [arg] => match &arg.rex_type {
             Some(substrait::proto::expression::RexType::ScalarFunction(call)) => {
@@ -225,8 +227,8 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
         },
         _ => None,
     };
-    match (name.as_str(), marker) {
-        ("sum", Some(mk @ (Marker::Contract | Marker::Reduce))) => {
+    match (agg, marker) {
+        (Some(AggKind::Sum), Some(mk @ (Marker::Contraction | Marker::Reduce))) => {
             if f.invocation() == AggregationInvocation::Distinct {
                 return Err(AdError::NotImplemented(
                     "SUM(DISTINCT …) over a gradient-carrying column".into(),
@@ -239,18 +241,20 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
             }
             Ok(mk)
         }
-        (_, Some(mk @ (Marker::Contract | Marker::Reduce))) => Err(AdError::Marker(format!(
-            "`{}` must be summed, but it sits inside `{name}`; for a mean, SUM and then \
-             divide as a separate elementwise step",
-            mk.name()
-        ))),
-        ("sum", _) => Err(AdError::Marker(
+        (_, Some(mk @ (Marker::Contraction | Marker::Reduce))) => {
+            Err(AdError::InvalidMarker(format!(
+                "`{}` must be summed, but it sits inside `{name}`; for a mean, SUM and then \
+                 divide as a separate elementwise step",
+                mk.name()
+            )))
+        }
+        (Some(AggKind::Sum), _) => Err(AdError::Untagged(
             "a SUM over a gradient-carrying column must say what it is: \
              SUM(ddx_contract_mark(a.val * b.val)) for a contraction of a join, or \
              SUM(ddx_reduce_mark(val)) for a reduction"
                 .into(),
         )),
-        ("max" | "min", _) => Err(AdError::Marker(format!(
+        (Some(AggKind::Extremum), _) => Err(AdError::Untagged(format!(
             "`{name}` over a gradient-carrying column has no transpose rule. If it is a \
              numerical-stability shift (softmax's max), wrap its use in ddx_stop_gradient; \
              for argmax routing, use the ddx_route_mark idiom"
@@ -264,7 +268,7 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::RelRef;
+    use crate::index::TableRef;
     use crate::test_plans::*;
 
     const SUM: u32 = 0;
@@ -295,13 +299,13 @@ mod tests {
     }
 
     /// The error analysing `root` with respect to `wrt` produces.
-    fn refusal(root: Rel, wrt: &[Param]) -> AdError {
+    fn refusal(root: Rel, wrt: &[ColumnRef]) -> AdError {
         let p = with_fns(root);
         Analysis::new(&p, wrt).map(|_| ()).unwrap_err()
     }
 
-    fn wrt(t: &str, c: &str) -> Vec<Param> {
-        vec![Param::new(RelRef::new([t]), c)]
+    fn wrt(t: &str, c: &str) -> Vec<ColumnRef> {
+        vec![ColumnRef::new(TableRef::new([t]), c)]
     }
 
     /// x(i, j, val) ⋈ w(j, k, val), contracted over j:
@@ -320,20 +324,23 @@ mod tests {
         let p = with_fns(contraction(SUM, call(CONTRACT, vec![mul_vals()])));
         let a = Analysis::new(&p, &wrt("w", "val")).unwrap();
         let root = a.index.root();
-        assert_eq!(a.activity.active(root), [2]);
-        assert_eq!(a.measure_marker(root, 2), Some(Marker::Contract));
+        assert_eq!(a.activity.active(root), [Col::new(2)]);
+        assert_eq!(
+            a.measure_marker(root, Col::new(2)),
+            Some(Marker::Contraction)
+        );
         // The join passes both `val`s through, but only w's depends on w.
-        assert_eq!(a.activity.active(NodeId(1)), [5]);
+        assert_eq!(a.activity.active(NodeId::new(1)), [Col::new(5)]);
         // x.val is varied by nothing; w's keys are inactive.
-        assert_eq!(a.activity.active(NodeId(3)), [2]);
-        assert!(a.activity.active(NodeId(2)).is_empty());
+        assert_eq!(a.activity.active(NodeId::new(3)), [Col::new(2)]);
+        assert!(a.activity.active(NodeId::new(2)).is_empty());
     }
 
     #[test]
     fn an_untagged_sum_over_a_parameter_is_refused() {
         let p = with_fns(contraction(SUM, mul_vals()));
         let err = Analysis::new(&p, &wrt("w", "val")).unwrap_err();
-        assert!(matches!(err, AdError::Marker(ref m) if m.contains("must say what it is")));
+        assert!(matches!(err, AdError::Untagged(ref m) if m.contains("must say what it is")));
     }
 
     #[test]
@@ -350,9 +357,12 @@ mod tests {
         );
         let p = with_fns(agg);
         let a = Analysis::new(&p, &wrt("w", "val")).unwrap();
-        assert_eq!(a.activity.active(a.index.root()), [2]);
-        assert_eq!(a.measure_marker(a.index.root(), 1), None);
-        assert_eq!(a.measure_marker(a.index.root(), 2), Some(Marker::Reduce));
+        assert_eq!(a.activity.active(a.index.root()), [Col::new(2)]);
+        assert_eq!(a.measure_marker(a.index.root(), Col::new(1)), None);
+        assert_eq!(
+            a.measure_marker(a.index.root(), Col::new(2)),
+            Some(Marker::Reduce)
+        );
     }
 
     #[test]
@@ -360,19 +370,19 @@ mod tests {
         // SUM(2 * ddx_contract_mark(…)) — the marker is not the whole argument.
         let nested = call(MUL, vec![lit_f64(2.0), call(CONTRACT, vec![mul_vals()])]);
         let err = refusal(contraction(SUM, nested), &wrt("w", "val"));
-        assert!(matches!(err, AdError::Marker(_)), "{err:?}");
+        assert!(matches!(err, AdError::InvalidMarker(_)), "{err:?}");
 
         // A contraction marker in a projection.
         let pr = project(read("w", &["val"]), vec![call(CONTRACT, vec![field(0)])]);
         let err = refusal(pr, &wrt("w", "val"));
-        assert!(matches!(err, AdError::Marker(_)), "{err:?}");
+        assert!(matches!(err, AdError::InvalidMarker(_)), "{err:?}");
 
         // A route marker inside a measure.
         let err = refusal(
             contraction(SUM, call(ROUTE, vec![mul_vals()])),
             &wrt("w", "val"),
         );
-        assert!(matches!(err, AdError::Marker(_)), "{err:?}");
+        assert!(matches!(err, AdError::InvalidMarker(_)), "{err:?}");
 
         // Two arguments.
         let err = refusal(
@@ -380,7 +390,7 @@ mod tests {
             &wrt("w", "val"),
         );
         assert!(
-            matches!(err, AdError::Marker(ref m) if m.contains("exactly one")),
+            matches!(err, AdError::InvalidMarker(ref m) if m.contains("exactly one")),
             "{err:?}"
         );
 
@@ -390,7 +400,7 @@ mod tests {
             &wrt("w", "val"),
         );
         assert!(
-            matches!(err, AdError::Marker(ref m) if m.contains("must be summed")),
+            matches!(err, AdError::InvalidMarker(ref m) if m.contains("must be summed")),
             "{err:?}"
         );
     }
@@ -413,14 +423,14 @@ mod tests {
         let ok = with_fns(shifted(call(STOP, vec![field(3)])));
         let a = Analysis::new(&ok, &wrt("t", "z")).unwrap();
         // The max is varied but never reached through a value position.
-        let max_node = NodeId(3);
-        assert!(a.activity.is_varied(max_node, 1));
-        assert!(!a.activity.is_active(max_node, 1));
+        let max_node = NodeId::new(3);
+        assert!(a.activity.is_varied(max_node, Col::new(1)));
+        assert!(!a.activity.is_active(max_node, Col::new(1)));
 
         // Without the stop, the MAX is active and has no rule: refused, loudly.
         let bad = with_fns(shifted(field(3)));
         let err = Analysis::new(&bad, &wrt("t", "z")).unwrap_err();
-        assert!(matches!(err, AdError::Marker(ref m) if m.contains("ddx_stop_gradient")));
+        assert!(matches!(err, AdError::Untagged(ref m) if m.contains("ddx_stop_gradient")));
     }
 
     #[test]
@@ -429,7 +439,7 @@ mod tests {
         let f = filter(read("w", &["k", "val"]), field(0));
         let p = with_fns(f);
         let a = Analysis::new(&p, &wrt("w", "val")).unwrap();
-        assert_eq!(a.activity.active(a.index.root()), [1]);
+        assert_eq!(a.activity.active(a.index.root()), [Col::new(1)]);
     }
 
     #[test]

@@ -23,12 +23,29 @@ use substrait::proto::Plan;
 
 use crate::error::{AdError, Result};
 
-/// One of ddx's extension-function markers (design.md §4.3).
+/// One of the four functions ddx claims the name of (design.md §4.3).
+///
+/// There are **four markers but five transpose rules**, and the mismatch is not
+/// an oversight: Elementwise needs no marker, because any projected expression
+/// that isn't one of the others is elementwise by default.
+///
+/// The four also aren't the same kind of thing, which [`Marker::is_tag`]
+/// separates:
+///
+/// - [`Marker::Contraction`], [`Marker::Reduce`] and [`Marker::Route`] are
+///   **tags**: they classify an operation the query already performs. Deleting
+///   one changes neither the forward value nor the true gradient — only ddx's
+///   ability to recognize which rule applies, which is why an untagged
+///   gradient-carrying aggregate is refused instead of guessed at.
+/// - [`Marker::StopGradient`] is an **operation**: it changes the derivative
+///   (cotangent stops there) while leaving the forward value alone. Deleting it
+///   changes the gradient — for softmax's stability shift, from correct to
+///   wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Marker {
     /// `SUM(ddx_contract_mark(a.val * b.val))` — this aggregate is a
     /// contraction of the join feeding it.
-    Contract,
+    Contraction,
     /// `SUM(ddx_reduce_mark(val))` — this aggregate is a plain reduction over
     /// the dims it drops.
     Reduce,
@@ -42,7 +59,7 @@ pub enum Marker {
 impl Marker {
     /// Every marker, in a fixed order.
     pub const ALL: [Marker; 4] = [
-        Marker::Contract,
+        Marker::Contraction,
         Marker::Reduce,
         Marker::Route,
         Marker::StopGradient,
@@ -51,11 +68,18 @@ impl Marker {
     /// The function name a user writes in SQL.
     pub fn name(self) -> &'static str {
         match self {
-            Marker::Contract => "ddx_contract_mark",
+            Marker::Contraction => "ddx_contract_mark",
             Marker::Reduce => "ddx_reduce_mark",
             Marker::Route => "ddx_route_mark",
             Marker::StopGradient => "ddx_stop_gradient",
         }
+    }
+
+    /// Does this marker only *classify* an operation, leaving the gradient it
+    /// describes unchanged? True for all but [`Marker::StopGradient`], which is
+    /// itself an operation on the gradient (see the type docs).
+    pub fn is_tag(self) -> bool {
+        self != Marker::StopGradient
     }
 
     /// The marker a declared function name refers to, if any.
@@ -141,6 +165,14 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_classifies_an_operation_but_stop_gradient_is_one() {
+        assert!(Marker::Contraction.is_tag());
+        assert!(Marker::Reduce.is_tag());
+        assert!(Marker::Route.is_tag());
+        assert!(!Marker::StopGradient.is_tag());
+    }
+
+    #[test]
     fn names_round_trip() {
         for m in Marker::ALL {
             assert_eq!(Marker::from_name(m.name()), Some(m));
@@ -151,7 +183,7 @@ mod tests {
     fn names_are_matched_case_insensitively_and_without_a_signature() {
         assert_eq!(
             Marker::from_name("DDX_Contract_Mark"),
-            Some(Marker::Contract)
+            Some(Marker::Contraction)
         );
         assert_eq!(
             Marker::from_name("ddx_reduce_mark:fp64"),

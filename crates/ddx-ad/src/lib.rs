@@ -16,12 +16,17 @@
 //! - [`Marker`] — the four marker functions a user writes in SQL
 //!   (`ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark`,
 //!   `ddx_stop_gradient`), recognized by name in the plan's function table.
+//!   Four, not five: Elementwise needs no marker, and `ddx_stop_gradient` is an
+//!   operation on the gradient rather than a tag ([`Marker::is_tag`]).
 //! - [`PlanIndex`] and [`Columns`] — the plan's nodes in backward order, and
 //!   every output column traced back to where it came from, through the
-//!   `Project`/`emit` layers real producers insert.
-//! - [`Activity`] — which columns carry gradient, derived from the parameters
-//!   the user names ([`Param`], e.g. `weight.val`) rather than from a naming
-//!   convention.
+//!   `Project`/`emit` layers real producers insert. A node's own output columns
+//!   ([`Col`]) and the positions its expressions read ([`Field`]) are separate
+//!   types, because they are separate numberings.
+//! - [`Activity`] — which columns carry gradient, derived from the columns the
+//!   user names ([`ColumnRef`], e.g. `weight.val`) rather than from a naming
+//!   convention. It answers only *that*: dims are structural, read off the
+//!   consuming node's join conditions and grouping keys, never guessed at.
 //! - [`Analysis`] — all of the above for one plan, plus enforcement of *tag,
 //!   don't infer*: a misplaced marker, or an untagged aggregate over a
 //!   gradient-carrying column, is an error.
@@ -33,7 +38,7 @@
 //! Planned surface (design.md §4.4):
 //!
 //! ```ignore
-//! pub fn vjp_query(plan: &Plan, wrt: &[Param]) -> Result<BackwardProgram, AdError>;
+//! pub fn vjp_query(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
 //! ```
 
 #![forbid(unsafe_code)]
@@ -45,6 +50,7 @@ mod error;
 mod expr;
 mod index;
 mod markers;
+mod names;
 
 #[cfg(test)]
 mod test_plans;
@@ -54,9 +60,10 @@ mod test_plans;
 /// `ddx-core` re-exports `sqlparser`, design.md §6).
 pub use substrait;
 
-pub use activity::{Activity, Param};
+pub use activity::{Activity, ColumnRef};
 pub use analysis::Analysis;
-pub use columns::{ColumnDef, Columns};
+pub use columns::{Col, ColumnDef, Columns, Field};
 pub use error::{AdError, Result};
-pub use index::{Node, NodeId, NodeKind, PlanIndex, RelRef};
+pub use index::{Node, NodeId, NodeKind, PlanIndex, TableRef};
 pub use markers::{Functions, Marker};
+pub use names::AggKind;

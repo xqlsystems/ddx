@@ -807,10 +807,21 @@ pub fn vjp_query(
     &self,
     plan: &Plan,              // a substrait::proto::Plan, already containing
                                // ddx's marker functions — recognized, not built
-    wrt: &[Param],             // which table columns to differentiate w.r.t.,
+    wrt: &[ColumnRef],         // which table columns to differentiate w.r.t.,
                                // e.g. weight.val, bias.val
 ) -> Result<BackwardProgram, AdError>;
 ```
+
+**Three roles, and only one of them is inferred `[S6]`.** A relation's columns
+are *dims* (the coordinates identifying a row — §1's dimensions) or *values*
+(§1's variables); differentiation splits values again, into those gradient flows
+through and *constants* like `nn.py`'s `images`. ddx infers only the last
+distinction. **Dim-ness is structural, never guessed:** which columns identify a
+row is already stated by the plan — in the join conditions and `GROUP BY` lists
+of whichever node consumes the relation — so that is where the transpose rules
+read it, and "carries no gradient" must never be read as "is a dim". The
+vocabulary is fixed as *dim* and *val* throughout (§4.3 and `nn.py` already use
+it).
 
 **Which columns carry gradient is derived, not declared per relation `[S6]`.**
 Every rule needs to know which columns are values (they get a cotangent) and
@@ -840,7 +851,7 @@ rule and accumulating cotangents.
 than one consumer — attention's `X` feeding `Wq`, `Wk`, and `Wv` — each
 consumer's contribution is summed, verified in `attention_ad_spike.py`
 (`Xbar = Xq + Xk + Xv`, matching `jax.grad` to 1e-16). In relational form the
-sum must be `UNION ALL` then `GROUP BY` the keys, **not** an inner join of the
+sum must be `UNION ALL` then `GROUP BY` the dims, **not** an inner join of the
 contributions followed by an elementwise add: cotangents are sparse (a row
 absent from a cotangent relation is a zero), and a filter or Route produces
 exactly such gaps. `nn.py`'s `weight` is read once per layer under
@@ -869,7 +880,7 @@ CREATE TEMP TABLE __ddx_bwd_7 AS SELECT * FROM from_substrait($1)
 pub struct BackwardProgram {
     pub forward_steps: Vec<(Ident, Plan)>,
     pub backward_steps: Vec<(Ident, Plan)>,
-    pub gradients: HashMap<RelRef, Ident>,
+    pub gradients: HashMap<ColumnRef, Ident>,
 }
 ```
 
@@ -1142,7 +1153,7 @@ This is the audit trail behind the design above: findings from two rounds of
 adversarial review on v1 (`F1`–`F12`, `G1`–`G9`), the spikes that resolved
 open research questions (`R1`, `R1b`, `R2`), the answered decision points
 (`Q1`–`Q7`), and the v2 pivot from a bespoke IR to Substrait and what building
-it settled (`S1`–`S8`). Each
+it settled (`S1`–`S9`). Each
 entry is referenced from the main text where it applies; nothing here changes
 the design as stated above — it's the evidence for why it's stated that way.
 
@@ -1474,6 +1485,31 @@ recognizer: case-folded name match, ignoring any `:signature` suffix. It also
 means the backward emitter must declare the functions it calls under each
 engine's own names — a per-engine name table, one layer down from v1's
 dialect-normalization table. → §4.2.
+
+**S9 — The vocabulary, fixed once (an ontology pass over M3's first half).**
+Reviewing the analysis code against this document's own words turned up four
+concepts named two or three ways each, and two names that actively misled:
+- *`RelRef` → `TableRef`.* In Substrait a "Rel" is any relation node, while only
+  a **named table** can be differentiated with respect to. The old name collided
+  with the `Rel` the index itself holds.
+- *`Param` → `ColumnRef`.* The unit is a table column, and it needn't be a
+  *parameter*: `attention_ad_spike.py` differentiates with respect to `X`, the
+  input. `ColumnRef` also makes it the plain twin of `ddx-core`'s `ColRef`, the
+  same concept one layer up. `BackwardProgram.gradients` is keyed by it.
+- *dim / val, one spelling each*, replacing dim ~ coordinate ~ key and
+  val ~ variable ~ value used interchangeably.
+- *Marker names match rule names* (`Contraction`, not `Contract`), with two
+  asymmetries now stated rather than implied: there are four markers and five
+  rules because Elementwise needs none, and `ddx_stop_gradient` is not a tag
+  like the other three — it *changes* the gradient, where they only classify an
+  operation whose gradient is already determined.
+Also: an aggregate's identity now comes from a one-place name table
+(`AggKind::from_name`) instead of `"sum"`/`"max"` literals in the rules, which is
+the recognizer half of the per-engine table `[S7]` says the emitter needs; the
+positions "output column of a node" and "field of a node's input row" are
+separate types rather than both `usize`; and the error type distinguishes a
+*malformed* marker from an *untagged* operation, with an `Internal` variant so an
+invariant between two modules is a typed error rather than a panic.
 
 **S8 — Fan-in must be `UNION ALL` + `GROUP BY`, not an elementwise add.** The
 original text of §4.4 said contributions are summed by an "ordinary

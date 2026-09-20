@@ -16,7 +16,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 
 use ddx_ad::substrait::proto::Plan;
-use ddx_ad::{AdError, Analysis, Marker, Param, RelRef};
+use ddx_ad::{AdError, Analysis, ColumnRef, Marker, TableRef};
 
 /// A context with `nn.py`'s tables — 2×2 images, one hidden layer of width 2 —
 /// and the v2 markers registered.
@@ -59,10 +59,11 @@ async fn substrait(ctx: &SessionContext, sql: &str) -> Plan {
     *to_substrait_plan(&plan, &ctx.state()).unwrap()
 }
 
-fn params() -> Vec<Param> {
+/// `nn.py`'s parameters: the weight and bias value columns.
+fn wrt() -> Vec<ColumnRef> {
     vec![
-        Param::new(RelRef::new(["weight"]), "val"),
-        Param::new(RelRef::new(["bias"]), "val"),
+        ColumnRef::new(TableRef::new(["weight"]), "val"),
+        ColumnRef::new(TableRef::new(["bias"]), "val"),
     ]
 }
 
@@ -72,7 +73,7 @@ fn active_outputs(a: &Analysis<'_>) -> Vec<String> {
     a.activity
         .active(a.index.root())
         .into_iter()
-        .map(|c| names[c].clone())
+        .map(|c| names[c.index()].clone())
         .collect()
 }
 
@@ -80,14 +81,14 @@ fn active_outputs(a: &Analysis<'_>) -> Vec<String> {
 fn tags(a: &Analysis<'_>) -> Vec<Marker> {
     let mut out = Vec::new();
     for n in a.index.nodes() {
-        for c in 0..a.columns.of(n.id).len() {
+        for c in a.columns.cols(n.id) {
             out.extend(a.measure_marker(n.id, c));
         }
     }
     out
 }
 
-fn refusal(plan: &Plan, wrt: &[Param]) -> AdError {
+fn refusal(plan: &Plan, wrt: &[ColumnRef]) -> AdError {
     Analysis::new(plan, wrt).map(|_| ()).unwrap_err()
 }
 
@@ -126,10 +127,10 @@ async fn a_marked_forward_query_returns_the_unmarked_answer() {
 async fn nn_first_layer() {
     let ctx = nn_context().await;
     let plan = substrait(&ctx, FWD0).await;
-    let a = Analysis::new(&plan, &params()).unwrap();
+    let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(a.index.root_names(), ["sample", "out", "z", "val"]);
     assert_eq!(active_outputs(&a), ["z", "val"]);
-    assert_eq!(tags(&a), [Marker::Contract]);
+    assert_eq!(tags(&a), [Marker::Contraction]);
 }
 
 /// With respect to the bias alone, the same columns carry gradient — through the
@@ -138,7 +139,7 @@ async fn nn_first_layer() {
 async fn nn_first_layer_wrt_bias_only() {
     let ctx = nn_context().await;
     let plan = substrait(&ctx, FWD0).await;
-    let a = Analysis::new(&plan, &params()[1..]).unwrap();
+    let a = Analysis::new(&plan, &wrt()[1..]).unwrap();
     assert_eq!(active_outputs(&a), ["z", "val"]);
     assert_eq!(tags(&a), []);
 }
@@ -159,12 +160,15 @@ async fn nn_two_layers_and_a_loss() {
          SELECT SUM(ddx_reduce_mark(c1.z * c1.z)) AS loss FROM c1"
     );
     let plan = substrait(&ctx, &sql).await;
-    let a = Analysis::new(&plan, &params()).unwrap();
+    let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(active_outputs(&a), ["loss"]);
-    assert_eq!(a.index.sources()[&RelRef::new(["weight"])].len(), 2);
+    assert_eq!(a.index.sources()[&TableRef::new(["weight"])].len(), 2);
     let mut t = tags(&a);
     t.sort_by_key(|m| m.name());
-    assert_eq!(t, [Marker::Contract, Marker::Contract, Marker::Reduce]);
+    assert_eq!(
+        t,
+        [Marker::Contraction, Marker::Contraction, Marker::Reduce]
+    );
 }
 
 /// The whole point of tagging: an untagged SUM over a parameter is refused, not
@@ -177,9 +181,9 @@ async fn an_untagged_contraction_is_refused() {
         &FWD0.replace("ddx_contract_mark(a.val * w.val)", "a.val * w.val"),
     )
     .await;
-    let err = refusal(&plan, &params());
+    let err = refusal(&plan, &wrt());
     assert!(
-        matches!(err, AdError::Marker(ref m) if m.contains("ddx_contract_mark")),
+        matches!(err, AdError::Untagged(ref m) if m.contains("ddx_contract_mark")),
         "{err}"
     );
 }
@@ -198,13 +202,13 @@ async fn softmax_shift_needs_stop_gradient() {
         )
     };
     let plan = substrait(&ctx, &softmax("ddx_stop_gradient(m.m)")).await;
-    let a = Analysis::new(&plan, &params()).unwrap();
+    let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(active_outputs(&a), ["e"]);
 
     let plan = substrait(&ctx, &softmax("m.m")).await;
-    let err = refusal(&plan, &params());
+    let err = refusal(&plan, &wrt());
     assert!(
-        matches!(err, AdError::Marker(ref m) if m.contains("ddx_stop_gradient")),
+        matches!(err, AdError::Untagged(ref m) if m.contains("ddx_stop_gradient")),
         "{err}"
     );
 }
@@ -215,12 +219,12 @@ async fn softmax_shift_needs_stop_gradient() {
 async fn a_wrt_typo_is_refused() {
     let ctx = nn_context().await;
     let plan = substrait(&ctx, FWD0).await;
-    let err = refusal(&plan, &[Param::new(RelRef::new(["weights"]), "val")]);
+    let err = refusal(&plan, &[ColumnRef::new(TableRef::new(["weights"]), "val")]);
     assert!(
         matches!(err, AdError::InvalidWrt(ref m) if m.contains("bias, pixels, weight")),
         "{err}"
     );
-    let err = refusal(&plan, &[Param::new(RelRef::new(["weight"]), "value")]);
+    let err = refusal(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "value")]);
     assert!(
         matches!(err, AdError::InvalidWrt(ref m) if m.contains("layer, inp, out, val")),
         "{err}"
@@ -242,7 +246,7 @@ async fn route_idiom() {
          SELECT sample, out, val FROM ranked WHERE rk = 1"
     );
     let plan = substrait(&ctx, &sql).await;
-    let a = Analysis::new(&plan, &params()).unwrap();
+    let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(active_outputs(&a), ["val"]);
 }
 
@@ -256,6 +260,6 @@ async fn an_in_subquery_is_a_mask() {
          WHERE sample IN (SELECT sample FROM pixels WHERE height = 0 AND width = 0)"
     );
     let plan = substrait(&ctx, &sql).await;
-    let a = Analysis::new(&plan, &params()).unwrap();
+    let a = Analysis::new(&plan, &wrt()).unwrap();
     assert_eq!(active_outputs(&a), ["val"]);
 }

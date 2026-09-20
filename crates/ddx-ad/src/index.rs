@@ -21,23 +21,28 @@ use substrait::proto::{Plan, Rel};
 
 use crate::error::{AdError, Result};
 
-/// A named table read by the plan. The unit a gradient is taken with respect to
-/// is a column of one of these (see [`crate::Param`]).
+/// A reference to a named table the plan reads. The unit a gradient is taken
+/// with respect to is a column of one of these (see [`crate::ColumnRef`]).
+///
+/// Named `TableRef`, not `RelRef`: in Substrait — and in [`Node::rel`] right
+/// below — a *relation* is any node of the plan, while only a named table can be
+/// differentiated with respect to. (design.md §4.4 called this `RelRef`; the
+/// doc follows the code.)
 ///
 /// Substrait plans are trees, so a table read twice appears as two `Read` nodes;
-/// `RelRef` is what joins them back together. That is where fan-in shows up —
+/// `TableRef` is what joins them back together. That is where fan-in shows up —
 /// `nn.py`'s `weight` is read once per layer (design.md §4.4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RelRef(Vec<String>);
+pub struct TableRef(Vec<String>);
 
-impl RelRef {
+impl TableRef {
     /// A reference to a table by its (possibly qualified) name parts.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        RelRef(names.into_iter().map(Into::into).collect())
+        TableRef(names.into_iter().map(Into::into).collect())
     }
 
     /// The name parts, outermost qualifier first.
@@ -46,7 +51,7 @@ impl RelRef {
     }
 }
 
-impl fmt::Display for RelRef {
+impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0.join("."))
     }
@@ -58,8 +63,13 @@ impl fmt::Display for RelRef {
 pub struct NodeId(pub(crate) usize);
 
 impl NodeId {
+    /// The node at pre-order position `i`.
+    pub const fn new(i: usize) -> Self {
+        NodeId(i)
+    }
+
     /// The id as an index into [`PlanIndex::nodes`].
-    pub fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self.0
     }
 }
@@ -76,13 +86,19 @@ pub enum NodeKind {
     /// A leaf read. `table` is `Some` only for a named table — the only kind a
     /// gradient can be taken with respect to.
     Read {
-        table: Option<RelRef>,
+        table: Option<TableRef>,
     },
     Filter,
     Project,
     Join,
     Aggregate,
-    /// A consistent-partition window.
+    /// A `ConsistentPartitionWindowRel` — a window as its own *relation*.
+    ///
+    /// Route's forward idiom does **not** land here on every engine: DataFusion
+    /// 54 emits `ROW_NUMBER() OVER (…)` as a window-function *expression inside
+    /// a `Project`* (verified against its producer), so the Route rule's subject
+    /// is that expression, not this node kind. This variant exists because a
+    /// producer may legitimately use the relation form instead.
     Window,
     Sort,
     Fetch,
@@ -156,6 +172,9 @@ impl<'a> PlanIndex<'a> {
 
     /// Consumers before inputs: the order the backward pass visits nodes, so a
     /// node's cotangent is complete by the time it is reached (design.md §4.4).
+    ///
+    /// Pre-order suffices because the plan is a tree — see [`Self::sources`] for
+    /// where fan-in actually appears.
     pub fn backward_order(&self) -> impl DoubleEndedIterator<Item = NodeId> + '_ {
         // Pre-order puts every consumer before its inputs.
         self.nodes.iter().map(|n| n.id)
@@ -169,8 +188,16 @@ impl<'a> PlanIndex<'a> {
 
     /// The `Read` nodes of each named table. More than one entry means the table
     /// feeds several consumers, so its gradient is a sum (design.md §4.4).
-    pub fn sources(&self) -> BTreeMap<&RelRef, Vec<NodeId>> {
-        let mut out: BTreeMap<&RelRef, Vec<NodeId>> = BTreeMap::new();
+    ///
+    /// This is where **all** fan-in lives. A Substrait plan is a tree, so every
+    /// node has exactly one consumer and no relation is shared between two of
+    /// them; the only way one relation feeds several is by being read more than
+    /// once. design.md §4.4 describes the general DAG discipline ("process a
+    /// node only once every consumer has contributed"); on a tree that reduces
+    /// to summing across a table's reads, which is what attention's `X` and
+    /// `nn.py`'s per-layer `weight` actually need.
+    pub fn sources(&self) -> BTreeMap<&TableRef, Vec<NodeId>> {
+        let mut out: BTreeMap<&TableRef, Vec<NodeId>> = BTreeMap::new();
         for n in &self.nodes {
             if let NodeKind::Read { table: Some(t) } = &n.kind {
                 out.entry(t).or_default().push(n.id);
@@ -199,7 +226,7 @@ fn visit<'a>(
     let (kind, inputs): (NodeKind, Vec<Option<&'a Rel>>) = match rel.rel_type.as_ref() {
         Some(RelType::Read(r)) => {
             let table = match r.read_type.as_ref() {
-                Some(ReadType::NamedTable(t)) => Some(RelRef::new(t.names.iter().cloned())),
+                Some(ReadType::NamedTable(t)) => Some(TableRef::new(t.names.iter().cloned())),
                 _ => None,
             };
             (NodeKind::Read { table }, vec![])
@@ -268,10 +295,10 @@ mod tests {
                 NodeKind::Aggregate,
                 NodeKind::Join,
                 NodeKind::Read {
-                    table: Some(RelRef::new(["a"]))
+                    table: Some(TableRef::new(["a"]))
                 },
                 NodeKind::Read {
-                    table: Some(RelRef::new(["b"]))
+                    table: Some(TableRef::new(["b"]))
                 },
             ]
         );
@@ -315,8 +342,8 @@ mod tests {
         ));
         let idx = PlanIndex::build(&p).unwrap();
         let sources = idx.sources();
-        assert_eq!(sources[&RelRef::new(["x"])].len(), 2);
-        assert_eq!(sources[&RelRef::new(["wq"])].len(), 1);
+        assert_eq!(sources[&TableRef::new(["x"])].len(), 2);
+        assert_eq!(sources[&TableRef::new(["wq"])].len(), 1);
         assert_eq!(sources.len(), 3);
     }
 

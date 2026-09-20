@@ -10,7 +10,9 @@ use std::fmt;
 ///
 /// Design principle 5 — *fail loud, never silently wrong* (design.md §2) — holds
 /// one layer up: a relation or expression `ddx-ad` doesn't understand is a typed
-/// error, never something the backward walk quietly skips.
+/// error, never something the backward walk quietly skips. The variants mirror
+/// `ddx_core::DiffError`'s granularity, so a caller can tell a missing rule from
+/// a malformed request from a bug in ddx.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdError {
     /// The plan uses a relation, expression or construct ddx-ad can't
@@ -25,9 +27,21 @@ pub enum AdError {
     /// column the table doesn't have, or an output that depends on none of them.
     InvalidWrt(String),
 
-    /// A ddx marker is missing, misplaced, or malformed — or an operation that
-    /// must be tagged (design.md §2, principle 3) isn't.
-    Marker(String),
+    /// A ddx marker is malformed or sits where its meaning would be ambiguous —
+    /// a contraction marker outside a `SUM`, a marker with two arguments.
+    InvalidMarker(String),
+
+    /// An operation that must be tagged isn't (design.md §2, principle 3): a
+    /// `SUM` over a gradient-carrying column that says neither *contraction* nor
+    /// *reduction*, or a `MAX` that says neither *route* nor *stop gradient*.
+    /// The user wrote no marker at all, which is why this is not
+    /// [`AdError::InvalidMarker`].
+    Untagged(String),
+
+    /// An internal invariant was violated. Should not occur in normal use; it is
+    /// an error rather than a panic because a wrong answer and a crash are both
+    /// worse than a typed failure in a correctness-critical library.
+    Internal(String),
 }
 
 impl fmt::Display for AdError {
@@ -36,7 +50,9 @@ impl fmt::Display for AdError {
             AdError::NotImplemented(m) => write!(f, "not implemented: {m}"),
             AdError::InvalidPlan(m) => write!(f, "invalid plan: {m}"),
             AdError::InvalidWrt(m) => write!(f, "invalid wrt: {m}"),
-            AdError::Marker(m) => write!(f, "marker: {m}"),
+            AdError::InvalidMarker(m) => write!(f, "invalid marker: {m}"),
+            AdError::Untagged(m) => write!(f, "untagged operation: {m}"),
+            AdError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
 }

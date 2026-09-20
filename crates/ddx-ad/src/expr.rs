@@ -15,6 +15,7 @@ use substrait::proto::expression::{FieldReference, RexType, ScalarFunction};
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::{Expression, FunctionArgument};
 
+use crate::columns::Field;
 use crate::error::{AdError, Result};
 use crate::index::MAX_DEPTH;
 use crate::markers::{Functions, Marker};
@@ -22,9 +23,9 @@ use crate::markers::{Functions, Marker};
 /// Something the walk found.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Event<'a> {
-    /// A read of input-row field `pos`. `stopped` is true under a
+    /// A read of a position in the node's input row. `stopped` is true under a
     /// `ddx_stop_gradient` call, where no cotangent flows.
-    Field { pos: usize, stopped: bool },
+    Read { field: Field, stopped: bool },
     /// A call to a marker. `at_root` is true when the call is the whole
     /// expression walked, not a sub-expression of it.
     Marker {
@@ -45,15 +46,15 @@ pub(crate) fn walk<'a>(
 
 /// The input-row fields `e` reads outside any `ddx_stop_gradient`: the ones a
 /// cotangent on `e` can flow back into.
-pub(crate) fn differentiable_refs(e: &Expression, fns: &Functions) -> Result<Vec<usize>> {
+pub(crate) fn differentiable_refs(e: &Expression, fns: &Functions) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     walk(e, fns, &mut |ev| {
-        if let Event::Field {
-            pos,
+        if let Event::Read {
+            field,
             stopped: false,
         } = ev
         {
-            out.push(pos);
+            out.push(field);
         }
         Ok(())
     })?;
@@ -61,7 +62,7 @@ pub(crate) fn differentiable_refs(e: &Expression, fns: &Functions) -> Result<Vec
 }
 
 /// [`differentiable_refs`] over each value argument of a function call.
-pub(crate) fn args_refs(args: &[FunctionArgument], fns: &Functions) -> Result<Vec<usize>> {
+pub(crate) fn args_refs(args: &[FunctionArgument], fns: &Functions) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     for a in args {
         if let Some(ArgType::Value(e)) = &a.arg_type {
@@ -101,8 +102,8 @@ impl<'a, F: FnMut(Event<'a>) -> Result<()>> Walker<'_, F> {
         match rex {
             RexType::Literal(_) | RexType::DynamicParameter(_) => Ok(()),
             RexType::Selection(r) => {
-                let pos = root_field(r)?;
-                (self.f)(Event::Field { pos, stopped })
+                let field = root_field(r)?;
+                (self.f)(Event::Read { field, stopped })
             }
             RexType::ScalarFunction(call) => {
                 let marker = self.fns.marker(call.function_reference)?;
@@ -180,7 +181,7 @@ impl<'a, F: FnMut(Event<'a>) -> Result<()>> Walker<'_, F> {
 }
 
 /// The input-row position a plain `root_reference` field selection names.
-pub(crate) fn root_field(r: &FieldReference) -> Result<usize> {
+pub(crate) fn root_field(r: &FieldReference) -> Result<Field> {
     match &r.root_type {
         Some(RootType::RootReference(_)) => {}
         Some(RootType::OuterReference(_)) => {
@@ -206,6 +207,7 @@ pub(crate) fn root_field(r: &FieldReference) -> Result<usize> {
         _ => return Err(AdError::NotImplemented("a masked field reference".into())),
     };
     usize::try_from(field)
+        .map(Field::new)
         .map_err(|_| AdError::InvalidPlan(format!("a field reference to position {field}")))
 }
 
@@ -235,8 +237,8 @@ mod tests {
         let mut events = Vec::new();
         walk(&e, &fns(), &mut |ev| {
             events.push(match ev {
-                Event::Field { pos, stopped } => {
-                    format!("f{pos}{}", if stopped { "!" } else { "" })
+                Event::Read { field, stopped } => {
+                    format!("f{}{}", field.index(), if stopped { "!" } else { "" })
                 }
                 Event::Marker {
                     marker, at_root, ..
@@ -254,7 +256,7 @@ mod tests {
                 "f1!"
             ]
         );
-        assert_eq!(differentiable_refs(&e, &fns()).unwrap(), [0]);
+        assert_eq!(differentiable_refs(&e, &fns()).unwrap(), [Field::new(0)]);
     }
 
     #[test]

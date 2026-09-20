@@ -12,7 +12,11 @@
 //! position is resolved back to where it came from, which is what this does.
 //!
 //! Positions inside a node's expressions index its **input row**: the input's
-//! columns for a single-input relation, left's then right's for a join.
+//! columns for a single-input relation, left's then right's for a join. That is a
+//! different numbering from the node's own output columns, so the two have
+//! separate types — [`Field`] and [`Col`] — rather than both being `usize`.
+
+use std::fmt;
 
 use substrait::proto::aggregate_rel::Measure;
 use substrait::proto::consistent_partition_window_rel::WindowRelFunction;
@@ -25,13 +29,59 @@ use substrait::proto::{Expression, ReadRel, Rel, RelCommon};
 use crate::error::{AdError, Result};
 use crate::index::{NodeId, PlanIndex};
 
+/// An **output column** of a node: an index into what that node produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Col(usize);
+
+/// A position in a node's **input row**: an index into its input's columns, or —
+/// for a join — into left's followed by right's. This is what a Substrait field
+/// reference inside the node's expressions names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Field(usize);
+
+impl Col {
+    /// The column at index `i`.
+    pub const fn new(i: usize) -> Self {
+        Col(i)
+    }
+
+    /// The index.
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl Field {
+    /// The input-row position at index `i`.
+    pub const fn new(i: usize) -> Self {
+        Field(i)
+    }
+
+    /// The index.
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for Col {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "column {}", self.0)
+    }
+}
+
+impl fmt::Display for Field {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "input field {}", self.0)
+    }
+}
+
 /// Where one output column of a node comes from.
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnDef<'a> {
     /// A column of a `Read`: field `field` of its base schema, named `name`.
     Source { field: usize, name: &'a str },
     /// The node's input-row column at this position, passed through unchanged.
-    Input(usize),
+    Input(Field),
     /// A `Project` expression over the input row.
     Computed(&'a Expression),
     /// An `Aggregate` grouping key: an expression over the input row.
@@ -54,16 +104,29 @@ impl<'a> Columns<'a> {
         let mut per_node: Vec<Vec<ColumnDef<'a>>> = vec![Vec::new(); index.nodes().len()];
         for id in index.forward_order() {
             let node = index.node(id);
-            let input_width: usize = node.inputs.iter().map(|i| per_node[i.0].len()).sum();
+            let input_width: usize = node.inputs.iter().map(|i| per_node[i.index()].len()).sum();
             let defs = direct_columns(node.rel, input_width, &node.inputs, &per_node)?;
-            per_node[id.0] = apply_emit(common(node.rel), defs, id)?;
+            per_node[id.index()] = apply_emit(common(node.rel), defs, id)?;
         }
         Ok(Columns { per_node })
     }
 
-    /// The output columns of `node`.
+    /// The output columns of `node`, indexed by [`Col`].
     pub fn of(&self, node: NodeId) -> &[ColumnDef<'a>] {
-        &self.per_node[node.0]
+        &self.per_node[node.index()]
+    }
+
+    /// Where output column `col` of `node` comes from.
+    pub fn def(&self, node: NodeId, col: Col) -> Result<ColumnDef<'a>> {
+        self.of(node)
+            .get(col.index())
+            .copied()
+            .ok_or_else(|| AdError::Internal(format!("relation {node} has no {col}")))
+    }
+
+    /// Every output column of `node`.
+    pub fn cols(&self, node: NodeId) -> impl Iterator<Item = Col> {
+        (0..self.of(node).len()).map(Col::new)
     }
 
     /// How many columns `node`'s input row has.
@@ -72,29 +135,29 @@ impl<'a> Columns<'a> {
             .node(node)
             .inputs
             .iter()
-            .map(|i| self.per_node[i.0].len())
+            .map(|i| self.per_node[i.index()].len())
             .sum()
     }
 
-    /// Resolve a position in `node`'s input row to the input node and the column
-    /// of it that the position names.
+    /// Resolve a position in `node`'s input row to the input node, and the output
+    /// column *of that input*, which the position names.
     pub fn resolve_input(
         &self,
         index: &PlanIndex<'_>,
         node: NodeId,
-        pos: usize,
-    ) -> Result<(NodeId, usize)> {
-        let mut rest = pos;
+        field: Field,
+    ) -> Result<(NodeId, Col)> {
+        let mut rest = field.index();
         for &input in &index.node(node).inputs {
-            let width = self.per_node[input.0].len();
+            let width = self.per_node[input.index()].len();
             if rest < width {
-                return Ok((input, rest));
+                return Ok((input, Col::new(rest)));
             }
             rest -= width;
         }
         Err(AdError::InvalidPlan(format!(
-            "relation {node} refers to input field {pos}, but its input has only {} fields",
-            pos - rest
+            "relation {node} refers to {field}, but its input row has only {} fields",
+            field.index() - rest
         )))
     }
 }
@@ -120,7 +183,7 @@ fn direct_columns<'a>(
     inputs: &[NodeId],
     per_node: &[Vec<ColumnDef<'a>>],
 ) -> Result<Vec<ColumnDef<'a>>> {
-    let passthrough = |n: usize| (0..n).map(ColumnDef::Input);
+    let passthrough = |n: usize| (0..n).map(|i| ColumnDef::Input(Field::new(i)));
     Ok(match rel.rel_type.as_ref() {
         Some(RelType::Read(r)) => read_columns(r)?,
         Some(RelType::Filter(_) | RelType::Sort(_) | RelType::Fetch(_)) => {
@@ -133,15 +196,15 @@ fn direct_columns<'a>(
             .chain(w.window_functions.iter().map(ColumnDef::Window))
             .collect(),
         Some(RelType::Join(j)) => {
-            let left = per_node[inputs[0].0].len();
+            let left = per_node[inputs[0].index()].len();
             match j.r#type() {
                 JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer => {
                     passthrough(input_width).collect()
                 }
                 JoinType::LeftSemi | JoinType::LeftAnti => passthrough(left).collect(),
-                JoinType::RightSemi | JoinType::RightAnti => {
-                    (left..input_width).map(ColumnDef::Input).collect()
-                }
+                JoinType::RightSemi | JoinType::RightAnti => (left..input_width)
+                    .map(|i| ColumnDef::Input(Field::new(i)))
+                    .collect(),
                 JoinType::Unspecified => {
                     return Err(AdError::InvalidPlan("a join has no join type".into()))
                 }
@@ -180,8 +243,13 @@ fn direct_columns<'a>(
                 .chain(a.measures.iter().map(ColumnDef::Measure))
                 .collect()
         }
-        // `PlanIndex::build` already refused every other relation.
-        _ => unreachable!("an indexed node is always a supported relation"),
+        // `PlanIndex::build` already refused every other relation, so this is a
+        // disagreement between the two modules rather than a plan ddx can't read.
+        _ => {
+            return Err(AdError::Internal(
+                "a relation the index accepted has no column tracing".into(),
+            ))
+        }
     })
 }
 
@@ -260,12 +328,17 @@ mod tests {
     use super::*;
     use crate::test_plans::*;
 
+    /// The node at pre-order position `i`.
+    fn node(i: usize) -> NodeId {
+        NodeId::new(i)
+    }
+
     fn kinds(cols: &Columns<'_>, n: usize) -> Vec<String> {
-        cols.of(NodeId(n))
+        cols.of(node(n))
             .iter()
             .map(|d| match d {
                 ColumnDef::Source { name, .. } => format!("src:{name}"),
-                ColumnDef::Input(p) => format!("in:{p}"),
+                ColumnDef::Input(p) => format!("in:{}", p.index()),
                 ColumnDef::Computed(_) => "expr".into(),
                 ColumnDef::GroupKey(_) => "key".into(),
                 ColumnDef::Measure(_) => "measure".into(),
@@ -293,15 +366,15 @@ mod tests {
         assert_eq!(kinds(&cols, 0), ["expr", "in:2", "in:4"]);
         // Input position 4 is right's second column, `k`.
         assert_eq!(
-            cols.resolve_input(&idx, NodeId(0), 4).unwrap(),
-            (NodeId(1), 4)
+            cols.resolve_input(&idx, node(0), Field::new(4)).unwrap(),
+            (node(1), Col::new(4))
         );
         assert_eq!(
-            cols.resolve_input(&idx, NodeId(1), 4).unwrap(),
-            (NodeId(3), 1)
+            cols.resolve_input(&idx, node(1), Field::new(4)).unwrap(),
+            (node(3), Col::new(1))
         );
         assert!(matches!(
-            cols.resolve_input(&idx, NodeId(1), 6),
+            cols.resolve_input(&idx, node(1), Field::new(6)),
             Err(AdError::InvalidPlan(_))
         ));
     }
