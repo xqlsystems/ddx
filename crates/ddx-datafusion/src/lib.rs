@@ -102,7 +102,7 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 
 pub use analyzer::DdxAnalyzer;
-pub use markers::{grad_udf, jvp_udf, GRAD, JVP};
+pub use markers::{ad_marker_udfs, grad_udf, jvp_udf, AD_MARKERS, GRAD, JVP};
 pub use sql::{ddx_sql, ddx_sql_with, rewrite_sql, rewrite_sql_with};
 
 /// The engine this adapter drives, re-exported so downstream code links the
@@ -137,4 +137,29 @@ pub fn install_with(ctx: &SessionContext, analyzer: DdxAnalyzer) {
     ctx.register_udf(grad_udf());
     ctx.register_udf(jvp_udf());
     ctx.add_analyzer_rule(Arc::new(analyzer));
+}
+
+/// Register the four marker UDFs of v2 on `ctx`: `ddx_contract_mark`,
+/// `ddx_reduce_mark`, `ddx_route_mark` and `ddx_stop_gradient`. A forward query
+/// that carries these tags for reverse-mode AD then plans and runs.
+///
+/// Each marker is the identity function, so a tagged query returns the same
+/// answer as the untagged query. The tags matter only to the backward pass,
+/// which reads them from the Substrait plan (design.md §4.2).
+///
+/// ```
+/// # use datafusion::prelude::SessionContext;
+/// # #[tokio::main]
+/// # async fn main() -> datafusion::error::Result<()> {
+/// let ctx = SessionContext::new();
+/// ddx_datafusion::register_ad_markers(&ctx);
+/// let df = ctx.sql("SELECT SUM(ddx_reduce_mark(column1)) FROM (VALUES (1.0), (2.0))").await?;
+/// # let _ = df.collect().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn register_ad_markers(ctx: &SessionContext) {
+    for udf in ad_marker_udfs() {
+        ctx.register_udf(udf);
+    }
 }

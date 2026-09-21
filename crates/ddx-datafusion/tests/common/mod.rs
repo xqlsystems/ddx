@@ -39,3 +39,32 @@ pub fn f64_column(batches: &[RecordBatch]) -> Vec<f64> {
 pub fn column_type(batches: &[RecordBatch]) -> DataType {
     batches[0].schema().field(0).data_type().clone()
 }
+
+/// Every version of the crate `name` in the lockfile of the workspace. The
+/// tests that pin a dependency to one version at the type level use this
+/// function.
+pub fn locked_versions(name: &str) -> Vec<String> {
+    let lock = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../Cargo.lock")
+        .canonicalize()
+        .expect("workspace Cargo.lock must exist");
+    let text = std::fs::read_to_string(&lock).expect("Cargo.lock must be readable");
+
+    let header = format!(r#"name = "{name}""#);
+    let mut versions = Vec::new();
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            in_package = false;
+        } else if line == header {
+            in_package = true;
+        } else if in_package {
+            if let Some(v) = line.strip_prefix("version = ") {
+                versions.push(v.trim_matches('"').to_string());
+                in_package = false;
+            }
+        }
+    }
+    versions
+}

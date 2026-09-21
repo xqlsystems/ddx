@@ -8,7 +8,7 @@
 //! *values*, never the symbolic expression of its argument, but differentiation
 //! is a function of the symbolic form — so `grad` cannot be computed at
 //! runtime. (Empirically pinned on a live engine in
-//! `docs/spikes/datafusion_python_analyzer_rule_r2.py`, T4: a `grad` UDF given
+//! `docs/spikes/datafusion_python_analyzer_rule_r2.py`: a `grad` UDF given
 //! `grad(x*x, x)` over `x = [1,2,3]` receives `[1.0, 4.0, 9.0]`.)
 //!
 //! Registration exists for exactly one reason: to make the marker call *parse
@@ -101,6 +101,64 @@ pub(crate) fn marker_kind(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The query-level markers of v2, as a user writes them in SQL:
+/// `ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark` and
+/// `ddx_stop_gradient`.
+///
+/// These names belong to `ddx_ad::Marker`. This crate restates them rather than
+/// imports them, so that this crate stays publishable while `ddx-ad` is not. A
+/// test keeps the two lists in step.
+pub const AD_MARKERS: [&str; 4] = [
+    "ddx_contract_mark",
+    "ddx_reduce_mark",
+    "ddx_route_mark",
+    "ddx_stop_gradient",
+];
+
+/// A marker UDF of v2, which is the identity function.
+///
+/// A v2 marker is built to execute, and `grad` and `jvp` are not. A v2 marker
+/// tags an operation in the forward query, as in
+/// `SUM(ddx_contract_mark(a.val * b.val))`. The backward pass then reads the
+/// kind of the operation from the plan (design.md §4.2). The forward query must
+/// still run, and it must return the same answer as the untagged query.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct AdMarker {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for AdMarker {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        Ok(args.args.swap_remove(0))
+    }
+}
+
+/// The four marker UDFs of v2. [`AD_MARKERS`] lists their names.
+pub fn ad_marker_udfs() -> Vec<ScalarUDF> {
+    AD_MARKERS
+        .into_iter()
+        .map(|name| {
+            ScalarUDF::new_from_impl(AdMarker {
+                name,
+                signature: Signature::any(1, Volatility::Immutable),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

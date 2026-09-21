@@ -3,7 +3,7 @@
 _author_: Alex Merose
 _co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
 _status_: Design — iterating toward implementation
-_last updated_: 2026-07-20
+_last updated_: 2026-09-19
 
 ---
 
@@ -807,9 +807,56 @@ pub fn vjp_query(
     &self,
     plan: &Plan,              // a substrait::proto::Plan, already containing
                                // ddx's marker functions — recognized, not built
-    wrt: &[RelRef],            // which Source relations to differentiate w.r.t.
-) -> Result<BackwardProgram, DiffError>;
+    wrt: &[ColumnRef],         // which table columns to differentiate w.r.t.,
+                               // e.g. weight.val, bias.val
+) -> Result<BackwardProgram, AdError>;
 ```
+
+**Three roles, and only one of them is inferred `[S6]`.** A relation's columns
+are *dims* (the coordinates identifying a row — §1's dimensions) or *values*
+(§1's variables); differentiation splits values again, into those gradient flows
+through and *constants* like `nn.py`'s `images`. ddx infers only the last
+distinction. **Dim-ness is structural, never guessed:** which columns identify a
+row is already stated by the plan — in the join conditions and `GROUP BY` lists
+of whichever node consumes the relation — so that is where the transpose rules
+read it, and "carries no gradient" must never be read as "is a dim". The
+vocabulary is fixed as *dim* and *val* throughout (§4.3 and `nn.py` already use
+it).
+
+**The definition of *useful* is authoritative, and the two halves are
+deliberately asymmetric.** A column is *useful* when it reaches an output column
+through **value** positions only — never solely through a join condition, filter,
+grouping key, sort key or `CASE` condition, in each of which the result is
+piecewise constant and the derivative is zero almost everywhere. The
+implementation matches that definition exactly. Its partner, *varied*, matches it
+only from above: a read in a control position still makes a column varied, so a
+column can be varied whose true derivative is zero. That asymmetry is the point —
+an over-approximated *varied* costs at worst a typed error from a rule, while an
+over-approximated *useful* would demand a marker (and then a transpose rule) for
+a value that only orders rows `[S10]`.
+
+**What gets seeded is every root column, for now.** Until `vjp_query` exists to
+take the output columns explicitly, the analysis seeds *all* of the root's
+columns, so a root with two active columns describes the gradient of their sum.
+That is stated in the API rather than left implicit, and the seeded columns are
+reported back to the caller; `vjp_query` takes an explicit output selector when it
+lands (§9) `[S10]`.
+
+**Which columns carry gradient is derived, not declared per relation `[S6]`.**
+Every rule needs to know which columns are values (they get a cotangent) and
+which are coordinates or constants (the backward pass joins on them, or ignores
+them). The user names only the parameters, `wrt`; ddx runs standard AD
+*activity analysis* over the plan. A column is **active** when it is *varied*
+(depends on a parameter outside any `ddx_stop_gradient`) and *useful* (reaches
+the output through a value position, not only through a join condition,
+filter, grouping key or sort). A naming convention (`val` is the value, the rest
+are dims) was rejected: `nn.py` itself breaks it (`fwd0` carries both `z` and
+`val`; `pixels` calls its value `images`), and breaking it is a wrong gradient,
+not an error. Activity analysis also makes *tag, don't infer* checkable: an
+untagged `SUM`, or a `MAX`, over an active column is refused with an error
+naming the marker to use, while the same aggregate over data alone needs no tag.
+Softmax's shift falls out of this: `MAX(z)` wrapped in `ddx_stop_gradient` at
+its use is varied but not useful, so it needs no rule at all.
 
 `vjp_query` first walks the plan once to locate every ddx marker anchor and
 build a lightweight annotated-node index (which aggregates are contractions
@@ -821,9 +868,15 @@ rule and accumulating cotangents.
 
 **Fan-in accumulation is real, not hypothetical.** When a relation feeds more
 than one consumer — attention's `X` feeding `Wq`, `Wk`, and `Wv` — each
-consumer's contribution is summed via an ordinary elementwise-add step,
-verified in `attention_ad_spike.py` (`Xbar = Xq + Xk + Xv`, matching
-`jax.grad` to 1e-16). This is why the walk must process a node only once
+consumer's contribution is summed, verified in `attention_ad_spike.py`
+(`Xbar = Xq + Xk + Xv`, matching `jax.grad` to 1e-16). In relational form the
+sum must be `UNION ALL` then `GROUP BY` the dims, **not** an inner join of the
+contributions followed by an elementwise add: cotangents are sparse (a row
+absent from a cotangent relation is a zero), and a filter or Route produces
+exactly such gaps. `nn.py`'s `weight` is read once per layer under
+`w.layer = 0/1/2`, so each contribution covers only its own layer's rows — an
+inner join of the three matches no row at all, and the gradient comes back
+empty with no error `[S8]`. This is why the walk must process a node only once
 every one of its consumers has contributed — the standard reverse-mode-AD
 scheduling discipline, applied to a relational-node graph instead of a
 tensor-op graph.
@@ -846,7 +899,7 @@ CREATE TEMP TABLE __ddx_bwd_7 AS SELECT * FROM from_substrait($1)
 pub struct BackwardProgram {
     pub forward_steps: Vec<(Ident, Plan)>,
     pub backward_steps: Vec<(Ident, Plan)>,
-    pub gradients: HashMap<RelRef, Ident>,
+    pub gradients: HashMap<ColumnRef, Ident>,
 }
 ```
 
@@ -883,9 +936,30 @@ from ties. **Verified cross-engine:** the marker-tagging mechanism itself.
 **Found and closed, not left as a risk:** the DuckDB Substrait window-idiom
 bug (workaround verified, no upstream-fix dependency).
 
+**Refused for now, each with a named reason** (all reachable from ordinary SQL,
+so each is a typed error rather than a silent assumption): an **outer join** whose
+nullable side carries gradient, because an unmatched row holds NULL where a
+missing cotangent means zero, and no transpose rule reconciles the two; a
+**grouping key** that carries gradient, since a key is a dim; `SUM(DISTINCT …)`;
+grouping sets; and a `ddx_stop_gradient` in a position where it would cut nothing.
+
 **Genuinely open:**
 - The physical fused-contraction operator for BLAS-class performance on
   dense data (§4.1) — not yet spiked.
+- **`UNION ALL` is not yet readable, though `[S8]` makes it the primitive the
+  backward pass *emits*.** A `SetRel` is currently refused, which is loud and
+  safe, but it means ddx cannot read its own output — so the higher-order
+  question below is closed off more firmly than "undecided" suggests, and a
+  forward query that unions per-layer parameter tables is turned away too.
+  `SetRel` with `op = UNION_ALL` is the cheapest relation to add when either case
+  is wanted.
+- **What a cast to an integer type does to a gradient.** `CAST(val AS BIGINT)` is
+  a floor: its true derivative is zero almost everywhere, but both layers
+  currently differentiate through it as if it were the identity (v1's `Cast`
+  rule, §3.2; v2's activity analysis treats the column as varied). The candidates
+  are "an integral cast is a stop-gradient" and "an integral cast over an active
+  value is a typed refusal". It wants settling once, for both layers, alongside
+  §3.8's neighbouring problem — the primal's arithmetic not being ddx's.
 - Higher-order AD over an already-emitted backward query (differentiating
   ddx's own generated plan a second time) — the backward output is currently
   unmarked by design (§4.3); whether it needs markers for this case is
@@ -1110,6 +1184,12 @@ breadth, not de-risking.
 - **Higher-order AD over an emitted v2 backward plan** — genuinely
   undecided (§4.6); revisit once M4 has a working single-order emitter to
   reason about concretely.
+- **How `vjp_query` names the output it differentiates.** The analysis seeds
+  every root column today (§4.4), which is the gradient of their sum — right for
+  a query that returns just a loss, wrong for one returning a loss next to a
+  metric. Either `vjp_query` takes the output columns, or it refuses a root with
+  more than one active column. Decide with the emitter in M4, since the
+  signature is the place it shows up.
 
 ---
 
@@ -1118,7 +1198,8 @@ breadth, not de-risking.
 This is the audit trail behind the design above: findings from two rounds of
 adversarial review on v1 (`F1`–`F12`, `G1`–`G9`), the spikes that resolved
 open research questions (`R1`, `R1b`, `R2`), the answered decision points
-(`Q1`–`Q7`), and the v2 pivot from a bespoke IR to Substrait (`S1`–`S5`). Each
+(`Q1`–`Q7`), and the v2 pivot from a bespoke IR to Substrait and what building
+it settled (`S1`–`S10`). Each
 entry is referenced from the main text where it applies; nothing here changes
 the design as stated above — it's the evidence for why it's stated that way.
 
@@ -1430,6 +1511,89 @@ first concrete instance; more rules (LayerNorm, conv) will likely surface
 more. The resolution pattern each time: spike the forward idiom against
 both engines before trusting a rule, and prefer a verified workaround over
 waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
+
+**S6 — Values vs. coordinates: activity analysis from `wrt`, not a naming
+convention.** Settled at the start of M3. The rules need every column
+classified as gradient-carrying or not; the two candidates were a convention
+(one value column named `val` per relation) and deriving it from the
+parameters the user names. The convention was rejected because `nn.py` breaks
+it in three places and a break is silent. Implemented as varied ∧ useful
+activity analysis over the Substrait plan, erring towards "varied": a false
+positive costs a typed error from a rule, a false negative a dropped gradient.
+→ §4.4.
+
+**S7 — Markers are recognized by name; there is no URN to read.** Checked
+against DataFusion 54's producer while building the recognizer: every
+function, built-in and marker alike, is declared with a bare name and
+`extension_urn_reference = u32::MAX` (Substrait 0.63 moved from URIs to URNs;
+DataFusion fills in neither). This confirms `[S2]`'s nuance and settles the
+recognizer: case-folded name match, ignoring any `:signature` suffix. It also
+means the backward emitter must declare the functions it calls under each
+engine's own names — a per-engine name table, one layer down from v1's
+dialect-normalization table. → §4.2.
+
+**S8 — Fan-in must be `UNION ALL` + `GROUP BY`, not an elementwise add.** The
+original text of §4.4 said contributions are summed by an "ordinary
+elementwise-add step". Relationally that is an inner join of the
+contributions, which silently drops every row missing from any of them — and
+sparse cotangents are the norm (filters, Route, and `nn.py`'s per-layer
+`weight` reads). Corrected in §4.4 before the emitter was written.
+
+**S9 — The vocabulary, fixed once (an ontology pass over M3's first half).**
+Reviewing the analysis code against this document's own words turned up four
+concepts named two or three ways each, and two names that actively misled:
+- *`RelRef` → `TableRef`.* In Substrait a "Rel" is any relation node, while only
+  a **named table** can be differentiated with respect to. The old name collided
+  with the `Rel` the index itself holds.
+- *`Param` → `ColumnRef`.* The unit is a table column, and it needn't be a
+  *parameter*: `attention_ad_spike.py` differentiates with respect to `X`, the
+  input. `ColumnRef` also makes it the plain twin of `ddx-core`'s `ColRef`, the
+  same concept one layer up. `BackwardProgram.gradients` is keyed by it.
+- *dim / val, one spelling each*, replacing dim ~ coordinate ~ key and
+  val ~ variable ~ value used interchangeably.
+- *Marker names match rule names* (`Contraction`, not `Contract`), with two
+  asymmetries now stated rather than implied: there are four markers and five
+  rules because Elementwise needs none, and `ddx_stop_gradient` is not a tag
+  like the other three — it *changes* the gradient, where they only classify an
+  operation whose gradient is already determined.
+Also: an aggregate's identity now comes from a one-place name table
+(`AggKind::from_name`) instead of `"sum"`/`"max"` literals in the rules, which is
+the recognizer half of the per-engine table `[S7]` says the emitter needs; the
+positions "output column of a node" and "field of a node's input row" are
+separate types rather than both `usize`; and the error type distinguishes a
+*malformed* marker from an *untagged* operation, with an `Internal` variant so an
+invariant between two modules is a typed error rather than a panic.
+
+
+**S10 — What an adversarial review of the analysis changed.** The analysis was
+reviewed against this document, line by line, before any rule was built on it.
+Two findings were *false refusals* of SQL the design tells users to write, and
+both were fixed rather than documented:
+- **A coerced marker.** Summing a `REAL` column makes DataFusion coerce, and the
+  cast lands *around* the marker: `sum(CAST(ddx_reduce_mark(fval) AS Float64))`.
+  The marker was then refused as "not the whole argument" of the SUM it was in
+  fact written inside. Placement now compares against the cast-peeled expression.
+  The irony is instructive: v1 chose `Signature::any` precisely so coercion could
+  not inject a cast *inside* a marker's argument (§3.3), and v2 re-opened the same
+  hole from the other side.
+- **Control positions leaking into *useful*.** A value reaching the output only
+  through a window's `ORDER BY`, or only through a `CASE` condition, was treated
+  as reaching it at all — so an untagged `SUM` feeding a sort key was refused for
+  want of a marker it never needed. Reads are now reported with the kind of
+  position they sit in, and the two halves of activity analysis consume them
+  differently, which is what makes the asymmetry in §4.4 real rather than
+  aspirational.
+
+Three were *silent-wrong* shapes, closed while the rules are still unwritten: an
+outer join over a gradient-carrying column, a deprecated Substrait argument form
+(`AggregateFunction.args`) that made an aggregate look like it read nothing — and
+therefore need no tag — and two spellings of one table (`w` and `public.w`)
+becoming two tables, which halves a gradient. `COUNT` over a value is no longer
+refused (a row count's derivative is zero, which is what makes §4.3's mean recipe
+expressible), a wrt column that reaches no output is refused per column rather
+than only when *every* column is dead, and a `ddx_stop_gradient` that would cut
+nothing is refused rather than silently doing nothing.
+
 
 ---
 
