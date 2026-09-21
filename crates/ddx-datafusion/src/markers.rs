@@ -103,12 +103,13 @@ pub(crate) fn marker_kind(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The query-level (v2) markers, as written in SQL: `ddx_contract_mark`,
-/// `ddx_reduce_mark`, `ddx_route_mark`, `ddx_stop_gradient`.
+/// The query-level markers of v2, as a user writes them in SQL:
+/// `ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark` and
+/// `ddx_stop_gradient`.
 ///
-/// The names are `ddx_ad::Marker`'s, restated rather than imported so this
-/// crate stays publishable while `ddx-ad` isn't yet; a test holds the two lists
-/// together.
+/// These names belong to `ddx_ad::Marker`. This crate restates them rather than
+/// imports them, so that this crate stays publishable while `ddx-ad` is not. A
+/// test keeps the two lists in step.
 pub const AD_MARKERS: [&str; 4] = [
     "ddx_contract_mark",
     "ddx_reduce_mark",
@@ -116,12 +117,13 @@ pub const AD_MARKERS: [&str; 4] = [
     "ddx_stop_gradient",
 ];
 
-/// A v2 marker UDF: the identity function.
+/// A marker UDF of v2, which is the identity function.
 ///
-/// Unlike `grad`/`jvp`, a v2 marker is *meant* to execute. It tags an operation
-/// in the forward query — `SUM(ddx_contract_mark(a.val * b.val))` — so the
-/// backward pass can read what the operation is off the plan (design.md §4.2),
-/// and the forward query itself must still run and return the unmarked answer.
+/// A v2 marker is built to execute, and `grad` and `jvp` are not. A v2 marker
+/// tags an operation in the forward query, as in
+/// `SUM(ddx_contract_mark(a.val * b.val))`. The backward pass then reads the
+/// kind of the operation from the plan (design.md §4.2). The forward query must
+/// still run, and it must return the same answer as the untagged query.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AdMarker {
     name: &'static str,
@@ -146,7 +148,7 @@ impl ScalarUDFImpl for AdMarker {
     }
 }
 
-/// The four v2 marker UDFs (see [`AD_MARKERS`]).
+/// The four marker UDFs of v2. [`AD_MARKERS`] lists their names.
 pub fn ad_marker_udfs() -> Vec<ScalarUDF> {
     AD_MARKERS
         .into_iter()

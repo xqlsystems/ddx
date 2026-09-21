@@ -5,11 +5,13 @@
 //! The annotated-node index: a flat view of a Substrait plan for the backward
 //! walk (design.md §4.4).
 //!
-//! This is an implementation detail of the walker, not a competing IR — the same
-//! relationship `ddx-core`'s `ColRef` has to `sqlparser::ast::Expr`. Each node
-//! borrows its `Rel` from the plan, which stays the source of truth; the index
-//! only adds what the walk needs to schedule itself: which node consumes which,
-//! and which named tables feed the plan.
+//! The index is an implementation detail of the walker and not a second IR. It
+//! stands in the same relation to a Substrait plan as `ColRef` in `ddx-core`
+//! stands to `sqlparser::ast::Expr`. Each node borrows its `Rel` from the plan,
+//! and the plan remains the source of truth.
+//!
+//! The index adds only what the walk needs to schedule itself: which node
+//! consumes which, and which named tables feed the plan.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,18 +23,19 @@ use substrait::proto::{Plan, Rel};
 
 use crate::error::{AdError, Result};
 
-/// A reference to a named table the plan reads. The unit a gradient is taken
-/// with respect to is a column of one of these (see [`crate::ColumnRef`]).
+/// A reference to a named table that the plan reads. A gradient is taken with
+/// respect to a column of such a table (see [`crate::ColumnRef`]).
 ///
-/// Named `TableRef`, not `RelRef`: in Substrait — and in [`Node::rel`] right
-/// below — a *relation* is any node of the plan, while only a named table can be
-/// differentiated with respect to. (design.md §4.4 called this `RelRef`; the
-/// doc follows the code.)
+/// The name is `TableRef` and not `RelRef`, because in Substrait a relation is
+/// any node of the plan, including the [`Node::rel`] field below. Only a named
+/// table can be differentiated with respect to. design.md §4.4 called this type
+/// `RelRef`, and the document now follows the code.
 ///
-/// Substrait plans are trees, so a table read twice appears as two `Read` nodes;
-/// `TableRef` is what joins them back together. That is where fan-in shows up: a
-/// parameter table read once per layer of a model, say, contributes a gradient
-/// term per read, and they must be summed (design.md §4.4).
+/// A Substrait plan is a tree, so a table that the plan reads twice appears as
+/// two `Read` nodes. `TableRef` joins the two reads back together, which is
+/// where fan-in appears. A parameter table that a model reads once per layer
+/// contributes one gradient term per read, and ddx sums the terms
+/// (design.md §4.4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableRef(Vec<String>);
 
@@ -58,23 +61,24 @@ impl fmt::Display for TableRef {
     }
 }
 
-/// A node's position in the index. Ids are assigned in pre-order, so a node's id
-/// is always smaller than any of its inputs'.
+/// The position of a node in the index. ddx assigns the ids in pre-order, so the
+/// id of a node is always smaller than the id of each of its inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub(crate) usize);
 
 impl NodeId {
     /// The node at pre-order position `i`.
     ///
-    /// Test-only: a `NodeId` indexes one analysed plan, so callers — including
-    /// ddx's own rules — take theirs from [`PlanIndex::nodes`] or [`Node::inputs`]
-    /// rather than building one that may not exist.
+    /// This function is for tests. A `NodeId` indexes one analysed plan, so every
+    /// caller, the rules of ddx included, takes a `NodeId` from
+    /// [`PlanIndex::nodes`] or from [`Node::inputs`]. A `NodeId` built by hand
+    /// can name a node that does not exist.
     #[cfg(test)]
     pub(crate) const fn new(i: usize) -> Self {
         NodeId(i)
     }
 
-    /// The id as an index into [`PlanIndex::nodes`].
+    /// The id as an index into the slice that [`PlanIndex::nodes`] returns.
     pub const fn index(self) -> usize {
         self.0
     }
@@ -86,11 +90,12 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// What a relation is, as far as the backward walk cares.
+/// What a relation is, in the terms that the backward walk needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
-    /// A leaf read. `table` is `Some` only for a named table — the only kind a
-    /// gradient can be taken with respect to.
+    /// A leaf read. The `table` field is `Some` only for a named table. A named
+    /// table is the only kind of read that a gradient can be taken with respect
+    /// to.
     Read {
         table: Option<TableRef>,
     },
@@ -98,13 +103,13 @@ pub enum NodeKind {
     Project,
     Join,
     Aggregate,
-    /// A `ConsistentPartitionWindowRel` — a window as its own *relation*.
+    /// A `ConsistentPartitionWindowRel`, which is a window as its own relation.
     ///
-    /// Route's forward idiom does **not** land here on every engine: DataFusion
-    /// 54 emits `ROW_NUMBER() OVER (…)` as a window-function *expression inside
-    /// a `Project`* (verified against its producer), so the Route rule's subject
-    /// is that expression, not this node kind. This variant exists because a
-    /// producer may legitimately use the relation form instead.
+    /// The forward idiom for Route does not always produce this node. DataFusion
+    /// 54 emits `ROW_NUMBER() OVER (…)` as a window-function expression inside a
+    /// `Project`, which was checked against its producer. The subject of the
+    /// Route rule is therefore that expression and not this node kind. This
+    /// variant exists because another producer can use the relation form.
     Window,
     Sort,
     Fetch,
@@ -117,9 +122,11 @@ pub struct Node<'a> {
     pub kind: NodeKind,
     /// The relation itself, borrowed from the plan.
     pub rel: &'a Rel,
-    /// The relations feeding this one, in the order Substrait lists them.
+    /// The relations that feed this one, in the order that Substrait lists
+    /// them.
     pub inputs: Vec<NodeId>,
-    /// The relation consuming this one; `None` for the plan's root.
+    /// The relation that consumes this one. It is `None` for the root of the
+    /// plan.
     pub consumer: Option<NodeId>,
 }
 
@@ -131,10 +138,11 @@ pub struct PlanIndex<'a> {
 }
 
 impl<'a> PlanIndex<'a> {
-    /// Index `plan`, which must have exactly one root relation.
+    /// Index `plan`. The plan must have exactly one root relation.
     ///
-    /// A relation with no [`NodeKind`] is an [`AdError::NotImplemented`] naming
-    /// it: the walk refuses a plan it can't fully see rather than skip part of it.
+    /// A relation with no [`NodeKind`] produces an [`AdError::NotImplemented`]
+    /// that names the relation. The walk refuses a plan that it cannot see in
+    /// full, and never passes over part of one.
     pub fn build(plan: &'a Plan) -> Result<Self> {
         let [plan_rel] = plan.relations.as_slice() else {
             return Err(AdError::InvalidPlan(format!(
@@ -155,7 +163,7 @@ impl<'a> PlanIndex<'a> {
         Ok(PlanIndex { nodes, root_names })
     }
 
-    /// Every node, indexed by [`NodeId`], in pre-order.
+    /// Every node in pre-order, indexed by [`NodeId`].
     pub fn nodes(&self) -> &[Node<'a>] {
         &self.nodes
     }
@@ -165,46 +173,53 @@ impl<'a> PlanIndex<'a> {
         &self.nodes[id.0]
     }
 
-    /// The plan's root: the relation nothing consumes.
+    /// The root of the plan, which is the relation that nothing consumes.
     pub fn root(&self) -> NodeId {
         NodeId(0)
     }
 
-    /// The root's output column names, when the plan carries them (a `RelRoot`
-    /// does; a bare `Rel` root doesn't).
+    /// The names of the output columns of the root, when the plan carries them.
+    /// A `RelRoot` carries the names. A bare `Rel` root does not.
     pub fn root_names(&self) -> &'a [String] {
         self.root_names
     }
 
-    /// Consumers before inputs: the order the backward pass visits nodes, so a
-    /// node's cotangent is complete by the time it is reached (design.md §4.4).
+    /// Consumers before inputs, which is the order in which the backward pass
+    /// visits nodes. The cotangent of a node is complete when the walk reaches
+    /// the node (design.md §4.4).
     ///
-    /// Pre-order suffices because the plan is a tree — see [`Self::sources`] for
-    /// where fan-in actually appears.
+    /// Pre-order is enough here because the plan is a tree. [`Self::sources`]
+    /// describes where fan-in appears.
     pub fn backward_order(&self) -> impl DoubleEndedIterator<Item = NodeId> + '_ {
         // Pre-order puts every consumer before its inputs.
         self.nodes.iter().map(|n| n.id)
     }
 
-    /// Inputs before consumers: the order forward facts (column shapes,
-    /// dependence on a parameter) are computed in.
+    /// Inputs before consumers, which is the order in which ddx computes the
+    /// forward facts. Those facts are the shape of each column, and the
+    /// dependence of a column on a wrt column.
     pub fn forward_order(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.backward_order().rev()
     }
 
-    /// The `Read` nodes of each named table. More than one entry means the table
-    /// feeds several consumers, so its gradient is a sum (design.md §4.4).
+    /// The `Read` nodes of each named table. Two or more entries mean that the
+    /// table feeds several consumers, so its gradient is a sum (design.md §4.4).
     ///
-    /// This is where **all** fan-in lives. A Substrait plan is a tree, so every
-    /// node has exactly one consumer and no relation is shared between two of
-    /// them; the only way one relation feeds several is by being read more than
-    /// once. That tree property is not inherent to Substrait — it holds because
-    /// [`Self::build`] refuses a plan with several roots and any relation that
-    /// references another (`ReferenceRel`). Relaxing either, to support shared
-    /// CTE subtrees, would make [`Self::backward_order`] an invalid schedule. design.md §4.4 describes the general DAG discipline ("process a
-    /// node only once every consumer has contributed"); on a tree that reduces
-    /// to summing across a table's reads, which is what a parameter table read
-    /// once per layer, or an input read by several projections, actually needs.
+    /// All fan-in appears here. A Substrait plan is a tree, so every node has
+    /// exactly one consumer and no two consumers share a relation. One relation
+    /// feeds several consumers only when the plan reads it more than once.
+    ///
+    /// Substrait itself does not guarantee the tree property. It holds because
+    /// [`Self::build`] refuses a plan with several roots, and refuses any
+    /// relation that references another one (`ReferenceRel`). If a later change
+    /// relaxes either refusal to support shared CTE subtrees,
+    /// [`Self::backward_order`] stops being a valid schedule.
+    ///
+    /// design.md §4.4 states the general rule for a DAG: process a node only
+    /// after every consumer of that node has contributed. On a tree the rule
+    /// reduces to a sum across the reads of one table. That is what a parameter
+    /// table read once per layer needs, and what an input read by several
+    /// projections needs.
     pub fn sources(&self) -> BTreeMap<&TableRef, Vec<NodeId>> {
         let mut out: BTreeMap<&TableRef, Vec<NodeId>> = BTreeMap::new();
         for n in &self.nodes {
@@ -216,14 +231,13 @@ impl<'a> PlanIndex<'a> {
     }
 }
 
-/// How deep a plan may nest, as a guard on the recursion below: a plan deeper
-/// than this is refused rather than risking the stack.
+/// How deep a plan can nest. This is a guard on the recursion below, and ddx
+/// refuses a deeper plan rather than risk the stack.
 ///
-/// The bound is arbitrary and generous, not derived. (Decoding gives a smaller
-/// one for free — prost stops at 100 nested *messages*, and a Substrait relation
-/// is several messages deep, so a decoded plan bottoms out well before this —
-/// but an in-memory plan never went through the decoder, which is the case this
-/// guard exists for.)
+/// The bound is generous and it is not derived from anything. Decoding gives a
+/// smaller bound at no cost, because prost stops at 100 nested messages and a
+/// Substrait relation is several messages deep. A plan built in memory never
+/// passes through the decoder, and that is the case this guard exists for.
 pub(crate) const MAX_DEPTH: usize = 128;
 
 fn visit<'a>(
@@ -280,8 +294,8 @@ fn visit<'a>(
     Ok(id)
 }
 
-/// The variant name of a relation, read off its `Debug` form so the list can't
-/// drift from the `substrait` version the crate is pinned to.
+/// The variant name of a relation, taken from its `Debug` form. The list of
+/// names cannot drift from the `substrait` version that the crate pins.
 fn rel_name(t: &RelType) -> String {
     let dbg = format!("{t:?}");
     match dbg.split_once('(') {
@@ -296,7 +310,7 @@ mod tests {
     use crate::test_plans::*;
     use substrait::proto::{plan_rel, PlanRel, SetRel};
 
-    /// `SELECT … FROM a JOIN b GROUP BY …` — the shape of a contraction.
+    /// `SELECT … FROM a JOIN b GROUP BY …`, which is the shape of a contraction.
     #[test]
     fn indexes_a_join_aggregate() {
         let p = plan(aggregate(
@@ -325,8 +339,8 @@ mod tests {
         assert_eq!(idx.node(NodeId(2)).consumer, Some(NodeId(1)));
     }
 
-    /// The property the backward walk depends on: a node is reached only after
-    /// the node consuming it.
+    /// The property that the backward walk depends on. The walk reaches a node
+    /// only after it reaches the node that consumes it.
     #[test]
     fn backward_order_visits_consumers_first() {
         let p = plan(aggregate(
@@ -350,7 +364,8 @@ mod tests {
         assert_eq!(fwd, order.into_iter().rev().collect::<Vec<_>>());
     }
 
-    /// Attention's `X` feeding several projections: one table, several reads.
+    /// One table with several reads, as an input that feeds several projections
+    /// produces.
     #[test]
     fn a_table_read_twice_is_fan_in() {
         let p = plan(join(

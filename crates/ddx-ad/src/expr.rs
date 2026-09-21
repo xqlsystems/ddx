@@ -2,21 +2,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! A walk over one Substrait expression, reporting the two things analysis
-//! needs from it: which input fields it reads, and where the ddx markers are.
+//! A walk over one Substrait expression. The walk reports the two things that
+//! analysis needs: which input fields the expression reads, and where the ddx
+//! markers are.
 //!
-//! Each read is reported with the kind of position it sits in, because the two
+//! Each read carries the kind of position that it sits in, because the two
 //! halves of activity analysis need different answers (see [`Reads`]):
 //!
-//! - a **value** position contributes to the expression's value, so a cotangent
-//!   can flow back into it;
-//! - a **control** position only selects or orders rows — a `CASE` condition, a
-//!   window's `PARTITION BY`/`ORDER BY`. The result is piecewise constant in
-//!   such a read, so its derivative is zero almost everywhere.
+//! - A value position contributes to the value of the expression, so a
+//!   cotangent can flow back into it.
+//! - A control position only selects or orders rows. A `CASE` condition and the
+//!   `PARTITION BY` or `ORDER BY` of a window are control positions. The result
+//!   is piecewise constant in such a read, so its derivative is zero almost
+//!   everywhere.
 //!
-//! Anything the walk can't see into — a subquery, a lambda, a nested-field
-//! reference — is [`AdError::NotImplemented`] rather than "reads nothing": a
-//! dependency the walk missed is a gradient it would silently drop.
+//! The walk cannot see into a subquery, a lambda, or a reference to a nested
+//! field. Each of these produces an [`AdError::NotImplemented`] rather than a
+//! report of no reads. A dependency that the walk misses is a gradient that ddx
+//! would drop in silence.
 
 use substrait::proto::consistent_partition_window_rel::WindowRelFunction;
 use substrait::proto::expression::field_reference::{ReferenceType, RootType};
@@ -33,13 +36,14 @@ use crate::markers::{Functions, Marker};
 /// Which reads a caller wants back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reads {
-    /// Only value positions: where a cotangent can flow. This is what *useful*
-    /// is defined as (design.md §4.4) — reaching the output "not only through a
-    /// join condition, filter, grouping key or sort".
+    /// Only value positions, which are the positions a cotangent can flow into.
+    /// This matches the definition of *useful* in design.md §4.4: a column
+    /// reaches the output, and not only through a join condition, a filter, a
+    /// grouping key or a sort key.
     Value,
-    /// Value *and* control positions: anything the expression's result could
-    /// depend on. This is the *varied* side, which deliberately
-    /// over-approximates.
+    /// Value positions and control positions, which together cover everything
+    /// the result of the expression can depend on. This is the *varied* side,
+    /// and it over-approximates on purpose.
     Varied,
 }
 
@@ -49,20 +53,23 @@ impl Reads {
     }
 }
 
-/// Something the walk found.
+/// Something that the walk found.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Event<'a> {
-    /// A read of a position in the node's input row.
+    /// A read of a position in the input row of the node.
     Read {
         field: Field,
-        /// Inside a `ddx_stop_gradient` call, where no cotangent flows.
+        /// The read is inside a `ddx_stop_gradient` call, where no cotangent
+        /// flows.
         stopped: bool,
-        /// In a position that only selects or orders rows and never contributes
-        /// to the value: a `CASE` condition, a window `PARTITION BY`/`ORDER BY`.
+        /// The read is in a position that only selects or orders rows and never
+        /// contributes to the value. A `CASE` condition is one such position,
+        /// and so is the `PARTITION BY` or `ORDER BY` of a window.
         control: bool,
     },
-    /// A call to a marker. `at_root` is true when the call is the whole
-    /// expression walked, not a sub-expression of it.
+    /// A call to a marker. The `at_root` field is true when the call is the
+    /// whole expression that the walk started from, and false when the call is a
+    /// sub-expression.
     Marker {
         marker: Marker,
         call: &'a ScalarFunction,
@@ -70,7 +77,7 @@ pub(crate) enum Event<'a> {
     },
 }
 
-/// Walk `e`, calling `f` for every field read and marker call in it.
+/// Walk `e` and call `f` for every field read and every marker call in `e`.
 pub(crate) fn walk<'a>(
     e: &'a Expression,
     fns: &Functions,
@@ -79,8 +86,8 @@ pub(crate) fn walk<'a>(
     Walker { fns, f }.expr(e, Where::default(), 0)
 }
 
-/// The input-row fields `e` reads, outside any `ddx_stop_gradient`, in the
-/// positions `which` asks for.
+/// The input-row fields that `e` reads outside any `ddx_stop_gradient`, in the
+/// positions that `which` asks for.
 pub(crate) fn refs(e: &Expression, fns: &Functions, which: Reads) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     walk(e, fns, &mut |ev| {
@@ -112,13 +119,14 @@ pub(crate) fn args_refs(
     Ok(out)
 }
 
-/// Every value expression an aggregate function reads.
+/// Every value expression that an aggregate function reads.
 ///
-/// Both argument forms, because `arguments` superseded `args` without removing
-/// it: a producer still emitting the deprecated field would otherwise look like
-/// an aggregate over nothing — not varied, not active, and so never checked for
-/// a tag, which is a silent zero gradient rather than a refusal. The deprecated
-/// forms of a scalar call, a window call and a grouping are handled the same way.
+/// This function reads both argument forms, because `arguments` replaced `args`
+/// without removing it. An aggregate from a producer that still emits the
+/// deprecated field would otherwise appear to read nothing. Such an aggregate is
+/// neither varied nor active, so ddx never checks it for a tag. The result is a
+/// zero gradient in silence, where a refusal belongs. ddx treats the deprecated
+/// forms of a scalar call, a window call and a grouping the same way.
 pub(crate) fn agg_value_exprs(f: &AggregateFunction) -> Vec<&Expression> {
     #[allow(deprecated)]
     value_args(&f.arguments)
@@ -127,7 +135,7 @@ pub(crate) fn agg_value_exprs(f: &AggregateFunction) -> Vec<&Expression> {
         .collect()
 }
 
-/// The input-row fields an aggregate function reads.
+/// The input-row fields that an aggregate function reads.
 pub(crate) fn agg_refs(f: &AggregateFunction, fns: &Functions, which: Reads) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     for e in agg_value_exprs(f) {
@@ -136,15 +144,15 @@ pub(crate) fn agg_refs(f: &AggregateFunction, fns: &Functions, which: Reads) -> 
     Ok(out)
 }
 
-/// The input-row fields a window relation's function reads: its own arguments,
-/// plus — for [`Reads::Varied`] — the partition and sort expressions the
-/// *relation* holds.
+/// The input-row fields that the function of a window relation reads. These are
+/// the arguments of the function. For [`Reads::Varied`] they also include the
+/// partition expressions and the sort expressions that the relation holds.
 ///
-/// A `WindowRelFunction` has no partitions or sorts of its own; a
-/// consistent-partition window shares them across every function in it. Reading
-/// only `arguments` would make `ROW_NUMBER() OVER (ORDER BY val)` unvaried here
-/// while the same window written as an expression inside a projection is varied.
-/// Same SQL, same answer, whichever form the producer chose.
+/// A `WindowRelFunction` has no partitions or sorts of its own, because a
+/// consistent-partition window shares them across every function in it. A read
+/// of `arguments` alone would make `ROW_NUMBER() OVER (ORDER BY val)` unvaried
+/// here. The same window written as an expression inside a projection is
+/// varied. The same SQL gives the same answer for either form.
 pub(crate) fn window_rel_refs(
     w: &WindowRelFunction,
     partitions: &[Expression],
@@ -166,13 +174,14 @@ pub(crate) fn window_rel_refs(
     Ok(out)
 }
 
-/// `e` with any casts peeled off its root.
+/// `e` with every cast removed from its root.
 ///
-/// An engine's type coercion wraps a marker rather than replacing it: summing a
-/// `REAL` column makes DataFusion plan `sum(CAST(ddx_reduce_mark(fval) AS
-/// Float64))`, where the marker is no longer the root of the measure's argument
-/// even though the user wrote it there. A cast around an identity marker is still
-/// that marker, so placement checks compare against the peeled expression.
+/// Type coercion in an engine wraps a marker and does not replace it. A `SUM`
+/// over a `REAL` column makes DataFusion plan
+/// `sum(CAST(ddx_reduce_mark(fval) AS Float64))`. The marker is then not the
+/// root of the argument of the measure, although the user wrote it there. A cast
+/// around an identity marker is still that marker, so the placement checks
+/// compare against the expression that this function returns.
 pub(crate) fn peel_casts(e: &Expression) -> &Expression {
     let mut e = e;
     for _ in 0..MAX_DEPTH {
@@ -197,7 +206,7 @@ pub(crate) fn value_args(args: &[FunctionArgument]) -> Vec<&Expression> {
         .collect()
 }
 
-/// Where in an expression the walk currently is.
+/// The position in an expression that the walk has reached.
 #[derive(Debug, Clone, Copy, Default)]
 struct Where {
     stopped: bool,
@@ -330,7 +339,8 @@ impl<'a, F: FnMut(Event<'a>) -> Result<()>> Walker<'_, F> {
     }
 }
 
-/// The input-row position a plain `root_reference` field selection names.
+/// The input-row position that a plain `root_reference` field selection
+/// names.
 pub(crate) fn root_field(r: &FieldReference) -> Result<Field> {
     match &r.root_type {
         Some(RootType::RootReference(_)) => {}
@@ -361,7 +371,7 @@ pub(crate) fn root_field(r: &FieldReference) -> Result<Field> {
         .map_err(|_| AdError::InvalidPlan(format!("a field reference to position {field}")))
 }
 
-/// The variant name of an expression, read off its `Debug` form.
+/// The variant name of an expression, taken from its `Debug` form.
 fn variant_name(r: &RexType) -> String {
     let dbg = format!("{r:?}");
     match dbg.split_once('(') {
@@ -420,8 +430,8 @@ mod tests {
         assert_eq!(refs(&e, &fns(), Reads::Value).unwrap(), [Field::new(0)]);
     }
 
-    /// A `CASE` condition selects a branch rather than contributing a value, and
-    /// the two halves of activity analysis want different answers about it.
+    /// A `CASE` condition selects a branch and contributes no value. The two
+    /// halves of activity analysis need different answers about such a read.
     #[test]
     fn a_condition_is_a_control_read_not_a_value_read() {
         let e = if_then(

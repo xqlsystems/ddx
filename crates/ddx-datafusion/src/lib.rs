@@ -139,13 +139,13 @@ pub fn install_with(ctx: &SessionContext, analyzer: DdxAnalyzer) {
     ctx.add_analyzer_rule(Arc::new(analyzer));
 }
 
-/// Register the query-level (v2) marker UDFs on `ctx` — `ddx_contract_mark`,
-/// `ddx_reduce_mark`, `ddx_route_mark` and `ddx_stop_gradient` — so a forward
-/// query tagged for reverse-mode AD plans and runs.
+/// Register the four marker UDFs of v2 on `ctx`: `ddx_contract_mark`,
+/// `ddx_reduce_mark`, `ddx_route_mark` and `ddx_stop_gradient`. A forward query
+/// that carries these tags for reverse-mode AD then plans and runs.
 ///
-/// Each is the identity: a marked query returns exactly what the unmarked one
-/// does. The tags matter only to the backward pass, which reads them off the
-/// Substrait plan (design.md §4.2).
+/// Each marker is the identity function, so a tagged query returns the same
+/// answer as the untagged query. The tags matter only to the backward pass,
+/// which reads them from the Substrait plan (design.md §4.2).
 ///
 /// ```
 /// # use datafusion::prelude::SessionContext;

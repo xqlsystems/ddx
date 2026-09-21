@@ -6,41 +6,45 @@
 
 use std::fmt;
 
-/// An error produced while analysing or differentiating a plan.
+/// An error from the analysis or the differentiation of a plan.
 ///
-/// Design principle 5 — *fail loud, never silently wrong* (design.md §2) — holds
-/// one layer up: a relation or expression `ddx-ad` doesn't understand is a typed
-/// error, never something the backward walk quietly skips. The variants mirror
-/// `ddx_core::DiffError`'s granularity, so a caller can tell a missing rule from
-/// a malformed request from a bug in ddx.
+/// Design principle 5 in design.md §2 is "fail loud, never silently wrong", and
+/// it holds one layer up as well. A relation or an expression that `ddx-ad` does
+/// not understand becomes one of these errors. The backward walk never passes
+/// over such a relation in silence.
+///
+/// The variants match the granularity of `ddx_core::DiffError`. A caller can
+/// tell a missing rule from a malformed request, and both from a defect in ddx.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdError {
-    /// The plan uses a relation, expression or construct ddx-ad can't
-    /// differentiate through yet.
+    /// The plan uses a relation or an expression that ddx-ad cannot
+    /// differentiate yet.
     NotImplemented(String),
 
-    /// The plan is malformed: no root, an input missing, a field reference past
-    /// the end of its input, a function anchor that was never declared.
+    /// The plan is malformed. For example, the plan has no root, a relation
+    /// misses an input that it needs, or a function anchor has no declaration.
     InvalidPlan(String),
 
-    /// The `wrt` list doesn't describe the plan: a table the plan never reads, a
-    /// column the table doesn't have, or an output that depends on none of them.
+    /// The `wrt` list does not match the plan. For example, the plan never reads
+    /// the named table, or the table has no column of that name.
     InvalidWrt(String),
 
-    /// A ddx marker is malformed or sits where its meaning would be ambiguous —
-    /// a contraction marker outside a `SUM`, a marker with two arguments.
+    /// A ddx marker is malformed, or the marker sits where its meaning is
+    /// ambiguous. For example, a contraction marker outside a `SUM`, or a marker
+    /// with two arguments.
     InvalidMarker(String),
 
-    /// An operation that must be tagged isn't (design.md §2, principle 3): a
-    /// `SUM` over a gradient-carrying column that says neither *contraction* nor
-    /// *reduction*, or a `MAX` that says neither *route* nor *stop gradient*.
-    /// The user wrote no marker at all, which is why this is not
-    /// [`AdError::InvalidMarker`].
+    /// An operation that needs a tag has none (design.md §2, principle 3).
+    ///
+    /// For example, a `SUM` over a gradient-carrying column that names neither a
+    /// contraction nor a reduction. The user wrote no marker at all. For a
+    /// marker that is present but wrong, see [`AdError::InvalidMarker`].
     Untagged(String),
 
-    /// An internal invariant was violated. Should not occur in normal use; it is
-    /// an error rather than a panic because a wrong answer and a crash are both
-    /// worse than a typed failure in a correctness-critical library.
+    /// An internal invariant of ddx-ad is broken. Normal use does not produce
+    /// this error. It is an error and not a panic. In a library that must be
+    /// correct, a crash and a wrong answer are both worse than a typed
+    /// failure.
     Internal(String),
 }
 

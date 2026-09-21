@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `substrait` single-version guard — v2's counterpart to `sqlparser_pin.rs`.
+//! The single-version guard for `substrait`. This is the counterpart in v2 to
+//! `sqlparser_pin.rs`.
 //!
-//! `ddx-ad` reads the `substrait::proto::Plan` DataFusion produces and, from M4,
-//! hands its backward steps back to DataFusion's consumer. That only works while
-//! both resolve the *same* `substrait`: two versions are two unrelated Rust types.
+//! `ddx-ad` reads the `substrait::proto::Plan` that DataFusion produces. From M4
+//! it also hands its backward steps to the consumer in DataFusion. Both work
+//! only while the two crates resolve the same `substrait`, because two versions
+//! of the crate are two unrelated Rust types.
 
 mod common;
 

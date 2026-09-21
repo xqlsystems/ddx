@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Everything the transpose rules need to know about a plan before emitting a
-//! backward step: its nodes, its columns, which columns carry gradient, and what
-//! each gradient-carrying aggregate was tagged as.
+//! Everything that the transpose rules need to know about a plan before they
+//! emit a backward step. That is the nodes of the plan, its columns, which
+//! columns carry gradient, and the tag on each aggregate that carries gradient.
 //!
-//! This is also where *tag, don't infer* (design.md §2, principle 3) is
-//! enforced. A marker must sit where its meaning is unambiguous, and an
-//! aggregate that carries gradient must say what it is — an untagged `SUM` over
-//! a gradient-carrying column is an error, not a guess.
+//! This module also enforces "tag explicitly, never infer" (design.md §2,
+//! principle 3). A marker must sit where its meaning is unambiguous, and an
+//! aggregate that carries gradient must name what it is. An untagged `SUM` over
+//! a column that carries gradient is an error, and never a guess.
 
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ use crate::index::{NodeId, PlanIndex};
 use crate::markers::{Functions, Marker};
 use crate::names::AggKind;
 
-/// A plan, analysed with respect to a set of parameters.
+/// A plan, analysed with respect to a set of wrt columns.
 #[derive(Debug, Clone)]
 pub struct Analysis<'a> {
     pub index: PlanIndex<'a>,
@@ -59,32 +59,32 @@ impl<'a> Analysis<'a> {
         })
     }
 
-    /// For an aggregate output column that carries gradient, the marker it was
-    /// tagged with: [`Marker::Contraction`] or [`Marker::Reduce`]. `None` for a
-    /// column that isn't a gradient-carrying measure.
+    /// The marker on an aggregate output column that carries gradient, which is
+    /// [`Marker::Contraction`] or [`Marker::Reduce`]. The result is `None` for a
+    /// column that is not a measure that carries gradient.
     pub fn measure_marker(&self, node: NodeId, col: Col) -> Option<Marker> {
         self.measures.get(&(node, col)).copied()
     }
 }
 
-/// Where in a relation an expression sits — which decides which markers may
-/// appear at its root.
+/// Where an expression sits in a relation. The position decides which markers
+/// can appear at the root of that expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     /// The value argument of an aggregate measure.
     MeasureArg,
     /// A projected value.
     Projected,
-    /// Anywhere else: conditions, keys, sort fields.
+    /// Any other position, such as a condition, a key or a sort field.
     Other,
 }
 
 impl Slot {
-    /// How to describe this slot to someone whose SQL didn't obviously put a
-    /// marker here. The plan is what ddx sees, and an engine may move a marker
-    /// somewhere the SQL didn't suggest: DataFusion plans `SUM(DISTINCT x)` as a
-    /// *grouping* on `x` feeding an outer sum, so a marker written inside that
-    /// SUM arrives in a grouping key.
+    /// How to describe this slot to a user whose SQL did not appear to put a
+    /// marker here. ddx sees the plan, and an engine can move a marker to a
+    /// position that the SQL did not suggest. DataFusion plans `SUM(DISTINCT x)`
+    /// as a grouping on `x` that feeds an outer sum. A marker written inside
+    /// that `SUM` therefore arrives in a grouping key.
     fn describe(self) -> &'static str {
         match self {
             Slot::MeasureArg => "an aggregate's argument",
@@ -140,8 +140,9 @@ fn check_marker_placement(index: &PlanIndex<'_>, fns: &Functions) -> Result<()> 
                         "a whole projected value, as in SELECT ddx_route_mark(val) AS val"
                     }
                     Marker::StopGradient => {
-                        "inside a value — a projected expression or an aggregate's \
-                         argument — where a cotangent would otherwise flow"
+                        "inside a value, which is a projected expression or the \
+                         argument of an aggregate, where a cotangent would \
+                         otherwise flow"
                     }
                 };
                 let found = if at_root {
@@ -227,7 +228,8 @@ fn slotted_expressions<'a>(rel: &'a Rel) -> Vec<(&'a Expression, Slot)> {
     out
 }
 
-/// Tag every gradient-carrying measure, refusing the ones that aren't tagged.
+/// Tag every measure that carries gradient. ddx refuses a measure that has no
+/// tag.
 fn classify_measures(
     index: &PlanIndex<'_>,
     columns: &Columns<'_>,
@@ -312,15 +314,17 @@ fn measure_marker(m: &Measure, fns: &Functions) -> Result<Marker> {
     }
 }
 
-/// Two reads of the same physical table must not be spelled differently.
+/// Two reads of one physical table must spell its name the same way.
 ///
-/// [`PlanIndex::sources`] groups reads by their `NamedTable.names`, and every
-/// gradient is accumulated per group. If one read says `w` and another
-/// `public.w`, they become two tables: the wrt column matches one spelling, the
-/// other contributes nothing, and the gradient comes back quietly halved — the
-/// failure mode fan-in accumulation exists to prevent. DataFusion is internally
-/// consistent within a plan, so this guards against a producer that isn't, and
-/// against a hand-assembled plan.
+/// [`PlanIndex::sources`] groups the reads by their `NamedTable.names`, and ddx
+/// accumulates one gradient for each group. If one read says `w` and another
+/// says `public.w`, the two reads become two tables. The wrt column then matches
+/// one spelling, the other read contributes nothing, and the gradient comes back
+/// halved in silence. Fan-in accumulation exists to prevent exactly that.
+///
+/// DataFusion spells a table the same way throughout one plan. This check
+/// guards against a producer that does not, and against a plan assembled by
+/// hand.
 fn check_one_name_per_table(index: &PlanIndex<'_>) -> Result<()> {
     let sources = index.sources();
     for a in sources.keys() {
@@ -337,10 +341,11 @@ fn check_one_name_per_table(index: &PlanIndex<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Refuse the plan shapes no transpose rule covers, now that activity is known.
+/// Refuse the plan shapes that no transpose rule covers. This check runs after
+/// activity analysis, because it needs to know which columns carry gradient.
 ///
-/// Both are cases where the columns line up but the *gradient* doesn't, so
-/// nothing downstream would notice: they have to be refused here or not at all.
+/// In both shapes the columns line up and the gradient does not, so no later
+/// step can detect the problem. ddx refuses them here or not at all.
 fn check_differentiable_shape(
     index: &PlanIndex<'_>,
     columns: &Columns<'_>,
@@ -356,7 +361,7 @@ fn check_differentiable_shape(
             {
                 return Err(AdError::NotImplemented(format!(
                     "relation {} groups by {c}, which depends on a wrt column; a grouping key \
-                     is a dim, and gradient can't flow through one",
+                     is a dim, and gradient cannot flow through one",
                     node.id
                 )));
             }
@@ -402,7 +407,7 @@ fn check_differentiable_shape(
     Ok(())
 }
 
-/// Which side of an outer join may be NULL-extended.
+/// Which side of an outer join can hold NULL in an unmatched row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Nullable {
     Neither,
@@ -444,7 +449,7 @@ mod tests {
         )
     }
 
-    /// The error analysing `root` with respect to `wrt` produces.
+    /// The error that the analysis of `root` with respect to `wrt` produces.
     fn refusal(root: Rel, wrt: &[ColumnRef]) -> AdError {
         let p = with_fns(root);
         Analysis::new(&p, wrt).map(|_| ()).unwrap_err()
@@ -454,7 +459,7 @@ mod tests {
         vec![ColumnRef::new(TableRef::new([t]), c)]
     }
 
-    /// x(i, j, val) ⋈ w(j, k, val), contracted over j:
+    /// A contraction of x(i, j, val) and w(j, k, val) over j:
     /// SELECT i, k, SUM(ddx_contract_mark(x.val * w.val)) GROUP BY i, k
     fn contraction(measure_fn: u32, arg: Expression) -> Rel {
         let j = join(read("x", &["i", "j", "val"]), read("w", &["j", "k", "val"]));
@@ -551,8 +556,8 @@ mod tests {
         );
     }
 
-    /// Softmax's shift: `exp(z - max(z))` with the max stopped. The max is
-    /// varied but not useful, so it needs no rule.
+    /// The softmax stability shift, `exp(z - max(z))`, with a stop-gradient on
+    /// the max. The max is varied and not useful, so it needs no rule.
     #[test]
     fn stop_gradient_cuts_a_max_out_of_the_backward_pass() {
         // m = SELECT i, MAX(z) FROM t GROUP BY i ; SELECT tanh(t.z - stop(m.m)) FROM t JOIN m

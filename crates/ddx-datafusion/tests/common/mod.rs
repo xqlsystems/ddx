@@ -40,8 +40,9 @@ pub fn column_type(batches: &[RecordBatch]) -> DataType {
     batches[0].schema().field(0).data_type().clone()
 }
 
-/// Every version of the crate `name` in the workspace lockfile — for the tests
-/// that pin a type-level dependency to exactly one version.
+/// Every version of the crate `name` in the lockfile of the workspace. The
+/// tests that pin a dependency to one version at the type level use this
+/// function.
 pub fn locked_versions(name: &str) -> Vec<String> {
     let lock = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../Cargo.lock")

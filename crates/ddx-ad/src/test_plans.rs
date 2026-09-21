@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Small builders for hand-written Substrait plans in unit tests. Real producer
-//! output is tested from `ddx-datafusion`, which can plan SQL.
+//! Small builders for Substrait plans written by hand, for use in unit tests.
+//! The tests in `ddx-datafusion` cover the output of a real producer, because
+//! that crate can plan SQL.
 
 use substrait::proto::aggregate_rel::{Grouping, Measure};
 use substrait::proto::expression::field_reference::{ReferenceType, RootReference, RootType};
@@ -47,7 +48,7 @@ pub fn read(name: &str, cols: &[&str]) -> Rel {
     })))
 }
 
-/// A read that projects the base schema down to `select`.
+/// A read that projects the base schema down to the fields in `select`.
 pub fn masked_read(name: &str, cols: &[&str], select: &[i32]) -> Rel {
     let mut r = read(name, cols);
     if let Some(RelType::Read(r)) = r.rel_type.as_mut() {
@@ -94,7 +95,8 @@ pub fn project(input: Rel, expressions: Vec<Expression>) -> Rel {
     })))
 }
 
-/// `GROUP BY keys` with `measures` given as `(function anchor, arguments)`.
+/// `GROUP BY keys`, with each measure given as a function anchor and its
+/// arguments.
 pub fn aggregate(input: Rel, keys: &[Expression], measures: &[(u32, Vec<Expression>)]) -> Rel {
     rel(RelType::Aggregate(Box::new(AggregateRel {
         input: Some(Box::new(input)),
@@ -118,7 +120,7 @@ pub fn aggregate(input: Rel, keys: &[Expression], measures: &[(u32, Vec<Expressi
     })))
 }
 
-/// Set a relation's `emit` output mapping.
+/// Set the `emit` output mapping of a relation.
 pub fn emit(mut r: Rel, mapping: &[i32]) -> Rel {
     let common = Some(RelCommon {
         emit_kind: Some(EmitKind::Emit(Emit {

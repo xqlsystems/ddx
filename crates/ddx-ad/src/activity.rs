@@ -4,56 +4,60 @@
 
 //! Activity analysis: which columns carry gradient.
 //!
-//! # The three roles a column can play
+//! # The three roles of a column
 //!
 //! In the XQL data model a relation is an N-dimensional array in tidy form: one
-//! row per coordinate tuple, with the coordinates and the data in columns. So a
-//! column is either a **dim** (a coordinate identifying the row) or a **value**
-//! (design.md §1 calls these dimensions and variables; §4.3 says *dim* and
-//! *val*, the spelling this crate uses). Differentiation adds a third role,
-//! because not every value is differentiated: a **constant** is a value that
-//! gradient doesn't flow through, such as an input-data column in a query whose
-//! parameters are the weights.
+//! row for each coordinate tuple, with the coordinates and the data in columns.
+//! A column is therefore a dim, which is a coordinate that identifies the row,
+//! or a value. design.md §1 calls these dimensions and variables, and §4.3 uses
+//! the shorter words dim and val, which this crate also uses.
 //!
-//! This module answers *one* of those questions: which columns are values that
-//! carry gradient. It deliberately does **not** classify dims, and "not active"
-//! must never be read as "is a dim" — an input-data column is neither. Dim-ness
-//! is **structural**: which columns identify a row is stated by the plan, in the
-//! join conditions and grouping keys of whichever node consumes the relation, so
-//! the transpose rules read it from there rather than from an intrinsic property
-//! guessed at here (design.md §4.4).
+//! Differentiation adds a third role, because ddx does not differentiate every
+//! value. A constant is a value that gradient does not flow through, such as an
+//! input-data column in a query whose parameters are the weights.
 //!
-//! # Active = varied ∧ useful
+//! This module answers one of those questions: which columns are values that
+//! carry gradient. It does not classify dims. Read "not active" as "carries no
+//! gradient", and never as "is a dim", because an input-data column is neither.
 //!
-//! The user names the wrt columns and ddx derives the rest, rather than asking
-//! for a naming convention. Following the AD literature's standard activity
-//! analysis, a column is **active** when it is both:
+//! Dim-ness is structural. The plan states which columns identify a row, in the
+//! join conditions and the grouping keys of the node that consumes the relation.
+//! The transpose rules read dim-ness from the plan, and not from a property that
+//! this module infers (design.md §4.4).
 //!
-//! - **varied**: its value depends on a wrt column, outside any
-//!   `ddx_stop_gradient`, and
-//! - **useful**: it reaches an output column through *value* positions — not
-//!   only through a join condition, filter, grouping key, sort key or `CASE`
-//!   condition, in each of which the result is piecewise constant.
+//! # Active means varied and useful
 //!
-//! Only active columns get a cotangent. A dim computed arithmetically from other
-//! dims (`height * width_count + width AS inp`) is inactive because no wrt
-//! column reaches it; an input-data column is inactive for the same reason.
+//! The user names the wrt columns and ddx derives the rest, so the user needs no
+//! naming convention. This is the standard activity analysis of the AD
+//! literature. A column is active when both of these hold:
 //!
-//! The two halves are asymmetric on purpose. *Varied* over-approximates — it
-//! counts control-position reads, so a column can be varied whose true
-//! derivative is zero — because a false positive costs at worst a typed error
-//! from a rule that can't handle the column, while a false negative silently
-//! drops a gradient. *Useful* follows the definition above exactly, so that a
-//! value which genuinely only orders or filters rows needs no transpose rule and
-//! no tag.
+//! - The column is varied. Its value depends on a wrt column, outside any
+//!   `ddx_stop_gradient` call.
+//! - The column is useful. It reaches an output column through value positions.
+//!   A column that reaches the output only through a control position is not
+//!   useful. The control positions are a join condition, a filter, a grouping
+//!   key, a sort key and a `CASE` condition. In each of them the result is
+//!   piecewise constant.
 //!
-//! # What is differentiated
+//! Only an active column gets a cotangent. A dim that arithmetic computes from
+//! other dims, such as `height * width_count + width AS inp`, is inactive,
+//! because no wrt column reaches it. An input-data column is inactive for the
+//! same reason.
 //!
-//! [`Activity::analyze`] seeds **every** output column of the plan's root, so a
-//! root with two active columns is the gradient of their *sum*. That is the
-//! contract until `vjp_query` exists to take the output columns explicitly
-//! (design.md §4.4); [`Activity::seeded`] reports what was seeded so a caller
-//! never has to guess.
+//! The two halves are asymmetric on purpose. Varied over-approximates: it counts
+//! reads in control positions, so a column can be varied when its true
+//! derivative is zero. A false positive costs at most a typed error from a rule
+//! that cannot handle the column. A false negative drops a gradient in
+//! silence. Useful follows the definition above exactly, so a value that only
+//! orders or filters rows needs no transpose rule and no tag.
+//!
+//! # What ddx differentiates
+//!
+//! [`Activity::analyze`] seeds every output column of the root of the plan. A
+//! root with two active columns therefore describes the gradient of the sum of
+//! those columns. This is the contract until `vjp_query` exists and takes the
+//! output columns as an argument (design.md §4.4). [`Activity::seeded`] reports
+//! the columns that ddx seeded, so a caller never has to guess.
 
 use std::fmt;
 
@@ -66,16 +70,18 @@ use crate::index::{NodeId, NodeKind, PlanIndex, TableRef};
 use crate::markers::Functions;
 use crate::names::AggKind;
 
-/// A column of a named table: the unit a gradient is taken with respect to.
+/// A column of a named table, which is the unit that a gradient is taken with
+/// respect to.
 ///
-/// The plan-level twin of `ddx_core::ColRef`, the same concept one layer up (a
-/// column reference, qualified by where it comes from). Not called `Param`: what
-/// you differentiate with respect to needn't be a *parameter* — a sensitivity to
-/// an input column is an ordinary request — and the AD literature's word for the
-/// role is *independent variable*.
+/// This type is the plan-level twin of `ddx_core::ColRef`, the same concept one
+/// layer up: a column reference, qualified by its origin. The name is not
+/// `Param`, because what you differentiate with respect to need not be a
+/// parameter. A sensitivity to an input column is an ordinary request, and the
+/// AD literature calls the role an independent variable.
 ///
-/// The column name is matched exactly against the table's schema as the plan
-/// records it (DataFusion lower-cases unquoted identifiers, so `val`, not `VAL`).
+/// ddx matches the column name exactly against the schema of the table as the
+/// plan records it. DataFusion writes an unquoted identifier in lower case, so
+/// the name to give is `val` and not `VAL`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ColumnRef {
     pub table: TableRef,
@@ -107,8 +113,8 @@ pub struct Activity {
 }
 
 impl Activity {
-    /// Analyse a plan with respect to `wrt`, seeding every output column of the
-    /// root (see the module docs).
+    /// Analyse a plan with respect to `wrt`. ddx seeds every output column of
+    /// the root, as the module documentation describes.
     pub fn analyze(
         index: &PlanIndex<'_>,
         columns: &Columns<'_>,
@@ -125,21 +131,22 @@ impl Activity {
         })
     }
 
-    /// Does column `col` of `node` depend on a wrt column?
+    /// Does the column `col` of `node` depend on a wrt column?
     ///
-    /// `col` must be a column of `node` in the analysed plan — one handed out by
-    /// [`Columns::cols`].
+    /// The `col` argument must be a column of `node` in the analysed plan, which
+    /// means a column that [`Columns::cols`] handed out.
     pub fn is_varied(&self, node: NodeId, col: Col) -> bool {
         self.varied[node.index()][col.index()]
     }
 
-    /// Does column `col` of `node` reach an output column through value
-    /// positions? Independent of the wrt columns: this is a property of the plan.
+    /// Does the column `col` of `node` reach an output column through value
+    /// positions? The answer does not depend on the wrt columns, because it is a
+    /// property of the plan.
     pub fn is_useful(&self, node: NodeId, col: Col) -> bool {
         self.useful[node.index()][col.index()]
     }
 
-    /// Does column `col` of `node` carry gradient?
+    /// Does the column `col` of `node` carry gradient?
     pub fn is_active(&self, node: NodeId, col: Col) -> bool {
         self.is_varied(node, col) && self.is_useful(node, col)
     }
@@ -152,20 +159,24 @@ impl Activity {
             .collect()
     }
 
-    /// The root columns the backward pass is seeded at: every root column, so
-    /// several active ones mean the gradient of their sum (module docs).
+    /// The root columns that the backward pass is seeded at. ddx seeds every
+    /// root column, so two or more active columns describe the gradient of their
+    /// sum. The module documentation gives the reason.
     pub fn seeded(&self) -> &[Col] {
         &self.seeded
     }
 
-    /// Every wrt column must actually carry gradient somewhere, or its gradient
-    /// is zero — which is worth an error rather than a column of zeros. Checked
-    /// per column, so asking for one live and one dead column is refused just as
-    /// loudly as asking for the dead one alone.
+    /// Every wrt column must carry gradient somewhere. A column that carries
+    /// none has a gradient of zero, and ddx reports an error instead of a column
+    /// of zeros.
     ///
-    /// Runs after the structural refusals in `Analysis::new`, so a plan shape ddx
-    /// can't differentiate is reported as such rather than as an unreachable
-    /// column.
+    /// ddx checks each wrt column on its own. A request for one live column and
+    /// one dead column is refused as loudly as a request for the dead column
+    /// alone.
+    ///
+    /// This check runs after the structural refusals in `Analysis::new`. A plan
+    /// shape that ddx cannot differentiate is then reported as such, and not as
+    /// a column that gradient cannot reach.
     pub(crate) fn check_reachable(
         &self,
         index: &PlanIndex<'_>,
@@ -205,8 +216,9 @@ impl Activity {
     }
 }
 
-/// Every wrt column must name a table the plan reads and a column that table
-/// exposes. A typo would otherwise be a gradient of zero.
+/// Every wrt column must name a table that the plan reads, and a column that
+/// the table exposes. Without this check, a mistyped name gives a gradient of
+/// zero.
 fn check_wrt(index: &PlanIndex<'_>, columns: &Columns<'_>, wrt: &[ColumnRef]) -> Result<()> {
     if wrt.is_empty() {
         return Err(AdError::InvalidWrt(
@@ -252,8 +264,8 @@ fn check_wrt(index: &PlanIndex<'_>, columns: &Columns<'_>, wrt: &[ColumnRef]) ->
         });
         if !is_read {
             return Err(AdError::InvalidWrt(format!(
-                "`{p}`: the query reads table `{}` but not its `{}` column — the plan projects \
-                 that column away, so no gradient could reach it",
+                "`{p}`: the query reads table `{}` but not its `{}` column. The plan \
+                 projects that column away, so no gradient can reach it",
                 p.table, p.column
             )));
         }
@@ -268,8 +280,8 @@ fn base_names<'a>(index: &PlanIndex<'a>, read: NodeId) -> &'a [String] {
     }
 }
 
-/// A node's window relation, if it is one: the partition and sort expressions
-/// every window function in it shares.
+/// The partition expressions and the sort expressions of a node, if the node is
+/// a window relation. Every window function in that relation shares them.
 fn window_frame<'a>(
     index: &PlanIndex<'a>,
     id: NodeId,
@@ -344,8 +356,8 @@ fn varied(
     Ok(varied)
 }
 
-/// Which columns reach an output column through value positions. A property of
-/// the plan alone — the wrt columns don't enter into it.
+/// Which columns reach an output column through value positions. This is a
+/// property of the plan alone, and the wrt columns do not enter into it.
 fn useful(index: &PlanIndex<'_>, columns: &Columns<'_>, fns: &Functions) -> Result<Vec<Vec<bool>>> {
     let mut useful: Vec<Vec<bool>> = index
         .nodes()

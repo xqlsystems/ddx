@@ -2,19 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The four marker functions, and the plan's function table they're found in.
+//! The four marker functions, and the function table of the plan that holds
+//! them.
 //!
-//! A marker is an identity scalar function whose only job is to survive planning
-//! and tag the operation around it (design.md §4.2). In a Substrait plan it's an
-//! ordinary `scalar_function` whose `function_reference` points at an extension
-//! declaration carrying the marker's name.
+//! A marker is an identity scalar function. It survives planning and tags the
+//! operation around it (design.md §4.2). In a Substrait plan a marker is an
+//! ordinary `scalar_function`, and its `function_reference` points at an
+//! extension declaration that carries the name of the marker.
 //!
-//! Markers are recognized **by name**. Neither target engine emits an extension
-//! URN for a user-registered function: DataFusion 54 declares every function —
-//! its own built-ins and `ddx_contract_mark` alike — with a bare name and
-//! `extension_urn_reference = u32::MAX` (checked against real producer output
-//! while building this; design.md `[S2]` found the same of DuckDB). A URN can't
-//! identify a marker when there is none to read.
+//! ddx recognizes a marker by name. Neither target engine emits an extension URN
+//! for a function that the user registered. DataFusion 54 declares every
+//! function with a bare name and `extension_urn_reference = u32::MAX`, its own
+//! built-in functions and `ddx_contract_mark` alike. This was checked against
+//! the output of the producer, and design.md `[S2]` reports the same of DuckDB.
+//! A URN cannot identify a marker when the plan carries no URN.
 
 use std::collections::HashMap;
 
@@ -23,36 +24,36 @@ use substrait::proto::Plan;
 
 use crate::error::{AdError, Result};
 
-/// One of the four functions ddx claims the name of (design.md §4.3).
+/// One of the four function names that ddx claims (design.md §4.3).
 ///
-/// There are **four markers but five transpose rules**, and the mismatch is not
-/// an oversight: Elementwise needs no marker, because any projected expression
-/// that isn't one of the others is elementwise by default.
+/// ddx has four markers and five transpose rules. The difference is deliberate.
+/// Elementwise needs no marker, because a projected expression that carries no
+/// other marker is elementwise by default.
 ///
-/// The four also aren't the same kind of thing, which [`Marker::is_tag`]
+/// The four markers are also two kinds of thing, which [`Marker::is_tag`]
 /// separates:
 ///
-/// - [`Marker::Contraction`], [`Marker::Reduce`] and [`Marker::Route`] are
-///   **tags**: they classify an operation the query already performs. Deleting
-///   one changes neither the forward value nor the true gradient — only ddx's
-///   ability to recognize which rule applies, which is why an untagged
-///   gradient-carrying aggregate is refused instead of guessed at.
-/// - [`Marker::StopGradient`] is an **operation**: it changes the derivative
-///   (cotangent stops there) while leaving the forward value alone. Deleting it
-///   changes the gradient — for softmax's stability shift, from correct to
+/// - [`Marker::Contraction`], [`Marker::Reduce`] and [`Marker::Route`] are tags.
+///   Each one classifies an operation that the query already performs. If you
+///   delete one, the forward value and the true gradient both stay the same.
+///   Only the ability of ddx to choose a rule changes. For that reason, ddx
+///   refuses an untagged aggregate that carries gradient instead of guessing.
+/// - [`Marker::StopGradient`] is an operation. It changes the derivative,
+///   because the cotangent stops there, and it leaves the forward value alone.
+///   If you delete it from a softmax stability shift, the gradient becomes
 ///   wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Marker {
-    /// `SUM(ddx_contract_mark(a.val * b.val))` — this aggregate is a
-    /// contraction of the join feeding it.
+    /// `SUM(ddx_contract_mark(a.val * b.val))`. This aggregate is a contraction
+    /// of the join that feeds it.
     Contraction,
-    /// `SUM(ddx_reduce_mark(val))` — this aggregate is a plain reduction over
-    /// the dims it drops.
+    /// `SUM(ddx_reduce_mark(val))`. This aggregate is a plain reduction over the
+    /// dims that it drops.
     Reduce,
-    /// `ddx_route_mark(val)` — this value is selected by a top-1-per-group
-    /// window (argmax/argmin routing).
+    /// `ddx_route_mark(val)`. A top-1-per-group window selects this value, which
+    /// is how ddx expresses argmax or argmin routing.
     Route,
-    /// `ddx_stop_gradient(x)` — no cotangent flows into `x`.
+    /// `ddx_stop_gradient(x)`. No cotangent flows into `x`.
     StopGradient,
 }
 
@@ -65,7 +66,7 @@ impl Marker {
         Marker::StopGradient,
     ];
 
-    /// The function name a user writes in SQL.
+    /// The function name that a user writes in SQL.
     pub fn name(self) -> &'static str {
         match self {
             Marker::Contraction => "ddx_contract_mark",
@@ -75,18 +76,19 @@ impl Marker {
         }
     }
 
-    /// Does this marker only *classify* an operation, leaving the gradient it
-    /// describes unchanged? True for all but [`Marker::StopGradient`], which is
-    /// itself an operation on the gradient (see the type docs).
+    /// Does this marker only classify an operation and leave the gradient of
+    /// that operation unchanged? This is true of every marker except
+    /// [`Marker::StopGradient`], which is itself an operation on the gradient.
+    /// The documentation of [`Marker`] gives the reason.
     pub fn is_tag(self) -> bool {
         self != Marker::StopGradient
     }
 
-    /// The marker a declared function name refers to, if any.
+    /// The marker that a declared function name refers to, if the name is one.
     ///
-    /// Case-folded, because SQL function names are case-insensitive. A Substrait
-    /// compound name (`ddx_contract_mark:fp64`) is matched on the part before
-    /// the signature.
+    /// The match ignores case, because SQL function names are case-insensitive.
+    /// For a compound Substrait name such as `ddx_contract_mark:fp64`, the match
+    /// uses the part before the signature.
     pub fn from_name(name: &str) -> Option<Marker> {
         let base = base_name(name);
         Marker::ALL
@@ -95,7 +97,8 @@ impl Marker {
     }
 }
 
-/// A function name without its Substrait signature suffix: `add:i64_i64` → `add`.
+/// A function name without its Substrait signature suffix. `add:i64_i64`
+/// becomes `add`.
 pub(crate) fn base_name(name: &str) -> &str {
     match name.split_once(':') {
         Some((base, _signature)) => base,
@@ -103,14 +106,15 @@ pub(crate) fn base_name(name: &str) -> &str {
     }
 }
 
-/// The plan's scalar/aggregate/window function declarations, by anchor.
+/// The function declarations of the plan, by anchor. These cover scalar
+/// functions, aggregate functions and window functions.
 #[derive(Debug, Clone, Default)]
 pub struct Functions {
     by_anchor: HashMap<u32, String>,
 }
 
 impl Functions {
-    /// Read the function declarations out of `plan.extensions`.
+    /// Read the function declarations from `plan.extensions`.
     pub fn from_plan(plan: &Plan) -> Result<Self> {
         let mut by_anchor = HashMap::new();
         for ext in &plan.extensions {
@@ -129,7 +133,8 @@ impl Functions {
         Ok(Functions { by_anchor })
     }
 
-    /// The declared name of the function at `anchor`, signature suffix and all.
+    /// The declared name of the function at `anchor`, with the signature suffix
+    /// if the name has one.
     pub fn name(&self, anchor: u32) -> Result<&str> {
         self.by_anchor
             .get(&anchor)
@@ -139,13 +144,13 @@ impl Functions {
             })
     }
 
-    /// The declared name without its signature suffix, lower-cased — the form
-    /// to compare against (`sum`, `multiply`, `tanh`).
+    /// The declared name in lower case and without its signature suffix. This is
+    /// the form to compare against, such as `sum`, `multiply` or `tanh`.
     pub fn base_name(&self, anchor: u32) -> Result<String> {
         Ok(base_name(self.name(anchor)?).to_ascii_lowercase())
     }
 
-    /// The marker the function at `anchor` is, if it is one.
+    /// The marker that the function at `anchor` is, if the function is one.
     pub fn marker(&self, anchor: u32) -> Result<Option<Marker>> {
         Ok(Marker::from_name(self.name(anchor)?))
     }

@@ -2,19 +2,22 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Column tracing: what each output column of each node *is*.
+//! Column tracing: what each output column of each node is.
 //!
-//! Substrait refers to columns by position, and a position means something
-//! different at every node. A real producer layers these freely — DataFusion
-//! puts a `Project` with an `emit` remapping between a contraction's `Join` and
-//! its `Aggregate`, and pushes a column mask into every `Read`. The rules can't
-//! read "the contracted dim off the join condition" (design.md §4.3) until every
-//! position is resolved back to where it came from, which is what this does.
+//! Substrait refers to a column by position, and a position means something
+//! different at every node. A producer layers these positions freely.
+//! DataFusion puts a `Project` with an `emit` remapping between the `Join` of a
+//! contraction and its `Aggregate`. It also pushes a column mask into every
+//! `Read`. design.md §4.3 asks the rules to read the contracted dim from the
+//! join condition. The rules can do so only after every position is resolved
+//! back to its origin, which is the work of this module.
 //!
-//! Positions inside a node's expressions index its **input row**: the input's
-//! columns for a single-input relation, left's then right's for a join. That is a
-//! different numbering from the node's own output columns, so the two have
-//! separate types — [`Field`] and [`Col`] — rather than both being `usize`.
+//! A position inside the expressions of a node indexes the input row of that
+//! node. For a relation with one input, the input row holds the columns of that
+//! input. For a join, it holds the columns of the left input and then those of
+//! the right input. That numbering differs from the numbering of the output
+//! columns of the node. The two therefore have separate types, [`Field`] and
+//! [`Col`], rather than one `usize`.
 
 use std::fmt;
 
@@ -29,23 +32,24 @@ use substrait::proto::{Expression, ReadRel, Rel, RelCommon};
 use crate::error::{AdError, Result};
 use crate::index::{NodeId, PlanIndex};
 
-/// An **output column** of a node: an index into what that node produces.
+/// An output column of a node, which is an index into what the node produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Col(usize);
 
-/// A position in a node's **input row**: an index into its input's columns, or —
-/// for a join — into left's followed by right's. This is what a Substrait field
-/// reference inside the node's expressions names.
+/// A position in the input row of a node. For a relation with one input, the
+/// position indexes the columns of that input. For a join, it indexes the
+/// columns of the left input and then those of the right input. A Substrait
+/// field reference inside the expressions of the node names such a position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Field(usize);
 
 impl Col {
     /// The column at index `i`.
     ///
-    /// Crate-private on purpose: a `Col` is only meaningful for the node it came
-    /// from, and the accessors that take one index into that node's columns
-    /// directly. Callers get theirs from [`Columns::cols`], which can only yield
-    /// valid ones.
+    /// This function is crate-private. A `Col` has a meaning only for the node
+    /// that it came from. The accessors that take a `Col` index the columns of
+    /// that node directly. A caller takes a `Col` from [`Columns::cols`], which
+    /// yields only valid ones.
     pub(crate) const fn new(i: usize) -> Self {
         Col(i)
     }
@@ -57,8 +61,8 @@ impl Col {
 }
 
 impl Field {
-    /// The input-row position at index `i`. Crate-private for the same reason as
-    /// [`Col::new`].
+    /// The input-row position at index `i`. This function is crate-private, for
+    /// the reason given on [`Col::new`].
     pub(crate) const fn new(i: usize) -> Self {
         Field(i)
     }
@@ -84,15 +88,18 @@ impl fmt::Display for Field {
 /// Where one output column of a node comes from.
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnDef<'a> {
-    /// A column of a `Read`: field `field` of its base schema, named `name`.
+    /// A column of a `Read`. It is field `field` of the base schema, and its
+    /// name is `name`.
     Source { field: usize, name: &'a str },
-    /// The node's input-row column at this position, passed through unchanged.
+    /// The column of the input row at this position, passed through
+    /// unchanged.
     Input(Field),
     /// A `Project` expression over the input row.
     Computed(&'a Expression),
-    /// An `Aggregate` grouping key: an expression over the input row.
+    /// A grouping key of an `Aggregate`, which is an expression over the input
+    /// row.
     GroupKey(&'a Expression),
-    /// An `Aggregate` measure over the input row.
+    /// A measure of an `Aggregate` over the input row.
     Measure(&'a Measure),
     /// A window function of a consistent-partition window.
     Window(&'a WindowRelFunction),
@@ -105,7 +112,7 @@ pub struct Columns<'a> {
 }
 
 impl<'a> Columns<'a> {
-    /// Trace every node's output columns.
+    /// Trace the output columns of every node.
     pub fn build(index: &PlanIndex<'a>) -> Result<Self> {
         let mut per_node: Vec<Vec<ColumnDef<'a>>> = vec![Vec::new(); index.nodes().len()];
         for id in index.forward_order() {
@@ -119,13 +126,13 @@ impl<'a> Columns<'a> {
 
     /// The output columns of `node`, indexed by [`Col`].
     ///
-    /// Panics if `node` is not a node of the analysed plan; every [`NodeId`] the
-    /// crate hands out is.
+    /// This function panics if `node` is not a node of the analysed plan. Every
+    /// [`NodeId`] that the crate hands out is such a node.
     pub fn of(&self, node: NodeId) -> &[ColumnDef<'a>] {
         &self.per_node[node.index()]
     }
 
-    /// Where output column `col` of `node` comes from.
+    /// Where the output column `col` of `node` comes from.
     pub fn def(&self, node: NodeId, col: Col) -> Result<ColumnDef<'a>> {
         self.of(node)
             .get(col.index())
@@ -138,7 +145,7 @@ impl<'a> Columns<'a> {
         (0..self.of(node).len()).map(Col::new)
     }
 
-    /// How many columns `node`'s input row has.
+    /// The number of columns in the input row of `node`.
     pub fn input_width(&self, index: &PlanIndex<'_>, node: NodeId) -> usize {
         index
             .node(node)
@@ -148,8 +155,8 @@ impl<'a> Columns<'a> {
             .sum()
     }
 
-    /// Resolve a position in `node`'s input row to the input node, and the output
-    /// column *of that input*, which the position names.
+    /// Resolve a position in the input row of `node`. The result names the input
+    /// node, and the output column of that input node.
     pub fn resolve_input(
         &self,
         index: &PlanIndex<'_>,
@@ -185,7 +192,7 @@ fn common(rel: &Rel) -> Option<&RelCommon> {
     }
 }
 
-/// A relation's columns before its `emit` is applied.
+/// The columns of a relation before ddx applies the `emit` of that relation.
 fn direct_columns<'a>(
     rel: &'a Rel,
     input_width: usize,
@@ -235,7 +242,7 @@ fn direct_columns<'a>(
                     .map(|&r| {
                         a.grouping_expressions.get(r as usize).ok_or_else(|| {
                             AdError::InvalidPlan(format!(
-                                "grouping refers to grouping expression {r}, which doesn't exist"
+                                "grouping refers to grouping expression {r}, which does not exist"
                             ))
                         })
                     })

@@ -2,21 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx-ad`'s analysis, run on the Substrait plans DataFusion actually produces.
+//! The analysis of `ddx-ad`, run on the Substrait plans that DataFusion
+//! produces.
 //!
-//! Hand-built plans (ddx-ad's unit tests) show the analysis does what it says;
-//! these show it survives a real producer — the `Project`/`emit` layers, masked
-//! reads and function naming DataFusion uses.
+//! The unit tests of `ddx-ad` use plans built by hand, and they show that the
+//! analysis does what it claims. These tests show that the analysis survives a
+//! real producer. DataFusion inserts `Project` and `emit` layers, masks the
+//! columns of a read, and chooses its own function names.
 //!
-//! The queries are a small MLP's forward pass over long/tidy tables — the shape
-//! design.md §4.5 works through — with one marker added per contraction and
-//! nothing else changed:
+//! The queries are the forward pass of a small MLP over long and tidy tables,
+//! which is the shape that design.md §4.5 works through. Each contraction
+//! carries one marker, and nothing else changes:
 //!
-//! - `pixels(sample, height, width, images)` is the input, one row per pixel;
+//! - `pixels(sample, height, width, images)` is the input, with one row for
+//!   each pixel.
 //! - `weight(layer, inp, out, val)` and `bias(layer, out, val)` are the
-//!   parameters, one row per matrix entry, all layers in one table;
-//! - a layer is a contraction (`JOIN` on the shared index + grouped `SUM`), then
-//!   a bias term (`JOIN` on `out`), then an activation.
+//!   parameters, with one row for each matrix entry and every layer in one
+//!   table.
+//! - A layer is a contraction, which is a `JOIN` on the shared index and a
+//!   grouped `SUM`. A bias term follows, which is a `JOIN` on `out`, and then an
+//!   activation.
 
 mod common;
 
@@ -27,8 +32,8 @@ use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::Plan;
 use ddx_ad::{AdError, Analysis, ColumnRef, Marker, TableRef};
 
-/// A context with the tables above — 2×2 images, two units per layer — and the
-/// v2 markers registered.
+/// A context that holds the tables named above, with 2×2 images and two units
+/// for each layer, and that has the v2 markers registered.
 async fn nn_context() -> SessionContext {
     let ctx = SessionContext::new();
     ddx_datafusion::register_ad_markers(&ctx);
@@ -64,14 +69,14 @@ WITH c AS (
 SELECT c.sample, c.out AS out, c.z + b.val AS z, tanh(c.z + b.val) AS val
 FROM c JOIN bias b ON c.out = b.out AND b.layer = 0";
 
-/// The Substrait plan DataFusion produces for `sql`, after optimization — the
-/// plan a user would hand to ddx.
+/// The Substrait plan that DataFusion produces for `sql` after optimization.
+/// This is the plan that a user hands to ddx.
 async fn substrait(ctx: &SessionContext, sql: &str) -> Plan {
     let plan = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
     *to_substrait_plan(&plan, &ctx.state()).unwrap()
 }
 
-/// The parameters: the weight and bias value columns.
+/// The parameters, which are the value columns of `weight` and `bias`.
 fn wrt() -> Vec<ColumnRef> {
     vec![
         ColumnRef::new(TableRef::new(["weight"]), "val"),
@@ -79,7 +84,7 @@ fn wrt() -> Vec<ColumnRef> {
     ]
 }
 
-/// The names of the root's gradient-carrying columns.
+/// The names of the columns of the root that carry gradient.
 fn active_outputs(a: &Analysis<'_>) -> Vec<String> {
     let names = a.index.root_names();
     a.activity
@@ -89,7 +94,7 @@ fn active_outputs(a: &Analysis<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Every gradient-carrying measure's tag, across the whole plan.
+/// The tag on every measure that carries gradient, across the whole plan.
 fn tags(a: &Analysis<'_>) -> Vec<Marker> {
     let mut out = Vec::new();
     for n in a.index.nodes() {
@@ -110,7 +115,8 @@ fn the_marker_names_are_ddx_ads() {
     assert_eq!(ddx_datafusion::AD_MARKERS.to_vec(), ad);
 }
 
-/// The markers are identities: tagging a query doesn't change its answer.
+/// The markers are identity functions, so a tag does not change the answer of a
+/// query.
 #[tokio::test]
 async fn a_marked_forward_query_returns_the_unmarked_answer() {
     let ctx = nn_context().await;
@@ -133,8 +139,9 @@ async fn a_marked_forward_query_returns_the_unmarked_answer() {
     assert_eq!(marked, unmarked);
 }
 
-/// The first layer: `z` and `val` carry gradient, and nothing else does —
-/// including `inp`, which is computed, and `images`, which is data.
+/// The first layer. Here `z` and `val` carry gradient and no other column does.
+/// That includes `inp`, which arithmetic computes, and `images`, which is
+/// data.
 #[tokio::test]
 async fn nn_first_layer() {
     let ctx = nn_context().await;
@@ -145,8 +152,8 @@ async fn nn_first_layer() {
     assert_eq!(tags(&a), [Marker::Contraction]);
 }
 
-/// With respect to the bias alone, the same columns carry gradient — through the
-/// `+ b.val`, not the contraction, which no longer carries any.
+/// With respect to the bias alone, the same columns carry gradient. The gradient
+/// arrives through the `+ b.val` term. The contraction carries none.
 #[tokio::test]
 async fn nn_first_layer_wrt_bias_only() {
     let ctx = nn_context().await;
@@ -156,7 +163,7 @@ async fn nn_first_layer_wrt_bias_only() {
     assert_eq!(tags(&a), []);
 }
 
-/// Two layers in one query read `weight` twice — fan-in — and a scalar loss
+/// Two layers in one query read `weight` twice, which is fan-in. A scalar loss
 /// reduces the output.
 #[tokio::test]
 async fn nn_two_layers_and_a_loss() {
@@ -183,8 +190,8 @@ async fn nn_two_layers_and_a_loss() {
     );
 }
 
-/// The whole point of tagging: an untagged SUM over a parameter is refused, not
-/// guessed at.
+/// An untagged `SUM` over a parameter is refused and never guessed at, which is
+/// what tagging is for.
 #[tokio::test]
 async fn an_untagged_contraction_is_refused() {
     let ctx = nn_context().await;
@@ -200,9 +207,9 @@ async fn an_untagged_contraction_is_refused() {
     );
 }
 
-/// The softmax stability shift, `exp(z - max(z))`, which is a no-op for the
-/// gradient. With the max stopped it needs no rule; without, it is refused and
-/// the error says what to do.
+/// The softmax stability shift, `exp(z - max(z))`, which leaves the gradient
+/// unchanged. With a stop-gradient on the max it needs no rule. Without one, ddx
+/// refuses it and the error states the remedy.
 #[tokio::test]
 async fn softmax_shift_needs_stop_gradient() {
     let ctx = nn_context().await;
@@ -226,8 +233,8 @@ async fn softmax_shift_needs_stop_gradient() {
     );
 }
 
-/// A typo in `wrt` is an error naming what the plan does have, never a gradient
-/// of zero.
+/// A mistyped `wrt` column produces an error that names what the plan does
+/// hold, and never a gradient of zero.
 #[tokio::test]
 async fn a_wrt_typo_is_refused() {
     let ctx = nn_context().await;
@@ -244,9 +251,9 @@ async fn a_wrt_typo_is_refused() {
     );
 }
 
-/// Route, design.md §4.3's idiom: keep each sample's top unit. The row number
-/// depends on `val` only through its ORDER BY, so it isn't active; the routed
-/// `val` is.
+/// The Route idiom of design.md §4.3, which keeps the top unit of each sample.
+/// The row number depends on `val` only through the `ORDER BY`, so the row
+/// number is not active. The routed `val` is active.
 #[tokio::test]
 async fn route_idiom() {
     let ctx = nn_context().await;
@@ -263,9 +270,9 @@ async fn route_idiom() {
     assert_eq!(active_outputs(&a), ["val"]);
 }
 
-/// Restricting the backward pass to a subset of rows — a train/test split, say —
-/// reads as `WHERE sample IN (…)`, which DataFusion plans as a semi-join: a mask
-/// over one side.
+/// A restriction of the backward pass to a subset of rows, such as a train and
+/// test split, reads as `WHERE sample IN (…)`. DataFusion plans it as a
+/// semi-join, which is a mask over one side.
 #[tokio::test]
 async fn an_in_subquery_is_a_mask() {
     let ctx = nn_context().await;
@@ -278,10 +285,10 @@ async fn an_in_subquery_is_a_mask() {
     assert_eq!(active_outputs(&a), ["val"]);
 }
 
-/// A `REAL` value column makes DataFusion coerce the sum to `Float64`, wrapping
-/// the marker in a cast — `sum(CAST(ddx_reduce_mark(fval) AS Float64))`. The
-/// marker is then not the syntactic root of the measure's argument even though
-/// the user wrote it there, so placement must see through the cast.
+/// A `REAL` value column makes DataFusion coerce the sum to `Float64`, and the
+/// cast wraps the marker: `sum(CAST(ddx_reduce_mark(fval) AS Float64))`. The
+/// marker is then not the root of the argument of the measure, although the user
+/// wrote it there. The placement check must therefore see through the cast.
 #[tokio::test]
 async fn a_coerced_marker_is_still_the_whole_argument() {
     let ctx = nn_context().await;
@@ -295,9 +302,10 @@ async fn a_coerced_marker_is_still_the_whole_argument() {
     assert_eq!(tags(&a), [Marker::Reduce]);
 }
 
-/// A value that reaches the output *only* through a window's `ORDER BY` is not
-/// useful by §4.4's definition, so it carries no gradient and needs no tag. This
-/// is the expression form of a window, which is what DataFusion emits.
+/// A value that reaches the output only through the `ORDER BY` of a window is
+/// not useful, by the definition in design.md §4.4. It carries no gradient and
+/// needs no tag. This test uses the expression form of a window, which is the
+/// form that DataFusion emits.
 #[tokio::test]
 async fn a_value_used_only_as_a_sort_key_is_not_active() {
     let ctx = nn_context().await;
@@ -308,8 +316,8 @@ async fn a_value_used_only_as_a_sort_key_is_not_active() {
     )
     .await;
     let a = Analysis::new(&plan, &[ColumnRef::new(TableRef::new(["weight"]), "val")]);
-    // `total` orders rows and nothing else, so the SUM needs no marker — but no
-    // gradient reaches the output either, which is what is refused.
+    // `total` orders rows and nothing else, so the SUM needs no marker. No
+    // gradient reaches the output either, and that is what ddx refuses.
     let err = a.map(|_| ()).unwrap_err();
     assert!(
         matches!(err, AdError::InvalidWrt(ref m) if m.contains("no gradient can reach")),
@@ -317,8 +325,9 @@ async fn a_value_used_only_as_a_sort_key_is_not_active() {
     );
 }
 
-/// `COUNT` counts rows, so its derivative is zero and it needs no tag — which is
-/// what makes §4.3's "SUM then divide by the count" recipe expressible.
+/// `COUNT` counts rows, so its derivative is zero and it needs no tag. This is
+/// what lets a user write the recipe in design.md §4.3: take a `SUM`, then
+/// divide by the count.
 #[tokio::test]
 async fn a_count_needs_no_tag() {
     let ctx = nn_context().await;
@@ -332,9 +341,9 @@ async fn a_count_needs_no_tag() {
     assert_eq!(tags(&a), [Marker::Reduce]);
 }
 
-/// An outer join NULL-extends unmatched rows, and a missing cotangent row means
-/// *zero*, not NULL. No transpose rule covers the difference, so a gradient
-/// through the nullable side is refused rather than assumed.
+/// An outer join holds NULL in an unmatched row, and a missing cotangent row
+/// means zero rather than NULL. No transpose rule covers that difference, so ddx
+/// refuses a gradient through the nullable side.
 #[tokio::test]
 async fn an_outer_join_over_a_gradient_carrying_column_is_refused() {
     let ctx = nn_context().await;
@@ -351,8 +360,9 @@ async fn an_outer_join_over_a_gradient_carrying_column_is_refused() {
     );
 }
 
-/// A stop-gradient in a condition or key cuts nothing, because no cotangent
-/// flows there. Silently doing nothing is what this marker exists to prevent.
+/// A stop-gradient in a condition or a key cuts nothing, because no cotangent
+/// flows there. This marker exists to stop a cotangent, so a placement where it
+/// does nothing is refused.
 #[tokio::test]
 async fn a_stop_gradient_that_cuts_nothing_is_refused() {
     let ctx = nn_context().await;

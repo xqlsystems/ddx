@@ -2,40 +2,43 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx-ad` — query-level reverse-mode automatic differentiation (ddx v2).
+//! `ddx-ad`: query-level reverse-mode automatic differentiation, which is ddx
+//! v2.
 //!
-//! **Status: work in progress (M3).** This crate is the home for the v2 engine
-//! described in [`docs/design.md`](../../../docs/design.md) §4: differentiating
-//! whole queries (not scalar expressions) by applying one transpose rule per
-//! relational primitive — contraction, elementwise, reduce, route,
-//! stop-gradient — over `substrait::proto` plans tagged with
-//! extension-function markers.
+//! Status: work in progress (M3). This crate holds the v2 engine that
+//! [`docs/design.md`](../../../docs/design.md) §4 describes. The engine
+//! differentiates whole queries rather than scalar expressions. It applies one
+//! transpose rule for each relational primitive, and the primitives are
+//! contraction, elementwise, reduce, route and stop-gradient. It operates on
+//! `substrait::proto` plans that carry extension-function markers.
 //!
-//! What exists so far is the analysis the rules stand on:
+//! What exists so far is the analysis that the rules stand on:
 //!
-//! - [`Marker`] — the four marker functions a user writes in SQL
-//!   (`ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark`,
-//!   `ddx_stop_gradient`), recognized by name in the plan's function table.
-//!   Four, not five: Elementwise needs no marker, and `ddx_stop_gradient` is an
-//!   operation on the gradient rather than a tag ([`Marker::is_tag`]).
-//! - [`PlanIndex`] and [`Columns`] — the plan's nodes in backward order, and
-//!   every output column traced back to where it came from, through the
-//!   `Project`/`emit` layers real producers insert. A node's own output columns
-//!   ([`Col`]) and the positions its expressions read ([`Field`]) are separate
-//!   types, because they are separate numberings.
-//! - [`Activity`] — which columns carry gradient, derived from the columns the
-//!   user names ([`ColumnRef`], e.g. `weight.val`) rather than from a naming
-//!   convention. It answers only *that*: dims are structural, read off the
-//!   consuming node's join conditions and grouping keys, never guessed at.
-//! - [`Analysis`] — all of the above for one plan, plus enforcement of *tag,
-//!   don't infer*: a misplaced marker, or an untagged aggregate over a
-//!   gradient-carrying column, is an error.
+//! - [`Marker`] holds the four marker functions that a user writes in SQL:
+//!   `ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark` and
+//!   `ddx_stop_gradient`. ddx recognizes each one by name in the function table
+//!   of the plan. There are four markers and five rules, because elementwise
+//!   needs no marker, and because `ddx_stop_gradient` is an operation on the
+//!   gradient rather than a tag ([`Marker::is_tag`]).
+//! - [`PlanIndex`] and [`Columns`] give the nodes of the plan in backward order,
+//!   and trace every output column back to its origin. The trace passes through
+//!   the `Project` and `emit` layers that a producer inserts. The output columns
+//!   of a node ([`Col`]) and the positions that its expressions read
+//!   ([`Field`]) have separate types, because they are separate numberings.
+//! - [`Activity`] reports which columns carry gradient. It derives the answer
+//!   from the columns that the user names ([`ColumnRef`], such as
+//!   `weight.val`), and not from a naming convention. It answers that question
+//!   only. Dim-ness is structural: ddx reads it from the join conditions and the
+//!   grouping keys of the consuming node, and never infers it.
+//! - [`Analysis`] holds all of the above for one plan. It also enforces "tag
+//!   explicitly, never infer": a misplaced marker is an error, and so is an
+//!   untagged aggregate over a column that carries gradient.
 //!
-//! The transpose rules and `vjp_query` land over M3/M4. The scalar core,
-//! [`ddx-core`](../ddx_core/index.html), becomes the *elementwise leaf* of this
+//! The transpose rules and `vjp_query` arrive in M3 and M4. The scalar core,
+//! [`ddx-core`](../ddx_core/index.html), becomes the elementwise leaf of this
 //! engine (design.md §4.3).
 //!
-//! Planned surface (design.md §4.4):
+//! The planned surface (design.md §4.4):
 //!
 //! ```ignore
 //! pub fn vjp_query(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
@@ -55,9 +58,10 @@ mod names;
 #[cfg(test)]
 mod test_plans;
 
-/// Re-exported so a downstream crate can't accidentally link a different
-/// `substrait` than the one `ddx-ad`'s API is written against (the same reason
-/// `ddx-core` re-exports `sqlparser`, design.md §6).
+/// The `substrait` crate that this crate was built against, re-exported. A
+/// downstream crate that reaches for `substrait` through this path cannot link a
+/// different version from the one that the API of `ddx-ad` uses. `ddx-core`
+/// re-exports `sqlparser` for the same reason (design.md §6).
 pub use substrait;
 
 pub use activity::{Activity, ColumnRef};
