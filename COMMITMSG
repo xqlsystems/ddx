@@ -1,0 +1,7 @@
+fix: Make comments and docs self-contained: replace internal-tracker refere
+
+- README.md
+
+Fixes #50
+
+Signed-off-by: Vedant Madane <6527493+VedantMadane@users.noreply.github.com>
