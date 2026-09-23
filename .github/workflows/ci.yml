@@ -176,5 +176,8 @@ jobs:
       # tries to publish. Add publishable crates here as they come online.
       - name: cargo publish --dry-run (ddx-core)
         run: cargo publish --dry-run -p ddx-core
-      - name: cargo publish --dry-run (ddx-datafusion)
-        run: cargo publish --dry-run -p ddx-datafusion
+      # ddx-datafusion depends on ddx-ad, which may not be on crates.io yet at
+      # the version the workspace has. Packaging the two together lets cargo
+      # resolve ddx-ad from the local package instead of the registry.
+      - name: cargo publish --dry-run (ddx-ad, ddx-datafusion)
+        run: cargo publish --dry-run -p ddx-ad -p ddx-datafusion

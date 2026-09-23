@@ -88,9 +88,17 @@
 //! downcast and match on the variant.
 //!
 //! [`DataFusionError::External`]: datafusion::error::DataFusionError::External
+//!
+//! # Query-level AD (v2)
+//!
+//! [`ad`] differentiates a whole query rather than one expression: write the
+//! forward pass and loss as one SQL query, and get back the gradient of the
+//! loss with respect to table columns, computed by DataFusion as a sequence of
+//! plans. See the module docs.
 
 #![forbid(unsafe_code)]
 
+pub mod ad;
 mod analyzer;
 mod error;
 mod markers;

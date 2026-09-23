@@ -224,3 +224,45 @@ async fn vjp_pulls_a_cotangent_back() {
         assert_eq!(g[2], cot[row[0] as usize] * 2.0 * row[2], "{g:?}");
     }
 }
+
+#[tokio::test]
+async fn the_public_api_differentiates_sql_and_reports_refusals() {
+    use ddx_datafusion::ad;
+    let ctx = ctx();
+    w().create(&ctx).await;
+    let program = ad::grad(
+        &ctx,
+        "SELECT SUM(val * val) AS loss FROM w",
+        &[wrt("w", "val")],
+    )
+    .await
+    .unwrap();
+    ad::run(&ctx, &program).await.unwrap();
+    let got = common::ad::rows(
+        &ctx,
+        &format!(
+            "SELECT i, o, val FROM {} ORDER BY i, o",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    for (g, row) in got.iter().zip(&w().rows) {
+        assert_eq!(g[2], 2.0 * row[2]);
+    }
+
+    // A refusal is a DataFusionError::External boxing the AdError.
+    let err = ad::grad(
+        &ctx,
+        "SELECT i, SUM(val) AS s FROM w GROUP BY i",
+        &[wrt("w", "val")],
+    )
+    .await
+    .unwrap_err();
+    let datafusion::error::DataFusionError::External(boxed) = err else {
+        panic!("expected External")
+    };
+    assert!(matches!(
+        boxed.downcast_ref::<AdError>(),
+        Some(AdError::NotScalar(_))
+    ));
+}
