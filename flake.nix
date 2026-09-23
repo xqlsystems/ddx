@@ -35,6 +35,9 @@
             # The `substrait` crate (ddx-ad, v2) generates its Rust types from
             # .proto files at build time, which needs protoc.
             protobuf
+            # The ddxdb wheel builds protoc from source instead (substrait's
+            # `protoc` feature), which needs cmake.
+            cmake
           ];
 
           # Lets rust-analyzer find the standard library sources.

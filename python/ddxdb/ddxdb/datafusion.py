@@ -22,7 +22,7 @@ except ImportError as e:  # pragma: no cover - depends on the environment
         "the result to that engine yourself."
     ) from e
 
-from ._ddxdb import rewrite_sql
+from ._ddxdb import _find_grad_calls, rewrite_sql
 
 __all__ = ["Context"]
 
@@ -53,9 +53,20 @@ class Context(SessionContext):
         object.__setattr__(self, "_ddx_dialect", dialect)
 
     def sql(self, query: str, *args, **kwargs):
-        """Rewrite `grad`/`jvp` markers in `query`, then plan it as usual.
+        """Rewrite `grad` in `query`, then plan it as usual.
 
-        A statement with no marker is passed through byte-identical and is
-        never parsed by ddx, so routing every query through here is free.
+        Two kinds of `grad` are understood. In a select list, `grad(expr,
+        column)` is a derivative column (v1). In a `FROM` clause, `grad(loss,
+        table.column)` is the gradient of the loss a CTE computes, as a relation
+        shaped like the table (see :mod:`ddxdb.ad`).
+
+        A statement with neither is passed through byte-identical and is never
+        parsed by ddx, so routing every query through here is free.
         """
+        if not args and not kwargs and _find_grad_calls(query) is not None:
+            from . import ad
+
+            # ad.sql runs the loss's program, then plans the rewritten
+            # statement through this method again, for any v1 `grad`.
+            return ad.sql(self, query)
         return super().sql(rewrite_sql(query, self._ddx_dialect), *args, **kwargs)
