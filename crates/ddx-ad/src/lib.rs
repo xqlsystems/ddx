@@ -49,6 +49,9 @@
 //! along, is refused as [`AdError::NotImplemented`]. Off that path (constant
 //! data, or a subtree no gradient reaches) it is copied as it is.
 //!
+//! [`sql`] finds `grad(loss, table.column)` in a SQL statement, for
+//! adapters that let users write `grad` in SQL.
+//!
 //! # `substrait` version policy
 //!
 //! The public API takes and returns [`substrait::proto`] types, so the version
@@ -74,6 +77,7 @@ mod error;
 mod functions;
 mod program;
 mod run;
+pub mod sql;
 mod transpose;
 internal! {
     mod emit;
@@ -90,6 +94,7 @@ pub use program::{
 };
 pub use relation::ColumnRef;
 pub use run::{run, Action, Backend, RunError, Runner};
+pub use sql::{GradCall, GradCalls, Loss};
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use {
