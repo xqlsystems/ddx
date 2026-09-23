@@ -6,39 +6,13 @@
 //! against finite differences computed by the same engine.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Float64Type, Int64Type};
-use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
-use datafusion_substrait::logical_plan::producer::to_substrait_plan;
-use ddx_ad::emit::{bind_reads, unbound_reads};
-use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
-use ddx_ad::substrait::proto::rel::RelType;
-use ddx_ad::substrait::proto::{NamedStruct, Rel};
 use ddx_ad::{BackwardProgram, ColumnRef};
 
 use super::substrait_of;
-
-/// The Substrait schema of the registered table `name`: the base schema of the
-/// read in the plan of `SELECT * FROM name`.
-pub async fn schema_of(ctx: &SessionContext, name: &str) -> NamedStruct {
-    let lp = ctx.table(name).await.unwrap().into_unoptimized_plan();
-    let p = to_substrait_plan(&lp, &ctx.state()).unwrap();
-    let Some(PlanRelType::Root(root)) = &p.relations[0].rel_type else {
-        panic!("no root")
-    };
-    fn find(rel: &Rel) -> NamedStruct {
-        match rel.rel_type.as_ref().unwrap() {
-            RelType::Read(r) => r.base_schema.clone().unwrap(),
-            RelType::Project(p) => find(p.input.as_ref().unwrap()),
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-    find(root.input.as_ref().unwrap())
-}
 
 /// Run every step of `program`, registering each result as a table.
 pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
@@ -54,12 +28,15 @@ pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<
         // A check can read a table ddx has no types for (a vjp's cotangent).
         let mut plan = check.plan.clone();
         let mut schemas = HashMap::new();
-        for name in unbound_reads(&plan) {
-            let s = schema_of(ctx, &name).await;
+        for name in ddx_ad::emit::unbound_reads(&plan) {
+            let s = ddx_datafusion::ad::table_schema(ctx, &name).await.unwrap();
             schemas.insert(name, s);
         }
-        bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
-        let lp = from_substrait_plan(&ctx.state(), &plan).await.unwrap();
+        ddx_ad::emit::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
+        let lp =
+            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &plan)
+                .await
+                .unwrap();
         let rows: usize = ctx
             .execute_logical_plan(lp)
             .await
@@ -74,31 +51,9 @@ pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<
             return Err(check.message.clone());
         }
     }
-    for step in program.steps() {
-        let mut plan = step.plan.clone();
-        let mut schemas = HashMap::new();
-        for name in unbound_reads(&plan) {
-            let s = schema_of(ctx, &name).await;
-            schemas.insert(name, s);
-        }
-        bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
-        let lp = from_substrait_plan(&ctx.state(), &plan)
-            .await
-            .unwrap_or_else(|e| panic!("consuming step {}: {e}", step.name));
-        let df = ctx.execute_logical_plan(lp).await.unwrap();
-        let schema = df.schema().inner().clone();
-        let batches = df
-            .collect()
-            .await
-            .unwrap_or_else(|e| panic!("running step {}: {e}", step.name));
-        ctx.deregister_table(step.name.as_str()).unwrap();
-        ctx.register_table(
-            step.name.as_str(),
-            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
-        )
-        .unwrap();
-    }
-    Ok(())
+    ddx_datafusion::ad::run(ctx, program)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// A small table of numbers, kept in memory so it can be perturbed.

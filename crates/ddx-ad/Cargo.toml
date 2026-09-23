@@ -1,9 +1,12 @@
 [package]
 name = "ddx-ad"
 description = "Query-level reverse-mode AD for ddx (v2): vjp over Substrait plans."
-version.workspace = true
-# Not on crates.io until it has a working `vjp_query` (M4).
-publish = false
+# Versioned independently, like ddx-core. First published with M4, when
+# ddx-datafusion started depending on it.
+version = "0.1.0"
+readme = "README.md"
+keywords = ["sql", "autograd", "differentiation", "substrait", "backpropagation"]
+categories = ["mathematics", "database"]
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
