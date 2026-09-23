@@ -15,10 +15,13 @@
 //! to be labelled for this; the one function ddx claims is
 //! `ddx_stop_gradient`, JAX's `lax.stop_gradient`.
 //!
-//! This crate is being built across milestones M3 and M4. So far it pins the
-//! plan type, reads a plan's function table ([`Functions`]), and has the map
-//! primitive's local derivatives ([`Elementwise`]). [`emit`] writes the plans
-//! of a backward program, and [`expr`] builds the expressions inside them.
+//! [`grad`] and [`vjp`] take a plan and the `wrt` columns and return a
+//! [`BackwardProgram`]: plain Substrait plans for an engine to run in order,
+//! the last of which hold the gradients, shaped like the tables they are
+//! gradients of. The pieces are public for adapters: [`relation`] states what
+//! dims and values are, [`forward`] reads the plan, [`Elementwise`] gives the
+//! map primitive's local derivatives, and [`emit`] writes plans and binds their
+//! reads.
 //!
 //! # `substrait` version policy
 //!
@@ -35,12 +38,17 @@ mod error;
 pub mod expr;
 pub mod forward;
 mod functions;
+mod program;
 pub mod relation;
+mod transpose;
 
 pub use elementwise::Elementwise;
 pub use error::{AdError, Result};
 pub use forward::Forward;
 pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
+pub use program::{
+    grad, grad_with, vjp, vjp_with, BackwardProgram, Gradient, Step, COTANGENT, VALUE,
+};
 pub use relation::{ColumnRef, Table};
 
 /// The exact `substrait` this crate was built against, re-exported so an
