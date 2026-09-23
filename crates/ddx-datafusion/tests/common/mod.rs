@@ -13,6 +13,8 @@
 // module, so unused helpers are expected rather than a smell.
 #![allow(dead_code)]
 
+pub mod ad;
+
 use datafusion::arrow::array::{Array, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
 
