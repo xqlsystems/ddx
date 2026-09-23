@@ -164,10 +164,13 @@ async fn refusal(sql: &str) -> AdError {
 }
 
 #[tokio::test]
-async fn aggregates_other_than_sum_and_count_are_refused_for_now() {
+async fn an_aggregate_with_no_rule_is_refused() {
     let err = refusal("SELECT STDDEV(val) AS loss FROM w").await;
     assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
-    assert!(err.to_string().contains("SUM and COUNT"), "{err}");
+    assert!(
+        err.to_string().contains("SUM, AVG, MAX, MIN and COUNT"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
