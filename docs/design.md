@@ -71,7 +71,7 @@ differentiation engine:
 
 Both layers follow the same shape: a minimal-dependency, engine-neutral core,
 with thin adapters per engine. v1's core depends on `sqlparser` only; v2's
-depends on `substrait` only. Neither depends on `datafusion` or `duckdb`.
+depends on `substrait` and v1's core. Neither depends on `datafusion` or `duckdb`.
 
 ### 1.1 Non-goals
 
@@ -717,8 +717,10 @@ before trusting it, verify a workaround rather than wait for an upstream
 fix) is the template for handling this class of risk as more rules get
 built `[S4]`/`[S5]`.
 
-`ddx-core` v2's dependency stays symmetric with v1's: `substrait` only, no
-`datafusion`, no `duckdb`.
+`ddx-ad`'s dependencies stay symmetric with v1's: `substrait`, plus `ddx-core`
+for the elementwise rule, and no `datafusion` or `duckdb`. `substrait` is pinned
+exactly to the version `datafusion-substrait` uses, for the reason §6 gives for
+`sqlparser`.
 
 ### 4.3 The five transpose rules
 
@@ -964,7 +966,7 @@ ddx/                               (repo; crates published under the ddx-* names
 │   ├── ddx-core/                   # v1 engine — differentiate sqlparser::ast::Expr
 │   │                               #   + rewrite_sql; dep: sqlparser only
 │   ├── ddx-ad/                      # v2 engine — vjp_query over substrait::proto
-│   │                               #   dep: substrait only
+│   │                               #   deps: substrait, ddx-core
 │   ├── ddx-datafusion/             # markers + AnalyzerRule (Path B) + ddx_sql helper
 │   │                               #   deps: ddx-core, ddx-ad, datafusion
 │   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` + v2 table fn
