@@ -33,11 +33,15 @@ mod elementwise;
 pub mod emit;
 mod error;
 pub mod expr;
+pub mod forward;
 mod functions;
+pub mod relation;
 
 pub use elementwise::Elementwise;
 pub use error::{AdError, Result};
+pub use forward::Forward;
 pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
+pub use relation::{ColumnRef, Table};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.

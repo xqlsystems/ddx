@@ -324,6 +324,65 @@ fn walk_arguments(
     Ok(())
 }
 
+/// The direct subexpressions of `e`. A subquery's relation is not included.
+pub fn children(e: &Expression) -> Vec<&Expression> {
+    let mut out = Vec::new();
+    let Some(rex) = &e.rex_type else {
+        return out;
+    };
+    fn args<'e>(a: &'e [FunctionArgument], out: &mut Vec<&'e Expression>) {
+        for x in a {
+            if let Some(ArgType::Value(v)) = &x.arg_type {
+                out.push(v);
+            }
+        }
+    }
+    match rex {
+        RexType::ScalarFunction(s) => {
+            args(&s.arguments, &mut out);
+            #[allow(deprecated)]
+            out.extend(s.args.iter());
+        }
+        RexType::WindowFunction(w) => {
+            args(&w.arguments, &mut out);
+            #[allow(deprecated)]
+            out.extend(w.args.iter());
+            out.extend(w.partitions.iter());
+            out.extend(w.sorts.iter().filter_map(|s| s.expr.as_ref()));
+        }
+        RexType::IfThen(it) => {
+            for c in &it.ifs {
+                out.extend(c.r#if.iter());
+                out.extend(c.then.iter());
+            }
+            out.extend(it.r#else.as_deref());
+        }
+        RexType::SwitchExpression(sw) => {
+            out.extend(sw.r#match.as_deref());
+            out.extend(sw.ifs.iter().filter_map(|c| c.then.as_ref()));
+            out.extend(sw.r#else.as_deref());
+        }
+        RexType::SingularOrList(sl) => {
+            out.extend(sl.value.as_deref());
+            out.extend(sl.options.iter());
+        }
+        RexType::MultiOrList(ml) => {
+            out.extend(ml.value.iter());
+            for rec in &ml.options {
+                out.extend(rec.fields.iter());
+            }
+        }
+        RexType::Cast(c) => out.extend(c.input.as_deref()),
+        _ => {}
+    }
+    out
+}
+
+/// Does `e`, or any expression inside it, satisfy `pred`?
+pub fn contains(e: &Expression, pred: &dyn Fn(&Expression) -> bool) -> bool {
+    pred(e) || children(e).into_iter().any(|c| contains(c, pred))
+}
+
 /// A short name for an expression kind, for error messages.
 pub fn rex_name(r: &RexType) -> &'static str {
     match r {
