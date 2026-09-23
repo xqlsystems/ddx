@@ -5,17 +5,18 @@
 //! `ddx-ad`: query-level reverse-mode automatic differentiation (ddx v2).
 //!
 //! v1 ([`ddx_core`]) differentiates one scalar expression. v2 differentiates a
-//! whole query: given a Substrait plan whose root is a loss, it emits the
-//! queries that compute the loss's gradient with respect to chosen table
-//! columns (design.md §4). It works by applying one transpose rule per
-//! relational operator, and uses `ddx-core` for the elementwise one.
+//! whole query, the way `jax.grad` differentiates a function: given a Substrait
+//! plan whose result is a loss, it emits the queries that compute the loss's
+//! gradient with respect to chosen table columns (design.md §4).
 //!
-//! The user marks the operations whose meaning ddx must not guess with four
-//! identity functions: `ddx_contract_mark`, `ddx_reduce_mark`,
-//! `ddx_route_mark` and `ddx_stop_gradient` (§4.3).
+//! A query is a composition of relational operators (map, select, join,
+//! aggregate), and each has a transpose rule, as each JAX primitive does. The
+//! map rule's local derivatives come from `ddx-core`. Nothing in the query has
+//! to be labelled for this; the one function ddx claims is
+//! `ddx_stop_gradient`, JAX's `lax.stop_gradient`.
 //!
 //! This crate is being built across milestones M3 and M4. So far it pins the
-//! plan type.
+//! plan type and reads a plan's function table ([`Functions`]).
 //!
 //! # `substrait` version policy
 //!
@@ -25,6 +26,12 @@
 //! re-export.
 
 #![forbid(unsafe_code)]
+
+mod error;
+mod functions;
+
+pub use error::{AdError, Result};
+pub use functions::{normalize, Functions, STOP_GRADIENT};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.
