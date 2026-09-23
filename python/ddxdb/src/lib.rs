@@ -2,18 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Rust half of `ddxdb` — a thin PyO3 surface over `ddx-core`.
+//! The Rust half of `ddxdb` — a thin PyO3 surface over `ddx-core` and `ddx-ad`.
 //!
 //! Thin is the point. All the calculus lives in `ddx-core`; this file moves
 //! strings across the FFI boundary and turns a `DiffError` into an exception a
 //! Python caller can actually branch on. Nothing here decides anything about
 //! differentiation, and nothing here should grow to.
 
-use ddx_core::sqlparser::dialect::{dialect_from_str, Dialect};
+use std::collections::HashMap;
+
+use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+use ddx_ad::substrait::proto::rel::RelType;
+use ddx_ad::substrait::proto::{NamedStruct, Plan, Rel};
+use ddx_ad::{AdError, ColumnRef};
+use ddx_core::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
 use ddx_core::{Ddx, DiffError, IdentCasing};
+use prost::Message;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 // The first argument names the module the class claims to live in, and it must
 // be the *importable* path (`ddxdb._ddxdb`), not the bare crate name. Python
@@ -59,6 +67,19 @@ create_exception!(
     "The statement did not parse under the chosen dialect."
 );
 
+create_exception!(
+    ddxdb._ddxdb,
+    NotScalar,
+    DdxError,
+    "grad was asked for the gradient of something that is not a loss: one row and one column."
+);
+create_exception!(
+    ddxdb._ddxdb,
+    UnknownColumn,
+    DdxError,
+    "A wrt column names a table or column the query does not read."
+);
+
 /// Map a [`DiffError`] onto a Python exception, one class per variant.
 ///
 /// A single exception type carrying a message would force callers to match on
@@ -76,6 +97,19 @@ fn to_py_err(e: DiffError) -> PyErr {
         DiffError::ProjectionBoundary(_) => ProjectionBoundary::new_err(msg),
         DiffError::Parse(_) => SqlParseError::new_err(msg),
         DiffError::Internal(_) => DdxError::new_err(msg),
+    }
+}
+
+/// Map an [`AdError`] onto a Python exception. Variants that mean the same
+/// thing as a v1 error share its class.
+fn ad_to_py_err(e: AdError) -> PyErr {
+    let msg = e.to_string();
+    match e {
+        AdError::NotImplemented(_) => UnsupportedExpression::new_err(msg),
+        AdError::NotScalar(_) => NotScalar::new_err(msg),
+        AdError::UnknownWrt(_) => UnknownColumn::new_err(msg),
+        AdError::Diff(inner) => to_py_err(inner),
+        AdError::InvalidPlan(_) | AdError::Internal(_) => DdxError::new_err(msg),
     }
 }
 
@@ -218,11 +252,182 @@ fn supported_functions() -> Vec<String> {
     Ddx::new().unary_rule_names()
 }
 
+fn decode(plan: &[u8]) -> PyResult<Plan> {
+    Plan::decode(plan).map_err(|e| PyValueError::new_err(format!("not a Substrait plan: {e}")))
+}
+
+fn bytes<'py>(py: Python<'py>, plan: &Plan) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &plan.encode_to_vec())
+}
+
+/// A step as `(name, plan bytes)`.
+type PyStep<'py> = (String, Bound<'py, PyBytes>);
+
+/// A program as `(forward_steps, value, cotangent, backward_steps, gradients)`:
+/// a step is `(name, plan bytes)`, `cotangent` the columns a vjp program's
+/// cotangent table needs, and a gradient `(table, step, columns)`.
+type PyProgram<'py> = (
+    Vec<PyStep<'py>>,
+    String,
+    Vec<String>,
+    Vec<PyStep<'py>>,
+    Vec<(String, String, Vec<String>)>,
+);
+
+fn to_py_program<'py>(py: Python<'py>, program: ddx_ad::BackwardProgram) -> PyProgram<'py> {
+    let steps = |steps: &[ddx_ad::Step]| {
+        steps
+            .iter()
+            .map(|s| (s.name.clone(), bytes(py, &s.plan)))
+            .collect::<Vec<_>>()
+    };
+    let gradients = program
+        .gradients
+        .iter()
+        .map(|g| (g.table.join("."), g.step.clone(), g.columns.clone()))
+        .collect();
+    (
+        steps(&program.forward_steps),
+        program.value.clone(),
+        program.cotangent.clone(),
+        steps(&program.backward_steps),
+        gradients,
+    )
+}
+
+fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
+    wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
+}
+
+/// `grad` of a serialized Substrait plan (see `ddxdb.ad`).
+#[pyfunction]
+fn _grad<'py>(
+    py: Python<'py>,
+    plan: &[u8],
+    wrt: Vec<(String, String)>,
+) -> PyResult<PyProgram<'py>> {
+    let program = ddx_ad::grad(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
+    Ok(to_py_program(py, program))
+}
+
+/// `vjp` of a serialized Substrait plan (see `ddxdb.ad`).
+#[pyfunction]
+fn _vjp<'py>(py: Python<'py>, plan: &[u8], wrt: Vec<(String, String)>) -> PyResult<PyProgram<'py>> {
+    let program = ddx_ad::vjp(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
+    Ok(to_py_program(py, program))
+}
+
+/// The `grad(loss, table.column, …)` calls in a SQL statement, or `None`.
+///
+/// Returns `(losses, calls)`: a loss is `(name, query, wrt)`, a call
+/// `(loss index, table, columns)`, in source order.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn _find_grad_calls(
+    sql: &str,
+) -> PyResult<
+    Option<(
+        Vec<(String, String, Vec<(String, String)>)>,
+        Vec<(usize, String, Vec<String>)>,
+    )>,
+> {
+    let Some(found) = ddx_ad::GradCalls::find(sql, &GenericDialect {}).map_err(ad_to_py_err)?
+    else {
+        return Ok(None);
+    };
+    let losses = found
+        .losses
+        .iter()
+        .map(|l| {
+            let wrt = l
+                .wrt
+                .iter()
+                .map(|w| (w.table.clone(), w.column.clone()))
+                .collect();
+            (l.name.clone(), l.query.clone(), wrt)
+        })
+        .collect();
+    let calls = found
+        .calls
+        .iter()
+        .map(|c| (c.loss, c.table.clone(), c.columns.clone()))
+        .collect();
+    Ok(Some((losses, calls)))
+}
+
+/// `sql` with its `grad` calls replaced, in source order, by `relations`.
+#[pyfunction]
+fn _rewrite_grad_calls(sql: &str, relations: Vec<String>) -> PyResult<String> {
+    let found = ddx_ad::GradCalls::find(sql, &GenericDialect {})
+        .map_err(ad_to_py_err)?
+        .ok_or_else(|| PyValueError::new_err("the statement has no grad(loss, …) call"))?;
+    if relations.len() != found.calls.len() {
+        return Err(PyValueError::new_err(format!(
+            "{} replacements for {} grad calls",
+            relations.len(),
+            found.calls.len()
+        )));
+    }
+    let mut next = relations.into_iter();
+    Ok(found.rewrite(&mut |_| next.next().expect("counted above")))
+}
+
+/// The tables a step's plan reads without their types: the earlier steps it
+/// depends on.
+#[pyfunction]
+fn _unbound_reads(plan: &[u8]) -> PyResult<Vec<String>> {
+    Ok(ddx_ad::emit::unbound_reads(&decode(plan)?))
+}
+
+/// Bind a step's reads. `schemas` maps each table it reads to the serialized
+/// plan of `SELECT * FROM table` on the engine, whose read states the table's
+/// types in the engine's own terms.
+#[pyfunction]
+fn _bind_reads<'py>(
+    py: Python<'py>,
+    plan: &[u8],
+    schemas: HashMap<String, Vec<u8>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut plan = decode(plan)?;
+    let mut structs = HashMap::new();
+    for (name, select_all) in schemas {
+        let s = base_schema(&decode(&select_all)?).ok_or_else(|| {
+            PyValueError::new_err(format!("no table read in the plan given for `{name}`"))
+        })?;
+        structs.insert(name, s);
+    }
+    ddx_ad::emit::bind_reads(&mut plan, &mut |n| structs.get(n).cloned()).map_err(ad_to_py_err)?;
+    Ok(bytes(py, &plan))
+}
+
+/// The base schema of the table read at the bottom of `SELECT * FROM t`.
+fn base_schema(plan: &Plan) -> Option<NamedStruct> {
+    let mut rel: Option<&Rel> = plan.relations.iter().find_map(|r| match &r.rel_type {
+        Some(PlanRelType::Root(root)) => root.input.as_ref(),
+        _ => None,
+    });
+    while let Some(r) = rel {
+        match &r.rel_type {
+            Some(RelType::Read(read)) => return read.base_schema.clone(),
+            Some(RelType::Project(p)) => rel = p.input.as_deref(),
+            Some(RelType::Filter(f)) => rel = f.input.as_deref(),
+            _ => return None,
+        }
+    }
+    None
+}
+
 #[pymodule]
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rewrite_sql, m)?)?;
     m.add_function(wrap_pyfunction!(differentiate_sql, m)?)?;
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
+    m.add_function(wrap_pyfunction!(_grad, m)?)?;
+    m.add_function(wrap_pyfunction!(_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(_find_grad_calls, m)?)?;
+    m.add_function(wrap_pyfunction!(_rewrite_grad_calls, m)?)?;
+    m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(
@@ -236,5 +441,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<ProjectionBoundary>(),
     )?;
     m.add("SqlParseError", m.py().get_type::<SqlParseError>())?;
+    m.add("NotScalar", m.py().get_type::<NotScalar>())?;
+    m.add("UnknownColumn", m.py().get_type::<UnknownColumn>())?;
     Ok(())
 }
