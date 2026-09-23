@@ -13,8 +13,31 @@ SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
 request through planning and are always rewritten away *before* execution, so
 what DataFusion runs is an ordinary expression it already knows how to evaluate.
 
-All the calculus lives in [`ddx-core`](https://crates.io/crates/ddx-core); this
-crate only connects it to an engine.
+All the calculus lives in [`ddx-core`](https://crates.io/crates/ddx-core) and
+[`ddx-ad`](https://crates.io/crates/ddx-ad); this crate only connects them to an
+engine.
+
+## Gradients of whole queries: `ad`
+
+`ad` differentiates a query rather than an expression (ddx v2). In SQL,
+`grad(loss, table.column)` in a `FROM` clause is the gradient of the loss a CTE
+computes, as a relation shaped like the table:
+
+```rust
+use ddx_datafusion::ad;
+
+let step = ad::sql(&ctx, "
+    WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+    SELECT w.i, w.val - 0.1 * g.val AS val
+    FROM w JOIN grad(loss, w.val) g ON w.i = g.i").await?;
+```
+
+Nothing in the loss is labelled; the one function ddx claims is
+`ddx_stop_gradient` (`register_stop_gradient`). `ad::sql_all` runs several
+statements that take `grad` of one loss for one backward pass, and
+`ad::grad`/`ad::vjp` with `ad::run` give the program underneath.
+[`examples/nn`](examples/nn) trains nn.py's MLP (xarray-sql#196) with one SQL
+statement per parameter table: `cargo run -p ddx-datafusion --example nn`.
 
 ## Two routes to the same rewrite
 
@@ -81,9 +104,13 @@ bridge does not compile, so the dependency is pinned exactly and a test asserts
 the resolved tree still contains exactly one `sqlparser` — a future bump fails at
 the pin, with an explanation, rather than confusingly at the bridge.
 
-| `ddx-datafusion` | `datafusion` | `sqlparser` |
-|---|---|---|
-| 0.1 | 54 | 0.62 |
+v2 has the same shape one layer down: `ddx-ad` reads and writes the plans
+`datafusion-substrait` produces and consumes, so the two must resolve the same
+`substrait`, and `tests/substrait_pin.rs` asserts it.
+
+| `ddx-datafusion` | `datafusion` | `sqlparser` | `substrait` |
+|---|---|---|---|
+| 0.1 | 54 | 0.62 | 0.63 |
 
 ## Status
 
