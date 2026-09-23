@@ -57,8 +57,8 @@ substrait = { version = "=0.63.0" }
 # `substrait` requirement is what the pin above follows.
 datafusion-substrait = { version = "54.1" }
 # The protobuf runtime `substrait`'s types are generated for. ddx-ad encodes
-# plans as bytes for hosts that hold them so; the version is whatever
-# `substrait` uses.
+# plans as bytes for hosts that hold them so, and relations to compare them;
+# the version is whatever `substrait` uses.
 prost = { version = "0.14" }
 
 # Internal crates, referenced by path within the workspace.
