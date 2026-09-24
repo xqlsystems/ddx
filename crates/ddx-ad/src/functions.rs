@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 
 use substrait::proto::extensions::simple_extension_declaration::{ExtensionFunction, MappingType};
+use substrait::proto::extensions::SimpleExtensionDeclaration;
 use substrait::proto::Plan;
 
 use crate::error::{AdError, Result};
@@ -95,10 +96,76 @@ impl Functions {
     }
 }
 
+/// The functions a plan ddx writes declares.
+///
+/// It starts from the input plan's declarations, anchors unchanged, so an
+/// expression copied out of the forward query keeps meaning the same thing
+/// without being rewritten. A function ddx introduces (the `multiply` of a
+/// chain rule, the `sum` of a transpose) reuses the input's anchor when the
+/// input declares that name, and gets a fresh one otherwise.
+#[derive(Debug, Clone)]
+pub struct Extensions {
+    declarations: Vec<ExtensionFunction>,
+    by_name: HashMap<String, u32>,
+    next: u32,
+}
+
+impl Extensions {
+    /// Start from `functions`' declarations.
+    pub fn new(functions: &Functions) -> Self {
+        let mut by_name = HashMap::new();
+        for d in functions.declarations() {
+            by_name
+                .entry(normalize(&d.name))
+                .or_insert(d.function_anchor);
+        }
+        let next = functions
+            .declarations()
+            .iter()
+            .map(|d| d.function_anchor + 1)
+            .max()
+            .unwrap_or(0);
+        Extensions {
+            declarations: functions.declarations().to_vec(),
+            by_name,
+            next,
+        }
+    }
+
+    /// The anchor for function `name`, declaring it if needed.
+    ///
+    /// A new declaration has no extension URN, which is how DataFusion 54
+    /// declares every function, its own included; its consumer resolves
+    /// functions by name.
+    pub fn anchor(&mut self, name: &str) -> u32 {
+        if let Some(a) = self.by_name.get(&normalize(name)) {
+            return *a;
+        }
+        let anchor = self.next;
+        self.next += 1;
+        self.by_name.insert(normalize(name), anchor);
+        self.declarations.push(ExtensionFunction {
+            extension_urn_reference: u32::MAX,
+            function_anchor: anchor,
+            name: name.to_string(),
+        });
+        anchor
+    }
+
+    /// The declarations, for a plan's `extensions` list.
+    pub fn declarations(&self) -> Vec<SimpleExtensionDeclaration> {
+        self.declarations
+            .iter()
+            .map(|d| SimpleExtensionDeclaration {
+                mapping_type: Some(MappingType::ExtensionFunction(d.clone())),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use substrait::proto::extensions::SimpleExtensionDeclaration;
 
     pub(crate) fn plan_declaring(names: &[(u32, &str)]) -> Plan {
         Plan {
@@ -130,6 +197,23 @@ pub(crate) mod tests {
         assert_eq!(f.name(3).unwrap(), "sum");
         assert!(f.is_stop_gradient(7).unwrap());
         assert!(!f.is_stop_gradient(0).unwrap());
+    }
+
+    #[test]
+    fn extensions_keep_the_input_anchors_and_add_new_ones_after_them() {
+        let plan = plan_declaring(&[(0, "multiply"), (4, "sum:fp64")]);
+        let mut ext = Extensions::new(&Functions::from_plan(&plan).unwrap());
+        assert_eq!(ext.anchor("multiply"), 0);
+        assert_eq!(ext.anchor("SUM"), 4);
+        assert_eq!(ext.anchor("add"), 5);
+        assert_eq!(ext.anchor("add"), 5);
+        let out = Plan {
+            extensions: ext.declarations(),
+            ..Default::default()
+        };
+        let f = Functions::from_plan(&out).unwrap();
+        assert_eq!(f.name(4).unwrap(), "sum");
+        assert_eq!(f.name(5).unwrap(), "add");
     }
 
     #[test]
