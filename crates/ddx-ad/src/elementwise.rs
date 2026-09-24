@@ -279,14 +279,24 @@ fn function_name(op: &BinaryOperator) -> Option<&'static str> {
     })
 }
 
+/// The SQL type of a cast over a value that carries gradient: a float type.
+///
+/// A cast to an integer type truncates, so its derivative is zero almost
+/// everywhere and undefined at the steps. `ddx-core` would treat it as the
+/// identity (derivative 1), a silently wrong answer, so it is refused here.
 fn sql_type(t: &Type) -> Result<DataType> {
     Ok(match &t.kind {
         Some(Kind::Fp64(_)) => DataType::Double(ExactNumberInfo::None),
         Some(Kind::Fp32(_)) => DataType::Real,
-        Some(Kind::I64(_)) => DataType::BigInt(None),
-        Some(Kind::I32(_)) => DataType::Int(None),
-        Some(Kind::I16(_)) => DataType::SmallInt(None),
-        Some(Kind::I8(_)) => DataType::TinyInt(None),
+        Some(Kind::I64(_) | Kind::I32(_) | Kind::I16(_) | Kind::I8(_)) => {
+            return Err(AdError::NotImplemented(
+                "a cast to an integer type over a value that carries gradient: it truncates, \
+                 so its derivative is zero almost everywhere, not the identity. Cast to a \
+                 float type, or wrap the cast in ddx_stop_gradient(...) if no gradient \
+                 should flow through it"
+                    .into(),
+            ))
+        }
         other => {
             return Err(AdError::NotImplemented(format!(
                 "a cast to {other:?} over a value that carries gradient"
@@ -669,6 +679,27 @@ mod tests {
             )],
         );
         check(&fx, &e, &[0, 1], &[2.0, -3.0], &[0, 1]);
+    }
+
+    #[test]
+    fn a_cast_to_an_integer_is_refused_not_treated_as_the_identity() {
+        let fx = fixture();
+        let bigint = Type {
+            kind: Some(Kind::I64(I64 {
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            })),
+        };
+        let ddx = Ddx::new();
+        let mut ext = Extensions::new(&fx.functions);
+        let ew = Elementwise::new(&ddx, &fx.functions);
+        let e = cast(field(0), bigint.clone());
+        let err = ew.partials(&e, &|_| true, &mut ext).unwrap_err();
+        assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
+        assert!(err.to_string().contains("truncates"), "{err}");
+        // Over a constant it is a placeholder, and fine.
+        let e = fx.f("multiply", vec![field(0), cast(field(1), bigint)]);
+        assert_eq!(ew.partials(&e, &|i| i == 0, &mut ext).unwrap().len(), 1);
     }
 
     #[test]
