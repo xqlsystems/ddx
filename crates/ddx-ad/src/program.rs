@@ -223,8 +223,7 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
 }
 
 /// The loss column for [`grad`]: the query must return one column, on one
-/// row. One row is certain when no table or grouped aggregate with dims feeds
-/// the output.
+/// row.
 fn scalar_output(f: &Forward) -> Result<usize> {
     let names = &f.output_names;
     let [col] = f.output.outputs.as_slice() else {
@@ -234,11 +233,18 @@ fn scalar_output(f: &Forward) -> Result<usize> {
             names.len()
         )));
     };
-    let dims = output_dims(f);
-    if !dims.is_empty() {
+    // One row is certain only when every input the output reads is: a table
+    // has a row per dim tuple, and constant data joined in can multiply rows
+    // without having dims ddx knows about.
+    if f.output
+        .slots
+        .iter()
+        .any(|s| s.offset.is_some() && !s.at_most_one_row)
+    {
         return Err(AdError::NotScalar(format!(
-            "grad needs a loss, one row and one column, but `{}` has a row per value of its \
-             dims. Sum it into one row, or use vjp",
+            "grad needs a loss, one row and one column, but `{}` may have many rows: it \
+             reads a table, a grouped aggregate, or data that is not one row. Sum it into \
+             one row, or use vjp",
             names[0]
         )));
     }

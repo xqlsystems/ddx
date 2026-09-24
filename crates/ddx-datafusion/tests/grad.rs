@@ -130,6 +130,19 @@ async fn a_loss_computed_above_its_aggregates() {
 }
 
 #[tokio::test]
+async fn a_loss_may_divide_by_a_one_row_constant() {
+    // An ungrouped aggregate over data is one row, so the loss still is.
+    check_gradients(
+        &ctx(),
+        "SELECT s.t / c.n AS loss \
+         FROM (SELECT SUM(val * val) AS t FROM w) s CROSS JOIN (SELECT COUNT(*) AS n FROM x) c",
+        &[w(), x()],
+        &[wrt("w", "val")],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_wrt_table_the_loss_does_not_depend_on_gets_zeros() {
     let grads = check_gradients(
         &ctx(),
@@ -167,6 +180,12 @@ async fn grad_needs_a_loss() {
     let err = refusal("SELECT i, SUM(val * val) AS s FROM w GROUP BY i").await;
     assert!(matches!(err, AdError::NotScalar(_)), "{err}");
     let err = refusal("SELECT SUM(val * val) AS s FROM w GROUP BY i").await;
+    assert!(matches!(err, AdError::NotScalar(_)), "{err}");
+    // One row times a many-row constant table is many rows.
+    let err = refusal(
+        "WITH s AS (SELECT SUM(val * val) AS t FROM w) SELECT s.t * x.v AS l FROM s CROSS JOIN x",
+    )
+    .await;
     assert!(matches!(err, AdError::NotScalar(_)), "{err}");
 }
 
