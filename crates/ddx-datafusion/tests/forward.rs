@@ -202,3 +202,39 @@ async fn a_query_that_reads_no_wrt_table_is_refused() {
     let err = Forward::new(&plan, &[ColumnRef::new("w", "val")]).unwrap_err();
     assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
 }
+
+#[tokio::test]
+async fn a_wrt_table_with_no_dims_is_refused() {
+    // Every column is a wrt value: nothing tells one row's gradient from
+    // another's, so each row would get the sum of all of them.
+    let ctx = ctx().await;
+    ctx.sql("CREATE TABLE v (val DOUBLE) AS VALUES (1.0), (2.0), (3.0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM v", true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("v", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
+    assert!(
+        err.to_string().contains("no column identifies its"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn inputs_record_whether_they_are_one_row() {
+    // The output reads the loss (one row) and a constant one-row count; the
+    // aggregate grouped by i reads w, which is many rows.
+    let sql = "SELECT s.t / c.n AS l \
+               FROM (SELECT SUM(val) AS t FROM w) s CROSS JOIN (SELECT COUNT(*) AS n FROM pixels) c";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        assert!(
+            g.output.slots.iter().all(|s| s.at_most_one_row),
+            "{:?}",
+            g.output.slots
+        );
+        assert!(g.saved[0].input.slots.iter().all(|s| !s.at_most_one_row));
+    }
+}

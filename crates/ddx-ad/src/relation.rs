@@ -20,7 +20,10 @@
 //! the gradient of, as `jax.grad` returns a pytree shaped like its argument.
 //!
 //! For a table the query reads, the values are the columns named in `wrt`, and
-//! the dims are all the others. For a relation the query computes, the plan
+//! the dims are all the others. A table whose every column is named in `wrt`
+//! has no dims and is refused. That the dims identify the rows (no two rows
+//! share a dim tuple) is the XQL model's promise; ddx cannot see it in a plan,
+//! and a table that breaks it gets each shared tuple's rows' gradients summed. For a relation the query computes, the plan
 //! says which is which: a `GROUP BY` key is a dim, an aggregate is a value, and
 //! a join's dims are both sides' dims.
 

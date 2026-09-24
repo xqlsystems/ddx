@@ -81,6 +81,10 @@ pub struct Slot {
     pub offset: Option<usize>,
     /// Its number of columns.
     pub width: usize,
+    /// Whether the plan guarantees it has at most one row: a saved aggregate
+    /// with no grouping, or constant data the plan shows is one row. `grad`
+    /// needs this of every input its loss reads.
+    pub at_most_one_row: bool,
 }
 
 /// How a column of a rebuilt region is computed.
@@ -363,6 +367,7 @@ impl Builder<'_> {
                     input: Input::Saved(n),
                     offset: Some(0),
                     width,
+                    at_most_one_row: self.saved[n].groupings.is_empty(),
                 });
                 for c in 0..width {
                     let v = self.saved[n].varied[c];
@@ -389,6 +394,7 @@ impl Builder<'_> {
             input: Input::Const,
             offset: Some(0),
             width,
+            at_most_one_row: at_most_one_row(rel),
         });
         for _ in 0..width {
             s.push(Def::Const, false);
@@ -414,6 +420,7 @@ impl Builder<'_> {
             input: Input::Table(table),
             offset: Some(0),
             width,
+            at_most_one_row: false,
         });
         for c in 0..width {
             let v = self.tables[table].values.contains(&c);
@@ -454,9 +461,19 @@ impl Builder<'_> {
             }
         }
         values.sort_unstable();
-        let dims = (0..schema.names.len())
+        let dims: Vec<usize> = (0..schema.names.len())
             .filter(|c| !values.contains(c))
             .collect();
+        // A cotangent is keyed by its table's dims. With none, nothing tells
+        // one row's gradient from another's, and every row would get the sum.
+        if dims.is_empty() {
+            return Err(AdError::UnknownWrt(format!(
+                "every column of table `{}` is a wrt column, so no column identifies its \
+                 rows and their gradients cannot be told apart. Add a dim column (a row \
+                 index or coordinate) to the table",
+                names.join(".")
+            )));
+        }
         self.tables.push(Table {
             names: names.to_vec(),
             schema: schema.clone(),
@@ -818,6 +835,34 @@ fn read_outputs(r: &ReadRel) -> Result<Vec<usize>> {
             })
             .collect(),
         None => Ok((0..all).collect()),
+    }
+}
+
+/// Does the plan guarantee `rel` has at most one row? True for an aggregate
+/// with no grouping, a one-row `VALUES`, and anything that only filters,
+/// projects, sorts, limits or cross-joins such relations. False when unsure.
+fn at_most_one_row(rel: &Rel) -> bool {
+    let Some(kind) = &rel.rel_type else {
+        return false;
+    };
+    let below = |r: &Option<Box<Rel>>| r.as_deref().is_some_and(at_most_one_row);
+    match kind {
+        RelType::Aggregate(a) => grouping_expressions(a).is_ok_and(|g| g.is_empty()),
+        RelType::Project(p) => below(&p.input),
+        RelType::Filter(f) => below(&f.input),
+        RelType::Sort(s) => below(&s.input),
+        RelType::Fetch(f) => below(&f.input),
+        RelType::Cross(c) => below(&c.left) && below(&c.right),
+        RelType::Read(r) => match &r.read_type {
+            Some(ReadType::VirtualTable(v)) => {
+                // Older producers fill the deprecated `values`.
+                #[allow(deprecated)]
+                let rows = v.values.len() + v.expressions.len();
+                rows <= 1
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
