@@ -103,7 +103,11 @@ impl<'a> Elementwise<'a> {
     }
 }
 
-fn depends(functions: &Functions, e: &Expression, varied: &dyn Fn(usize) -> bool) -> Result<bool> {
+pub(crate) fn depends(
+    functions: &Functions,
+    e: &Expression,
+    varied: &dyn Fn(usize) -> bool,
+) -> Result<bool> {
     if let Some(RexType::ScalarFunction(f)) = &e.rex_type {
         if functions.is_stop_gradient(f.function_reference)? {
             return Ok(false);
