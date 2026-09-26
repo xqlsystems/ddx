@@ -1109,7 +1109,24 @@ breadth, not de-risking.
   pure-logical; performance is a separate, physical concern (the
   fused-contraction operator, still to spike). Runs first on DataFusion.
   *Exit:* train the `nn.py` MLP with gradients *emitted by* `ddx`'s `grad`, not
-  hand-written, matching the demo and JAX.
+  hand-written, matching the demo and JAX. **Built:** `grad(loss,
+  table.column)` in SQL, from Rust (`ddx_datafusion::ad::sql`) and Python
+  (`ddxdb.Context.sql`, `ddxdb.ad`), over `grad`/`vjp` programs run on
+  DataFusion. `ddx-datafusion/examples/nn` trains nn.py's MLP with one SQL
+  statement per parameter table; its gradients equal nn.py's hand-written
+  backward queries to 1e-12, and the spikes' MLP, attention and max-pool
+  gradients, taken in SQL, equal `jax.grad` to 1e-12 (`tests/test_v2_jax.py`).
+  Query-level `jvp` is the next milestone, M4.5.
+- **M4.5 — `jvp` over queries: the forward-mode half (#86).** Completes the
+  SQL surface as `grad`, `vjp` and `jvp`. Forward mode needs no transposes and
+  no tape: tangents travel beside values through the same operators (map via
+  `ddx-core`'s scalar `jvp`; sum, mean and join linear in the tangent; `MAX`
+  and `MIN` taking the attaining row's tangent, averaged over ties), so a `jvp`
+  is one rewritten query rather than a program. Surfaces as `jvp(query,
+  table.column, tangent)` in a `FROM` clause, from Rust and Python. *Exit:*
+  matches `jax.jvp` on the spikes' fixtures, passes the dot-product test
+  ⟨J t, c⟩ = ⟨t, Jᵀ c⟩ against `vjp`, and gives a Hessian-vector product on
+  the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
@@ -1151,8 +1168,25 @@ breadth, not de-risking.
   those guards unnecessary by construction. Decide if that tripwire fires,
   not preemptively.
 - **Higher-order AD over an emitted v2 backward plan** — genuinely
-  undecided (§4.6); revisit once M4 has a working single-order emitter to
-  reason about concretely.
+  undecided (§4.6). M4 now has a working single-order emitter to reason about
+  concretely: its backward steps read saved relations by name, so
+  differentiating it again would need a way to differentiate through a read
+  of a materialized step.
+- **Query-level `jvp`** (#86). The review that reshaped v2 asked for `grad`,
+  `vjp` and `jvp` as the whole SQL surface. `grad` and `vjp` exist; forward
+  mode through joins and aggregates does not yet. It is the easier half: with
+  no transposes and no tape, tangents travel beside values through the same
+  operators, so a `jvp` can be one rewritten query rather than a program. It
+  would also give Hessian-vector products (forward-over-reverse) and a
+  dot-product test of `vjp` that needs no JAX. Scheduled as M4.5 (§8). The
+  open part is forward-over-reverse, which means differentiating a `grad`
+  program whose steps read saved relations by name (#40).
+- **Recomputation vs. saving inside a region.** A region's backward step
+  rebuilds the region's joins rather than reading them from a saved relation
+  (S6). For nn.py's first layer that is one extra join per backward step, the
+  same size as the forward one. Whether some regions should be saved instead
+  is a performance question for the fused-contraction work, not a
+  correctness one.
 
 ---
 

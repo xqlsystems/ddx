@@ -77,7 +77,7 @@ this guide then work unchanged. CI does not use Nix; this is a dev shell only.
 crates/
   ddx-core/          # the v1 engine — sqlparser only. Start here.
   ddx-datafusion/    # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql
-  ddx-ad/            # v2 query-level reverse-mode AD over Substrait (M3/M4)
+  ddx-ad/            # v2: query-level reverse-mode AD over Substrait
 python/ddxdb/        # PyO3/maturin wheel: rewrite_sql + a DataFusion Context
 tests/               # cross-engine numeric-agreement suites (vs JAX)
 docs/design.md       # the design (source of truth)
@@ -86,7 +86,8 @@ docs/spikes/         # runnable evidence behind the design
 ```
 
 `ddx-core` is where most work happens; everything else is a thin layer over it.
-`ddx-ad` is under construction for M3/M4.
+`ddx-ad` is v2. Its integration tests live in `ddx-datafusion/tests/`, where
+there is an engine to run the plans it emits.
 
 ## Working on the Python code
 
