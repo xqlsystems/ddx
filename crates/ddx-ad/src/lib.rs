@@ -21,7 +21,8 @@
 //! gradients of. The pieces are public for adapters: [`relation`] states what
 //! dims and values are, [`forward`] reads the plan, [`Elementwise`] gives the
 //! map primitive's local derivatives, and [`emit`] writes plans and binds their
-//! reads.
+//! reads. [`sql`] finds `grad(loss, table.column)` in a SQL statement, for
+//! adapters that let users write `grad` in SQL.
 //!
 //! # `substrait` version policy
 //!
@@ -40,6 +41,7 @@ pub mod forward;
 mod functions;
 mod program;
 pub mod relation;
+pub mod sql;
 mod transpose;
 
 pub use elementwise::Elementwise;
@@ -50,6 +52,7 @@ pub use program::{
     grad, grad_with, vjp, vjp_with, BackwardProgram, Gradient, Step, COTANGENT, VALUE,
 };
 pub use relation::{ColumnRef, Table};
+pub use sql::{GradCall, GradCalls, Loss};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.
