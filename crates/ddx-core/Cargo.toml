@@ -1,8 +1,8 @@
 [package]
 name = "ddx-core"
 description = "Engine-neutral symbolic differentiation of SQL scalar expressions: `grad` & `jvp`."
-# Versioned independently of the workspace (the scaffold crates stay at the
-# workspace 0.0.0). This is the first publishable crate; release-plz manages
+# Versioned independently of the workspace (unpublished crates stay at the
+# workspace 0.0.0). This was the first publishable crate; release-plz manages
 # bumps from here (SemVer). See CONTRIBUTING.md → Releases.
 version = "0.2.1"
 edition.workspace = true

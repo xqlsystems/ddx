@@ -18,12 +18,14 @@ rust-version.workspace = true
 # `sqlparser` version or Path B's bridge won't compile — the workspace
 # Cargo.toml documents the pin and tests/sqlparser_pin.rs enforces it in CI.
 #
-# `ddx-ad` is only a dev-dependency so far: the tests check that it reads the
-# plans DataFusion produces. It becomes a real dependency (and publishable)
-# when the adapter runs v2's backward program (M4).
+# `ddx-ad` and `datafusion-substrait` carry v2: DataFusion produces the forward
+# query's Substrait plan, ddx-ad differentiates it, and DataFusion consumes the
+# steps it returns. tests/substrait_pin.rs checks they share one `substrait`.
 [dependencies]
 ddx-core = { workspace = true }
+ddx-ad = { workspace = true }
 datafusion = { workspace = true }
+datafusion-substrait = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -32,5 +34,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # agreement test proves nothing if each side invents its own idea of "a random
 # derivable expression".
 ddx-core = { workspace = true, features = ["test-utils"] }
-ddx-ad = { workspace = true }
-datafusion-substrait = { workspace = true }
