@@ -316,10 +316,12 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<Vec<String>> {
         .collect();
     let width = out.defs.len();
     let keys: Vec<Expression> = dim_cols.iter().map(|&i| field(out.outputs[i])).collect();
+    let positions: Vec<usize> = (0..dim_cols.len()).collect();
     let base = t.join_on(
         out.rel.clone(),
         read_step(COTANGENT, names.clone()),
         keys,
+        &positions,
         width,
     )?;
     let seeds = value_cols
