@@ -238,3 +238,19 @@ async fn inputs_record_whether_they_are_one_row() {
         assert!(g.saved[0].input.slots.iter().all(|s| !s.at_most_one_row));
     }
 }
+
+#[tokio::test]
+async fn a_wrt_table_matches_regardless_of_case() {
+    // DataFusion folds the unquoted `W` to `w`; the wrt names it as written.
+    let wrt = [ColumnRef::new("W", "val"), ColumnRef::new("B", "Val")];
+    for g in both(&LAYER.replace("JOIN w ON", "JOIN W ON"), &wrt).await {
+        assert!(g
+            .tables
+            .iter()
+            .any(|t| t.names == ["w"] && t.values == vec![2]));
+        assert!(g
+            .tables
+            .iter()
+            .any(|t| t.names == ["b"] && t.values == vec![1]));
+    }
+}
