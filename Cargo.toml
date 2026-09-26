@@ -56,6 +56,9 @@ substrait = { version = "=0.63.0" }
 # DataFusion's Substrait producer and consumer, for the v2 adapter. Its
 # `substrait` requirement is what the pin above follows.
 datafusion-substrait = { version = "54.1" }
+# The protobuf runtime `substrait`'s types are generated for. ddx-ad encodes
+# relations to compare them; the version is whatever `substrait` uses.
+prost = { version = "0.14" }
 
 # Internal crates, referenced by path within the workspace.
 #

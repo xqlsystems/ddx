@@ -38,7 +38,9 @@
 //! derivative (a window rank, the `NULL` side of an outer join); each carries
 //! a refusal that is raised only if gradient actually reaches it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+
+use prost::Message;
 
 use substrait::proto::aggregate_rel::Grouping;
 use substrait::proto::expression::RexType;
@@ -247,6 +249,7 @@ impl Forward {
             wrt,
             tables: Vec::new(),
             saved: Vec::new(),
+            by_encoding: HashMap::new(),
             seen: BTreeSet::new(),
         };
         let output = b.lower(root)?;
@@ -287,6 +290,8 @@ struct Builder<'a> {
     wrt: &'a [ColumnRef],
     tables: Vec<Table>,
     saved: Vec<Saved>,
+    /// Each saved aggregate, by the encoding of the aggregate it was read from.
+    by_encoding: HashMap<Vec<u8>, usize>,
     /// Every table name the plan reads, for the error when a `wrt` names none.
     seen: BTreeSet<String>,
 }
@@ -634,8 +639,26 @@ impl Builder<'_> {
         Ok((s, direct))
     }
 
-    /// Read aggregate `a` as a saved relation.
+    /// The saved relation for aggregate `a`, read on first sight.
+    ///
+    /// A query that reads a CTE twice gets the CTE's plan twice: Substrait
+    /// plans are trees, and producers inline. Two identical aggregates are one
+    /// saved relation, computed and stored once, and both readers' cotangents
+    /// are added into one (design.md §4.4's fan-in). Treating them as two
+    /// would also be correct, by linearity, but would do the work twice. This
+    /// is the other half of the save-or-recompute policy the module docs
+    /// describe.
     fn read_saved(&mut self, a: &AggregateRel) -> Result<usize> {
+        let encoding = a.encode_to_vec();
+        if let Some(&n) = self.by_encoding.get(&encoding) {
+            return Ok(n);
+        }
+        let n = self.read_aggregate(a)?;
+        self.by_encoding.insert(encoding, n);
+        Ok(n)
+    }
+
+    fn read_aggregate(&mut self, a: &AggregateRel) -> Result<usize> {
         let input = self.lower(input(&a.input)?)?;
         let outputs = &input.outputs;
         let groupings = grouping_expressions(a)?

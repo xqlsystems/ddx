@@ -1349,6 +1349,7 @@ name = "ddx-ad"
 version = "0.0.0"
 dependencies = [
  "ddx-core",
+ "prost",
  "substrait",
 ]
 
