@@ -34,7 +34,8 @@ use substrait::proto::NamedStruct;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
     /// The table, as the plan names it: `weights`, or `schema.weights`. A bare
-    /// name also matches a qualified one with that last part.
+    /// name also matches a qualified one with that last part, and case is
+    /// ignored.
     pub table: String,
     /// The column.
     pub column: String,
@@ -71,9 +72,13 @@ impl Table {
 }
 
 /// Does the `wrt` table name `wanted` name the table `names`?
+///
+/// Compared case-insensitively, as columns are: a producer folds unquoted
+/// identifiers (DataFusion to lower case), so `W` in a `wrt` names the table a
+/// query wrote as `W` and the plan reads as `w`.
 pub(crate) fn table_matches(wanted: &str, names: &[String]) -> bool {
-    names.join(".") == wanted
-        || (!wanted.contains('.') && names.last().is_some_and(|n| n == wanted))
+    names.join(".").eq_ignore_ascii_case(wanted)
+        || (!wanted.contains('.') && names.last().is_some_and(|n| n.eq_ignore_ascii_case(wanted)))
 }
 
 /// The column called `wanted`: an exact match, else the only
