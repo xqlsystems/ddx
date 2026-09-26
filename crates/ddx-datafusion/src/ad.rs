@@ -148,7 +148,11 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
                 }
             };
             for w in &loss.wrt {
-                if !programs[p].1.contains(w) {
+                let same = |x: &ColumnRef| {
+                    x.table.eq_ignore_ascii_case(&w.table)
+                        && x.column.eq_ignore_ascii_case(&w.column)
+                };
+                if !programs[p].1.iter().any(same) {
                     programs[p].1.push(w.clone());
                 }
             }
@@ -180,27 +184,30 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
         let mut failure = None;
         let rewritten = calls.rewrite(&mut |call| {
             let p = program_of[&(s, call.loss)];
-            let found = kept.iter().find(|(q, table, _, _)| {
-                *q == p
-                    && (table.join(".") == call.table
-                        || table
-                            .last()
-                            .is_some_and(|t| t.eq_ignore_ascii_case(&call.table)))
-            });
-            let Some((_, _, name, columns)) = found else {
+            let found = kept
+                .iter()
+                .find(|(q, table, _, _)| *q == p && names_table(&call.table, table));
+            let Some((_, table, name, columns)) = found else {
                 failure = Some(format!("no gradient was computed for `{}`", call.table));
                 return String::new();
             };
             // The table's dims, then the columns this call asked for.
-            let values = value_count(columns, &programs[p].1, &call.table);
-            let dims = &columns[..columns.len() - values];
+            // A column is one of this table's values when some wrt entry for
+            // the table names it; every other column is a dim.
+            let is_value = |c: &String| {
+                programs[p]
+                    .1
+                    .iter()
+                    .any(|w| names_table(&w.table, table) && w.column.eq_ignore_ascii_case(c))
+            };
+            let dims: Vec<&String> = columns.iter().filter(|c| !is_value(c)).collect();
             let picked: Vec<String> = dims
-                .iter()
+                .into_iter()
                 .cloned()
                 .chain(call.columns.iter().filter_map(|c| {
-                    columns[dims.len()..]
+                    columns
                         .iter()
-                        .find(|v| v.eq_ignore_ascii_case(c))
+                        .find(|v| is_value(v) && v.eq_ignore_ascii_case(c))
                         .cloned()
                 }))
                 .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
@@ -215,13 +222,11 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     Ok(frames)
 }
 
-/// How many of a gradient's `columns` (dims, then values) are values: the
-/// `wrt` columns of `table`.
-fn value_count(columns: &[String], wrt: &[ColumnRef], table: &str) -> usize {
-    wrt.iter()
-        .filter(|w| w.table.eq_ignore_ascii_case(table))
-        .filter(|w| columns.iter().any(|c| c.eq_ignore_ascii_case(&w.column)))
-        .count()
+/// Does the table name `wanted`, as written in SQL, name the plan's `table`?
+/// A bare name matches a qualified table's last part; case is ignored.
+fn names_table(wanted: &str, table: &[String]) -> bool {
+    table.join(".").eq_ignore_ascii_case(wanted)
+        || (!wanted.contains('.') && table.last().is_some_and(|t| t.eq_ignore_ascii_case(wanted)))
 }
 
 /// Run every step of `program`, forward then backward, registering each

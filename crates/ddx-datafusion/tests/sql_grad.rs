@@ -177,3 +177,17 @@ async fn statements_sharing_a_loss_share_its_program() {
         assert_eq!(got[1][k].1, b[1] - 0.5 * w[1] * w[1]);
     }
 }
+
+#[tokio::test]
+async fn case_variants_of_a_column_keep_the_dims() {
+    // w.val and W.VAL are one wrt column; the gradient keeps its dim `i`.
+    let ctx = ctx().await;
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT a.i, a.val + b.val AS v \
+         FROM grad(loss, w.val) a JOIN grad(loss, W.VAL) b ON a.i = b.i",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 4.0), (1, -8.0), (2, 2.0)]);
+}
