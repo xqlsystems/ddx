@@ -67,6 +67,28 @@ def test_statements_sharing_a_loss_share_its_program(ad, ctx):
     assert pairs(fb) == [(i, b[i] - 0.5 * w[i] * w[i]) for i in range(3)]
 
 
+def test_case_variants_of_a_column_keep_the_dims(ad, ctx):
+    df = ad.sql(
+        ctx,
+        """WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+           SELECT a.i, a.val + b.val AS v
+           FROM grad(loss, w.val) a JOIN grad(loss, W.VAL) b ON a.i = b.i""",
+    )
+    assert pairs(df) == [(0, 4.0), (1, -8.0), (2, 2.0)]
+
+
+def test_stop_gradient_on_a_real_column(ad, ctx):
+    ctx.register_record_batches(
+        "h", [pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.5, 2.5], pa.float32())}).to_batches()]
+    )
+    df = ad.sql(
+        ctx,
+        """WITH loss AS (SELECT SUM(w.val * ddx_stop_gradient(h.x)) AS l FROM w JOIN h ON w.i = h.i)
+           SELECT * FROM grad(loss, w.val)""",
+    )
+    assert pairs(df) == [(0, 1.5), (1, 2.5), (2, 0.0)]
+
+
 def test_context_sql_understands_grad(ad):
     pytest.importorskip("datafusion")
     ctx = ddxdb.Context()

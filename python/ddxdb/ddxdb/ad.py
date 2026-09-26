@@ -34,7 +34,7 @@ Importing this module requires DataFusion.
 from __future__ import annotations
 
 import dataclasses
-from typing import Iterable, Iterator, Sequence
+from typing import Iterator, Sequence
 
 try:
     import pyarrow as pa
@@ -113,10 +113,14 @@ class BackwardProgram:
         yield from self.backward_steps
 
 
-def register_stop_gradient(ctx: SessionContext, types: Iterable[pa.DataType] = (pa.float64(),)) -> None:
-    """Register ``ddx_stop_gradient`` on ``ctx`` as the identity, for ``types``."""
-    for t in types:
-        ctx.register_udf(udf(lambda x: x, [t], t, "immutable", name=STOP_GRADIENT))
+def register_stop_gradient(ctx: SessionContext) -> None:
+    """Register ``ddx_stop_gradient`` on ``ctx`` as the identity on DOUBLE.
+
+    DataFusion keeps one UDF per name, so it takes one type; an argument of
+    another numeric type is cast to DOUBLE inside the call. That is harmless:
+    ddx treats the argument as a constant whatever it contains.
+    """
+    ctx.register_udf(udf(lambda x: x, [pa.float64()], pa.float64(), "immutable", name=STOP_GRADIENT))
 
 
 def _program(raw) -> BackwardProgram:
@@ -182,6 +186,14 @@ def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
     ctx.register_record_batches(name, [batches])
 
 
+def _names_table(wanted: str, table: str) -> bool:
+    """Does the table name ``wanted``, as written in SQL, name the plan's
+    ``table``? A bare name matches a qualified table's last part; case is
+    ignored."""
+    wanted, table = wanted.lower(), table.lower()
+    return wanted == table or ("." not in wanted and table.split(".")[-1] == wanted)
+
+
 def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -218,9 +230,10 @@ def sql_all(ctx: SessionContext, statements: Sequence[str]) -> list:
                 queries.append(query)
                 wrts.append([])
             p = queries.index(query)
-            for w in wrt:
-                if tuple(w) not in wrts[p]:
-                    wrts[p].append(tuple(w))
+            for t, c in wrt:
+                # w.VAL and w.val are one column, as ddx_ad::grad compares them.
+                if not any(t.lower() == t2.lower() and c.lower() == c2.lower() for t2, c2 in wrts[p]):
+                    wrts[p].append((t, c))
             program_of[(s, l)] = p
 
     # Run each, keeping its gradients under names of their own: the next
@@ -244,16 +257,17 @@ def sql_all(ctx: SessionContext, statements: Sequence[str]) -> list:
         for loss, table, columns in calls:
             p = program_of[(s, loss)]
             match = next(
-                (v for (q, t), v in kept.items()
-                 if q == p and (t == table or t.split(".")[-1].lower() == table.lower())),
+                ((t, v) for (q, t), v in kept.items() if q == p and _names_table(table, t)),
                 None,
             )
             if match is None:
                 raise RuntimeError(f"no gradient was computed for {table!r}")
-            name, all_columns = match
-            values = sum(1 for t, c in wrts[p] if t.lower() == table.lower())
-            dims = list(all_columns[: len(all_columns) - values])
-            asked = [v for c in columns for v in all_columns[len(dims):] if v.lower() == c.lower()]
+            plan_table, (name, all_columns) = match
+            # A column is one of the table's values when a wrt entry for the
+            # table names it; every other column is a dim.
+            value_names = {c.lower() for t, c in wrts[p] if _names_table(t, plan_table)}
+            dims = [c for c in all_columns if c.lower() not in value_names]
+            asked = [v for c in columns for v in all_columns if v.lower() in value_names and v.lower() == c.lower()]
             picked = ", ".join(_quote(c) for c in dims + asked)
             relations.append(f"(SELECT {picked} FROM {_quote(name)})")
         frames.append(ctx.sql(_rewrite_grad_calls(statement, relations)))
