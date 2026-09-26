@@ -51,7 +51,8 @@ pub struct Loss {
     /// A query computing just the loss: the statement's CTEs up to and
     /// including this one, then `SELECT * FROM` it.
     pub query: String,
-    /// Every column any call takes this loss's gradient with respect to.
+    /// Every column any call takes this loss's gradient with respect to, each
+    /// once, compared case-insensitively.
     pub wrt: Vec<ColumnRef>,
 }
 
@@ -128,7 +129,13 @@ impl GradCalls {
                 )));
             }
             for w in &wrt {
-                if !losses[loss].wrt.contains(w) {
+                // `w.VAL` and `w.val` are one column: identifiers are
+                // compared case-insensitively, as `ddx_ad::grad` does.
+                let same = |x: &ColumnRef| {
+                    x.table.eq_ignore_ascii_case(&w.table)
+                        && x.column.eq_ignore_ascii_case(&w.column)
+                };
+                if !losses[loss].wrt.iter().any(same) {
                     losses[loss].wrt.push(w.clone());
                 }
             }
@@ -380,6 +387,15 @@ mod tests {
         );
         let out = found.rewrite(&mut |c| format!("g_{}", c.table));
         assert!(out.ends_with("SELECT * FROM g_w gw, g_b gb"), "{out}");
+    }
+
+    #[test]
+    fn case_variants_of_a_column_are_one_wrt_column() {
+        let sql = "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+                   SELECT * FROM grad(loss, w.val) a, grad(loss, W.VAL) b";
+        let found = GradCalls::find(sql, &GenericDialect {}).unwrap().unwrap();
+        assert_eq!(found.losses[0].wrt, vec![ColumnRef::new("w", "val")]);
+        assert_eq!(found.calls.len(), 2);
     }
 
     #[test]
