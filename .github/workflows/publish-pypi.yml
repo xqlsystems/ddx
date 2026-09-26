@@ -63,6 +63,16 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
+      # Windows: substrait's build needs protoc, and building it from source
+      # fails under MSVC (see python/ddxdb/Cargo.toml), so fetch the release.
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" \
+            https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-win64.zip
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "PROTOC=$RUNNER_TEMP/protoc/bin/protoc.exe" >> "$GITHUB_ENV"
       - name: Build wheel
         working-directory: python/ddxdb
         shell: bash

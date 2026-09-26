@@ -134,7 +134,41 @@ except ddxdb.AmbiguousColumn:
 
 All of them derive from `ddxdb.DdxError`. The full set is
 `UnsupportedExpression`, `InvalidMarker`, `AmbiguousColumn`,
-`ProjectionBoundary` and `SqlParseError`.
+`ProjectionBoundary` and `SqlParseError`, plus `NotScalar` and
+`UnknownColumn` from whole-query `grad`.
+
+## Gradients of whole queries: `grad(loss, table.column)`
+
+`grad(expr, column)` differentiates one expression. Training a model needs the
+gradient of a whole query, and that is `grad` too, in a `FROM` clause: the
+gradient of the loss a CTE computes, as a relation shaped like the table.
+
+```python
+from ddxdb import Context
+
+ctx = Context()
+# ... register x(sample, inp, val), w(inp, out, val), y(sample, out, val) ...
+
+ctx.sql("""
+WITH h AS (
+  SELECT x.sample, w.out, SUM(x.val * w.val) AS z
+  FROM x JOIN w ON x.inp = w.inp GROUP BY x.sample, w.out),
+loss AS (
+  SELECT SUM(power(tanh(h.z) - y.val, 2)) AS l
+  FROM h JOIN y ON h.sample = y.sample AND h.out = y.out)
+SELECT w.inp, w.out, w.val - 0.1 * g.val AS val
+FROM w JOIN grad(loss, w.val) g ON w.inp = g.inp AND w.out = g.out
+""")
+```
+
+That is one SGD step: `params - lr * grad(loss)(params)`, written as a join.
+Nothing in the loss is labelled for ddx; the one function it gives a meaning
+to is `ddx_stop_gradient(x)`, JAX's `lax.stop_gradient`. On a plain
+`SessionContext`, `ddxdb.ad.sql(ctx, statement)` does the same, and
+`ddxdb.ad.sql_all` runs several statements that take `grad` of one loss for
+the price of one backward pass. `ddxdb.ad.grad` and `ddxdb.ad.vjp` give the
+underlying program. A query that is not a loss raises `NotScalar`, and a
+column the loss does not read raises `UnknownColumn`. This needs DataFusion.
 
 ## One thing to know
 
@@ -160,6 +194,9 @@ pip install maturin pytest
 maturin develop --uv
 python -m pytest tests/
 ```
+
+Building compiles `protoc` from source for the `substrait` crate (it needs
+`cmake` and a C++ compiler), which takes a few minutes the first time.
 
 ## License
 

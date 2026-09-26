@@ -37,7 +37,9 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     DdxError,
     InvalidMarker,
     ProjectionBoundary,
+    NotScalar,
     SqlParseError,
+    UnknownColumn,
     UnsupportedExpression,
     differentiate_sql,
     rewrite_sql,
@@ -66,6 +68,8 @@ __all__ = [
     "AmbiguousColumn",
     "ProjectionBoundary",
     "SqlParseError",
+    "NotScalar",
+    "UnknownColumn",
     "__version__",
 ]
 
