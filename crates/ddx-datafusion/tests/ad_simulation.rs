@@ -302,6 +302,11 @@ struct Node {
     reads: BTreeSet<String>,
     /// Kinds of primitive it (or anything beneath it) uses, for coverage.
     kinds: BTreeSet<&'static str>,
+    /// Whether a later relation may read it. A softmax with its shift
+    /// stopped keeps its exponentials and their sum to itself: only the
+    /// ratio is shift-invariant, so a gradient through them is, by
+    /// stop-gradient's definition, not the loss's derivative.
+    shared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -443,6 +448,7 @@ impl Gen<'_> {
             dims,
             reads,
             kinds,
+            shared: true,
         });
         self.nodes.len() - 1
     }
@@ -463,7 +469,11 @@ impl Gen<'_> {
         }
         if !self.nodes.is_empty() && self.rng.below(100) < 10 {
             // Reuse: a relation read twice (attention's X feeding Q, K and V).
-            return self.rng.below(self.nodes.len() as u64) as usize;
+            let k = self.rng.below(self.nodes.len() as u64) as usize;
+            if let Some(k) = (0..=k).rev().find(|&i| self.nodes[i].shared) {
+                return k;
+            }
+            return self.leaf();
         }
         match self.rng.below(100) {
             0..=19 => self.map(depth),
@@ -857,6 +867,10 @@ impl Gen<'_> {
             n.reads.clone(),
             kinds.clone(),
         );
+        if shift != "b.v" {
+            self.nodes[e].shared = false;
+            self.nodes[s].shared = false;
+        }
         let ratio = if self.rng.below(3) == 0 {
             "ln(a.v / b.v)"
         } else {
