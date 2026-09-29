@@ -265,8 +265,8 @@ fn gen_table(
 }
 
 /// Percent of parameter values generated NULL (`DDX_V2_NULL_PCT`, default
-/// 4). Setting it to 0 hunts past a known NULL bug without it drowning
-/// everything else.
+/// 4). Setting it to 0 replays a case minus its NULLs, which is how a
+/// failure is attributed to them.
 fn null_pct() -> u64 {
     env_u64("DDX_V2_NULL_PCT", 4)
 }

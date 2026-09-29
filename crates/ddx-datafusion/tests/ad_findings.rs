@@ -5,22 +5,25 @@
 //! Bugs `ad_simulation.rs` found, each reduced to the smallest query that
 //! shows it and pinned against a gradient worked by hand.
 //!
-//! Each is `#[ignore]`d as a known bug until its fix lands (CONTRIBUTING.md,
-//! "a failing test first"); `cargo test --test ad_findings -- --ignored` runs
-//! them, and every one fails on this branch. Its fix removes the `ignore`.
+//! Each was `#[ignore]`d as a known bug until its fix landed (CONTRIBUTING.md,
+//! "a failing test first"). Every one is now fixed, and runs as an ordinary
+//! test; each entry below names the fix.
 //!
 //! - **NULL rows leak gradient.** SUM, AVG, MAX and MIN skip a row whose
 //!   argument is NULL, so nothing in that row can move the loss. ddx still
 //!   broadcasts the group's cotangent to the row and pushes it through the
 //!   row's other inputs, where a partial that does not read the NULL (the 1 of
 //!   `p + q`) is not NULL. The gradient is silently wrong at every parameter
-//!   joined to a NULL, in a parameter table or in constant data.
+//!   joined to a NULL, in a parameter table or in constant data. *Fixed in
+//!   #74 and #76:* each reduce rule's seed is NULL where its argument is.
 //! - **Two rank filters in one region collide.** Rebuilding the region keeps
 //!   both window columns, and the optimizer has given them the same name, so
 //!   DataFusion's consumer refuses the step. The program was accepted.
+//!   *Fixed in #73:* a window column is renamed in place once computed.
 //! - **An unoptimized plan's join condition and a CASE.** `grad_plan` accepts
 //!   any `LogicalPlan`, a DataFrame's included; this unoptimized one is
 //!   accepted and its backward step then fails DataFusion's schema check.
+//!   *Fixed in #79:* a step's table takes the schema of the plan that ran.
 
 use datafusion::prelude::SessionContext;
 use ddx_datafusion::ad::{self, ColumnRef};
@@ -59,7 +62,6 @@ async fn grad(ctx: &SessionContext, loss: &str, table: &str) -> Vec<(i64, Option
 }
 
 #[tokio::test]
-#[ignore = "known bug: a row an aggregate skips as NULL still sends its cotangent to its other inputs"]
 async fn a_row_an_aggregate_skips_as_null_sends_no_gradient() {
     let ctx = SessionContext::new();
     exec(
@@ -84,7 +86,6 @@ async fn a_row_an_aggregate_skips_as_null_sends_no_gradient() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: two rankings in one recomputed region share a column name"]
 async fn a_rank_filter_over_a_rank_filter_runs() {
     let ctx = SessionContext::new();
     exec(
@@ -105,7 +106,6 @@ async fn a_rank_filter_over_a_rank_filter_runs() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: a row an aggregate skips as NULL still sends its cotangent to its other inputs"]
 async fn a_null_in_constant_data_sends_no_gradient_through_its_row() {
     let ctx = SessionContext::new();
     exec(
@@ -130,7 +130,6 @@ async fn a_null_in_constant_data_sends_no_gradient_through_its_row() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: the backward step does not match its own schema"]
 async fn an_unoptimized_join_with_a_constant_condition_under_a_case_runs() {
     // grad_plan takes any LogicalPlan, a DataFrame's included, and this one is
     // accepted, then its backward step does not match its own schema.
