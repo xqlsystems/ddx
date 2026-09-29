@@ -33,7 +33,7 @@
 //!   saved value.
 //! - **A table with capitals has no gradient in SQL.** `ad::sql` reads a
 //!   gradient step back under a quoted name DataFusion lowercased when it
-//!   was registered.
+//!   was registered. *Fixed in #74:* a step's name is lower case.
 //! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
@@ -245,7 +245,6 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: grad in SQL reads a gradient step under a name DataFusion lowercased"]
 async fn grad_in_sql_of_a_table_with_capitals() {
     // A gradient step is named after its table (`…_grad_0_W`). DataFusion
     // folds the unquoted name it is registered under to lower case, and

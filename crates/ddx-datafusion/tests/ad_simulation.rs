@@ -2270,14 +2270,6 @@ async fn name_checks(
         "two-losses",
         "lookalikes",
     ]);
-    // A quoted name with capitals meets a known bug (ad_findings.rs,
-    // grad_in_sql_of_a_table_with_capitals) every time, so only the soak
-    // tries it until that is fixed; then drop this line.
-    let kind = if kind == "quoted" && !SOAKING.load(Ordering::Relaxed) {
-        "schema"
-    } else {
-        kind
-    };
     let (sql, value) = match kind {
         "schema" | "quoted" => {
             let (reference, register) = if kind == "schema" {
