@@ -35,7 +35,10 @@ let step = ad::sql(&ctx, "
 Nothing in the loss is labelled; the one function ddx claims is
 `ddx_stop_gradient` (`register_stop_gradient`). `ad::sql_all` runs several
 statements that take `grad` of one loss for one backward pass, and
-`ad::grad`/`ad::vjp` with `ad::run` give the program underneath.
+`ad::grad`/`ad::vjp` with `ad::run` give the program underneath. A program's
+tables are named under a prefix of its own (`__ddx_{id}_`, a reserved
+prefix), so programs never touch each other's tables or yours; `ad::sql`
+leaves none behind, and `ad::release` drops what `ad::run` keeps.
 [`examples/nn`](examples/nn) trains nn.py's MLP (xarray-sql#196) with one SQL
 statement per parameter table: `cargo run -p ddx-datafusion --example nn`.
 

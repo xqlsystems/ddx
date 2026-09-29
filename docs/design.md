@@ -820,8 +820,8 @@ pub struct Step { pub name: String, pub plan: Plan }
 As in JAX, `vjp` pulls a cotangent of the output back to the inputs, and
 `grad` is `vjp` of a loss seeded with 1. `grad` requires one row and one
 column, as `jax.grad` requires a scalar; anything else is an error that points
-at `vjp`. `vjp` reads the cotangent from a table the caller supplies
-(`__ddx_cotangent`), keyed like the output.
+at `vjp`. `vjp` reads the cotangent from a table the caller supplies (the
+program names it, `cotangent_table`), keyed like the output.
 
 **Dims and values.** A gradient has the shape of what it is taken with
 respect to, and ddx's version of shape is the XQL model (§1). A relation's
@@ -837,7 +837,7 @@ reads but no `wrt` names is constant data.
 **Saved and recomputed.** Like any AD system, ddx chooses which forward values
 to save and which to recompute (JAX exposes the same choice as `jax.checkpoint`
 policies). It saves the output of every aggregate that depends on a `wrt`
-column, once, as `__ddx_saved_{n}`: no saved relation is bigger than a layer's
+column, once, as `{prefix}saved_{n}` (the program's prefix, below): no saved relation is bigger than a layer's
 output. The row-local work between two saved aggregates is a **region**, and
 is recomputed inside each backward step, never written out, so a contraction's
 `N × D × H` join never is. A region is rebuilt with the same relations in the
@@ -869,7 +869,7 @@ as a new column rather than inlined; and at each input, sum the cotangent by
 the input's dims (the broadcast rule's transpose). An aggregate skips a row
 whose argument is NULL, so that row's seed is NULL rather than the group's
 cotangent, and nothing in it gets gradient. The result is the input's
-contribution: a saved aggregate's cotangent, `__ddx_cotangent_{n}`, or a part
+contribution: a saved aggregate's cotangent, `{prefix}cotangent_{n}`, or a part
 of a table's gradient.
 
 **Fan-in accumulation is real, not hypothetical.** When a relation feeds more
@@ -911,7 +911,7 @@ A step that reads an earlier one is emitted **unbound**: its read names the
 columns and leaves their types out. ddx does not know them without
 re-implementing each engine's typing rules, and by the time the engine runs
 the step, the table it reads exists. The adapter fills the types in from it
-(`ddx_ad::emit::bind_reads`), so they are the engine's own by construction
+(`ddx_ad::bind_reads`), so they are the engine's own by construction
 (`S7`).
 
 ### 4.5 Worked example
@@ -1165,8 +1165,13 @@ breadth, not de-risking.
   DataFusion. `ddx-datafusion/examples/nn` trains nn.py's MLP with one SQL
   statement per parameter table; its gradients equal nn.py's hand-written
   backward queries to 1e-12, and the spikes' MLP, attention and max-pool
-  gradients, taken in SQL, equal `jax.grad` to 1e-12 (`tests/test_v2_jax.py`).
-  Query-level `jvp` is the next milestone, M4.5.
+  gradients, taken in SQL, equal `jax.grad` to 1e-12 (`tests/test_v2_jax.py`),
+  as do the gradients of nn.py's own network and SQL. Not built: a loss
+  defined in a `WITH RECURSIVE` clause is refused by the SQL surface, so a
+  whole training loop is not yet one recursive statement (§5). That refusal
+  is ddx's, independent of DataFusion 54's recursive-CTE bug (§3.6); lifting it
+  means differentiating a loss inside the recursive term. Query-level `jvp` is
+  the next milestone, M4.5.
 - **M4.5 — `jvp` over queries: the forward-mode half (#86).** Completes the
   SQL surface as `grad`, `vjp` and `jvp`. Forward mode needs no transposes and
   no tape: tangents travel beside values through the same operators (map via
