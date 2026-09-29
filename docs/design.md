@@ -1101,7 +1101,9 @@ layered:
   the program's gradient under schema-qualified and quoted names with a decoy
   of the old name, a shadowing CTE, the call in a subquery or a later CTE, and
   two losses in one statement; three SGD steps written in SQL must each be
-  θ − lr·∇L and lower the loss. It runs nightly beside v1's soak.
+  θ − lr·∇L and lower the loss. It runs nightly beside v1's soak, and a
+  weekly mutation test seeds bugs into each rule to measure how fast the soak
+  catches them.
 - **v2-specific: spike each rule's forward idiom against both engines'
   actual Substrait implementations before trusting it** — the coverage
   discipline §4.2 commits to, now a standing test-plan item, not a one-time
