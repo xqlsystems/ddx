@@ -288,3 +288,67 @@ async fn a_rank_used_as_a_value_is_refused() {
     assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
     assert!(err.to_string().contains("rank"), "{err}");
 }
+
+#[tokio::test]
+async fn a_ranking_that_does_not_break_ties_is_refused() {
+    // ORDER BY val alone leaves ties to the engine; recomputing the ranking
+    // could then keep a different row than the forward pass kept.
+    let ctx = ctx();
+    for t in pool_tables(false) {
+        t.create(&ctx).await;
+    }
+    let sql = RANK_POOL.replace("ORDER BY val DESC, item", "ORDER BY val DESC");
+    let plan = substrait_of(&ctx, &sql, true).await;
+    let err = grad(&plan, &[ColumnRef::new("x", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
+    assert!(err.to_string().contains("break ties"), "{err}");
+}
+
+#[tokio::test]
+async fn avg_gives_a_null_row_a_null_gradient() {
+    let ctx = ctx();
+    Table {
+        name: "wn",
+        columns: vec![("i", "BIGINT"), ("val", "DOUBLE")],
+        rows: vec![vec![0.0, 1.0], vec![2.0, 3.0]],
+    }
+    .create(&ctx)
+    .await;
+    ctx.sql("INSERT INTO wn VALUES (1, NULL)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = substrait_of(&ctx, "SELECT AVG(val * val) AS l FROM wn", true).await;
+    let program = grad(&plan, &[ColumnRef::new("wn", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    // AVG over the two non-NULL rows: d/dv (v²/2) = v.
+    assert_eq!(got[0], vec![0.0, 1.0]);
+    assert!(got[1][1].is_nan(), "{:?}", got[1]);
+    assert_eq!(got[2], vec![2.0, 3.0]);
+}
+
+#[tokio::test]
+async fn relu_written_as_case_or_greatest() {
+    for relu in [
+        "CASE WHEN val > 0.25 THEN val ELSE 0.25 END",
+        "greatest(val, 0.25)",
+    ] {
+        check_gradients(
+            &ctx(),
+            &format!("SELECT SUM(power({relu}, 2)) AS loss FROM z"),
+            &logits(),
+            &[ColumnRef::new("z", "val")],
+        )
+        .await;
+    }
+}

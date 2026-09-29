@@ -304,6 +304,7 @@ impl<'a> Transposer<'a> {
         base: Rel,
         seeds: Vec<(usize, Expression)>,
     ) -> Result<()> {
+        self.check_rankings_are_total(region)?;
         let mut width = width(&base)?;
         let mut rel = base;
         let mut pending: BTreeMap<usize, Vec<Expression>> = BTreeMap::new();
@@ -367,6 +368,47 @@ impl<'a> Transposer<'a> {
         }
         for (slot, cols) in at_inputs {
             self.broadcast(region, &rel, slot, cols)?;
+        }
+        Ok(())
+    }
+
+    /// A window function in a region is recomputed in the backward pass, and
+    /// a filter on its rank must keep the same rows it kept forward. SQL does
+    /// not order ties, so an engine may rank tied rows differently each time;
+    /// that only cannot happen when the ranking is total. So every window
+    /// must partition or order by each dim of the rows beneath it; otherwise
+    /// the program is refused rather than risk sending gradient to rows the
+    /// forward pass did not keep.
+    fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+        for (c, def) in region.defs.iter().enumerate() {
+            let Def::Window { keys } = def else { continue };
+            for s in &region.slots {
+                let Some(offset) = s.offset.filter(|&o| o < c) else {
+                    continue;
+                };
+                let dims = match s.input {
+                    Input::Table(t) => self.f.tables[t].dims.clone(),
+                    Input::Saved(n) => self.f.saved[n].dims(),
+                    Input::Const if s.at_most_one_row => continue,
+                    Input::Const => {
+                        return Err(AdError::NotImplemented(
+                            "a window function over rows joined to data ddx has no dims \
+                             for: ddx cannot show its ranking is total, and recomputing it \
+                             could keep different rows than the forward pass"
+                                .into(),
+                        ))
+                    }
+                };
+                if dims.iter().any(|d| !keys.contains(&(offset + d))) {
+                    return Err(AdError::NotImplemented(
+                        "a window function whose PARTITION BY and ORDER BY do not include \
+                         every dim of the rows it ranks. Its ties may be ranked differently \
+                         when ddx recomputes it for the backward pass; add the remaining dims \
+                         to its ORDER BY to break ties"
+                            .into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
