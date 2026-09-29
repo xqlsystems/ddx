@@ -1662,10 +1662,12 @@ async fn fd_check(
     // to it whatever the smooth curvature, which a plain ratio of the two
     // misses when a quadratic term dominates both.
     let kink = (a_h - 4.0 * a_h2).abs() > 16.0 * noise + 1e-7 * scale * h;
-    if (kink || (d1 - d2).abs() > 1e-3 * scale) && case.modes.ties {
+    let exact_ties = case.modes.ties || case.modes.extreme == Some(Extreme::NegZero);
+    if (kink || (d1 - d2).abs() > 1e-3 * scale) && exact_ties {
         // A tie between computed values (0.25 · 1 and -0.5 · -0.5) can still
         // break along a tie-preserving direction, and at a tie the bracket
-        // below is not sound (several kinks meet, with any signs).
+        // below is not sound (several kinks meet, with any signs). `-0.0`
+        // values tie too: a parameter at -0 equals data at -0.
         return Ok(Fd::Screened);
     }
     if kink || (d1 - d2).abs() > 1e-3 * scale {
@@ -1994,6 +1996,13 @@ async fn check_case_inner(
             ("stop-sum", pairs("l.loss + ddx_stop_gradient(k.loss)"), 1.0),
         ];
         for (label, q, factor) in checks {
+            // Huge values take a transform past what f64 can compare: the
+            // square of a loss near 1e270 overflows, and sin of a loss past
+            // 1e15 is rounding (an ulp there exceeds 2π). Such a check says
+            // nothing about ddx.
+            if !(factor * scale_of(&grads)).is_finite() || (label == "sin" && l0.abs() > 1e15) {
+                continue;
+            }
             // A chain factor can make the gradient much larger or smaller
             // than the base's, so the tolerance follows the factor.
             let r = grad_of(&ctx, &q, &wrt).await;
@@ -2066,8 +2075,18 @@ async fn check_case_inner(
         }
 
         // Partitions and row order.
+        // Each is compared only where the engine computes the same loss
+        // there: over NaN data a MAX can depend on the order it meets rows
+        // in, and then the query itself differs, before ddx is involved.
+        let same_loss = |l: Option<f64>| match l {
+            Some(v) => v == l0 || (v - l0).abs() <= 1e-12 * l0.abs().max(1.0),
+            None => false,
+        };
         for parts in [1usize, 7] {
             let other = setup(case, parts).await?;
+            if !same_loss(loss(&other, &sql).await?) {
+                continue;
+            }
             let r = grad_of(&other, &sql, &wrt).await;
             meta(
                 if parts == 1 {
@@ -2090,8 +2109,10 @@ async fn check_case_inner(
             t.vals = idx.iter().map(|&k| t.vals[k]).collect();
         }
         let other = setup(&shuffled, 4).await?;
-        let r = grad_of(&other, &sql, &wrt).await;
-        meta("row-order", r, 1.0, 1e-8, out, true);
+        if same_loss(loss(&other, &sql).await?) {
+            let r = grad_of(&other, &sql, &wrt).await;
+            meta("row-order", r, 1.0, 1e-8, out, true);
+        }
     }
 
     if props.contract {
