@@ -228,3 +228,23 @@ async fn tables_whose_names_join_alike_keep_their_own_gradients() {
     // d/dp = 2p = 2 and d/dq = 2q = 20, packed as 2 * 1000 + 20.
     assert_eq!(got, vec![(0, 2020.0)]);
 }
+
+#[tokio::test]
+async fn grad_in_sql_of_a_table_with_capitals() {
+    // From the v2 soak (#92): the gradient step was registered under a name
+    // DataFusion lowercased, then read back quoted, case and all.
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") \
+         SELECT i, val FROM grad(loss, \"W\".val) ORDER BY i",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 2.0), (1, 4.0)]);
+}
