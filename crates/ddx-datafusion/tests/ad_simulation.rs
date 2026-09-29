@@ -1715,6 +1715,15 @@ async fn fd_check(
     // misses when a quadratic term dominates both.
     let kink = (a_h - 4.0 * a_h2).abs() > 16.0 * noise + 1e-7 * scale * h;
     if !finite_grad {
+        // A loss that does not move along d beyond rounding, with a NaN
+        // gradient, is a chain rule through an infinite partial that meets
+        // a zero one: sqrt of ln(softmax) of a single row is sqrt(0) for
+        // every value (seed 811), and tanh(b · ∞) is 1 whatever b is, so
+        // tanh'(∞) · ∞ = 0 · ∞ (seed 500192). jax.grad gives NaN there too,
+        // so it is screened, not failed.
+        if ad_dot.is_nan() && (p2 - m2).abs() <= noise && (p1 - m1).abs() <= noise {
+            return Ok(Fd::Screened);
+        }
         let smooth = !kink && (d1 - d2).abs() <= 1e-3 * scale && d2.is_finite();
         return Ok(if smooth {
             Fd::Disagree(format!(
