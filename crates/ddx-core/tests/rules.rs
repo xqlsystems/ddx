@@ -200,6 +200,32 @@ fn cast_to_non_numeric_type_errors() {
 }
 
 #[test]
+fn cast_to_an_integer_or_decimal_type_is_refused_where_it_depends_on_the_variable() {
+    // It rounds: the derivative is 0 almost everywhere and undefined at each
+    // step, so returning 1 (the float cast's rule) would be a confident wrong
+    // number (#87).
+    for sql in [
+        "CAST(x AS BIGINT)",
+        "CAST(x * 2 AS INTEGER)",
+        "CAST(x AS DECIMAL(10, 2))",
+        "CAST(x AS SMALLINT) + x",
+    ] {
+        let err = Ddx::new()
+            .differentiate_sql(sql, "x", &GenericDialect {})
+            .unwrap_err();
+        assert!(
+            matches!(err, DiffError::NotImplemented(ref m) if m.contains("Cast to DOUBLE")),
+            "{sql}: {err}"
+        );
+    }
+    // A cast that does not depend on the variable is a constant.
+    assert_eq!(d("CAST(y AS BIGINT)", "x"), "0.0");
+    assert_eq!(d("x * CAST(y AS BIGINT)", "x"), "CAST(y AS BIGINT)");
+    // A float cast is still linear.
+    assert_eq!(d("CAST(x AS REAL)", "x"), "CAST(1.0 AS REAL)");
+}
+
+#[test]
 fn abs_derivative_is_portable_and_pins_the_kink_at_zero() {
     // d/du |u| = sign(u), emitted as a portable CASE (no engine-specific
     // signum/sign builtin) that pins abs'(0) = 0 on every engine.

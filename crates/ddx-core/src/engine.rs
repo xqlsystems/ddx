@@ -220,11 +220,15 @@ fn linearize(expr: &Expr, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
         // constructors re-introduce any precedence parentheses the result needs.
         Expr::Nested(inner) => linearize(inner, leaf, reg),
 
-        // A cast to a numeric type is locally linear: tangent of cast(u) =
-        // cast(du) to the same type. A cast to a non-numeric type (VARCHAR,
-        // DATE, BOOLEAN, …) is not differentiable — differentiating through it
-        // would emit a nonsensical `CAST(1.0 AS VARCHAR)`, so it is a typed
-        // error rather than a silently-wrong derivative (principle 5).
+        // A cast to a float type is locally linear: tangent of cast(u) =
+        // cast(du) to the same type. A cast to an integer or decimal type
+        // rounds, so its derivative is 0 almost everywhere and undefined at
+        // each step: a cast of anything that depends on the variable is a
+        // typed error (#87), and only a constant one differentiates, to 0. A
+        // cast to a non-numeric type (VARCHAR, DATE, BOOLEAN, …) is not
+        // differentiable — differentiating through it would emit a
+        // nonsensical `CAST(1.0 AS VARCHAR)`, so it is a typed error rather
+        // than a silently-wrong derivative (principle 5).
         Expr::Cast {
             kind,
             expr: inner,
@@ -239,6 +243,16 @@ fn linearize(expr: &Expr, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
                 )));
             }
             let du = linearize(inner, leaf, reg)?;
+            if !is_float_type(data_type) {
+                if is_zero(&du) {
+                    return Ok(zero());
+                }
+                return Err(DiffError::NotImplemented(format!(
+                    "differentiation through a cast to `{data_type}`, which rounds: its \
+                     derivative is 0 almost everywhere and undefined at each step. Cast to \
+                     DOUBLE to differentiate the unrounded value"
+                )));
+            }
             Ok(Expr::Cast {
                 kind: kind.clone(),
                 expr: Box::new(du),
@@ -426,8 +440,28 @@ pub(crate) fn positional_args(f: &Function) -> Option<Vec<&Expr>> {
     }
 }
 
-/// True if `dt` is a numeric type — the only kind of cast that is locally
-/// linear (and so differentiable). The list is exhaustive for the pinned
+/// True if `dt` is a floating-point type: a cast to one is locally linear.
+/// Integer and decimal types round.
+pub(crate) fn is_float_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Float(_)
+            | DataType::FloatUnsigned(_)
+            | DataType::Float4
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Real
+            | DataType::RealUnsigned
+            | DataType::Float8
+            | DataType::Double(_)
+            | DataType::DoubleUnsigned(_)
+            | DataType::DoublePrecision
+            | DataType::DoublePrecisionUnsigned
+    )
+}
+
+/// True if `dt` is a numeric type — the only kind of cast that can be
+/// differentiated (see [`is_float_type`] for which are linear). The list is exhaustive for the pinned
 /// `sqlparser` version; a `sqlparser` bump is already a breaking release of
 /// `ddx-core` (design.md §6, G2), at which point this is re-checked.
 pub(crate) fn is_numeric_type(dt: &DataType) -> bool {
