@@ -95,6 +95,26 @@ def test_the_second_derivative_of_abs_is_refused_rather_than_guessed():
     assert float(jax.grad(jax.grad(jax.numpy.abs))(1.5)) == 0.0
 
 
+def test_an_integer_cast_is_refused_where_jax_returns_zero():
+    """A cast to an integer rounds, so ddx refuses to differentiate it (#87).
+
+    Its derivative is 0 almost everywhere and undefined at every step. ddx used
+    to treat it like a float cast and return 1, a confident wrong number; now it
+    raises, naming the float cast that would differentiate the unrounded value.
+    JAX returns the almost-everywhere 0 instead, which is right between steps
+    and silent at them, so the two differ on purpose. A cast that does not
+    depend on the variable is a constant, and differentiates to 0 in both.
+    """
+    with pytest.raises(ddxdb.UnsupportedExpression) as raised:
+        ddxdb.rewrite_sql("SELECT grad(CAST(x AS BIGINT), x) AS d FROM t")
+    assert "DOUBLE" in str(raised.value)
+
+    jnp = jax.numpy
+    assert float(jax.grad(lambda x: x.astype(jnp.int32).astype(jnp.float64))(1.5)) == 0.0
+
+    assert "0" in ddxdb.rewrite_sql("SELECT grad(CAST(y AS BIGINT), x) AS d FROM t")
+
+
 @pytest.mark.parametrize("engine", ENGINES, ids=str)
 def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside(engine):
     """`sqrt(x)` is defined at 0; `1/(2*sqrt(x))` is not.
