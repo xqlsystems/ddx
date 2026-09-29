@@ -1739,6 +1739,13 @@ async fn fd_check(
         if ad_dot.is_nan() && case.modes.extreme == Some(Extreme::InfData) {
             return Ok(Fd::Screened);
         }
+        // A derivative past √f64::MAX cannot be evaluated without some
+        // intermediate overflowing: d/dv ln(3/v) at v = 1e-160 is -1e160,
+        // but the chain rule passes through 3/v² (seed 2000728). jax.grad
+        // overflows the same way.
+        if d2.abs() > f64::MAX.sqrt() {
+            return Ok(Fd::Screened);
+        }
         let smooth = !kink && (d1 - d2).abs() <= 1e-3 * scale && d2.is_finite();
         return Ok(if smooth {
             Fd::Disagree(format!(
