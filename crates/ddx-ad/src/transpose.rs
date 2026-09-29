@@ -364,6 +364,46 @@ impl<'a> Transposer<'a> {
     /// the program is refused rather than risk sending gradient to rows the
     /// forward pass did not keep.
     fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+        // Constant data is recomputed too, and ddx has no dims for it, so it
+        // cannot show a ranking or LIMIT inside it is total.
+        if region
+            .slots
+            .iter()
+            .any(|s| s.input == Input::Const && s.ordered)
+        {
+            return Err(AdError::NotImplemented(
+                "a window function or LIMIT over data that reads no wrt table, joined into                  rows that carry gradient: ddx recomputes it for the backward pass and cannot                  show it keeps the same rows (its ties may be ordered differently);                  materialize it as a table first"
+                    .into(),
+            ));
+        }
+        for cut in &region.cuts {
+            for &(input, offset, one) in &cut.covers {
+                let dims = match input {
+                    Input::Table(t) => self.f.tables[t].dims.clone(),
+                    Input::Saved(n) => self.f.saved[n].dims(),
+                    Input::Const if one => continue,
+                    Input::Const => {
+                        return Err(AdError::NotImplemented(
+                            "a LIMIT, or a ranking on a semi-join's right side, over rows                              joined to data ddx has no dims for: ddx cannot show which rows                              it keeps when it recomputes them"
+                                .into(),
+                        ))
+                    }
+                };
+                if one {
+                    continue;
+                }
+                let total = match &cut.keys {
+                    Some(keys) => dims.iter().all(|d| keys.contains(&(offset + d))),
+                    None => false,
+                };
+                if !total {
+                    return Err(AdError::NotImplemented(
+                        "a LIMIT (or a ranking on a semi-join's right side) whose ORDER BY                          does not include every dim of the rows it cuts. The rows it keeps                          may differ when ddx recomputes it for the backward pass; add the                          remaining dims to its ORDER BY to break ties"
+                            .into(),
+                    ));
+                }
+            }
+        }
         for (c, def) in region.defs.iter().enumerate() {
             let Def::Window { keys } = def else { continue };
             for s in &region.slots {

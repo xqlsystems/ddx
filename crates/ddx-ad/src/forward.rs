@@ -88,6 +88,23 @@ pub struct Slot {
     /// with no grouping, or constant data the plan shows is one row. `grad`
     /// needs this of every input its loss reads.
     pub at_most_one_row: bool,
+    /// Whether it is constant data computed with a window function or a
+    /// `LIMIT`, which a recomputation need not repeat row for row.
+    pub ordered: bool,
+}
+
+/// Rows cut by an ordering: a `LIMIT` (after an `ORDER BY` on `keys`, or with
+/// none), or a window function a semi-join's right side computed. The
+/// recomputed region keeps the same rows only if the ordering is total over
+/// the inputs it covers. Self-contained: `keys` and the offsets in `covers`
+/// are in one numbering, so it outlives the columns it was recorded over.
+#[derive(Debug, Clone)]
+pub struct Cut {
+    /// The columns it orders by, or `None` for a `LIMIT` with no `ORDER BY`.
+    pub keys: Option<Vec<usize>>,
+    /// Each input it cuts: the input, its first column, and whether it has at
+    /// most one row.
+    pub covers: Vec<(Input, usize, bool)>,
 }
 
 /// How a column of a rebuilt region is computed.
@@ -128,6 +145,8 @@ pub struct Region {
     pub outputs: Vec<usize>,
     /// Its inputs.
     pub slots: Vec<Slot>,
+    /// Where its rows were cut by an ordering (see [`Cut`]).
+    pub cuts: Vec<Cut>,
 }
 
 impl Region {
@@ -158,6 +177,8 @@ impl Region {
             offset: s.offset.map(|o| o + shift),
             ..s
         }));
+        self.cuts
+            .extend(other.cuts.into_iter().map(|c| c.shifted(shift)));
         Ok(shift)
     }
 
@@ -168,9 +189,52 @@ impl Region {
         self.defs.len() - 1
     }
 
+    /// A cut by `keys` over every input whose columns come before `before`.
+    fn cut(&self, keys: Option<Vec<usize>>, before: usize) -> Cut {
+        Cut {
+            keys,
+            covers: self
+                .slots
+                .iter()
+                .filter_map(|s| {
+                    s.offset
+                        .filter(|&o| o < before)
+                        .map(|o| (s.input, o, s.at_most_one_row))
+                })
+                .collect(),
+        }
+    }
+
+    /// Its windows and cuts, as cuts that need none of its columns: for a
+    /// semi-join's right side, whose columns are dropped.
+    fn detached_cuts(&self) -> Vec<Cut> {
+        let mut cuts = self.cuts.clone();
+        for (c, d) in self.defs.iter().enumerate() {
+            if let Def::Window { keys } = d {
+                cuts.push(self.cut(Some(keys.clone()), c));
+            }
+        }
+        cuts
+    }
+
     fn refuse(&mut self, col: usize, why: AdError) {
         if self.refusals[col].is_none() {
             self.refusals[col] = Some(why);
+        }
+    }
+}
+
+impl Cut {
+    fn shifted(self, shift: usize) -> Cut {
+        Cut {
+            keys: self
+                .keys
+                .map(|k| k.into_iter().map(|c| c + shift).collect()),
+            covers: self
+                .covers
+                .into_iter()
+                .map(|(i, o, one)| (i, o + shift, one))
+                .collect(),
         }
     }
 }
@@ -475,7 +539,24 @@ impl Builder<'_> {
                 (s, direct, so.common.as_ref())
             }
             RelType::Fetch(fe) => {
-                let mut s = self.lower(input(&fe.input)?)?;
+                let below = input(&fe.input)?;
+                let mut s = self.lower(below)?;
+                // The rows a LIMIT keeps are the first in its input's order:
+                // an ORDER BY's keys, or none.
+                let keys = match &below.rel_type {
+                    Some(RelType::Sort(so)) => {
+                        let mut keys = Vec::new();
+                        for e in so.sorts.iter().filter_map(|sf| sf.expr.as_ref()) {
+                            for f in fields_of(e)? {
+                                keys.push(lookup(&s.outputs, f)?);
+                            }
+                        }
+                        Some(keys)
+                    }
+                    _ => None,
+                };
+                let cut = s.cut(keys, s.width());
+                s.cuts.push(cut);
                 s.rel = Rel {
                     rel_type: Some(RelType::Fetch(Box::new(FetchRel {
                         common: None,
@@ -506,6 +587,7 @@ impl Builder<'_> {
                     offset: Some(0),
                     width,
                     at_most_one_row: self.saved[n].groupings.is_empty(),
+                    ordered: false,
                 });
                 for c in 0..width {
                     let v = self.saved[n].varied[c];
@@ -533,6 +615,7 @@ impl Builder<'_> {
             offset: Some(0),
             width,
             at_most_one_row: at_most_one_row(rel),
+            ordered: is_ordered(rel),
         });
         for _ in 0..width {
             s.push(Def::Const, false);
@@ -559,6 +642,7 @@ impl Builder<'_> {
             offset: Some(0),
             width,
             at_most_one_row: false,
+            ordered: false,
         });
         for c in 0..width {
             let v = self.tables[table].values.contains(&c);
@@ -739,7 +823,8 @@ impl Builder<'_> {
         };
         if semi {
             // Only the left side's columns come out. The right side is still
-            // read, to decide which rows do.
+            // read, to decide which rows do, so its orderings still count.
+            s.cuts.extend(right.detached_cuts());
             s.slots.extend(
                 right
                     .slots
@@ -994,6 +1079,24 @@ fn rename_in_place(rel: Rel, width: usize, cols: &[usize]) -> Rel {
     emit::project_emit(rel, exprs, Some(emit))
 }
 
+/// Whether `rel` computes a window function or cuts rows with a `LIMIT`
+/// anywhere in it: then which rows it gives can depend on how the engine
+/// orders ties, and a recomputation need not give the same ones.
+fn is_ordered(rel: &Rel) -> bool {
+    let Some(kind) = rel.rel_type.as_ref() else {
+        return false;
+    };
+    if matches!(kind, RelType::Fetch(_) | RelType::Window(_)) {
+        return true;
+    }
+    let window = |e: &Expression| {
+        contains(e, &|x| {
+            matches!(x.rex_type, Some(RexType::WindowFunction(_)))
+        })
+    };
+    rel_expressions(kind).into_iter().any(window) || rel_inputs(kind).into_iter().any(is_ordered)
+}
+
 fn empty(rel: Rel) -> Region {
     Region {
         rel,
@@ -1002,6 +1105,7 @@ fn empty(rel: Rel) -> Region {
         refusals: Vec::new(),
         outputs: Vec::new(),
         slots: Vec::new(),
+        cuts: Vec::new(),
     }
 }
 

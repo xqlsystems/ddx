@@ -479,3 +479,95 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
         );
     }
 }
+
+/// `grad` of `loss` with respect to `table.val`: `Ok(())` if it would run, or
+/// the refusal.
+async fn refusal(ctx: &SessionContext, loss: &str, table: &str) -> Option<String> {
+    let plan = substrait_of(ctx, loss, true).await;
+    match grad(&plan, &[ColumnRef::new(table, "val")]) {
+        Ok(_) => None,
+        Err(AdError::NotImplemented(m)) => Some(m),
+        Err(e) => panic!("{loss}: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn a_limit_must_break_ties_by_the_dims_it_cuts() {
+    // A LIMIT keeps the first rows in its input's order, and SQL does not
+    // order ties: recomputed for the backward pass it could keep other rows.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE lp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 3.0), (2, 2.0)",
+    )
+    .await;
+    for loss in [
+        "SELECT SUM(v) AS l FROM (SELECT val AS v FROM lp ORDER BY val DESC LIMIT 2)",
+        "SELECT SUM(v) AS l FROM (SELECT val AS v FROM lp LIMIT 2)",
+    ] {
+        let why = refusal(&ctx, loss, "lp").await;
+        assert!(
+            why.as_deref().is_some_and(|m| m.contains("LIMIT")),
+            "{loss}: {why:?}"
+        );
+    }
+    let got = gradient_of(
+        &ctx,
+        "SELECT SUM(v) AS l FROM (SELECT val AS v FROM lp ORDER BY val DESC, i LIMIT 2)",
+        "lp",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 1.0]]);
+}
+
+#[tokio::test]
+async fn a_ranking_over_constant_data_in_a_recomputed_region_is_refused() {
+    // From #93's mutation testing: constant subtrees are recomputed in each
+    // backward step, and ddx has no dims to show a ranking inside one is
+    // total, so a tie could keep a different row on the way back.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE cp (j BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE cd (j BIGINT, v DOUBLE) AS VALUES (0, 5.0), (0, 5.0), (1, 7.0)",
+    )
+    .await;
+    for loss in [
+        "SELECT SUM(cp.val * d.v) AS l FROM cp JOIN \
+           (SELECT j, v FROM (SELECT j, v, ROW_NUMBER() OVER (PARTITION BY j ORDER BY v) AS rk \
+                              FROM cd) WHERE rk = 1) d ON cp.j = d.j",
+        "SELECT SUM(cp.val * d.v) AS l FROM cp CROSS JOIN \
+           (SELECT v FROM cd ORDER BY v LIMIT 1) d",
+    ] {
+        let why = refusal(&ctx, loss, "cp").await;
+        assert!(
+            why.as_deref()
+                .is_some_and(|m| m.contains("reads no wrt table")),
+            "{loss}: {why:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_ranking_on_a_semi_joins_right_side_must_break_ties() {
+    // The right side of a semi-join decides which left rows are kept, so a
+    // ranking there is recomputed and must be total too.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE sp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 3.0), (2, 3.0)",
+    )
+    .await;
+    let loss = "SELECT SUM(val) AS l FROM sp WHERE i IN \
+                  (SELECT i FROM (SELECT i, ROW_NUMBER() OVER (ORDER BY val DESC) AS rk FROM sp) \
+                   WHERE rk = 1)";
+    let why = refusal(&ctx, loss, "sp").await;
+    assert!(
+        why.as_deref().is_some_and(|m| m.contains("semi-join")),
+        "{why:?}"
+    );
+}
