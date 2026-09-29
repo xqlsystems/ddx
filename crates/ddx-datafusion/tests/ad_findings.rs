@@ -21,6 +21,14 @@
 //!   both window columns, and the optimizer has given them the same name, so
 //!   DataFusion's consumer refuses the step. The program was accepted.
 //!   *Fixed in #73:* a window column is renamed in place once computed.
+//! - **MAX finds its row by float equality with a recomputation.** The
+//!   region beneath a saved MAX is recomputed, constant subtrees included,
+//!   and a grouped SUM over several partitions is not bit-reproducible, so
+//!   about half the time no row equals the saved maximum and the gradient is
+//!   silently 0. Found by the soak's big mode. MIN is built the same way. A
+//!   rank filter or a top-k orders the recomputed values rather than
+//!   comparing them with saved ones, so jitter can only move it at a
+//!   near-tie.
 //! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
@@ -151,6 +159,85 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let plan = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
     let program = ad::grad_plan(&ctx, &plan, &[ColumnRef::new("b", "val")]).unwrap();
     ad::run(&ctx, &program).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "known bug: MAX finds its row by float equality with a recomputation that is not bit-reproducible"]
+async fn max_finds_its_row_when_the_recomputed_values_jitter() {
+    // The MAX rule sends the cotangent to the rows whose recomputed value
+    // equals the saved maximum. The region beneath it is recomputed, a
+    // constant subtree included, and DataFusion's grouped SUM over several
+    // partitions adds its partial sums in whatever order they arrive, so the
+    // recomputed values can differ from the forward pass in the last bit.
+    // Then no row attains the saved maximum and the whole gradient is a
+    // silent 0. About half of these runs are.
+    use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, false),
+        Field::new("j", DataType::Int64, false),
+        Field::new("val", DataType::Float64, false),
+    ]));
+    let rows: Vec<(i64, i64, f64)> = (0..400)
+        .flat_map(|i| (0..4).map(move |j| (i, j, ((i * 131 + j * 17) as f64 * 0.731).sin())))
+        .collect();
+    // Constant data in seven partitions, as a real table has.
+    let partitions: Vec<Vec<RecordBatch>> = rows
+        .chunks(rows.len().div_ceil(7))
+        .map(|c| {
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(c.iter().map(|r| r.0).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(c.iter().map(|r| r.1).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        c.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()]
+        })
+        .collect();
+    let loss = "WITH s AS (SELECT m.j, SUM(exp(m.val) * n.val) AS s \
+                           FROM m JOIN m n ON m.i = n.i AND m.j = n.j GROUP BY m.j) \
+                SELECT MAX(p.val * s.s) AS loss FROM p JOIN s ON p.j = s.j";
+    for run in 0..40 {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "m",
+            Arc::new(MemTable::try_new(schema.clone(), partitions.clone()).unwrap()),
+        )
+        .unwrap();
+        exec(
+            &ctx,
+            "CREATE TABLE p (j BIGINT, val DOUBLE) AS VALUES (0, 0.5), (1, 2.0), (2, 1.0), (3, -1.0)",
+        )
+        .await;
+        let program = ad::grad(&ctx, loss, &[ColumnRef::new("p", "val")])
+            .await
+            .unwrap();
+        ad::run(&ctx, &program).await.unwrap();
+        let batches = ctx
+            .sql(&format!(
+                "SELECT SUM(ABS(val)) FROM {}",
+                program.gradients[0].step
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Float64Type;
+        let total = batches[0].column(0).as_primitive::<Float64Type>().value(0);
+        assert!(
+            total > 0.0,
+            "run {run}: the MAX's gradient is 0 at every row"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

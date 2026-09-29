@@ -79,6 +79,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -132,14 +133,16 @@ impl KeyType {
         }
     }
 
+    /// Keys as an array; [`NULL_KEY`] is a NULL.
     fn array(self, keys: Vec<i64>) -> ArrayRef {
+        let keys = keys.into_iter().map(|k| (k != NULL_KEY).then_some(k));
         match self {
-            KeyType::Int64 => Arc::new(Int64Array::from(keys)),
+            KeyType::Int64 => Arc::new(Int64Array::from(keys.collect::<Vec<_>>())),
             KeyType::Int32 => Arc::new(Int32Array::from(
-                keys.into_iter().map(|k| k as i32).collect::<Vec<_>>(),
+                keys.map(|k| k.map(|k| k as i32)).collect::<Vec<_>>(),
             )),
             KeyType::Utf8 => Arc::new(StringArray::from(
-                keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                keys.map(|k| k.map(|k| k.to_string())).collect::<Vec<_>>(),
             )),
         }
     }
@@ -153,6 +156,12 @@ impl KeyType {
     }
 }
 
+/// Set by the soak, which alone runs `big` mode (see [`Modes::draw`]).
+static SOAKING: AtomicBool = AtomicBool::new(false);
+
+/// A NULL key, in a data table only: a parameter's dims identify its rows.
+const NULL_KEY: i64 = i64::MIN;
+
 /// One table, held in memory so it can be perturbed and re-registered.
 #[derive(Clone, Debug)]
 struct Table {
@@ -162,6 +171,10 @@ struct Table {
     vals: Vec<Option<f64>>,
     param: bool,
     key_type: KeyType,
+    /// How its rows are split into partitions of batches when registered:
+    /// the engine must not care, and more than one batch or partition is
+    /// what a real table has.
+    chunks: Vec<Vec<usize>>,
 }
 
 impl Table {
@@ -173,7 +186,7 @@ impl Table {
         let mut fields: Vec<Field> = self
             .dims
             .iter()
-            .map(|d| Field::new(d, self.key_type.data_type(), false))
+            .map(|d| Field::new(d, self.key_type.data_type(), true))
             .collect();
         fields.push(Field::new("val", DataType::Float64, true));
         let mut cols: Vec<ArrayRef> = (0..self.dims.len())
@@ -188,7 +201,21 @@ impl Table {
 
     fn register(&self, ctx: &SessionContext) -> Result<(), DataFusionError> {
         let batch = self.batch();
-        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let mut partitions = Vec::new();
+        let mut at = 0;
+        for sizes in &self.chunks {
+            let mut part = Vec::new();
+            for &n in sizes {
+                let n = n.min(batch.num_rows() - at);
+                part.push(batch.slice(at, n));
+                at += n;
+            }
+            partitions.push(part);
+        }
+        if at < batch.num_rows() || partitions.is_empty() {
+            partitions.push(vec![batch.slice(at, batch.num_rows() - at)]);
+        }
+        let table = MemTable::try_new(batch.schema(), partitions)?;
         ctx.deregister_table(self.name.as_str())?;
         ctx.register_table(self.name.as_str(), Arc::new(table))?;
         Ok(())
@@ -268,6 +295,7 @@ fn gen_table(
         vals,
         param,
         key_type,
+        chunks: Vec::new(),
     }
 }
 
@@ -288,6 +316,172 @@ fn shuffle<T>(rng: &mut Rng, xs: &mut [T]) {
     for i in (1..xs.len()).rev() {
         let j = rng.below(i as u64 + 1) as usize;
         xs.swap(i, j);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modes: what a case's data looks like, beyond the ordinary.
+// ---------------------------------------------------------------------------
+
+/// Extreme values a case can hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Extreme {
+    /// Parameters thirty times larger: exp and softmax near overflow.
+    Huge,
+    /// Parameters around 1e-160: products underflow to subnormals and zero.
+    Tiny,
+    /// Some values are `-0.0`.
+    NegZero,
+    /// A data value is NaN, which is not NULL: aggregates do not skip it.
+    NanData,
+    /// A data value is infinite.
+    InfData,
+}
+
+/// A case's modes. Each is drawn from its own generator seeded by the case's
+/// seed and applied after the case is generated, so a seed with no mode
+/// replays as it did before modes existed. `DDX_V2_MODES=ties,nulls,
+/// extreme,big` forces the listed modes on every case instead.
+#[derive(Clone, Copy, Debug, Default)]
+struct Modes {
+    /// Parameters drawn from four values, so MAX, MIN and rankings tie
+    /// exactly: the conventions the finite difference cannot see.
+    ties: bool,
+    /// About a third of all values NULL, and some NULL keys in data.
+    nulls: bool,
+    extreme: Option<Extreme>,
+    /// Domains ten times larger: thousands of rows per relation.
+    big: bool,
+}
+
+impl Modes {
+    fn draw(seed: u64) -> (Modes, Rng) {
+        let mut r = seeded(seed, 0xD47A_5EED);
+        let extreme = |r: &mut Rng| {
+            *r.pick(&[
+                Extreme::Huge,
+                Extreme::Tiny,
+                Extreme::NegZero,
+                Extreme::NanData,
+                Extreme::InfData,
+            ])
+        };
+        let modes = match std::env::var("DDX_V2_MODES") {
+            Ok(names) => {
+                let on = |n: &str| names.split(',').any(|x| x.trim() == n);
+                Modes {
+                    ties: on("ties"),
+                    nulls: on("nulls"),
+                    extreme: on("extreme").then(|| extreme(&mut r)),
+                    big: on("big"),
+                }
+            }
+            Err(_) => Modes {
+                ties: r.below(100) < 15,
+                nulls: null_pct() > 0 && r.below(100) < 10,
+                extreme: (r.below(100) < 8).then(|| extreme(&mut r)),
+                // Drawn either way, so seeds replay alike, but only a soak
+                // uses it: a big case is slow, and the recomputation bug it
+                // finds is not deterministic, which a PR gate must be.
+                big: r.below(100) < 4 && SOAKING.load(Ordering::Relaxed),
+            },
+        };
+        (modes, r)
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.ties {
+            v.push("ties");
+        }
+        if self.nulls {
+            v.push("nulls");
+        }
+        if let Some(e) = self.extreme {
+            v.push(match e {
+                Extreme::Huge => "huge",
+                Extreme::Tiny => "tiny",
+                Extreme::NegZero => "-0.0",
+                Extreme::NanData => "NaN data",
+                Extreme::InfData => "inf data",
+            });
+        }
+        if self.big {
+            v.push("big");
+        }
+        v
+    }
+}
+
+/// The four values a parameter takes in `ties` mode.
+const TIE_VALUES: &[f64] = &[-0.5, 0.25, 0.75, 1.0];
+
+/// Apply `modes` to freshly generated tables, drawing from `r` only.
+fn apply_modes(tables: &mut [Table], modes: &Modes, r: &mut Rng) {
+    for t in tables.iter_mut() {
+        // Batches and partitions, always.
+        let n = t.keys.len();
+        let parts = 1 + r.below(3) as usize;
+        let mut left = n;
+        t.chunks = (0..parts)
+            .map(|p| {
+                let share = if p + 1 == parts {
+                    left
+                } else {
+                    r.below(left as u64 + 1) as usize
+                };
+                left -= share;
+                let mut sizes = Vec::new();
+                let mut rem = share;
+                while rem > 0 {
+                    let k = 1 + r.below(rem as u64) as usize;
+                    sizes.push(k);
+                    rem -= k;
+                }
+                sizes
+            })
+            .collect();
+        if modes.ties && t.param {
+            for v in t.vals.iter_mut().flatten() {
+                *v = *r.pick(TIE_VALUES);
+            }
+        }
+        if modes.nulls {
+            for v in t.vals.iter_mut() {
+                if r.below(100) < 30 {
+                    *v = None;
+                }
+            }
+            if !t.param {
+                for k in t.keys.iter_mut().flat_map(|k| k.iter_mut()) {
+                    if r.below(100) < 10 {
+                        *k = NULL_KEY;
+                    }
+                }
+            }
+        }
+        match modes.extreme {
+            Some(Extreme::Huge) if t.param => t.vals.iter_mut().flatten().for_each(|v| *v *= 30.0),
+            Some(Extreme::Tiny) if t.param => {
+                t.vals.iter_mut().flatten().for_each(|v| *v *= 1e-160)
+            }
+            Some(Extreme::NegZero) => {
+                for v in t.vals.iter_mut().flatten() {
+                    if r.below(100) < 30 {
+                        *v = -0.0;
+                    }
+                }
+            }
+            Some(Extreme::NanData | Extreme::InfData) if !t.param && !t.vals.is_empty() => {
+                let k = r.below(t.vals.len() as u64) as usize;
+                t.vals[k] = Some(if modes.extreme == Some(Extreme::NanData) {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                });
+            }
+            _ => {}
+        }
     }
 }
 
@@ -318,6 +512,7 @@ struct Node {
 
 #[derive(Clone, Debug)]
 struct Case {
+    modes: Modes,
     tables: Vec<Table>,
     nodes: Vec<Node>,
     root: usize,
@@ -423,6 +618,8 @@ fn join_clause(a: usize, b: usize, shared: &[&str]) -> String {
 }
 
 struct Gen<'r> {
+    /// The most rows a join may produce.
+    cap: i64,
     key_type: KeyType,
     rng: &'r mut Rng,
     dom: Domains,
@@ -565,7 +762,7 @@ impl Gen<'_> {
         let mut dims = na.dims.clone();
         dims.extend(&only_b);
         dims.sort_by_key(|d| DIMS.iter().position(|x| x == d));
-        if self.dom.rows(&dims) > 48 {
+        if self.dom.rows(&dims) > self.cap {
             return a;
         }
         let select: Vec<String> = dims
@@ -911,14 +1108,29 @@ const HEADS: &[&str] = &[
     "SUM(v * v) * 0.1 + SUM(v)",
 ];
 
+/// Seed `seed`'s case: generated from one stream, then its modes applied
+/// from another. The first stream is returned for the properties to go on
+/// drawing from, so a seed replays its checks exactly.
+fn case_for(seed: u64) -> (Case, Rng) {
+    let mut rng = seeded(seed, 0xAD_5EED_0002);
+    let (modes, mut mrng) = Modes::draw(seed);
+    let case = gen_case(&mut rng, modes, &mut mrng);
+    (case, rng)
+}
+
 /// A random case whose loss reads at least one parameter table.
-fn gen_case(rng: &mut Rng) -> Case {
+fn gen_case(rng: &mut Rng, modes: Modes, mrng: &mut Rng) -> Case {
     loop {
-        let dom = Domains(BTreeMap::from([
+        let mut dom = Domains(BTreeMap::from([
             ("s", 1 + rng.below(3) as i64),
             ("i", 1 + rng.below(4) as i64),
             ("j", 1 + rng.below(3) as i64),
         ]));
+        if modes.big {
+            for (d, n) in dom.0.iter_mut() {
+                *n *= if *d == "j" { 4 } else { 10 };
+            }
+        }
         let key_type = match rng.below(10) {
             0 => KeyType::Int32,
             1 => KeyType::Utf8,
@@ -931,8 +1143,10 @@ fn gen_case(rng: &mut Rng) -> Case {
         for (name, dims) in DATA {
             tables.push(gen_table(rng, &dom, name, dims, false, key_type));
         }
+        apply_modes(&mut tables, &modes, mrng);
         let depth = 1 + rng.below(4) as u32;
         let mut g = Gen {
+            cap: if modes.big { 6000 } else { 48 },
             key_type,
             rng,
             dom: dom.clone(),
@@ -960,6 +1174,7 @@ fn gen_case(rng: &mut Rng) -> Case {
         shuffle(rng, &mut wrt);
         let head = rng.pick(HEADS).to_string();
         return Case {
+            modes,
             tables,
             nodes,
             root,
@@ -1059,6 +1274,9 @@ impl Case {
         let mut s = String::new();
         let _ = writeln!(s, "  loss  = {}", self.loss_sql());
         let _ = writeln!(s, "  wrt   = {:?}", self.wrt);
+        if !self.modes.names().is_empty() {
+            let _ = writeln!(s, "  modes = {:?}", self.modes.names());
+        }
         for t in &self.tables {
             let rows: Vec<String> = t
                 .keys
@@ -1316,6 +1534,8 @@ fn compare(
             let ok = match (wv, gv) {
                 (None, None) => true,
                 (Some(a), Some(b)) if a.is_nan() && b.is_nan() => true,
+                // An infinite gradient equals itself; their difference is NaN.
+                (Some(a), Some(b)) if a * factor == *b => true,
                 // The absolute floor is for gradients that are zero in exact
                 // arithmetic (a softmax's outputs sum to one, so a loss over
                 // their sum has none), where two correct plans leave
@@ -1373,7 +1593,9 @@ async fn loss_at(
 
 enum Fd {
     Agree,
-    /// Not smooth enough here to compare.
+    /// Not smooth here, but ⟨∇L, d⟩ lies between the one-sided derivatives.
+    Bracketed,
+    /// Not comparable here: a non-finite loss or gradient.
     Screened,
     Disagree(String),
 }
@@ -1405,7 +1627,17 @@ async fn fd_check(
         ad_dot += g * d;
         ad_abs += (g * d).abs();
     }
-    let h = 1e-3;
+    // The step follows the parameters' magnitude.
+    let h = if case.modes.extreme == Some(Extreme::Tiny) {
+        1e-163
+    } else {
+        1e-3
+    };
+    // A step the loss is not linear over tells nothing: sin of a sum near
+    // 1e8 turns through many periods in one step.
+    if ad_abs * h > 1e-2 * l0.abs().max(1.0) {
+        return Ok(Fd::Screened);
+    }
     let mut at = BTreeMap::new();
     for k in [-2i32, -1, 1, 2] {
         let t = h * k as f64 / 2.0;
@@ -1417,22 +1649,60 @@ async fn fd_check(
         }
     }
     let (m2, m1, p1, p2) = (at[&-2], at[&-1], at[&1], at[&2]);
-    // Second differences at h and h/2: they shrink 4× on a smooth loss and
-    // only 2× across a kink.
+    // Second differences at h and h/2: they shrink 4× on a smooth loss.
     let noise = 64.0 * f64::EPSILON * (l0.abs() + m2.abs() + p2.abs() + 1e-300);
     let a_h = p2 - 2.0 * l0 + m2;
     let a_h2 = p1 - 2.0 * l0 + m1;
-    if a_h.abs() > noise && a_h2.abs() > 0.4 * a_h.abs() + noise {
-        return Ok(Fd::Screened);
-    }
     let d1 = (p2 - m2) / (2.0 * h);
     let d2 = (p1 - m1) / h;
     let scale = ad_abs.max(d2.abs()).max(1e-6);
-    if (d1 - d2).abs() > 1e-3 * scale {
+    // On a smooth loss a(h) = f''h² + O(h⁴) and a(h/2) = f''h²/4 + O(h⁴),
+    // so a(h) − 4·a(h/2) is O(h⁴); a kink within the step adds O(jump · h)
+    // to it whatever the smooth curvature, which a plain ratio of the two
+    // misses when a quadratic term dominates both.
+    let kink = (a_h - 4.0 * a_h2).abs() > 16.0 * noise + 1e-7 * scale * h;
+    if (kink || (d1 - d2).abs() > 1e-3 * scale) && case.modes.ties {
+        // A tie between computed values (0.25 · 1 and -0.5 · -0.5) can still
+        // break along a tie-preserving direction, and at a tie the bracket
+        // below is not sound (several kinks meet, with any signs).
         return Ok(Fd::Screened);
     }
+    if kink || (d1 - d2).abs() > 1e-3 * scale {
+        // Not smooth along d, so no central difference is the derivative.
+        // Every convention ddx pins at a kink (MAX shares evenly at a tie, a
+        // rank filter gives its winner everything, a CASE takes the branch
+        // the row takes, abs gives 0) is still a derivative of one of the
+        // pieces meeting here, so ⟨∇L, d⟩ must lie between the one-sided
+        // derivatives. Their own truncation error is the slack. This holds
+        // for one kink near the point, which is all random values produce;
+        // at an exact tie several meet at once and it need not (ties mode
+        // screens instead).
+        let fwd = [(p2 - l0) / h, (p1 - l0) / (h / 2.0)];
+        let bwd = [(l0 - m2) / h, (l0 - m1) / (h / 2.0)];
+        let (lo, hi) = (fwd[1].min(bwd[1]), fwd[1].max(bwd[1]));
+        let slack =
+            (fwd[0] - fwd[1]).abs() + (bwd[0] - bwd[1]).abs() + 1e-6 * scale + 8.0 * noise / h;
+        if ad_dot >= lo - slack && ad_dot <= hi + slack {
+            return Ok(Fd::Bracketed);
+        }
+        let what: Vec<String> = dir
+            .iter()
+            .take(6)
+            .map(|(n, r, d)| format!("{n}{:?}·{d:.3}", case.table(n).keys[*r]))
+            .collect();
+        return Ok(Fd::Disagree(format!(
+            "[subgradient] at a kink along d, ⟨∇L, d⟩ = {ad_dot:.12e} is outside the \
+             one-sided derivatives [{lo:.12e}, {hi:.12e}] (slack {slack:.3e}); no \
+             convention at a kink gives that. d = {}{}",
+            what.join(" + "),
+            if dir.len() > 6 { " + …" } else { "" }
+        )));
+    }
     let fd = (4.0 * d2 - d1) / 3.0;
-    let tol = 1e-6 * scale + 8.0 * noise / h;
+    // Richardson assumes the loss is smooth to fourth order. At a kink of a
+    // C¹ piece (greatest(v, 0)² at v = 0) its error is O(h), and |d1 − d2|
+    // estimates it; on a smooth loss that term is O(h²) and adds nothing.
+    let tol = 1e-6 * scale + 8.0 * noise / h + 2.0 * (d1 - d2).abs();
     if (fd - ad_dot).abs() <= tol {
         Ok(Fd::Agree)
     } else {
@@ -1469,6 +1739,33 @@ fn directions(rng: &mut Rng, case: &Case) -> Vec<Direction> {
         return Vec::new();
     }
     let mut dirs = Vec::new();
+    if case.modes.ties {
+        // At an exact tie the loss need not be differentiable at all: the
+        // median of three tied values moves at median(d) along any d, the
+        // same on both sides, yet has no gradient, and ddx's convention is
+        // one valid subgradient of many. A direction that breaks ties
+        // therefore proves nothing either way. One that moves every
+        // parameter by a function of its value keeps equal values equal, so
+        // the ties persist, the loss is smooth along it, and the central
+        // difference is exact: it checks that a tie's shared cotangent adds
+        // up, whatever the split.
+        for _ in 0..3 {
+            let mut coef: BTreeMap<u64, f64> = BTreeMap::new();
+            dirs.push(
+                entries
+                    .iter()
+                    .map(|(t, r)| {
+                        let v = case.table(t).vals[*r].unwrap_or(0.0);
+                        let c = *coef
+                            .entry(v.to_bits())
+                            .or_insert_with(|| rng.range(-1.0, 1.0));
+                        (t.clone(), *r, c)
+                    })
+                    .collect(),
+            );
+        }
+        return dirs;
+    }
     for _ in 0..2 {
         dirs.push(
             entries
@@ -1497,6 +1794,7 @@ struct Outcome {
     refusal: Option<String>,
     fd_compared: u32,
     fd_screened: u32,
+    fd_bracketed: u32,
     meta_compared: u32,
     kinds: BTreeSet<&'static str>,
     /// Failures DataFusion's physical planning is responsible for (see
@@ -1535,8 +1833,7 @@ const ALL: Props = Props {
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
-    let mut rng = seeded(seed, 0xAD_5EED_0002);
-    let case = gen_case(&mut rng);
+    let (case, mut rng) = case_for(seed);
     let mut out = Outcome {
         kinds: case.kinds(),
         ..Outcome::default()
@@ -1564,9 +1861,18 @@ async fn check_case_inner(
     let sql = case.loss_sql();
     let wrt = case.wrt_refs();
 
-    let Some(l0) = loss(&ctx, &sql).await? else {
-        out.refusal = Some("loss is NULL or not finite".into());
-        return Ok(());
+    // A loss DataFusion cannot compute (a NaN cast to an integer) is the
+    // generator's reach exceeding the engine's, not a finding.
+    let l0 = match loss(&ctx, &sql).await {
+        Ok(Some(l0)) => l0,
+        Ok(None) => {
+            out.refusal = Some("loss is NULL or not finite".into());
+            return Ok(());
+        }
+        Err(e) => {
+            out.refusal = Some(format!("the loss query fails: {}", short(&e)));
+            return Ok(());
+        }
     };
 
     let (program, grads) = match grad_of(&ctx, &sql, &wrt).await {
@@ -1633,6 +1939,7 @@ async fn check_case_inner(
             match fd_check(&ctx, case, &sql, l0, &grads, &dir).await? {
                 Fd::Agree => out.fd_compared += 1,
                 Fd::Screened => out.fd_screened += 1,
+                Fd::Bracketed => out.fd_bracketed += 1,
                 Fd::Disagree(msg) => {
                     out.fail(msg);
                     break;
@@ -2021,6 +2328,7 @@ async fn vjp_checks(
             vals: vec![Some(seed)],
             param: false,
             key_type: KeyType::Int64,
+            chunks: Vec::new(),
         };
         let batch = cot.batch();
         let renamed = RecordBatch::try_new(
@@ -2070,6 +2378,14 @@ async fn vjp_checks(
         }
     };
     let rows = query(ctx, &out_sql).await?;
+    // A NULL dim identifies no row, so no cotangent can be keyed by it.
+    if rows
+        .rows
+        .iter()
+        .any(|r| r[..dims.len()].iter().any(Option::is_none))
+    {
+        return Ok(());
+    }
     // The cotangent: the output's dims, then its value `v`, under the names
     // the program asks for.
     let mut cots: Vec<Vec<f64>> = Vec::new();
@@ -2307,7 +2623,7 @@ async fn contract_checks(
                 (
                     row[..row.len() - 1]
                         .iter()
-                        .map(|v| v.unwrap() as i64)
+                        .map(|v| v.map_or(NULL_KEY, |v| v as i64))
                         .collect(),
                     row[row.len() - 1],
                 )
@@ -2315,9 +2631,17 @@ async fn contract_checks(
             .collect();
         let mut want: Vec<(Vec<i64>, Option<f64>)> =
             t.keys.iter().cloned().zip(t.vals.iter().copied()).collect();
-        got.sort_by(|a, b| a.0.cmp(&b.0));
-        want.sort_by(|a, b| a.0.cmp(&b.0));
-        if got != want {
+        // By bits, so a NaN equals itself, and by value as well as key, since
+        // data may repeat a key.
+        let bits = |rows: &mut Vec<(Vec<i64>, Option<f64>)>| {
+            let mut b: Vec<(Vec<i64>, Option<u64>)> = rows
+                .iter()
+                .map(|(k, v)| (k.clone(), v.map(f64::to_bits)))
+                .collect();
+            b.sort();
+            b
+        };
+        if bits(&mut got) != bits(&mut want) {
             out.fail(format!(
                 "[catalog] running the program changed the user's table {}",
                 t.name
@@ -2625,8 +2949,7 @@ fn run_one(rt: &tokio::runtime::Runtime, seed: u64, props: Props) -> Outcome {
                 .map(|s| s.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic>".into());
-            let mut rng = seeded(seed, 0xAD_5EED_0002);
-            let case = gen_case(&mut rng);
+            let (case, _) = case_for(seed);
             Outcome {
                 failures: vec![format!("[panic] {msg}\n{}", case.describe())],
                 ..Outcome::default()
@@ -2643,6 +2966,7 @@ struct Tally {
     failures: u64,
     fd_compared: u64,
     fd_screened: u64,
+    fd_bracketed: u64,
     meta_compared: u64,
     refusals: BTreeMap<String, u64>,
     kinds: BTreeMap<&'static str, u64>,
@@ -2657,6 +2981,7 @@ impl Tally {
         self.failures += o.failures.len() as u64;
         self.fd_compared += o.fd_compared as u64;
         self.fd_screened += o.fd_screened as u64;
+        self.fd_bracketed += o.fd_bracketed as u64;
         self.meta_compared += o.meta_compared as u64;
         if let Some(r) = &o.refusal {
             *self.refusals.entry(r.clone()).or_default() += 1;
@@ -2676,11 +3001,13 @@ impl Tally {
 
     fn summary(&self) -> String {
         let mut s = format!(
-            "cases={} accepted={} failures={} fd_compared={} fd_screened={} meta_compared={}",
+            "cases={} accepted={} failures={} fd_compared={} fd_bracketed={} fd_screened={} \
+             meta_compared={}",
             self.cases,
             self.accepted,
             self.failures,
             self.fd_compared,
+            self.fd_bracketed,
             self.fd_screened,
             self.meta_compared
         );
@@ -2839,17 +3166,78 @@ fn grad_in_sql_is_the_programs_gradient() {
     );
 }
 
+/// Run `case`'s program one step at a time, printing what each step holds:
+/// for finding the step where a gradient goes wrong.
+async fn debug_steps(case: &Case) {
+    let ctx = match setup(case, 4).await {
+        Ok(c) => c,
+        Err(e) => return eprintln!("setup: {e}"),
+    };
+    let program = match ad::grad(&ctx, &case.loss_sql(), &case.wrt_refs()).await {
+        Ok(p) => p,
+        Err(e) => return eprintln!("grad: {e}"),
+    };
+    // Recomputation assumes a relation comes out the same every time it is
+    // computed; report any that does not, bit for bit.
+    for (k, n) in case.nodes.iter().enumerate() {
+        let order: Vec<String> = n
+            .dims
+            .iter()
+            .map(|d| d.to_string())
+            .chain(["v".into()])
+            .collect();
+        let sql = format!(
+            "WITH {} SELECT * FROM r{k} ORDER BY {}",
+            case.ctes(),
+            order.join(", ")
+        );
+        let mut seen = BTreeSet::new();
+        for _ in 0..30 {
+            if let Ok(r) = query(&ctx, &sql).await {
+                let bits: Vec<Option<u64>> = r
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter().map(|c| c.map(f64::to_bits)))
+                    .collect();
+                seen.insert(bits);
+            }
+        }
+        if seen.len() > 1 {
+            eprintln!(
+                "r{k} is not bit-reproducible: {} distinct results in 30 runs",
+                seen.len()
+            );
+        }
+    }
+    for step in program.steps() {
+        if let Err(e) = ad::run_step(&ctx, step).await {
+            return eprintln!("step {} failed: {e}", step.name);
+        }
+        match query(&ctx, &format!("SELECT * FROM \"{}\"", step.name)).await {
+            Ok(r) => {
+                eprintln!("== {} {:?}: {} rows", step.name, r.names, r.rows.len());
+                for row in r.rows.iter().take(12) {
+                    eprintln!("   {row:?}");
+                }
+            }
+            Err(e) => eprintln!("== {}: {e}", step.name),
+        }
+    }
+}
+
 /// Print one seed's case and run every property on it:
 /// `DDX_V2_SEED=<seed> cargo test … -- --ignored --nocapture replay_one_seed`.
 #[test]
 #[ignore]
 fn replay_one_seed() {
     let seed = env_u64("DDX_V2_SEED", 0);
-    let mut rng = seeded(seed, 0xAD_5EED_0002);
-    let case = gen_case(&mut rng);
+    let (case, _) = case_for(seed);
     eprintln!("seed {seed}:\n{}", case.describe());
     eprintln!("inline = {}", case.inline_sql());
-    let o = run_one(&runtime(), seed, ALL);
+    if std::env::var("DDX_V2_DEBUG").is_ok() {
+        runtime().block_on(debug_steps(&case));
+    }
+    let o = run_one(&runtime(), seed, soak_props());
     let mut tally = Tally::default();
     tally.add(&o);
     eprintln!("{}", tally.summary());
@@ -2903,6 +3291,7 @@ fn soak_v2_query_ad() {
         }
     };
 
+    SOAKING.store(true, Ordering::Relaxed);
     let props = soak_props();
     let rt = runtime();
     let start = Instant::now();
