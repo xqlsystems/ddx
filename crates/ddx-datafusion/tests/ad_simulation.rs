@@ -1258,6 +1258,26 @@ impl Case {
         self.modes.ties || self.modes.extreme == Some(Extreme::NegZero)
     }
 
+    /// The relations the loss reads, directly or through others.
+    fn reachable(&self) -> BTreeSet<usize> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![self.root];
+        while let Some(k) = stack.pop() {
+            if !seen.insert(k) {
+                continue;
+            }
+            // A node reads another as `§n§` in its body.
+            for (i, part) in self.nodes[k].body.split('§').enumerate() {
+                if i % 2 == 1 {
+                    if let Ok(n) = part.parse::<usize>() {
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
     /// `WITH r…, loss AS (SELECT head AS loss FROM root) SELECT outer AS loss
     /// FROM <from>`: the loss CTE, and an outer query over it that the
     /// metamorphic relations vary. `from` defaults to `loss`.
@@ -2022,14 +2042,15 @@ async fn check_case_inner(
         }
     };
     out.accepted = true;
-    // Only a ranking over what a wrt table feeds must be refused: one over
-    // constant data is recomputed unread, and not checked (see ad_findings.rs
-    // on recomputation).
-    if case
-        .nodes
-        .iter()
-        .any(|n| n.nontotal && n.reads.iter().any(|r| case.wrt.contains(r)))
-    {
+    // A ranking over what a wrt table feeds, which the loss reads, must be
+    // refused. One in a relation the loss does not read is pruned before
+    // ddx sees it (seed 1100069). One over constant data ddx refuses too
+    // when it is joined into a recomputed region, but that is not asserted
+    // here.
+    let reachable = case.reachable();
+    if case.nodes.iter().enumerate().any(|(k, n)| {
+        n.nontotal && reachable.contains(&k) && n.reads.iter().any(|r| case.wrt.contains(r))
+    }) {
         out.fail(
             "[contract] grad accepted a ranking over a varied relation that does not break \
              ties (its ORDER BY lacks a dim); recomputed, it can keep different rows",
