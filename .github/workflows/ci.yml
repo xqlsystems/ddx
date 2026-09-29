@@ -37,6 +37,10 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # ddx-ad's `substrait` dependency generates its types from .proto files
+      # at build time.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: rustfmt (check only)
         run: cargo fmt --all --check
       - name: clippy (warnings are errors)
@@ -66,6 +70,10 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # ddx-ad's `substrait` dependency generates its types from .proto files
+      # at build time.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Everything, discovered rather than enumerated.
       #
       # This used to be a hand-maintained allowlist of `--test` targets, which
@@ -159,6 +167,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # ddx-ad's `substrait` dependency generates its types from .proto files
+      # at build time.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Catch packaging/metadata breakage (missing files, bad metadata, a
       # path-dep without a version) on every PR — long before a release actually
       # tries to publish. Add publishable crates here as they come online.

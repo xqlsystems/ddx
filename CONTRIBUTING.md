@@ -41,6 +41,11 @@ You need a Rust toolchain. The **minimum supported Rust version (MSRV) is
 1.88** — this is enforced in CI and declared in `Cargo.toml`. (The floor comes
 from a transitive build dependency; `ddx`'s own code needs far less.)
 
+`ddx-ad` also needs `protoc`, the Protocol Buffers compiler: the `substrait`
+crate generates its Rust types from `.proto` files at build time. Install it
+with your package manager (`apt install protobuf-compiler`, `brew install
+protobuf`); the Nix shell below already has it.
+
 ```bash
 rustup toolchain install stable      # for day-to-day work
 rustup component add rustfmt clippy
@@ -72,7 +77,7 @@ this guide then work unchanged. CI does not use Nix; this is a dev shell only.
 crates/
   ddx-core/          # the v1 engine — sqlparser only. Start here.
   ddx-datafusion/    # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql
-  ddx-ad/            # v2 query-level reverse-mode AD — scaffold (M3/M4)
+  ddx-ad/            # v2 query-level reverse-mode AD over Substrait (M3/M4)
 python/ddxdb/        # PyO3/maturin wheel: rewrite_sql + a DataFusion Context
 tests/               # cross-engine numeric-agreement suites (vs JAX)
 docs/design.md       # the design (source of truth)
@@ -81,8 +86,7 @@ docs/spikes/         # runnable evidence behind the design
 ```
 
 `ddx-core` is where most work happens; everything else is a thin layer over it.
-`ddx-ad` is an honest, compile-checked scaffold (no hidden stubs) awaiting its
-milestone.
+`ddx-ad` is under construction for M3/M4.
 
 ## Working on the Python code
 
@@ -175,6 +179,11 @@ The differentiation cores are deliberately minimal so any engine can drive them:
 - `sqlparser` is **pinned exactly** (`=0.62.0`) and re-exported as
   `ddx_core::sqlparser`. A `sqlparser` bump is a breaking change to `ddx-core`
   and needs its own discussion (see design.md §6, `G2`).
+- **`ddx-ad` depends on `substrait` and `ddx-core`** — the scalar engine is
+  the elementwise rule of v2 (design.md §4.3). `substrait` is pinned exactly to
+  the version `datafusion-substrait` uses, for the same reason `sqlparser` is:
+  the adapter hands `ddx-ad` the engine's own plan type, and two versions would
+  be two unrelated Rust types.
 
 ## Development workflow
 

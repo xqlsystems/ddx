@@ -2,41 +2,33 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx-ad` — query-level reverse-mode automatic differentiation (ddx v2).
+//! `ddx-ad`: query-level reverse-mode automatic differentiation (ddx v2).
 //!
-//! **Status: scaffold.** This crate is the home for the v2 engine described in
-//! [`docs/design.md`](../../../docs/design.md) §4: differentiating whole
-//! queries (not scalar expressions) by applying one transpose rule per
-//! relational primitive — contraction, elementwise, reduce, route,
-//! stop-gradient — over `substrait::proto` plans tagged with
-//! extension-function markers.
+//! v1 ([`ddx_core`]) differentiates one scalar expression. v2 differentiates a
+//! whole query: given a Substrait plan whose root is a loss, it emits the
+//! queries that compute the loss's gradient with respect to chosen table
+//! columns (design.md §4). It works by applying one transpose rule per
+//! relational operator, and uses `ddx-core` for the elementwise one.
 //!
-//! Nothing here is implemented yet. M0 (the current milestone) delivers only
-//! the scalar core, [`ddx-core`](../ddx_core/index.html), which becomes the
-//! *elementwise leaf* of this engine (design.md §4.3). The public surface
-//! sketched below is the M3/M4 target and exists here as a compile-checked
-//! seam, not a working API.
+//! The user marks the operations whose meaning ddx must not guess with four
+//! identity functions: `ddx_contract_mark`, `ddx_reduce_mark`,
+//! `ddx_route_mark` and `ddx_stop_gradient` (§4.3).
 //!
-//! Planned surface (design.md §4.4):
+//! This crate is being built across milestones M3 and M4. So far it pins the
+//! plan type.
 //!
-//! ```ignore
-//! pub fn vjp_query(plan: &Plan, wrt: &[RelRef]) -> Result<BackwardProgram, DiffError>;
+//! # `substrait` version policy
 //!
-//! pub struct BackwardProgram {
-//!     pub forward_steps: Vec<(Ident, Plan)>,
-//!     pub backward_steps: Vec<(Ident, Plan)>,
-//!     pub gradients: HashMap<RelRef, Ident>,
-//! }
-//! ```
-//!
-//! The four marker names it recognizes (`ddx_contract_mark`,
-//! `ddx_reduce_mark`, `ddx_route_mark`, `ddx_stop_gradient`) are Substrait
-//! extension-function markers, the same "tag, don't infer" mechanism `grad()`
-//! uses in v1, one layer down in the plan.
+//! The public API takes and returns [`substrait::proto`] types, so the version
+//! is pinned exactly and re-exported as [`crate::substrait`], like
+//! `ddx_core::sqlparser`. An adapter should reach for plan types through this
+//! re-export.
 
 #![forbid(unsafe_code)]
 
-/// Milestone marker: v2 (`ddx-ad`) is not implemented in M0.
-///
-/// See [`docs/design.md`](../../../docs/design.md) §4 and milestones M3/M4.
-pub const STATUS: &str = "scaffold: query-level reverse-mode AD lands in M3/M4";
+/// The exact `substrait` this crate was built against, re-exported so an
+/// adapter links the same version.
+pub use substrait;
+
+/// The exact `ddx-core` this crate was built against.
+pub use ddx_core;

@@ -46,6 +46,14 @@ sqlparser = { version = "=0.62.0", features = ["visitor"] }
 # instead of confusingly at the bridge.
 datafusion = { version = "54" }
 
+# v2's plan type (M3). Pinned exactly, for the same reason as `sqlparser`:
+# `ddx-ad`'s public API takes and returns `substrait::proto` types, and an
+# adapter hands it the plan its engine produced. `datafusion-substrait` 54.1
+# depends on `substrait` 0.63, so that is the version here; if the two diverged,
+# `substrait::proto::Plan` would be two unrelated Rust types and the adapter
+# would stop compiling.
+substrait = { version = "=0.63.0" }
+
 # Internal crates, referenced by path within the workspace.
 #
 # `ddx-core` carries a `version` as well as a `path`: cargo uses the path for
