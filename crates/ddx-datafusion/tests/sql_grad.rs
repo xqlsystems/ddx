@@ -191,3 +191,30 @@ async fn case_variants_of_a_column_keep_the_dims() {
     .await;
     assert_eq!(got, vec![(0, 4.0), (1, -8.0), (2, 2.0)]);
 }
+
+#[tokio::test]
+async fn tables_whose_names_join_alike_keep_their_own_gradients() {
+    // Adversarial review (🤖😈): `sql_all` keeps each gradient as
+    // `__ddx_grad_{p}_{parts joined by _}`, so `a_b.c` and `a.b_c` share one
+    // name and both calls read the second table's gradient: 20, 20 instead
+    // of 2, 20, with no error.
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE SCHEMA a_b",
+        "CREATE SCHEMA a",
+        "CREATE TABLE a_b.c (i BIGINT, val DOUBLE) AS VALUES (0, 1.0)",
+        "CREATE TABLE a.b_c (i BIGINT, val DOUBLE) AS VALUES (0, 10.0)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(p.val * p.val) + SUM(q.val * q.val) AS l \
+                       FROM a_b.c p CROSS JOIN a.b_c q) \
+         SELECT g1.i, g1.val * 1000.0 + g2.val AS v \
+         FROM grad(loss, a_b.c.val) g1 CROSS JOIN grad(loss, a.b_c.val) g2",
+    )
+    .await;
+    // d/dp = 2p = 2 and d/dq = 2q = 20, packed as 2 * 1000 + 20.
+    assert_eq!(got, vec![(0, 2020.0)]);
+}
