@@ -100,6 +100,23 @@ impl Functions {
         Ok(self.name(anchor)? == STOP_GRADIENT)
     }
 
+    /// Can `anchor` give a different value each time a query is run
+    /// (`random()`, `now()`)? A recomputation would not repeat it.
+    pub fn is_volatile(&self, anchor: u32) -> Result<bool> {
+        const VOLATILE: &[&str] = &[
+            "random",
+            "rand",
+            "uuid",
+            "gen_random_uuid",
+            "now",
+            "current_timestamp",
+            "current_time",
+            "localtimestamp",
+            "localtime",
+        ];
+        Ok(VOLATILE.contains(&self.name(anchor)?))
+    }
+
     /// The declarations, as the plan gave them.
     pub fn declarations(&self) -> &[ExtensionFunction] {
         &self.declarations

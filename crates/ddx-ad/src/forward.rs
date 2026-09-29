@@ -147,6 +147,9 @@ pub struct Region {
     pub slots: Vec<Slot>,
     /// Where its rows were cut by an ordering (see [`Cut`]).
     pub cuts: Vec<Cut>,
+    /// Whether it calls a volatile function (`random()`, `now()`), which a
+    /// recomputation would not repeat.
+    pub volatile: bool,
 }
 
 impl Region {
@@ -179,6 +182,7 @@ impl Region {
         }));
         self.cuts
             .extend(other.cuts.into_iter().map(|c| c.shifted(shift)));
+        self.volatile |= other.volatile;
         Ok(shift)
     }
 
@@ -499,6 +503,10 @@ impl Builder<'_> {
                 }
             }
         }
+        let volatile = !matches!(kind, RelType::Aggregate(_))
+            && rel_expressions(kind)
+                .into_iter()
+                .any(|e| self.calls_volatile(e));
         let (mut s, direct, common) = match kind {
             RelType::Read(r) => {
                 let s = self.read(r)?;
@@ -603,6 +611,7 @@ impl Builder<'_> {
             }
         };
         s.outputs = apply_emit(common, direct)?;
+        s.volatile |= volatile;
         Ok(s)
     }
 
@@ -621,6 +630,7 @@ impl Builder<'_> {
             s.push(Def::Const, false);
         }
         s.outputs = (0..width).collect();
+        s.volatile = self.volatile_under(rel);
         Ok(s)
     }
 
@@ -825,6 +835,7 @@ impl Builder<'_> {
             // Only the left side's columns come out. The right side is still
             // read, to decide which rows do, so its orderings still count.
             s.cuts.extend(right.detached_cuts());
+            s.volatile |= right.volatile;
             s.slots.extend(
                 right
                     .slots
@@ -892,7 +903,7 @@ impl Builder<'_> {
 
     /// Read aggregate `a` as a saved relation.
     fn read_saved(&mut self, a: &AggregateRel) -> Result<usize> {
-        let input = self.lower(input(&a.input)?)?;
+        let mut input = self.lower(input(&a.input)?)?;
         let outputs = &input.outputs;
         let groupings = grouping_expressions(a)?
             .into_iter()
@@ -965,6 +976,16 @@ impl Builder<'_> {
                 advanced_extension: None,
             }))),
         };
+        // The region beneath is recomputed with the keys and the measures'
+        // arguments, so a volatile one makes it unrepeatable too.
+        let args = measures
+            .iter()
+            .flat_map(|m| &m.arguments)
+            .filter_map(|a| match &a.arg_type {
+                Some(ArgType::Value(e)) => Some(e),
+                _ => None,
+            });
+        input.volatile |= groupings.iter().chain(args).any(|e| self.calls_volatile(e));
         self.saved.push(Saved {
             input,
             groupings,
@@ -974,6 +995,35 @@ impl Builder<'_> {
             rel,
         });
         Ok(self.saved.len() - 1)
+    }
+
+    /// Does `e` call a volatile function?
+    fn calls_volatile(&self, e: &Expression) -> bool {
+        let direct = contains(e, &|x| match &x.rex_type {
+            Some(RexType::ScalarFunction(f)) => self
+                .functions
+                .is_volatile(f.function_reference)
+                .unwrap_or(false),
+            _ => false,
+        });
+        let mut subqueries = Vec::new();
+        collect_subqueries(e, &mut subqueries);
+        direct
+            || subqueries.into_iter().any(|sq| {
+                // A subquery ddx cannot read is refused elsewhere.
+                uncorrelated_scalar(sq).is_some_and(|r| self.volatile_under(r))
+            })
+    }
+
+    /// Does anything in `rel` call a volatile function?
+    fn volatile_under(&self, rel: &Rel) -> bool {
+        let Some(kind) = rel.rel_type.as_ref() else {
+            return false;
+        };
+        rel_expressions(kind)
+            .into_iter()
+            .any(|e| self.calls_volatile(e))
+            || rel_inputs(kind).into_iter().any(|r| self.volatile_under(r))
     }
 
     /// Does anything under `rel` read a `wrt` table? Records every table name
@@ -1106,6 +1156,7 @@ fn empty(rel: Rel) -> Region {
         outputs: Vec::new(),
         slots: Vec::new(),
         cuts: Vec::new(),
+        volatile: false,
     }
 }
 
@@ -1372,6 +1423,21 @@ pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
                         }
                     }
                 }
+            }
+            out.extend(r.measures.iter().filter_map(|m| m.filter.as_ref()));
+            out
+        }
+        // A read's filters, and a virtual table's rows (DataFusion writes a
+        // projection over one empty row, `SELECT random()`, as one).
+        RelType::Read(r) => {
+            let mut out: Vec<&Expression> = r
+                .filter
+                .as_deref()
+                .into_iter()
+                .chain(r.best_effort_filter.as_deref())
+                .collect();
+            if let Some(ReadType::VirtualTable(v)) = &r.read_type {
+                out.extend(v.expressions.iter().flat_map(|row| &row.fields));
             }
             out
         }

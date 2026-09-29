@@ -364,6 +364,14 @@ impl<'a> Transposer<'a> {
     /// the program is refused rather than risk sending gradient to rows the
     /// forward pass did not keep.
     fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+        if region.volatile {
+            return Err(AdError::NotImplemented(
+                "a volatile function (random(), now(), …) in rows that carry gradient: ddx \
+                 recomputes them for the backward pass, and the function would not give the \
+                 same values again; materialize its result as a table first"
+                    .into(),
+            ));
+        }
         // Constant data is recomputed too, and ddx has no dims for it, so it
         // cannot show a ranking or LIMIT inside it is total.
         if region

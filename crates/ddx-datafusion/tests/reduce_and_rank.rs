@@ -571,3 +571,34 @@ async fn a_ranking_on_a_semi_joins_right_side_must_break_ties() {
         "{why:?}"
     );
 }
+
+#[tokio::test]
+async fn a_volatile_function_in_a_recomputed_region_is_refused() {
+    // random() would give other values when the region is recomputed for the
+    // backward pass, whether it is on the path from a wrt table or in data
+    // joined into it.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE vp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE vd (i BIGINT, v DOUBLE) AS VALUES (0, 5.0), (1, 7.0)",
+    )
+    .await;
+    for loss in [
+        "SELECT SUM(val * random()) AS l FROM vp",
+        "SELECT SUM(vp.val * d.r) AS l FROM vp JOIN (SELECT i, v * random() AS r FROM vd) d \
+           ON vp.i = d.i",
+        "SELECT SUM(val) AS l FROM vp WHERE random() < 2.0",
+        "SELECT SUM(val * (SELECT random())) AS l FROM vp",
+    ] {
+        let why = refusal(&ctx, loss, "vp").await;
+        assert!(
+            why.as_deref().is_some_and(|m| m.contains("volatile")),
+            "{loss}: {why:?}"
+        );
+    }
+}
