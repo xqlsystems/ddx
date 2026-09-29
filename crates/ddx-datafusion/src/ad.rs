@@ -12,6 +12,12 @@
 //! same for a query with any output, pulling back a cotangent the caller
 //! registers as the table [`BackwardProgram::cotangent_table`] names.
 //!
+//! Every table a program writes is named with a prefix unique to that program,
+//! `__ddx_{id}_`, so two programs on one context never read each other's
+//! tables, and a user's table is never replaced unless its name starts with
+//! `__ddx_`, which is reserved. After [`run`], only the value and the
+//! gradients remain on the context; [`release`] drops those too.
+//!
 //! ```
 //! # use datafusion::prelude::SessionContext;
 //! # #[tokio::main]
@@ -45,10 +51,10 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
-use ddx_ad::emit::{bind_reads, unbound_reads};
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Rel};
+use ddx_ad::{bind_reads, unbound_reads};
 
 pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
 
@@ -92,20 +98,67 @@ pub fn vjp_plan(
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
 }
 
-/// Run every step of `program`, forward then backward, registering each
-/// result on `ctx` under the step's name, replacing a table of that name.
+/// Run `program`: its [`checks`](BackwardProgram::checks), then every step,
+/// forward then backward, registering each result on `ctx` under the step's
+/// name. Once the gradients are written, the intermediate tables (saved
+/// aggregates and cotangents) are dropped; the value and the gradients stay
+/// until [`release`] or the next run replaces them.
+///
+/// A failed check arrives as [`DataFusionError::External`] boxing
+/// [`AdError::InvalidWrt`]: a `wrt` table's rows are not what the program
+/// assumed, for instance two rows share their dims.
 ///
 /// A program depends on the tables' names and schemas, not their values, so
-/// build it once and run it on every training step.
+/// build it once and run it on every training step. One program's runs must
+/// not overlap: they write the same tables. Build a program per concurrent
+/// caller instead.
 pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
-    for step in program.steps() {
-        run_step(ctx, step).await?;
+    run_checks(ctx, program).await?;
+    let result = async {
+        for step in program.steps() {
+            run_step(ctx, step).await?;
+        }
+        Ok(())
+    }
+    .await;
+    for step in program.intermediate_steps() {
+        ctx.deregister_table(step.name.as_str())?;
+    }
+    result
+}
+
+/// Run `program`'s checks, failing on the first that returns a row.
+pub async fn run_checks(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+    for check in &program.checks {
+        let lp = from_substrait_plan(&ctx.state(), &check.plan).await?;
+        let rows: usize = ctx
+            .execute_logical_plan(lp)
+            .await?
+            .limit(0, Some(1))?
+            .collect()
+            .await?
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        if rows > 0 {
+            return Err(to_df_err(AdError::InvalidWrt(check.message.clone())));
+        }
     }
     Ok(())
 }
 
-/// Run one step and register its result. Every step it reads must already be
-/// registered.
+/// Drop every table `program` registered on `ctx`, the value and the
+/// gradients included.
+pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+    for step in program.steps() {
+        ctx.deregister_table(step.name.as_str())?;
+    }
+    Ok(())
+}
+
+/// Run one step and register its result, replacing a table of that name.
+/// Every step it reads must already be registered. Unlike [`run`], this
+/// neither runs the checks nor drops anything.
 pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
     let mut plan = step.plan.clone();
     let mut schemas = HashMap::new();

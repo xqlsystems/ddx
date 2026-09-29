@@ -5,7 +5,8 @@
 //! Adversarial review (🤖😈): `ad::run` materializes every step into the
 //! caller's `SessionContext` under fixed, global names (`__ddx_value`,
 //! `__ddx_saved_{n}`, `__ddx_cotangent_{n}`, `__ddx_grad_{table}`), replacing
-//! whatever is there and leaving it all behind. Each test below fails.
+//! whatever is there and leaving it all behind. The first two tests failed
+//! before each program got its own name prefix.
 
 use datafusion::arrow::array::{AsArray, RecordBatch};
 use datafusion::arrow::datatypes::Float64Type;
@@ -105,4 +106,49 @@ async fn interleaved_programs_do_not_read_each_others_tape() {
     )
     .await;
     assert_eq!(got, vec![0.0, 1.0], "d/dw MAX(w.val) is one-hot on the max");
+}
+
+#[tokio::test]
+async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 5.0)",
+    )
+    .await;
+    let program = ad::grad(
+        &ctx,
+        "SELECT MAX(val) * SUM(val) AS l FROM w",
+        &[ColumnRef::new("w", "val")],
+    )
+    .await
+    .unwrap();
+    assert!(program.intermediate_steps().next().is_some());
+    ad::run(&ctx, &program).await.unwrap();
+    for step in program.intermediate_steps() {
+        assert!(
+            !ctx.table_exist(step.name.as_str()).unwrap(),
+            "{}",
+            step.name
+        );
+    }
+    assert!(ctx.table_exist(program.value.as_str()).unwrap());
+    assert_eq!(
+        f64s(
+            &ctx,
+            &format!("SELECT val FROM {} ORDER BY i", program.gradients[0].step)
+        )
+        .await,
+        vec![5.0, 11.0]
+    );
+    // Running again works from a context with no intermediates left.
+    ad::run(&ctx, &program).await.unwrap();
+    ad::release(&ctx, &program).unwrap();
+    for step in program.steps() {
+        assert!(
+            !ctx.table_exist(step.name.as_str()).unwrap(),
+            "{}",
+            step.name
+        );
+    }
 }

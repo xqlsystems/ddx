@@ -18,10 +18,15 @@
 //! [`grad`] and [`vjp`] take a plan and the `wrt` columns and return a
 //! [`BackwardProgram`]: plain Substrait plans for an engine to run in order,
 //! the last of which hold the gradients, shaped like the tables they are
-//! gradients of. The pieces are public for adapters: [`relation`] states what
-//! dims and values are, [`forward`] reads the plan, [`Elementwise`] gives the
-//! map primitive's local derivatives, and [`emit`] writes plans and binds their
-//! reads.
+//! gradients of. An adapter runs the steps in order, late-binding each step's
+//! reads of earlier steps with [`unbound_reads`] and [`bind_reads`], and runs
+//! the program's [`checks`](BackwardProgram::checks) first. The table names
+//! a program writes all start with a prefix unique to the program,
+//! `__ddx_{id}_`; the `__ddx_` prefix is reserved.
+//!
+//! The modules that read and write plans (`forward`, `emit`, `expr`,
+//! `relation`) are public only so this workspace's adapters and tests can
+//! reach them; they are hidden from the docs and not part of the stable API.
 //!
 //! # `substrait` version policy
 //!
@@ -33,23 +38,34 @@
 #![forbid(unsafe_code)]
 
 mod elementwise;
+#[doc(hidden)]
 pub mod emit;
 mod error;
+#[doc(hidden)]
 pub mod expr;
+#[doc(hidden)]
 pub mod forward;
 mod functions;
 mod program;
+#[doc(hidden)]
 pub mod relation;
 mod transpose;
 
+#[doc(hidden)]
 pub use elementwise::Elementwise;
+pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
+#[doc(hidden)]
 pub use forward::Forward;
-pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
+pub use functions::STOP_GRADIENT;
+#[doc(hidden)]
+pub use functions::{normalize, Extensions, Functions};
 pub use program::{
     decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, Gradient, Options, Step,
 };
-pub use relation::{ColumnRef, Table};
+pub use relation::ColumnRef;
+#[doc(hidden)]
+pub use relation::Table;
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.

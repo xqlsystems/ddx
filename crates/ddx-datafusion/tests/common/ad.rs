@@ -21,36 +21,9 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// Run `program`'s checks, then its steps. A check that returns a row refuses
-/// the program, with the check's message.
+/// [`ddx_datafusion::ad::run`], with a refusal as its message. A check that
+/// returns a row refuses the program, with the check's message.
 pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<(), String> {
-    for check in &program.checks {
-        // A check can read a table ddx has no types for (a vjp's cotangent).
-        let mut plan = check.plan.clone();
-        let mut schemas = HashMap::new();
-        for name in ddx_ad::emit::unbound_reads(&plan) {
-            let s = ddx_datafusion::ad::table_schema(ctx, &name).await.unwrap();
-            schemas.insert(name, s);
-        }
-        ddx_ad::emit::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
-        let lp =
-            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &plan)
-                .await
-                .unwrap();
-        let rows: usize = ctx
-            .execute_logical_plan(lp)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap()
-            .iter()
-            .map(|b| b.num_rows())
-            .sum();
-        if rows > 0 {
-            return Err(check.message.clone());
-        }
-    }
     ddx_datafusion::ad::run(ctx, program)
         .await
         .map_err(|e| e.to_string())
