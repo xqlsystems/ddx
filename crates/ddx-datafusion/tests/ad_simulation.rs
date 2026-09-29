@@ -1303,7 +1303,15 @@ impl Case {
     }
 
     fn kinds(&self) -> BTreeSet<&'static str> {
-        self.nodes[self.root].kinds.clone()
+        let mut kinds = self.nodes[self.root].kinds.clone();
+        // The head aggregates the root, and can kink too (seed 1900692).
+        if self.head.contains("MAX(") {
+            kinds.insert("max");
+        }
+        if self.head.contains("MIN(") {
+            kinds.insert("min");
+        }
+        kinds
     }
 
     fn describe(&self) -> String {
@@ -2261,6 +2269,15 @@ async fn name_checks(
     grads: &BTreeMap<String, Grad>,
     out: &mut Outcome,
 ) -> Result<(), String> {
+    // SQL plans the loss a little differently from the program API, so the
+    // two add in different orders; with huge values a head like sin(SUM(v))
+    // turns an ulp of a sum near 1e9 into a relative difference near 1e-7
+    // (seed 1900495).
+    let names_rtol = if case.modes.extreme == Some(Extreme::Huge) {
+        1e-6
+    } else {
+        META_RTOL
+    };
     let t = rng.pick(&case.wrt).clone();
     let tb = case.table(&t).clone();
     let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
@@ -2437,7 +2454,7 @@ async fn name_checks(
                 .map(|k| (k.clone(), grads[&t].get(k).copied().flatten().map(|_| 0.0)))
                 .collect();
             let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
-            if let Some(f) = compare("names", &wrap(zeros), &wrap(got), 1.0, META_RTOL) {
+            if let Some(f) = compare("names", &wrap(zeros), &wrap(got), 1.0, names_rtol) {
                 out.fail(format!("{f}\n  two losses in one statement: {sql}"));
             }
         }
@@ -2449,7 +2466,7 @@ async fn name_checks(
             };
             let _ = key;
             let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
-            if let Some(f) = compare("names", &want, &wrap(got), 1.0, META_RTOL) {
+            if let Some(f) = compare("names", &want, &wrap(got), 1.0, names_rtol) {
                 out.fail(format!("{f}\n  {kind}: {sql}"));
             }
         }
