@@ -56,7 +56,10 @@ use substrait::proto::{
 use crate::elementwise::depends;
 use crate::emit;
 use crate::error::{AdError, Result};
-use crate::expr::{as_field, children, contains, fields_of, map_fields, uncorrelated_scalar};
+use crate::expr::{
+    as_field, children, contains, field, fields_of, if_then, lit_bool, map_fields,
+    uncorrelated_scalar,
+};
 use crate::functions::Functions;
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
 
@@ -576,7 +579,14 @@ impl Builder<'_> {
             direct.push(col);
             exprs.push(e);
         }
+        let windows: Vec<usize> = (s.width() - exprs.len()..s.width())
+            .filter(|&c| matches!(s.defs[c], Def::Window { .. }))
+            .collect();
         s.rel = emit::project(s.rel, exprs);
+        if !windows.is_empty() {
+            let width = s.width();
+            s.rel = rename_in_place(s.rel, width, &windows);
+        }
         Ok((s, direct))
     }
 
@@ -820,6 +830,27 @@ impl Builder<'_> {
         }
         Ok(())
     }
+}
+
+/// `rel` (`width` columns wide) with each column in `cols` replaced, in its
+/// place, by `CASE WHEN true THEN c ELSE c END`: the same values under a
+/// different name. A region is rebuilt keeping every column, so a window
+/// function computed over rows that already carry an identical window
+/// function's column would give the engine two columns of one name, which
+/// DataFusion refuses (a rank filter over a rank filter). Renaming each window
+/// column as soon as it is computed means no later one can collide with it.
+fn rename_in_place(rel: Rel, width: usize, cols: &[usize]) -> Rel {
+    let exprs = cols
+        .iter()
+        .map(|&c| if_then(vec![(lit_bool(true), field(c))], field(c)))
+        .collect();
+    let emit = (0..width)
+        .map(|c| match cols.iter().position(|&w| w == c) {
+            Some(k) => width + k,
+            None => c,
+        })
+        .collect();
+    emit::project_emit(rel, exprs, Some(emit))
 }
 
 fn empty(rel: Rel) -> Region {

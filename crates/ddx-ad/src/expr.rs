@@ -70,6 +70,17 @@ pub fn lit_f64(v: f64) -> Expression {
     }
 }
 
+/// The BOOLEAN literal `v`.
+pub fn lit_bool(v: bool) -> Expression {
+    Expression {
+        rex_type: Some(RexType::Literal(Literal {
+            nullable: false,
+            type_variation_reference: 0,
+            literal_type: Some(LiteralType::Boolean(v)),
+        })),
+    }
+}
+
 /// A NULL of type DOUBLE.
 pub fn null_f64() -> Expression {
     Expression {
