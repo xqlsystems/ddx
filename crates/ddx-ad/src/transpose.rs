@@ -47,10 +47,10 @@ use substrait::proto::rel::RelType;
 use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
 
 use crate::elementwise::{depends, Elementwise};
-use crate::emit::{aggregate, join, project, read_step};
+use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64};
-use crate::forward::{saved_name, step_columns, width, Def, Forward, Input, Output, Region};
+use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
+use crate::forward::{width, Def, Forward, Input, Output, Region};
 use crate::functions::Extensions;
 
 /// An input's cotangent from one place that reads it: the input's dims, then
@@ -126,40 +126,68 @@ impl<'a> Transposer<'a> {
             })
             .collect();
 
-        // Every row joined to the cotangent of the group it went into: the
-        // broadcast every reduce rule starts from. AVG, MAX and MIN also need
-        // the group's saved value and a count, joined on the same keys.
-        let needs_stats = rules.iter().any(|r| r.1 != Rule::Sum);
-        let mut base = rows.clone();
+        // AVG divides by its group's count, and MAX and MIN find the rows
+        // that attain the group's extreme and how many do. Each is a window
+        // over the recomputed rows themselves, partitioned by the group's
+        // keys, never a comparison with the saved aggregate: a recomputation
+        // need not be bit-identical to the forward pass (a grouped SUM over
+        // several partitions adds in arrival order), and a saved maximum no
+        // recomputed row equals would silently send no gradient at all.
+        let count = self.ext.anchor("count");
+        let sum = self.ext.anchor("sum");
+        let equal = self.ext.anchor("equal");
+        let mut rel = rows;
         let mut next = rows_width;
-        let mut tape_at = 0;
-        if needs_stats {
-            let tape = read_step(
-                &saved_name(&self.f.namespace, n),
-                step_columns(saved.outputs.len()),
-            );
-            base = self.join_on(base, tape, keys.clone(), &dims, next)?;
-            tape_at = next;
-            next += saved.outputs.len();
-        }
-        let cotangent_at = next + dims.len();
-        let key_positions: Vec<usize> = (0..dims.len()).collect();
-        base = self.join_on(base, cotangent, keys.clone(), &key_positions, next)?;
-        next += dims.len() + cols.len();
         let mut stat_at = BTreeMap::new();
-        if needs_stats {
-            let stats = self.group_stats(n, rows, rows_width, &keys, &dims, &rules)?;
-            base = self.join_on(base, stats.0, keys, &key_positions, next)?;
-            for (k, arg_col) in stats.1.into_iter().enumerate() {
-                stat_at.insert(arg_col, next + dims.len() + k);
+        let mut extreme_at = BTreeMap::new();
+        let mut windows = Vec::new();
+        for &(arg_col, rule, _, _) in &rules {
+            let at = next + windows.len();
+            match rule {
+                Rule::Sum => continue,
+                Rule::Mean => {
+                    windows.push(window(count, vec![field(arg_col)], keys.clone()));
+                    stat_at.insert(arg_col, at);
+                }
+                Rule::Extreme(name) => {
+                    let f = self.ext.anchor(name);
+                    windows.push(window(f, vec![field(arg_col)], keys.clone()));
+                    extreme_at.insert(arg_col, at);
+                }
             }
         }
+        if !windows.is_empty() {
+            next += windows.len();
+            rel = project(rel, windows);
+        }
+        let attaining: Vec<Expression> = extreme_at
+            .iter()
+            .map(|(&arg_col, &at)| {
+                let attains = if_then(
+                    vec![(call(equal, vec![field(arg_col), field(at)]), lit_f64(1.0))],
+                    lit_f64(0.0),
+                );
+                window(sum, vec![attains], keys.clone())
+            })
+            .collect();
+        for (k, &arg_col) in extreme_at.keys().enumerate() {
+            stat_at.insert(arg_col, next + k);
+        }
+        if !attaining.is_empty() {
+            next += attaining.len();
+            rel = project(rel, attaining);
+        }
+
+        // Every row joined to the cotangent of the group it went into: the
+        // broadcast every reduce rule starts from.
+        let cotangent_at = next + dims.len();
+        let key_positions: Vec<usize> = (0..dims.len()).collect();
+        let base = self.join_on(rel, cotangent, keys, &key_positions, next)?;
 
         let divide = self.ext.anchor("divide");
-        let equal = self.ext.anchor("equal");
         let is_null = self.ext.anchor("is_null");
         let mut seeds = Vec::new();
-        for (arg_col, rule, i, col) in rules {
+        for (arg_col, rule, i, _) in rules {
             let cot = field(cotangent_at + i);
             let seed = match rule {
                 // Every summed row gets the group's cotangent.
@@ -168,9 +196,9 @@ impl<'a> Transposer<'a> {
                 Rule::Mean => call(divide, vec![cot, field(stat_at[&arg_col])]),
                 // Only the rows equal to the extreme get it, shared evenly
                 // among them: jax.grad's convention for jnp.max at a tie.
-                Rule::Extreme => if_then(
+                Rule::Extreme(_) => if_then(
                     vec![(
-                        call(equal, vec![field(arg_col), field(tape_at + col)]),
+                        call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),
                         call(divide, vec![cot, field(stat_at[&arg_col])]),
                     )],
                     lit_f64(0.0),
@@ -214,50 +242,6 @@ impl<'a> Transposer<'a> {
             .reduce(|a, b| call(add, vec![a, b]))
             .expect("at least two terms");
         if_then(vec![(none, null_f64())], total)
-    }
-
-    /// Per-group statistics the mean and extreme rules divide by, keyed by
-    /// the group's dims: for a mean, how many rows it averaged; for a max or
-    /// min, how many rows attain it. Returns the relation and, for each
-    /// statistic column in order, the argument column it belongs to.
-    fn group_stats(
-        &mut self,
-        n: usize,
-        rows: Rel,
-        rows_width: usize,
-        keys: &[Expression],
-        dims: &[usize],
-        rules: &[(usize, Rule, usize, usize)],
-    ) -> Result<(Rel, Vec<usize>)> {
-        let saved = &self.f.saved[n];
-        let tape = read_step(
-            &saved_name(&self.f.namespace, n),
-            step_columns(saved.outputs.len()),
-        );
-        let with_tape = self.join_on(rows, tape, keys.to_vec(), dims, rows_width)?;
-        let count = self.ext.anchor("count");
-        let sum = self.ext.anchor("sum");
-        let equal = self.ext.anchor("equal");
-        let mut measures = Vec::new();
-        let mut owners = Vec::new();
-        for &(arg_col, rule, _, col) in rules {
-            match rule {
-                Rule::Sum => continue,
-                Rule::Mean => measures.push((count, vec![field(arg_col)])),
-                Rule::Extreme => measures.push((
-                    sum,
-                    vec![if_then(
-                        vec![(
-                            call(equal, vec![field(arg_col), field(rows_width + col)]),
-                            lit_f64(1.0),
-                        )],
-                        lit_f64(0.0),
-                    )],
-                )),
-            }
-            owners.push(arg_col);
-        }
-        Ok((aggregate(with_tape, keys.to_vec(), measures), owners))
     }
 
     /// Join `left` (whose columns before `left_width` are a region's) to
@@ -480,8 +464,9 @@ enum Rule {
     Sum,
     /// `AVG`: every row gets the group's cotangent over the group's count.
     Mean,
-    /// `MAX` or `MIN`: the rows attaining it share the group's cotangent.
-    Extreme,
+    /// `MAX` or `MIN` (the name): the rows attaining it share the group's
+    /// cotangent.
+    Extreme(&'static str),
 }
 
 /// What the reduce rules do with one measure.
@@ -508,7 +493,8 @@ fn reduce_rule(functions: &crate::Functions, f: &AggregateFunction) -> Result<Re
         "count" => return Ok(Reduce::Constant),
         "sum" => Rule::Sum,
         "avg" | "mean" => Rule::Mean,
-        "max" | "min" => Rule::Extreme,
+        "max" => Rule::Extreme("max"),
+        "min" => Rule::Extreme("min"),
         other => {
             return Err(AdError::NotImplemented(format!(
                 "the aggregate `{other}` over a value that carries gradient; ddx has transpose \
@@ -518,7 +504,7 @@ fn reduce_rule(functions: &crate::Functions, f: &AggregateFunction) -> Result<Re
     };
     // DISTINCT changes which rows a sum or mean counts; it makes no difference
     // to a max or min.
-    if f.invocation == AggregationInvocation::Distinct as i32 && rule != Rule::Extreme {
+    if f.invocation == AggregationInvocation::Distinct as i32 && !matches!(rule, Rule::Extreme(_)) {
         return Err(AdError::NotImplemented(format!(
             "{}(DISTINCT …) over a value that carries gradient",
             name.to_uppercase()

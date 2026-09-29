@@ -352,3 +352,130 @@ async fn relu_written_as_case_or_greatest() {
         .await;
     }
 }
+
+async fn exec(ctx: &SessionContext, sql: &str) {
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+}
+
+/// `(key, gradient)` of `table.val` under `loss`, a NULL gradient as NaN.
+async fn gradient_of(ctx: &SessionContext, loss: &str, table: &str) -> Vec<Vec<f64>> {
+    let plan = substrait_of(ctx, loss, true).await;
+    let program = grad(&plan, &[ColumnRef::new(table, "val")]).unwrap();
+    run(ctx, &program).await;
+    rows(
+        ctx,
+        &format!("SELECT * FROM {} ORDER BY 1", program.gradients[0].step),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn avg_max_and_min_send_no_gradient_through_a_row_they_skip() {
+    // From the v2 soak (#89): each skips row 1, whose argument p + q is NULL,
+    // so p(1) cannot move the loss.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE np (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 9.0), (2, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE nq (i BIGINT, val DOUBLE) AS VALUES (0, 5.0), (1, NULL), (2, 0.0)",
+    )
+    .await;
+    for (f, want) in [
+        ("AVG", [0.5, 0.0, 0.5]),
+        ("MAX", [1.0, 0.0, 0.0]),
+        ("MIN", [0.0, 0.0, 1.0]),
+    ] {
+        let loss = format!("SELECT {f}(np.val + nq.val) AS l FROM np JOIN nq ON np.i = nq.i");
+        let got = gradient_of(&ctx, &loss, "np").await;
+        let got: Vec<f64> = got.iter().map(|r| r[1]).collect();
+        assert_eq!(got, want, "{f}");
+    }
+}
+
+#[tokio::test]
+async fn a_rank_filter_over_a_rank_filter_runs() {
+    // From the v2 soak (#89): the rebuilt region held two identically named
+    // window columns. Top two by val, then the top one of those: row 1.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE rp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 3.0), (2, 2.0)",
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "WITH a AS (SELECT i, v FROM (SELECT i, val AS v, \
+                      ROW_NUMBER() OVER (ORDER BY val DESC, i) AS rk FROM rp) WHERE rk <= 2), \
+              b AS (SELECT i, v FROM (SELECT i, v, \
+                      ROW_NUMBER() OVER (ORDER BY v DESC, i) AS rk FROM a) WHERE rk = 1) \
+         SELECT SUM(v) AS loss FROM b",
+        "rp",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 0.0]]);
+}
+
+#[tokio::test]
+async fn max_finds_its_row_when_the_recomputed_values_jitter() {
+    // From the v2 soak (#91). The region beneath the MAX is recomputed, and
+    // a grouped SUM over several partitions adds in arrival order, so the
+    // recomputed values need not equal the forward pass's to the bit. The
+    // MAX rule compared them with the saved maximum, and about half these
+    // runs sent no gradient at all.
+    use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, false),
+        Field::new("j", DataType::Int64, false),
+        Field::new("val", DataType::Float64, false),
+    ]));
+    let rows: Vec<(i64, i64, f64)> = (0..400)
+        .flat_map(|i| (0..4).map(move |j| (i, j, ((i * 131 + j * 17) as f64 * 0.731).sin())))
+        .collect();
+    let partitions: Vec<Vec<RecordBatch>> = rows
+        .chunks(rows.len().div_ceil(7))
+        .map(|c| {
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(c.iter().map(|r| r.0).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(c.iter().map(|r| r.1).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        c.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()]
+        })
+        .collect();
+    let loss = "WITH s AS (SELECT m.j, SUM(exp(m.val) * n.val) AS s \
+                           FROM m JOIN m n ON m.i = n.i AND m.j = n.j GROUP BY m.j) \
+                SELECT MAX(p.val * s.s) AS loss FROM p JOIN s ON p.j = s.j";
+    for attempt in 0..20 {
+        let ctx = ctx();
+        ctx.register_table(
+            "m",
+            Arc::new(MemTable::try_new(schema.clone(), partitions.clone()).unwrap()),
+        )
+        .unwrap();
+        exec(
+            &ctx,
+            "CREATE TABLE p (j BIGINT, val DOUBLE) AS VALUES (0, 0.5), (1, 2.0), (2, 1.0), (3, -1.0)",
+        )
+        .await;
+        let got = gradient_of(&ctx, loss, "p").await;
+        let nonzero = got.iter().filter(|r| r[1] != 0.0).count();
+        assert_eq!(nonzero, 1, "attempt {attempt}: {got:?}");
+        assert!(
+            got.iter().all(|r| r[1].is_finite()),
+            "attempt {attempt}: {got:?}"
+        );
+    }
+}
