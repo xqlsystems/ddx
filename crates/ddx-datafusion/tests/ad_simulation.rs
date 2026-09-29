@@ -1724,6 +1724,13 @@ async fn fd_check(
         if ad_dot.is_nan() && (p2 - m2).abs() <= noise && (p1 - m1).abs() <= noise {
             return Ok(Fd::Screened);
         }
+        // Infinite data makes 0 · ∞ part of reverse mode wherever a row that
+        // does not move the loss (σ(x · w) with x = ∞ is 1 for every w)
+        // carries an infinite partial: jax.grad gives NaN there too (seed
+        // 600421). A finite gradient is still compared; a NaN one is not.
+        if ad_dot.is_nan() && case.modes.extreme == Some(Extreme::InfData) {
+            return Ok(Fd::Screened);
+        }
         let smooth = !kink && (d1 - d2).abs() <= 1e-3 * scale && d2.is_finite();
         return Ok(if smooth {
             Fd::Disagree(format!(
