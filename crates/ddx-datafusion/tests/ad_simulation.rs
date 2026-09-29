@@ -1739,6 +1739,15 @@ async fn fd_check(
         if ad_dot.is_nan() && case.modes.extreme == Some(Extreme::InfData) {
             return Ok(Fd::Screened);
         }
+        // Tiny values are the same from the other side: dividing by a
+        // parameter near 1e-160 makes a partial near 1e320, which overflows
+        // even where the derivative is small (1.5 / (0.7 / v) has derivative
+        // 1.5 / 0.7, but the chain rule passes through -0.7 / v², seed
+        // 2400607). jax.grad overflows the same way. A finite gradient is
+        // still compared.
+        if case.modes.extreme == Some(Extreme::Tiny) {
+            return Ok(Fd::Screened);
+        }
         // A derivative past √f64::MAX cannot be evaluated without some
         // intermediate overflowing: d/dv ln(3/v) at v = 1e-160 is -1e160,
         // but the chain rule passes through 3/v² (seed 2000728). jax.grad
@@ -2458,7 +2467,15 @@ async fn name_checks(
             // grad(2L) − 2·grad(L) is zero wherever it is defined.
             let zeros: Grad = got
                 .keys()
-                .map(|k| (k.clone(), grads[&t].get(k).copied().flatten().map(|_| 0.0)))
+                .map(|k| {
+                    // Where the gradient is not finite, neither is the
+                    // difference: ∞ - ∞ (seed 2400607, tiny values).
+                    let base = grads[&t].get(k).copied().flatten();
+                    (
+                        k.clone(),
+                        base.map(|g| if g.is_finite() { 0.0 } else { f64::NAN }),
+                    )
+                })
                 .collect();
             let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
             if let Some(f) = compare("names", &wrap(zeros), &wrap(got), 1.0, names_rtol) {
