@@ -367,7 +367,8 @@ fn linearize_function(f: &Function, leaf: &Leaf, reg: &RuleRegistry) -> Result<E
 
 /// Linearize `power(base, exponent)` (design.md §3.6).
 ///
-/// * Constant exponent `c`: `c * base^(c-1) * d(base)`.
+/// * Constant exponent `c`: `c * base^(c-1) * d(base)`, written
+///   `c / base^(1-c) * d(base)` when `c < 1`.
 /// * Constant base `a`: `a^u * ln(a) * d(u)`.
 /// * Both variable (`u^v`): not supported yet (needs the exp/log trick).
 fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
@@ -389,10 +390,25 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
             // out-of-range literal `1e400` → inf), but *only here at emission* —
             // after the zero short-circuit above — so a wrt-independent base
             // still differentiates to `0` rather than erroring (#49/F1, #33).
-            let outer = mul(
-                finite_num(c)?,
-                func("power", vec![base.clone(), finite_num(c - 1.0)?]),
-            );
+            if c == 0.0 {
+                return Ok(zero());
+            }
+            // A negative power is written as a division: at a zero base the
+            // derivative is infinite, and `c / power(u, 1 - c)` says so
+            // (`c / 0`), where DataFusion refuses `power(0, c - 1)` outright
+            // ("zero raised to a negative power is undefined"), failing the
+            // whole query instead (found by the v2 soak).
+            let outer = if c < 1.0 {
+                div(
+                    finite_num(c)?,
+                    func("power", vec![base.clone(), finite_num(1.0 - c)?]),
+                )
+            } else {
+                mul(
+                    finite_num(c)?,
+                    func("power", vec![base.clone(), finite_num(c - 1.0)?]),
+                )
+            };
             Ok(mul(outer, dbase))
         }
         // Constant base, variable exponent.
