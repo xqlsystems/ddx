@@ -390,3 +390,95 @@ async fn a_gradient_has_its_values_type() {
         &datafusion::arrow::datatypes::DataType::Float32
     );
 }
+
+#[tokio::test]
+async fn a_row_an_aggregate_skips_as_null_sends_no_gradient() {
+    // From the v2 soak (#89). SUM skips row 1, whose term p + q is NULL, so
+    // the loss is p(0) + 5 and ∂/∂p(1) is 0, not the group's cotangent.
+    // Likewise with the NULL in constant data: d - p.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE np (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE nq (i BIGINT, val DOUBLE) AS VALUES (0, 5.0), (1, NULL)",
+    )
+    .await;
+    for (loss, want) in [
+        (
+            "SELECT SUM(np.val + nq.val) AS l FROM np JOIN nq ON np.i = nq.i",
+            vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+        ),
+        (
+            "SELECT SUM(nq.val - np.val) AS l FROM np JOIN nq ON np.i = nq.i",
+            vec![vec![0.0, -1.0], vec![1.0, 0.0]],
+        ),
+    ] {
+        let plan = substrait_of(&ctx, loss, true).await;
+        let program = grad(&plan, &[ColumnRef::new("np", "val")]).unwrap();
+        run(&ctx, &program).await;
+        let got = rows(
+            &ctx,
+            &format!(
+                "SELECT i, val FROM {} ORDER BY i",
+                program.gradients[0].step
+            ),
+        )
+        .await;
+        assert_eq!(got, want, "{loss}");
+    }
+}
+
+#[tokio::test]
+async fn a_table_with_capitals_gets_a_step_its_engine_can_name() {
+    // From the v2 soak (#92): a step named `…_grad_0_W` was folded to lower
+    // case when registered, then not found under its own name.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE \"Wc\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM \"Wc\"", true).await;
+    let program = grad(&plan, &[ColumnRef::new("Wc", "val")]).unwrap();
+    let step = &program.gradients[0].step;
+    assert_eq!(step, &step.to_ascii_lowercase());
+    run(&ctx, &program).await;
+    let got = rows(&ctx, &format!("SELECT i, val FROM {step} ORDER BY i")).await;
+    assert_eq!(got, vec![vec![0.0, 2.0], vec![1.0, 4.0]]);
+}
+
+#[tokio::test]
+async fn a_program_runs_without_the_simplifier() {
+    // From the v2 soak (#90): DataFusion 54 runs coalesce only once its
+    // simplifier has rewritten it, and the gradient step used it.
+    use datafusion::execution::SessionStateBuilder;
+    let ctx = SessionContext::new_with_state(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rules(vec![])
+            .build(),
+    );
+    exec(
+        &ctx,
+        "CREATE TABLE ws (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, NULL), (2, 3.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM ws", true).await;
+    let program = grad(&plan, &[ColumnRef::new("ws", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    assert_eq!(got[0], vec![0.0, 2.0]);
+    assert!(got[1][1].is_nan());
+    assert_eq!(got[2], vec![2.0, 6.0]);
+}

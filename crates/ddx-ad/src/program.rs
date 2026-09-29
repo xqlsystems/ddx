@@ -137,14 +137,22 @@ fn cotangent_name(namespace: &str, n: usize) -> String {
 }
 
 /// Table `i`'s gradient step: numbered, so it is unique whatever the table is
-/// called, with the table's last name part after it, for a reader.
+/// called, with the table's last name part after it, for a reader: lower
+/// case and ASCII, since an engine folds the unquoted name a step is
+/// registered under.
 fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
     let readable: String = table
         .last()
         .map(String::as_str)
         .unwrap_or("")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{namespace}grad_{i}_{readable}")
 }
@@ -466,20 +474,25 @@ fn dense_gradient(t: &mut Transposer, i: usize, contribs: Vec<Contribution>) -> 
             .unwrap_or_else(lit_true);
         (join(rows, summed, cond, JoinType::Left), cols, k + v + k)
     };
-    let coalesce = t.ext.anchor("coalesce");
+    // CASE, not coalesce: DataFusion 54 runs coalesce only after its
+    // simplifier has rewritten it to a CASE, and a context may not run that
+    // rule.
     let is_null = t.ext.anchor("is_null");
     let grads: Vec<Expression> = values
         .iter()
         .enumerate()
         .map(|(n, val)| {
-            let reached = match cols.iter().position(|c| c == val) {
-                Some(c) => call(coalesce, vec![field(right + c), lit_f64(0.0)]),
-                None => lit_f64(0.0),
+            let null_value = (call(is_null, vec![field(k + n)]), null_f64());
+            let pinned = match cols.iter().position(|c| c == val) {
+                Some(c) => if_then(
+                    vec![
+                        null_value,
+                        (call(is_null, vec![field(right + c)]), lit_f64(0.0)),
+                    ],
+                    field(right + c),
+                ),
+                None => if_then(vec![null_value], lit_f64(0.0)),
             };
-            let pinned = if_then(
-                vec![(call(is_null, vec![field(k + n)]), null_f64())],
-                reached,
-            );
             cast(pinned, types[n].clone())
         })
         .collect();

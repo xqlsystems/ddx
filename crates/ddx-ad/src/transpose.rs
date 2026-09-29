@@ -47,7 +47,7 @@ use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field};
+use crate::expr::{as_number, call, field, if_then, null_f64};
 use crate::forward::{width, Def, Forward, Input, Output, Region};
 use crate::functions::Extensions;
 
@@ -127,9 +127,20 @@ impl<'a> Transposer<'a> {
             })
             .collect();
         let base = self.join_on(rows, cotangent, keys, region_width)?;
+        // An aggregate skips a row whose argument is NULL, so nothing in that
+        // row moves the loss: its cotangent is NULL, not the group's, or the
+        // row's other inputs (the `p` of `SUM(p + q)` where `q` is NULL) would
+        // get gradient through it.
+        let is_null = self.ext.anchor("is_null");
         let seeds = seeds
             .into_iter()
-            .map(|(arg, cot)| (arg, field(region_width + cot)))
+            .map(|(arg, cot)| {
+                let seed = if_then(
+                    vec![(call(is_null, vec![field(arg)]), null_f64())],
+                    field(region_width + cot),
+                );
+                (arg, seed)
+            })
             .collect();
         self.region(&region, base, seeds)
     }
