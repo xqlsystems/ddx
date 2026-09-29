@@ -305,6 +305,9 @@ fn walk_fields(
             Some(x) => walk_fields(x, f),
             None => Err(AdError::InvalidPlan("a cast with no input".into())),
         },
+        // An uncorrelated scalar subquery reads nothing from the row it sits
+        // in, so it has no field of this row to visit: it is a constant here.
+        RexType::Subquery(sq) if uncorrelated_scalar(sq).is_some() => Ok(()),
         other => Err(AdError::NotImplemented(format!(
             "this kind of expression inside a differentiated query: {}",
             rex_name(other)
@@ -322,6 +325,42 @@ fn walk_arguments(
         }
     }
     Ok(())
+}
+
+/// The relation of `sq`, if it is a scalar subquery that refers to nothing
+/// outside itself: no outer-row field, and no subquery of its own that might.
+pub fn uncorrelated_scalar(
+    sq: &substrait::proto::expression::Subquery,
+) -> Option<&substrait::proto::Rel> {
+    use substrait::proto::expression::subquery::SubqueryType;
+    let Some(SubqueryType::Scalar(scalar)) = &sq.subquery_type else {
+        return None;
+    };
+    let rel = scalar.input.as_deref()?;
+    let refers_out = |e: &Expression| {
+        contains(e, &|x| match &x.rex_type {
+            Some(RexType::Selection(r)) => !matches!(r.root_type, Some(RootType::RootReference(_))),
+            Some(RexType::Subquery(_)) => true,
+            _ => false,
+        })
+    };
+    let mut stack = vec![rel];
+    while let Some(r) = stack.pop() {
+        let Some(kind) = &r.rel_type else { continue };
+        if crate::forward::rel_expressions(kind)
+            .into_iter()
+            .any(refers_out)
+        {
+            return None;
+        }
+        if let substrait::proto::rel::RelType::Read(read) = kind {
+            if read.filter.as_deref().is_some_and(refers_out) {
+                return None;
+            }
+        }
+        stack.extend(crate::forward::rel_inputs(kind));
+    }
+    Some(rel)
 }
 
 /// The direct subexpressions of `e`. A subquery's relation is not included.

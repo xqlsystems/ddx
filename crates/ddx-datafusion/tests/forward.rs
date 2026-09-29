@@ -216,7 +216,7 @@ async fn a_wrt_table_with_no_dims_is_refused() {
         .unwrap();
     let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM v", true).await;
     let err = Forward::new(&plan, &[ColumnRef::new("v", "val")]).unwrap_err();
-    assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
+    assert!(matches!(err, AdError::InvalidWrt(_)), "{err}");
     assert!(
         err.to_string().contains("no column identifies its"),
         "{err}"
@@ -278,4 +278,23 @@ async fn an_integer_wrt_column_is_refused() {
         "a wrt column of integer type was accepted; its gradient would be computed \
          for real division while the engine runs integer division"
     );
+}
+
+#[tokio::test]
+async fn an_uncorrelated_subquery_over_data_is_a_constant() {
+    // The mean over the dataset, written the natural way.
+    let sql = "SELECT SUM(val * val) / (SELECT COUNT(*) FROM pixels) AS l FROM w";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        assert_eq!(g.saved.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_subquery_that_reads_a_wrt_table_is_refused() {
+    // Treating it as a constant would drop the gradient through it.
+    let ctx = ctx().await;
+    let sql = "SELECT SUM(val) / (SELECT SUM(val) FROM w) AS l FROM w";
+    let plan = substrait_of(&ctx, sql, true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("w", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
 }

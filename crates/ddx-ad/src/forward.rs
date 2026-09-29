@@ -56,7 +56,7 @@ use substrait::proto::{
 use crate::elementwise::depends;
 use crate::emit;
 use crate::error::{AdError, Result};
-use crate::expr::{as_field, contains, fields_of, map_fields};
+use crate::expr::{as_field, children, contains, fields_of, map_fields, uncorrelated_scalar};
 use crate::functions::Functions;
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
 
@@ -300,6 +300,27 @@ impl Builder<'_> {
             .rel_type
             .as_ref()
             .ok_or_else(|| AdError::InvalidPlan("an empty relation".into()))?;
+        // A subquery in this relation's expressions is carried through as a
+        // constant (see `uncorrelated_scalar`). That is only right if it reads
+        // no wrt table; otherwise the gradient through it would be dropped.
+        for e in rel_expressions(kind) {
+            let mut subqueries = Vec::new();
+            collect_subqueries(e, &mut subqueries);
+            for sq in subqueries {
+                let reads = match uncorrelated_scalar(sq) {
+                    Some(inner) => self.reads_wrt(inner)?,
+                    None => true,
+                };
+                if reads {
+                    return Err(AdError::NotImplemented(
+                        "a subquery that is correlated, or reads a wrt table, inside an \
+                         expression on the path from a wrt table to the output; write it as a \
+                         join"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let (mut s, direct, common) = match kind {
             RelType::Read(r) => {
                 let s = self.read(r)?;
@@ -461,13 +482,39 @@ impl Builder<'_> {
             }
         }
         values.sort_unstable();
+        // A gradient is taken only with respect to floating-point values, as
+        // jax.grad requires inexact inputs. An integer column is piecewise
+        // constant to the engine (`val / 2` truncates), while ddx would
+        // differentiate real arithmetic: a silently wrong gradient.
+        let types = schema
+            .r#struct
+            .as_ref()
+            .map(|t| t.types.as_slice())
+            .unwrap_or(&[]);
+        for &v in &values {
+            let float = matches!(
+                types.get(v).and_then(|t| t.kind.as_ref()),
+                Some(
+                    substrait::proto::r#type::Kind::Fp32(_)
+                        | substrait::proto::r#type::Kind::Fp64(_)
+                )
+            );
+            if !float {
+                return Err(AdError::InvalidWrt(format!(
+                    "column `{}` of table `{}` is not a floating-point column; a gradient is \
+                     taken only with respect to REAL or DOUBLE values. Store it as DOUBLE",
+                    schema.names[v],
+                    names.join(".")
+                )));
+            }
+        }
         let dims: Vec<usize> = (0..schema.names.len())
             .filter(|c| !values.contains(c))
             .collect();
         // A cotangent is keyed by its table's dims. With none, nothing tells
         // one row's gradient from another's, and every row would get the sum.
         if dims.is_empty() {
-            return Err(AdError::UnknownWrt(format!(
+            return Err(AdError::InvalidWrt(format!(
                 "every column of table `{}` is a wrt column, so no column identifies its \
                  rows and their gradients cannot be told apart. Add a dim column (a row \
                  index or coordinate) to the table",
@@ -736,9 +783,18 @@ impl Builder<'_> {
                     }
                 }
                 _ => {
+                    // A subquery inside an expression: an uncorrelated scalar
+                    // one is read like any other input; anything else is
+                    // conservatively assumed to read a wrt table, so lowering
+                    // refuses it rather than treating it as constant.
                     for e in rel_expressions(kind) {
-                        if contains(e, &|x| matches!(x.rex_type, Some(RexType::Subquery(_)))) {
-                            found = true;
+                        let mut subqueries = Vec::new();
+                        collect_subqueries(e, &mut subqueries);
+                        for sq in subqueries {
+                            match uncorrelated_scalar(sq) {
+                                Some(inner) => stack.push(inner),
+                                None => found = true,
+                            }
                         }
                     }
                     stack.extend(rel_inputs(kind));
@@ -960,11 +1016,25 @@ pub fn width(rel: &Rel) -> Result<usize> {
     }
 }
 
+/// Every subquery inside `e`, outermost first; not inside the subqueries.
+fn collect_subqueries<'e>(
+    e: &'e Expression,
+    out: &mut Vec<&'e substrait::proto::expression::Subquery>,
+) {
+    if let Some(RexType::Subquery(sq)) = &e.rex_type {
+        out.push(sq);
+        return;
+    }
+    for c in children(e) {
+        collect_subqueries(c, out);
+    }
+}
+
 fn one(r: &Option<Box<Rel>>) -> Vec<&Rel> {
     r.as_deref().into_iter().collect()
 }
 
-fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
+pub(crate) fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
     match kind {
         RelType::Filter(r) => one(&r.input),
         RelType::Fetch(r) => one(&r.input),
@@ -980,7 +1050,7 @@ fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
     }
 }
 
-fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
+pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
     match kind {
         RelType::Filter(r) => r.condition.as_deref().into_iter().collect(),
         RelType::Project(r) => r.expressions.iter().collect(),
