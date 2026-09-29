@@ -254,3 +254,28 @@ async fn a_wrt_table_matches_regardless_of_case() {
             .any(|t| t.names == ["b"] && t.values == vec![1]));
     }
 }
+
+#[tokio::test]
+async fn an_integer_wrt_column_is_refused() {
+    // Adversarial review (🤖😈): a gradient with respect to an integer column
+    // has no meaning. jax.grad raises TypeError for integer inputs ("grad
+    // requires real- or complex-valued inputs"), and ddx should too: the
+    // engine evaluates `val / 2` as integer division, which is piecewise
+    // constant (derivative 0), while ddx-core differentiates real division
+    // (derivative 0.5), a silently wrong gradient (#87). Unlike v1, v2 can
+    // see this: the read's base schema carries the column's type.
+    let ctx = ctx().await;
+    ctx.sql("CREATE TABLE wi (i BIGINT, val BIGINT) AS VALUES (0, 3), (1, 5)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = substrait_of(&ctx, "SELECT SUM(val / 2) AS l FROM wi", true).await;
+    let got = Forward::new(&plan, &[ColumnRef::new("wi", "val")]);
+    assert!(
+        got.is_err(),
+        "a wrt column of integer type was accepted; its gradient would be computed \
+         for real division while the engine runs integer division"
+    );
+}
