@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Adversarial review (🤖😈): `ad::run` materializes every step into the
+//! caller's `SessionContext` under fixed, global names (`__ddx_value`,
+//! `__ddx_saved_{n}`, `__ddx_cotangent_{n}`, `__ddx_grad_{table}`), replacing
+//! whatever is there and leaving it all behind. Each test below fails.
+
+use datafusion::arrow::array::{AsArray, RecordBatch};
+use datafusion::arrow::datatypes::Float64Type;
+use datafusion::prelude::SessionContext;
+use ddx_datafusion::ad::{self, ColumnRef};
+
+async fn exec(ctx: &SessionContext, sql: &str) {
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+}
+
+async fn f64s(ctx: &SessionContext, sql: &str) -> Vec<f64> {
+    let batches: Vec<RecordBatch> = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    batches
+        .iter()
+        .flat_map(|b| b.column(0).as_primitive::<Float64Type>().values().to_vec())
+        .collect()
+}
+
+#[tokio::test]
+async fn run_does_not_replace_a_users_table() {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE __ddx_value (note VARCHAR) AS VALUES ('mine')",
+    )
+    .await;
+    let program = ad::grad(
+        &ctx,
+        "SELECT SUM(val * val) AS l FROM w",
+        &[ColumnRef::new("w", "val")],
+    )
+    .await
+    .unwrap();
+    // Refusing to run is acceptable; silently dropping the user's table is not.
+    if ad::run(&ctx, &program).await.is_err() {
+        return;
+    }
+    let still_mine = ctx
+        .sql("SELECT note FROM __ddx_value")
+        .await
+        .map(|_| true)
+        .unwrap_or(false);
+    assert!(
+        still_mine,
+        "ad::run deregistered the user's table `__ddx_value`"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_programs_do_not_read_each_others_tape() {
+    // Two programs on one context (two models, two losses, or two requests to
+    // a server sharing a SessionContext) both write `__ddx_saved_0`. If B runs
+    // between A's forward and backward steps, A's MAX rule compares w's rows
+    // with v's saved maximum, no row matches, and A's gradient is silently
+    // all zeros. With tokio::spawn on a shared context this happens on its
+    // own; it can also fail with "No table named '__ddx_saved_0'".
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 5.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE v (i BIGINT, val DOUBLE) AS VALUES (0, 2.0), (1, 3.0)",
+    )
+    .await;
+    let a = ad::grad(
+        &ctx,
+        "SELECT MAX(val) AS l FROM w",
+        &[ColumnRef::new("w", "val")],
+    )
+    .await
+    .unwrap();
+    let b = ad::grad(
+        &ctx,
+        "SELECT MAX(val) AS l FROM v",
+        &[ColumnRef::new("v", "val")],
+    )
+    .await
+    .unwrap();
+    for s in &a.forward_steps {
+        ad::run_step(&ctx, s).await.unwrap();
+    }
+    ad::run(&ctx, &b).await.unwrap();
+    for s in &a.backward_steps {
+        ad::run_step(&ctx, s).await.unwrap();
+    }
+    let got = f64s(
+        &ctx,
+        &format!("SELECT val FROM {} ORDER BY i", a.gradients[0].step),
+    )
+    .await;
+    assert_eq!(got, vec![0.0, 1.0], "d/dw MAX(w.val) is one-hot on the max");
+}
