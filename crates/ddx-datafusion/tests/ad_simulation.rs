@@ -1671,13 +1671,11 @@ async fn fd_check(
     // the point.)
     let finite_grad = ad_dot.is_finite();
     if !finite_grad {
-        // With infinite or NaN data a symbolic derivative can be ∞/∞ where
-        // its limit is 0 (the quotient rule's (c − a·0)/c² for c = ∞), a
-        // known limit of ddx-core's expression forms, not a v2 rule; skip.
-        if matches!(
-            case.modes.extreme,
-            Some(Extreme::NanData | Extreme::InfData)
-        ) {
+        // NaN data makes whatever it reaches NaN, a gradient included, even
+        // where the loss has filtered it away along d; skip. Infinite data
+        // is compared: ddx-core writes a quotient's derivative term by term,
+        // so a partial whose limit at ∞ is 0 is 0, not ∞/∞.
+        if case.modes.extreme == Some(Extreme::NanData) {
             return Ok(Fd::Screened);
         }
         ad_abs = 0.0;
