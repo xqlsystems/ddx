@@ -345,3 +345,36 @@ async fn upstream_a_union_of_aggregates_over_windows_plans() {
                  GROUP BY a.i, a.j) GROUP BY i, j";
     ctx.sql(sql).await.unwrap().collect().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54: a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
+async fn upstream_max_treats_nan_alike_grouped_or_not() {
+    // The same values, the same MAX: grouped, it skips the NaN and gives
+    // 0.9; as a window over the same group, and ungrouped, it gives NaN. A
+    // query's value can then depend on how the engine plans it (or on row
+    // order, when partial aggregates meet). ddx's MAX rule leaves NaN out of
+    // the rows it compares, so it agrees with any MAX that gave a number
+    // (seed 600845), but the engine should agree with itself.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE t (g BIGINT, v DOUBLE) AS VALUES (0, 0.5), (0, 'NaN'::DOUBLE), (0, 0.9)",
+    )
+    .await;
+    let one = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            use datafusion::arrow::array::AsArray;
+            use datafusion::arrow::datatypes::Float64Type;
+            let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            b[0].column(0).as_primitive::<Float64Type>().value(0)
+        }
+    };
+    let grouped = one("SELECT MAX(v) FROM t GROUP BY g").await;
+    let window = one("SELECT MAX(v) OVER (PARTITION BY g) FROM t").await;
+    assert_eq!(
+        grouped.is_nan(),
+        window.is_nan(),
+        "grouped {grouped}, window {window}"
+    );
+}
