@@ -1222,6 +1222,12 @@ impl Case {
         Some(out)
     }
 
+    /// Whether the case holds exact ties by construction: its ties mode,
+    /// or `-0.0` values.
+    fn exact_ties(&self) -> bool {
+        self.modes.ties || self.modes.extreme == Some(Extreme::NegZero)
+    }
+
     /// `WITH r…, loss AS (SELECT head AS loss FROM root) SELECT outer AS loss
     /// FROM <from>`: the loss CTE, and an outer query over it that the
     /// metamorphic relations vary. `from` defaults to `loss`.
@@ -1666,7 +1672,7 @@ async fn fd_check(
     // to it whatever the smooth curvature, which a plain ratio of the two
     // misses when a quadratic term dominates both.
     let kink = (a_h - 4.0 * a_h2).abs() > 16.0 * noise + 1e-7 * scale * h;
-    let exact_ties = case.modes.ties || case.modes.extreme == Some(Extreme::NegZero);
+    let exact_ties = case.exact_ties();
     if (kink || (d1 - d2).abs() > 1e-3 * scale) && exact_ties {
         // A tie between computed values (0.25 · 1 and -0.5 · -0.5) can still
         // break along a tie-preserving direction, and at a tie the bracket
@@ -1746,7 +1752,10 @@ fn directions(rng: &mut Rng, case: &Case) -> Vec<Direction> {
         return Vec::new();
     }
     let mut dirs = Vec::new();
-    if case.modes.ties {
+    // `-0.0` values tie exactly too (a parameter at -0 equals data at -0,
+    // and three parameters at -0 tie each other), so they get the same
+    // tie-preserving directions (seeds 1300234, 1300617).
+    if case.exact_ties() {
         // At an exact tie the loss need not be differentiable at all: the
         // median of three tied values moves at median(d) along any d, the
         // same on both sides, yet has no gradient, and ddx's convention is
@@ -1763,6 +1772,13 @@ fn directions(rng: &mut Rng, case: &Case) -> Vec<Direction> {
                     .iter()
                     .map(|(t, r)| {
                         let v = case.table(t).vals[*r].unwrap_or(0.0);
+                        // In -0.0 mode a zero parameter stays put: it ties
+                        // with zero data and makes computed values tie
+                        // (u + z against u when z is -0), which moving it
+                        // would break (seed 1300617).
+                        if v == 0.0 && case.modes.extreme == Some(Extreme::NegZero) {
+                            return (t.clone(), *r, 0.0);
+                        }
                         let c = *coef
                             .entry(v.to_bits())
                             .or_insert_with(|| rng.range(-1.0, 1.0));
