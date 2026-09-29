@@ -551,6 +551,14 @@ const UNARY: &[&str] = &[
     "abs({v})",
 ];
 
+/// Does a map expression have a kink: a branch, a clamp, or `abs`?
+fn is_kinked(f: &str) -> bool {
+    let f = f.to_ascii_lowercase();
+    ["case ", "greatest(", "least(", "abs("]
+        .iter()
+        .any(|k| f.contains(k))
+}
+
 const BINARY: &[&str] = &[
     "({a} + {b})",
     "({a} * {b})",
@@ -741,7 +749,11 @@ impl Gen<'_> {
             lead(&self.nodes[c].dims, ""),
             f.replace("{v}", "v")
         );
-        self.derive(c, body, "map")
+        let n = self.derive(c, body, "map");
+        if is_kinked(&f) {
+            self.nodes[n].kinds.insert("kink");
+        }
+        n
     }
 
     fn join(&mut self, depth: u32) -> usize {
@@ -790,6 +802,9 @@ impl Gen<'_> {
         } else {
             self.rng.pick(BINARY).to_string()
         };
+        if is_kinked(&op) {
+            kinds.insert("kink");
+        }
         let op = op.replace("{a}", "a.v").replace("{b}", "b.v");
         let mut from = join_clause(a, b, &shared);
         if left {
@@ -1240,6 +1255,20 @@ impl Case {
         )
     }
 
+    /// The same case with every read of table `t` reading `to` instead: a
+    /// qualified or quoted name, or a copy registered elsewhere.
+    fn reading(&self, t: &str, to: &str) -> Case {
+        let mut c = self.clone();
+        let suffix = format!(" FROM {t}");
+        for n in &mut c.nodes {
+            if n.body.ends_with(&suffix) {
+                let keep = n.body.len() - suffix.len();
+                n.body = format!("{} FROM {to}", &n.body[..keep]);
+            }
+        }
+        c
+    }
+
     /// The loss query as the user would write it.
     fn loss_sql(&self) -> String {
         format!(
@@ -1632,11 +1661,26 @@ async fn fd_check(
             .ok_or_else(|| {
                 format!("[shape] no gradient for {name}{key:?}, whose value is not NULL")
             })?;
-        if !g.is_finite() {
-            return Ok(Fd::Screened);
-        }
         ad_dot += g * d;
         ad_abs += (g * d).abs();
+    }
+    // A NaN or infinite gradient is compared too, not skipped: where the
+    // loss is finite and smooth along d, the finite difference below is a
+    // finite number, and no convention makes the gradient anything else.
+    // (Where the derivative really is infinite, sqrt at 0, the gates screen
+    // the point.)
+    let finite_grad = ad_dot.is_finite();
+    if !finite_grad {
+        // With infinite or NaN data a symbolic derivative can be ∞/∞ where
+        // its limit is 0 (the quotient rule's (c − a·0)/c² for c = ∞), a
+        // known limit of ddx-core's expression forms, not a v2 rule; skip.
+        if matches!(
+            case.modes.extreme,
+            Some(Extreme::NanData | Extreme::InfData)
+        ) {
+            return Ok(Fd::Screened);
+        }
+        ad_abs = 0.0;
     }
     // The step follows the parameters' magnitude.
     let h = if case.modes.extreme == Some(Extreme::Tiny) {
@@ -1646,7 +1690,7 @@ async fn fd_check(
     };
     // A step the loss is not linear over tells nothing: sin of a sum near
     // 1e8 turns through many periods in one step.
-    if ad_abs * h > 1e-2 * l0.abs().max(1.0) {
+    if finite_grad && ad_abs * h > 1e-2 * l0.abs().max(1.0) {
         return Ok(Fd::Screened);
     }
     let mut at = BTreeMap::new();
@@ -1672,6 +1716,17 @@ async fn fd_check(
     // to it whatever the smooth curvature, which a plain ratio of the two
     // misses when a quadratic term dominates both.
     let kink = (a_h - 4.0 * a_h2).abs() > 16.0 * noise + 1e-7 * scale * h;
+    if !finite_grad {
+        let smooth = !kink && (d1 - d2).abs() <= 1e-3 * scale && d2.is_finite();
+        return Ok(if smooth {
+            Fd::Disagree(format!(
+                "[finite-diff] ⟨∇L, d⟩ = {ad_dot} but the loss is smooth along d and moves \
+                 at {d2:.12e}: the gradient is not finite where the loss is"
+            ))
+        } else {
+            Fd::Screened
+        });
+    }
     let exact_ties = case.exact_ties();
     if (kink || (d1 - d2).abs() > 1e-3 * scale) && exact_ties {
         // A tie between computed values (0.25 · 1 and -0.5 · -0.5) can still
@@ -1843,6 +1898,8 @@ struct Props {
     contract: bool,
     surface: bool,
     shapes: bool,
+    names: bool,
+    train: bool,
 }
 
 const ALL: Props = Props {
@@ -1853,6 +1910,8 @@ const ALL: Props = Props {
     contract: true,
     surface: true,
     shapes: true,
+    names: true,
+    train: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -2147,8 +2206,453 @@ async fn check_case_inner(
         optimizer_checks(rng, case, &grads, out).await?;
         mutation_checks(rng, case, &ctx, &sql, l0, &grads, out).await?;
     }
+
+    if props.names {
+        for _ in 0..2 {
+            name_checks(rng, case, &grads, out).await?;
+        }
+    }
+
+    if props.train {
+        train_checks(case, &grads, out).await?;
+    }
     Ok(())
 }
+
+/// A statement's rows as a gradient: every column but the last is a dim.
+async fn grad_rows(ctx: &SessionContext, sql: &str) -> Result<Grad, String> {
+    let frames = ad::sql(ctx, sql).await.map_err(|e| e.to_string())?;
+    let batches = frames.collect().await.map_err(|e| e.to_string())?;
+    let mut g = Grad::new();
+    for b in &batches {
+        let n = b.num_columns();
+        for r in 0..b.num_rows() {
+            let key: Vec<i64> = (0..n - 1)
+                .map(|c| cell(b.column(c), r).map_or(NULL_KEY, |v| v as i64))
+                .collect();
+            g.insert(key, cell(b.column(n - 1), r));
+        }
+    }
+    Ok(g)
+}
+
+/// `grad(loss, t.col)` in SQL against names and places a user might use:
+/// the table under a schema or a quoted name while a decoy of its old name
+/// holds other values, a CTE shadowing it, the call in a subquery or a later
+/// CTE, two losses in one statement, and user tables whose names look like
+/// ddx's own, which must come through untouched.
+async fn name_checks(
+    rng: &mut Rng,
+    case: &Case,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let t = rng.pick(&case.wrt).clone();
+    let tb = case.table(&t).clone();
+    let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
+    let want = BTreeMap::from([(t.clone(), grads[&t].clone())]);
+    let ctx = setup(case, 4).await?;
+    // A decoy under the table's own name, with other values, so reading the
+    // wrong one cannot pass by coincidence.
+    let decoy = || {
+        let mut d = tb.clone();
+        for v in d.vals.iter_mut().flatten() {
+            *v = round6(*v * 0.5 + 0.37);
+        }
+        d
+    };
+    let kind = *rng.pick(&[
+        "schema",
+        "quoted",
+        "shadow",
+        "subquery",
+        "later-cte",
+        "two-losses",
+        "lookalikes",
+    ]);
+    // A quoted name with capitals meets a known bug (ad_findings.rs,
+    // grad_in_sql_of_a_table_with_capitals) every time, so only the soak
+    // tries it until that is fixed; then drop this line.
+    let kind = if kind == "quoted" && !SOAKING.load(Ordering::Relaxed) {
+        "schema"
+    } else {
+        kind
+    };
+    let (sql, value) = match kind {
+        "schema" | "quoted" => {
+            let (reference, register) = if kind == "schema" {
+                ctx.sql("CREATE SCHEMA IF NOT EXISTS s1")
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .collect()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                (format!("s1.{t}"), format!("s1.{t}"))
+            } else {
+                (format!("\"T {t}\""), format!("T {t}"))
+            };
+            let batch = tb.batch();
+            let copy =
+                MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
+            let table_ref = if kind == "schema" {
+                datafusion::sql::TableReference::parse_str(&register)
+            } else {
+                datafusion::sql::TableReference::bare(register.clone())
+            };
+            ctx.register_table(table_ref, Arc::new(copy))
+                .map_err(|e| e.to_string())?;
+            decoy().register(&ctx).map_err(|e| e.to_string())?;
+            let moved = case.reading(&t, &reference);
+            (
+                format!(
+                    "WITH {}, loss AS (SELECT {} AS loss FROM r{} c) SELECT {}val FROM grad(loss, {reference}.val)",
+                    moved.ctes(),
+                    case.head,
+                    case.root,
+                    lead(&dims, "")
+                ),
+                "val",
+            )
+        }
+        "shadow" => (
+            format!(
+                "WITH {t} AS (SELECT * FROM {t}), {}, loss AS (SELECT {} AS loss FROM r{} c) \
+                 SELECT {}val FROM grad(loss, {t}.val)",
+                case.ctes(),
+                case.head,
+                case.root,
+                lead(&dims, "")
+            ),
+            "val",
+        ),
+        "subquery" => (
+            format!(
+                "{} SELECT * FROM (SELECT {}val FROM grad(loss, {t}.val)) AS g",
+                loss_prefix(case),
+                lead(&dims, "")
+            ),
+            "val",
+        ),
+        "later-cte" => (
+            format!(
+                "WITH {}, loss AS (SELECT {} AS loss FROM r{} c), \
+                 g AS (SELECT * FROM grad(loss, {t}.val)) SELECT {}val FROM g",
+                case.ctes(),
+                case.head,
+                case.root,
+                lead(&dims, "")
+            ),
+            "val",
+        ),
+        "two-losses" => {
+            let on = if dims.is_empty() {
+                "ON true".to_string()
+            } else {
+                format!(
+                    "ON {}",
+                    dims.iter()
+                        .map(|d| format!("a.{d} = b.{d}"))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                )
+            };
+            (
+                format!(
+                    "WITH {}, loss AS (SELECT {} AS loss FROM r{} c), \
+                     loss2 AS (SELECT 2.0 * loss AS loss FROM loss) \
+                     SELECT {}b.val - 2.0 * a.val AS val \
+                     FROM grad(loss, {t}.val) a JOIN grad(loss2, {t}.val) b {on}",
+                    case.ctes(),
+                    case.head,
+                    case.root,
+                    lead(&dims, "a.")
+                ),
+                "zero",
+            )
+        }
+        _ => {
+            // Tables named like the steps ddx writes, minus the reserved
+            // prefix: ddx must not read or replace them.
+            for name in [
+                "value",
+                "saved_0",
+                "cotangent_0",
+                "grad_0_w",
+                "__ddxvalue",
+                "ddx_value",
+            ] {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "sentinel",
+                        DataType::Float64,
+                        false,
+                    )])),
+                    vec![Arc::new(Float64Array::from(vec![42.0]))],
+                )
+                .map_err(|e| e.to_string())?;
+                register_batch(&ctx, name, batch)?;
+            }
+            (
+                format!(
+                    "{} SELECT {}val FROM grad(loss, {t}.val)",
+                    loss_prefix(case),
+                    lead(&dims, "")
+                ),
+                "lookalikes",
+            )
+        }
+    };
+    let got = match grad_rows(&ctx, &sql).await {
+        Ok(g) => g,
+        Err(e) => {
+            // The shadowing CTE is a DataFusion question first: skip it if
+            // the loss alone does not plan that way.
+            if kind == "shadow" && e.contains("DataFusion") {
+                return Ok(());
+            }
+            if let Some(ad) = e.strip_prefix("External error: ") {
+                if !ad.contains("internal error") && !ad.contains("invalid Substrait plan") {
+                    // A refusal the program API did not make: plan-shape
+                    // dependent coverage, tallied (see surface_checks).
+                    out.engine.push(format!("sql refused: {}", short(ad)));
+                    return Ok(());
+                }
+            }
+            out.fail(format!("[names] {kind}: {e}\n  {sql}"));
+            return Ok(());
+        }
+    };
+    out.meta_compared += 1;
+    match value {
+        "zero" => {
+            // grad(2L) − 2·grad(L) is zero wherever it is defined.
+            let zeros: Grad = got
+                .keys()
+                .map(|k| (k.clone(), grads[&t].get(k).copied().flatten().map(|_| 0.0)))
+                .collect();
+            let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
+            if let Some(f) = compare("names", &wrap(zeros), &wrap(got), 1.0, META_RTOL) {
+                out.fail(format!("{f}\n  two losses in one statement: {sql}"));
+            }
+        }
+        _ => {
+            let key = if kind == "quoted" {
+                format!("T {t}")
+            } else {
+                t.clone()
+            };
+            let _ = key;
+            let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
+            if let Some(f) = compare("names", &want, &wrap(got), 1.0, META_RTOL) {
+                out.fail(format!("{f}\n  {kind}: {sql}"));
+            }
+        }
+    }
+    if kind == "lookalikes" {
+        for name in [
+            "value",
+            "saved_0",
+            "cotangent_0",
+            "grad_0_w",
+            "__ddxvalue",
+            "ddx_value",
+        ] {
+            match query(&ctx, &format!("SELECT sentinel FROM \"{name}\"")).await {
+                Ok(r) if r.rows == vec![vec![Some(42.0)]] => {}
+                Ok(r) => out.fail(format!(
+                    "[names] the user's table {name} now holds {:?}",
+                    r.rows
+                )),
+                Err(e) => out.fail(format!("[names] the user's table {name} is gone: {e}")),
+            }
+        }
+    }
+    let left = ddx_tables(&ctx);
+    if !left.is_empty() {
+        out.fail(format!(
+            "[catalog] ad::sql left {left:?} on the context ({kind})"
+        ));
+    }
+    Ok(())
+}
+
+/// `WITH r…, loss AS (…)`: the start of a statement that calls grad.
+fn loss_prefix(case: &Case) -> String {
+    format!(
+        "WITH {}, loss AS (SELECT {} AS loss FROM r{} c)",
+        case.ctes(),
+        case.head,
+        case.root
+    )
+}
+
+/// Three SGD steps written in SQL with `grad(loss, t.val)`, one statement per
+/// table, sharing one program per step. Each must move θ to exactly
+/// θ − lr·∇L(θ) as a fresh program computes it, a small enough step must not
+/// raise the loss, and nothing may be left on the context.
+async fn train_checks(
+    case: &Case,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let mut theta = case.clone();
+    let mut g = grads.clone();
+    let sql = case.loss_sql();
+    let wrt = case.wrt_refs();
+    // A step of at most 1e-3 in any coordinate. Not 1e-3 / |∇L| unbounded:
+    // a gradient that is zero but for rounding (a softmax's, summed) would
+    // make that 1e14 and the comparison a comparison of noise.
+    let lr = 1e-3 / scale_of(&g).max(1.0);
+    for step in 0..3 {
+        let ctx = setup(&theta, 4).await?;
+        let Some(before) = loss(&ctx, &sql).await.ok().flatten() else {
+            return Ok(());
+        };
+        let mut statements = Vec::new();
+        for t in &case.wrt {
+            let tb = theta.table(t);
+            let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
+            let on = if dims.is_empty() {
+                "ON true".to_string()
+            } else {
+                format!(
+                    "ON {}",
+                    dims.iter()
+                        .map(|d| format!("p.{d} = g.{d}"))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                )
+            };
+            statements.push(format!(
+                "{} SELECT {}p.val - {lr:e} * g.val AS val FROM {t} p JOIN grad(loss, {t}.val) g {on}",
+                loss_prefix(&theta),
+                lead(&dims, "p.")
+            ));
+        }
+        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+        let frames = match ad::sql_all(&ctx, &refs).await {
+            Ok(f) => f,
+            Err(e) => {
+                if let Refusal::Bug(b) = classify(e) {
+                    out.fail(format!("[train] step {step}: {b}"));
+                }
+                return Ok(());
+            }
+        };
+        let mut next = theta.clone();
+        for (k, df) in frames.into_iter().enumerate() {
+            let t = &case.wrt[k];
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| format!("[train] step {step}: {e}"))?;
+            let mut moved = Grad::new();
+            for b in &batches {
+                let n = b.num_columns();
+                for r in 0..b.num_rows() {
+                    let key: Vec<i64> = (0..n - 1)
+                        .map(|c| cell(b.column(c), r).map_or(NULL_KEY, |v| v as i64))
+                        .collect();
+                    moved.insert(key, cell(b.column(n - 1), r));
+                }
+            }
+            let tb = theta.table(t);
+            let want: Grad = tb
+                .keys
+                .iter()
+                .zip(&tb.vals)
+                .map(|(key, v)| {
+                    let gv = g.get(t).and_then(|g| g.get(key)).copied().flatten();
+                    (key.clone(), v.zip(gv).map(|(v, gv)| v - lr * gv))
+                })
+                .collect();
+            let wrap = |x: Grad| BTreeMap::from([(t.clone(), x)]);
+            out.meta_compared += 1;
+            if let Some(f) = compare("train", &wrap(want), &wrap(moved.clone()), 1.0, META_RTOL) {
+                out.fail(format!("{f}\n  SGD step {step} in SQL is not θ − lr·∇L"));
+                return Ok(());
+            }
+            let nt = next.tables.iter_mut().find(|x| &x.name == t).unwrap();
+            for (key, v) in nt.keys.iter().zip(nt.vals.iter_mut()) {
+                *v = moved.get(key).copied().flatten();
+            }
+        }
+        let left = ddx_tables(&ctx);
+        if !left.is_empty() {
+            out.fail(format!(
+                "[catalog] SGD step {step} left {left:?} on the context"
+            ));
+        }
+        // Along −∇L some small enough step must lower the loss, unless the
+        // gradient is zero: try steps shrinking by 10× from the one taken.
+        // Curvature can make the SGD step itself overshoot, so that alone
+        // proves nothing.
+        let descent: Direction = case
+            .wrt
+            .iter()
+            .flat_map(|t| {
+                let tb = theta.table(t);
+                (0..tb.keys.len())
+                    .filter_map(|r| {
+                        let gv = g
+                            .get(t)
+                            .and_then(|x| x.get(&tb.keys[r]))
+                            .copied()
+                            .flatten()?;
+                        (tb.vals[r].is_some() && gv != 0.0).then(|| (t.clone(), r, -gv))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let decrease: f64 = descent.iter().map(|(_, _, d)| d * d).sum::<f64>() * lr;
+        if !descent.is_empty()
+            && !case.kinds().iter().any(|k| KINKY.contains(k))
+            && decrease > 1e-9 * before.abs().max(1.0)
+        {
+            let mut lowered = false;
+            let mut tried = Vec::new();
+            for k in 0..4 {
+                let eps = lr * 10f64.powi(-k);
+                if let Some(v) = loss_at(&ctx, &theta, &sql, &descent, eps).await? {
+                    tried.push((eps, v));
+                    if v < before {
+                        lowered = true;
+                        break;
+                    }
+                }
+            }
+            if !lowered && !tried.is_empty() {
+                out.fail(format!(
+                    "[descent] at SGD step {step}, no step along −∇L lowers the loss \
+                     {before:.15e}: {tried:?}"
+                ));
+            }
+        }
+        theta = next;
+        let ctx = setup(&theta, 4).await?;
+        if loss(&ctx, &sql).await.ok().flatten().is_none() {
+            return Ok(());
+        }
+        g = match grad_of(&ctx, &sql, &wrt).await {
+            Ok((_, g)) => g,
+            Err(_) => return Ok(()),
+        };
+    }
+    Ok(())
+}
+
+/// Primitives with kinks, where a step can cross one and the descent lemma
+/// does not apply.
+const KINKY: &[&str] = &[
+    "max",
+    "min",
+    "rank",
+    "limit",
+    "value-filter",
+    "kink",
+    "case",
+    "having",
+];
 
 /// A context with the given optimizer rules, in the given order.
 fn ctx_with_rules(rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>) -> SessionContext {
@@ -2909,9 +3413,10 @@ async fn surface_checks(
         Err(e) => {
             match classify(e) {
                 Refusal::Bug(b) => out.fail(format!("[sql] {b}")),
-                Refusal::Allowed(why) => out.fail(format!(
-                    "[sql] grad(loss, …) in SQL refused a loss the program API accepted: {why}"
-                )),
+                // Allowed, but the same loss planned through the SQL surface
+                // is refused where the program API accepted it: coverage
+                // that depends on plan shape, tallied, not failed.
+                Refusal::Allowed(why) => out.engine.push(format!("sql refused: {why}")),
             }
             return Ok(());
         }
@@ -3058,7 +3563,11 @@ impl Tally {
             let _ = write!(s, "\n  plan rewrites compared: {:?}", self.rewrites);
         }
         if !self.engine.is_empty() {
-            let _ = write!(s, "\n  DataFusion faults (not failures): {:?}", self.engine);
+            let _ = write!(
+                s,
+                "\n  engine faults and SQL-only refusals (not failures): {:?}",
+                self.engine
+            );
         }
         let mut refusals: Vec<(&String, &u64)> = self.refusals.iter().collect();
         refusals.sort_by(|a, b| b.1.cmp(a.1));
@@ -3114,6 +3623,8 @@ const NONE: Props = Props {
     contract: false,
     surface: false,
     shapes: false,
+    names: false,
+    train: false,
 };
 
 #[test]
@@ -3188,6 +3699,21 @@ fn gradients_do_not_depend_on_the_plans_shape() {
         seeds(),
         Props {
             shapes: true,
+            ..NONE
+        },
+        seeds() / 3,
+    );
+}
+
+#[test]
+fn grad_in_sql_survives_names_and_training_loops() {
+    bounded(
+        "names and training",
+        7_000,
+        seeds(),
+        Props {
+            names: true,
+            train: true,
             ..NONE
         },
         seeds() / 3,
@@ -3291,7 +3817,7 @@ fn replay_one_seed() {
 
 /// The property groups a soak runs: all of them, or the comma-separated
 /// names in `DDX_V2_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
-/// shapes`), to spend a soak's budget on one surface.
+/// shapes,names,train`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
     let Ok(names) = std::env::var("DDX_V2_PROPS") else {
         return ALL;
@@ -3305,6 +3831,8 @@ fn soak_props() -> Props {
         contract: on("contract"),
         surface: on("surface"),
         shapes: on("shapes"),
+        names: on("names"),
+        train: on("train"),
     }
 }
 

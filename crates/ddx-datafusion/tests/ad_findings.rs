@@ -31,6 +31,9 @@
 //!   near-tie. *Fixed in #76:* the extreme and the rows attaining it are
 //!   windows over the recomputed rows themselves, never compared with the
 //!   saved value.
+//! - **A table with capitals has no gradient in SQL.** `ad::sql` reads a
+//!   gradient step back under a quoted name DataFusion lowercased when it
+//!   was registered.
 //! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
@@ -239,6 +242,29 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
             "run {run}: the MAX's gradient is 0 at every row"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "known bug: grad in SQL reads a gradient step under a name DataFusion lowercased"]
+async fn grad_in_sql_of_a_table_with_capitals() {
+    // A gradient step is named after its table (`…_grad_0_W`). DataFusion
+    // folds the unquoted name it is registered under to lower case, and
+    // ad::sql then reads it back quoted, case and all, and finds nothing.
+    // Every table with a capital in its name, "Weights" from a Parquet file
+    // for one, has no gradient in SQL.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let df = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") SELECT i, val FROM grad(loss, \"W\".val) ORDER BY i",
+    )
+    .await
+    .unwrap();
+    df.collect().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

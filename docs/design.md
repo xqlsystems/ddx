@@ -1097,7 +1097,11 @@ layered:
   the loss need not be differentiable, and any subgradient is a convention);
   dense NULLs and NULL keys; huge, tiny, `-0.0`, NaN and infinite values; and
   thousand-row tables in several partitions. Near a kink, ⟨∇L, d⟩ must lie
-  between the one-sided derivatives. It runs nightly beside v1's soak.
+  between the one-sided derivatives. `grad(loss, t.col)` in SQL is held to
+  the program's gradient under schema-qualified and quoted names with a decoy
+  of the old name, a shadowing CTE, the call in a subquery or a later CTE, and
+  two losses in one statement; three SGD steps written in SQL must each be
+  θ − lr·∇L and lower the loss. It runs nightly beside v1's soak.
 - **v2-specific: spike each rule's forward idiom against both engines'
   actual Substrait implementations before trusting it** — the coverage
   discipline §4.2 commits to, now a standing test-plan item, not a one-time
