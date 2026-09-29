@@ -223,11 +223,30 @@ pub struct Forward {
     pub output: Region,
     /// The output column names.
     pub output_names: Vec<String>,
+    /// The prefix of every table name the program materializes.
+    pub namespace: String,
 }
 
-/// The name of saved aggregate `n`'s table.
-pub fn saved_name(n: usize) -> String {
-    format!("__ddx_saved_{n}")
+/// The name of saved aggregate `n`'s table, in a program's `namespace`.
+pub fn saved_name(namespace: &str, n: usize) -> String {
+    format!("{namespace}saved_{n}")
+}
+
+/// A fresh prefix for one program's table names: `__ddx_{id}_`.
+///
+/// Every table a program materializes lives under it, so two programs on one
+/// engine never read or replace each other's tables, and none takes a name a
+/// user is likely to have. The id is unique within the process (a counter)
+/// and unlikely to repeat across processes (the clock).
+pub fn new_namespace() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("__ddx_{:x}{n:x}_", clock & 0xffff_ffff)
 }
 
 /// The column names of a saved relation or its cotangent, `width` wide.
@@ -246,8 +265,10 @@ impl Forward {
                 "no wrt columns were given; name at least one table column".into(),
             ));
         }
+        let namespace = new_namespace();
         let mut b = Builder {
             functions: &functions,
+            namespace: namespace.clone(),
             wrt,
             tables: Vec::new(),
             saved: Vec::new(),
@@ -262,6 +283,7 @@ impl Forward {
             saved,
             output,
             output_names,
+            namespace,
         })
     }
 }
@@ -370,6 +392,7 @@ fn mentions_reference(rel: &Rel) -> bool {
 
 struct Builder<'a> {
     functions: &'a Functions,
+    namespace: String,
     wrt: &'a [ColumnRef],
     tables: Vec<Table>,
     saved: Vec<Saved>,
@@ -469,7 +492,10 @@ impl Builder<'_> {
             RelType::Aggregate(a) => {
                 let n = self.read_saved(a)?;
                 let width = self.saved[n].outputs.len();
-                let mut s = empty(emit::read_step(&saved_name(n), step_columns(width)));
+                let mut s = empty(emit::read_step(
+                    &saved_name(&self.namespace, n),
+                    step_columns(width),
+                ));
                 s.slots.push(Slot {
                     input: Input::Saved(n),
                     offset: Some(0),

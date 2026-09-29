@@ -42,6 +42,32 @@ pub async fn schema_of(ctx: &SessionContext, name: &str) -> NamedStruct {
 
 /// Run every step of `program`, registering each result as a table.
 pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
+    try_run(ctx, program)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Run `program`'s checks, then its steps. A check that returns a row refuses
+/// the program, with the check's message.
+pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<(), String> {
+    for check in &program.checks {
+        let lp = from_substrait_plan(&ctx.state(), &check.plan)
+            .await
+            .unwrap();
+        let rows: usize = ctx
+            .execute_logical_plan(lp)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        if rows > 0 {
+            return Err(check.message.clone());
+        }
+    }
     for step in program.steps() {
         let mut plan = step.plan.clone();
         let mut schemas = HashMap::new();
@@ -66,6 +92,7 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
         )
         .unwrap();
     }
+    Ok(())
 }
 
 /// A small table of numbers, kept in memory so it can be perturbed.

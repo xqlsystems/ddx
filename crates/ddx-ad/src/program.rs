@@ -8,22 +8,30 @@
 //!
 //! - [`vjp`] pulls a cotangent of the query's output back to the `wrt`
 //!   columns. The cotangent is a relation with the output's dims and values,
-//!   supplied by the caller as the table [`COTANGENT`] before the backward steps
-//!   run.
+//!   supplied by the caller as the table [`BackwardProgram::cotangent_table`]
+//!   names, before the backward steps run.
 //! - [`grad`] is `vjp` of a loss seeded with 1. The query's output must be one
 //!   row and one column, as `jax.grad` requires a scalar.
 //!
 //! Either way the result is a [`BackwardProgram`]: steps the engine runs in
 //! order, materializing each under its name (design.md §4.4).
 //!
-//! 1. **Forward**: one step per saved aggregate, `__ddx_saved_{n}`, then
-//!    [`VALUE`], the query's own result, so a program is `value_and_grad`.
+//! 1. **Forward**: one step per saved aggregate, `…saved_{n}`, then the
+//!    query's own result, [`BackwardProgram::value`], so a program is
+//!    `value_and_grad`.
 //! 2. **Backward**: one step per saved aggregate that gradient reaches,
-//!    `__ddx_cotangent_{n}`, with the aggregate's dims and the cotangent of
-//!    each of its values that receives gradient, under the same names.
-//! 3. **Gradients**: one step per `wrt` table, `__ddx_grad_{table}`, shaped like
-//!    the table: its dims and its `wrt` values, under the table's own column
-//!    names, holding the gradient, with `0` where none reached.
+//!    `…cotangent_{n}`, with the aggregate's dims and the cotangent of each of
+//!    its values that receives gradient, under the same names.
+//! 3. **Gradients**: one step per `wrt` table, named in
+//!    [`BackwardProgram::gradients`], shaped like the table: its dims and its
+//!    `wrt` values, under the table's own column names and in their types,
+//!    holding the gradient; `0` where none reached, NULL where the value is
+//!    NULL.
+//!
+//! Every name starts with a prefix fresh to the program (`__ddx_{id}_`), so
+//! programs never read or replace each other's tables. Before the steps, an
+//! adapter runs [`BackwardProgram::checks`]: plans that must return no rows,
+//! one per `wrt` table, confirming its dims identify its rows.
 //!
 //! # Fan-in
 //!
@@ -41,13 +49,12 @@ use ddx_core::Ddx;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::{Expression, Plan, Rel};
 
-use crate::emit::{
-    aggregate, join, plan, project, project_emit, read_step, read_table, select, union_all,
-};
+use crate::emit::{aggregate, join, plan, project_emit, read_step, read_table, select, union_all};
 use crate::error::{AdError, Result};
-use crate::expr::{call, field, lit_f64};
+use crate::expr::{call, cast, field, if_then, lit_f64, null_f64};
 use crate::forward::{saved_name, step_columns, Forward, Input};
 use crate::relation::ColumnRef;
+use crate::relation::Table;
 use crate::transpose::{Contribution, Transposer};
 
 /// One step of a program: a plan, and the name its result is materialized
@@ -78,12 +85,20 @@ pub struct Gradient {
 pub struct BackwardProgram {
     /// The saved aggregates, then the query's value.
     pub forward_steps: Vec<Step>,
-    /// The name of the step holding the query's value: [`VALUE`].
+    /// The name of the step holding the query's value.
     pub value: String,
-    /// For [`vjp`]: the columns the caller's [`COTANGENT`] table must have,
-    /// the output's dims then its values that depend on `wrt`, named as in
-    /// the output. Empty for [`grad`], which seeds 1 itself.
+    /// For [`vjp`]: the table the caller registers the output's cotangent as,
+    /// before the backward steps run.
+    pub cotangent_table: String,
+    /// For [`vjp`]: the columns that table must have, the output's dims then
+    /// its values that depend on `wrt`, named as in the output. Empty for
+    /// [`grad`], which seeds 1 itself.
     pub cotangent: Vec<String>,
+    /// Plans that must return no rows, run before the steps. Each checks a
+    /// promise the plan cannot show, that a `wrt` table's dims identify its
+    /// rows; a row back means the promise is broken, and the program must not
+    /// run.
+    pub checks: Vec<Check>,
     /// The cotangents, then the gradients.
     pub backward_steps: Vec<Step>,
     /// One per `wrt` table.
@@ -95,20 +110,43 @@ impl BackwardProgram {
     pub fn steps(&self) -> impl Iterator<Item = &Step> {
         self.forward_steps.iter().chain(&self.backward_steps)
     }
+
+    /// The steps whose tables only other steps read: the saved aggregates
+    /// and the cotangents. An adapter may drop them once the program has run;
+    /// the value and the gradients are what a caller reads.
+    pub fn intermediate_steps(&self) -> impl Iterator<Item = &Step> {
+        let keep: Vec<&str> = std::iter::once(self.value.as_str())
+            .chain(self.gradients.iter().map(|g| g.step.as_str()))
+            .collect();
+        self.steps()
+            .filter(move |s| !keep.contains(&s.name.as_str()))
+    }
 }
 
-/// The step holding the query's value.
-pub const VALUE: &str = "__ddx_value";
-
-/// The table a [`vjp`] program reads the output's cotangent from.
-pub const COTANGENT: &str = "__ddx_cotangent";
-
-fn cotangent_name(n: usize) -> String {
-    format!("__ddx_cotangent_{n}")
+/// A plan that must return no rows (see [`BackwardProgram::checks`]).
+#[derive(Debug, Clone)]
+pub struct Check {
+    /// The plan.
+    pub plan: Plan,
+    /// What a returned row means, for the error.
+    pub message: String,
 }
 
-fn gradient_name(table: &[String]) -> String {
-    format!("__ddx_grad_{}", table.join("_"))
+fn cotangent_name(namespace: &str, n: usize) -> String {
+    format!("{namespace}cotangent_{n}")
+}
+
+/// Table `i`'s gradient step: numbered, so it is unique whatever the table is
+/// called, with the table's last name part after it, for a reader.
+fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
+    let readable: String = table
+        .last()
+        .map(String::as_str)
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{namespace}grad_{i}_{readable}")
 }
 
 /// The gradient of the loss `plan` computes with respect to the `wrt`
@@ -124,8 +162,9 @@ pub fn grad_with(ddx: &Ddx, plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardPr
 }
 
 /// The vector-Jacobian product of the query `plan` with respect to the `wrt`
-/// columns: the program pulls the cotangent in table [`COTANGENT`] back to
-/// them. [`BackwardProgram::cotangent`] lists the columns that table needs.
+/// columns: the program pulls back the cotangent the caller registers as
+/// [`BackwardProgram::cotangent_table`], with the columns
+/// [`BackwardProgram::cotangent`] lists.
 pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
     vjp_with(&Ddx::new(), plan, wrt)
 }
@@ -147,12 +186,12 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
     let mut forward_steps = Vec::new();
     for (n, saved) in f.saved.iter().enumerate() {
         forward_steps.push(Step {
-            name: saved_name(n),
+            name: saved_name(&f.namespace, n),
             plan: plan(saved.rel.clone(), step_columns(saved.outputs.len()), &t.ext),
         });
     }
     forward_steps.push(Step {
-        name: VALUE.into(),
+        name: format!("{}value", f.namespace),
         plan: plan(
             select(f.output.rel.clone(), f.output.outputs.clone()),
             f.output_names.clone(),
@@ -180,16 +219,16 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         let (rel, cols) = combine(&mut t, contribs, dims.len())?;
         let names: Vec<String> = dims.iter().chain(&cols).map(|c| format!("c{c}")).collect();
         backward_steps.push(Step {
-            name: cotangent_name(n),
+            name: cotangent_name(&f.namespace, n),
             plan: plan(rel, names.clone(), &t.ext),
         });
-        t.saved(n, &cols, read_step(&cotangent_name(n), names))?;
+        t.saved(n, &cols, read_step(&cotangent_name(&f.namespace, n), names))?;
     }
 
     let mut gradients = Vec::new();
     for (i, table) in f.tables.iter().enumerate() {
         let contribs = t.contributions.remove(&Input::Table(i)).unwrap_or_default();
-        let step = gradient_name(&table.names);
+        let step = gradient_name(&f.namespace, i, &table.names);
         let rel = dense_gradient(&mut t, i, contribs)?;
         let columns: Vec<String> = table
             .dims
@@ -215,7 +254,13 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
     }
     Ok(BackwardProgram {
         forward_steps,
-        value: VALUE.into(),
+        value: format!("{}value", f.namespace),
+        cotangent_table: format!("{}cotangent", f.namespace),
+        checks: f
+            .tables
+            .iter()
+            .map(|table| dims_check(&mut t, table))
+            .collect(),
         cotangent,
         backward_steps,
         gradients,
@@ -242,9 +287,10 @@ fn scalar_output(f: &Forward) -> Result<usize> {
         .any(|s| s.offset.is_some() && !s.at_most_one_row)
     {
         return Err(AdError::NotScalar(format!(
-            "grad needs a loss, one row and one column, but `{}` may have many rows: it \
-             reads a table, a grouped aggregate, or data that is not one row. Sum it into \
-             one row, or use vjp",
+            "grad needs a loss, one row and one column, and ddx cannot show from the plan \
+             that `{}` is one row: it reads a table, a grouped aggregate, or data the plan \
+             does not prove is one row (ddx accepts an ungrouped aggregate). Sum it into one \
+             row, or use vjp",
             names[0]
         )));
     }
@@ -318,7 +364,7 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<Vec<String>> {
     let keys: Vec<Expression> = dim_cols.iter().map(|&i| field(out.outputs[i])).collect();
     let base = t.join_on(
         out.rel.clone(),
-        read_step(COTANGENT, names.clone()),
+        read_step(&format!("{}cotangent", f.namespace), names.clone()),
         keys,
         width,
     )?;
@@ -378,40 +424,112 @@ fn combine(
 }
 
 /// Table `i`'s gradient, dense: every row of the table, its dims, and each
-/// `wrt` value's gradient, zero where none reached it.
+/// `wrt` value's gradient, in the value's own type.
+///
+/// Two conventions are pinned here, whatever the loss:
+/// - a row no gradient reached gets `0`;
+/// - a row whose value is NULL gets NULL, as v1 does (#60): a missing value
+///   has no gradient, not a zero one.
 fn dense_gradient(t: &mut Transposer, i: usize, contribs: Vec<Contribution>) -> Result<Rel> {
     let table = &t.f.tables[i];
     let dims = table.dims.clone();
     let values = table.values.clone();
+    let types: Vec<substrait::proto::Type> = values
+        .iter()
+        .map(|&v| {
+            let mut ty = table
+                .schema
+                .r#struct
+                .as_ref()
+                .and_then(|s| s.types.get(v).cloned())
+                .unwrap_or_else(crate::expr::fp64);
+            set_nullable(&mut ty);
+            ty
+        })
+        .collect();
+    // The table's dims, then its wrt values (for the NULL convention).
+    let picked: Vec<usize> = dims.iter().chain(&values).copied().collect();
     let rows = select(
         read_table(table.names.clone(), table.schema.clone()),
-        dims.clone(),
+        picked,
     );
-    if contribs.is_empty() {
-        let zeros = values.iter().map(|_| lit_f64(0.0)).collect();
-        return Ok(project(rows, zeros));
-    }
-    let (summed, cols) = combine(t, contribs, dims.len())?;
-    let same = t.ext.anchor("is_not_distinct_from");
-    let and = t.ext.anchor("and");
+    let (k, v) = (dims.len(), values.len());
+    let (joined, cols, right) = if contribs.is_empty() {
+        (rows, Vec::new(), k + v)
+    } else {
+        let (summed, cols) = combine(t, contribs, k)?;
+        let same = t.ext.anchor("is_not_distinct_from");
+        let and = t.ext.anchor("and");
+        let cond = (0..k)
+            .map(|d| call(same, vec![field(d), field(k + v + d)]))
+            .reduce(|a, b| call(and, vec![a, b]))
+            .unwrap_or_else(lit_true);
+        (join(rows, summed, cond, JoinType::Left), cols, k + v + k)
+    };
     let coalesce = t.ext.anchor("coalesce");
-    let cond = (0..dims.len())
-        .map(|k| call(same, vec![field(k), field(dims.len() + k)]))
-        .reduce(|a, b| call(and, vec![a, b]))
-        .unwrap_or_else(lit_true);
-    let joined = join(rows, summed, cond, JoinType::Left);
-    let right = 2 * dims.len();
+    let is_null = t.ext.anchor("is_null");
     let grads: Vec<Expression> = values
         .iter()
-        .map(|v| match cols.iter().position(|c| c == v) {
-            Some(i) => call(coalesce, vec![field(right + i), lit_f64(0.0)]),
-            None => lit_f64(0.0),
+        .enumerate()
+        .map(|(n, val)| {
+            let reached = match cols.iter().position(|c| c == val) {
+                Some(c) => call(coalesce, vec![field(right + c), lit_f64(0.0)]),
+                None => lit_f64(0.0),
+            };
+            let pinned = if_then(
+                vec![(call(is_null, vec![field(k + n)]), null_f64())],
+                reached,
+            );
+            cast(pinned, types[n].clone())
         })
         .collect();
     let width = right + cols.len();
-    let mut emit: Vec<usize> = (0..dims.len()).collect();
-    emit.extend((0..grads.len()).map(|i| width + i));
+    let mut emit: Vec<usize> = (0..k).collect();
+    emit.extend((0..grads.len()).map(|g| width + g));
     Ok(project_emit(joined, grads, Some(emit)))
+}
+
+/// Make a type nullable: a gradient is NULL where its value is.
+fn set_nullable(ty: &mut substrait::proto::Type) {
+    use substrait::proto::r#type::{Kind, Nullability};
+    let n = Nullability::Nullable as i32;
+    match ty.kind.as_mut() {
+        Some(Kind::Fp32(t)) => t.nullability = n,
+        Some(Kind::Fp64(t)) => t.nullability = n,
+        _ => {}
+    }
+}
+
+/// The check that table's dims identify its rows: the dim tuples that occur
+/// more than once. Must return no rows.
+fn dims_check(t: &mut Transposer, table: &Table) -> Check {
+    let count = t.ext.anchor("count");
+    let gt = t.ext.anchor("gt");
+    let k = table.dims.len();
+    let grouped = aggregate(
+        read_table(table.names.clone(), table.schema.clone()),
+        table.dims.iter().map(|&d| field(d)).collect(),
+        vec![(count, vec![lit_f64(1.0)])],
+    );
+    let repeated = select(
+        crate::emit::filter(grouped, call(gt, vec![field(k), lit_f64(1.0)])),
+        (0..k).collect(),
+    );
+    let names: Vec<String> = table
+        .dims
+        .iter()
+        .map(|&d| table.columns()[d].clone())
+        .collect();
+    Check {
+        plan: plan(repeated, names.clone(), &t.ext),
+        message: format!(
+            "table `{}` has rows that share their dims ({}), so their gradients cannot be \
+             told apart; ddx takes the columns not named in wrt as the table's dims, and \
+             needs them to identify its rows",
+            table.names.join("."),
+            names.join(", ")
+        ),
+    }
 }
 
 fn lit_true() -> Expression {

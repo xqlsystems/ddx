@@ -10,7 +10,7 @@ mod common;
 use common::ad::{check_gradients, rows, run, Table};
 use common::substrait_of;
 use datafusion::prelude::SessionContext;
-use ddx_ad::{grad, vjp, AdError, ColumnRef, COTANGENT};
+use ddx_ad::{grad, vjp, AdError, ColumnRef};
 
 fn w() -> Table {
     Table {
@@ -200,8 +200,9 @@ async fn vjp_pulls_a_cotangent_back() {
     let program = vjp(&plan, &[wrt("w", "val")]).unwrap();
     assert_eq!(program.cotangent, vec!["i", "s"]);
 
+    let cotangent_table: &'static str = Box::leak(program.cotangent_table.clone().into_boxed_str());
     Table {
-        name: COTANGENT,
+        name: cotangent_table,
         columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
         rows: vec![vec![0.0, 2.0], vec![1.0, -1.0], vec![2.0, 0.5]],
     }
@@ -249,7 +250,11 @@ async fn a_table_whose_dims_repeat_is_not_given_summed_gradients() {
     let Ok(program) = grad(&plan, &[ColumnRef::new("d", "val")]) else {
         return; // refused: fine
     };
-    run(&ctx, &program).await;
+    // Refused when run, by the program's check that dims identify rows: fine.
+    if let Err(e) = common::ad::try_run(&ctx, &program).await {
+        assert!(e.contains("share their dims"), "{e}");
+        return;
+    }
     let mut got = rows(
         &ctx,
         &format!("SELECT * FROM {}", program.gradients[0].step),
@@ -334,4 +339,54 @@ async fn tables_whose_names_join_alike_get_their_own_gradient_steps() {
     .unwrap();
     let steps: Vec<&str> = program.gradients.iter().map(|g| g.step.as_str()).collect();
     assert_ne!(steps[0], steps[1], "two wrt tables, one gradient step name");
+}
+
+#[tokio::test]
+async fn a_null_rows_gradient_is_null_and_a_reached_rows_is_not() {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE wn (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, NULL), (2, 3.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM wn", true).await;
+    let program = grad(&plan, &[ColumnRef::new("wn", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+
+    assert_eq!(got[0], vec![0.0, 2.0]);
+    assert!(
+        got[1][1].is_nan(),
+        "the NULL row's gradient is NULL: {:?}",
+        got[1]
+    );
+    assert_eq!(got[2], vec![2.0, 6.0]);
+}
+
+#[tokio::test]
+async fn a_gradient_has_its_values_type() {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE wr (i BIGINT, val REAL) AS VALUES (0, 1.5), (1, 2.5)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM wr", true).await;
+    let program = grad(&plan, &[ColumnRef::new("wr", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let df = ctx
+        .sql(&format!("SELECT val FROM {}", program.gradients[0].step))
+        .await
+        .unwrap();
+    assert_eq!(
+        df.schema().field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Float32
+    );
 }
