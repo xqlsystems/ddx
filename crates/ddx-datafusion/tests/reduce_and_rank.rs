@@ -632,3 +632,32 @@ async fn an_infinite_row_that_does_not_attain_the_min_sends_no_nan() {
     assert_eq!(got[1], vec![1.0, 0.0]);
     assert!((got[0][1] - 0.5 / 1.25f64.sqrt()).abs() < 1e-12, "{got:?}");
 }
+
+#[tokio::test]
+async fn a_grouped_max_over_nan_data_finds_its_row() {
+    // From the v2 soak (seed 600845). DataFusion's grouped MAX skips a NaN,
+    // but a window MAX returns it, so the rows attaining the saved maximum
+    // were compared with NaN and none matched: a silent zero gradient.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE np2 (i BIGINT, val DOUBLE) AS VALUES (0, 0.9), (1, 0.2)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE nd (i BIGINT, j BIGINT, v DOUBLE) AS \
+         VALUES (0, 0, 0.5), (0, 1, 'NaN'::DOUBLE), (0, 2, -0.4), (1, 0, 0.3)",
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT SUM(mx) AS l FROM (SELECT nd.i, MAX(greatest(nd.v, np2.val)) AS mx \
+                                   FROM nd JOIN np2 ON nd.i = np2.i GROUP BY nd.i)",
+        "np2",
+    )
+    .await;
+    // Group 0's maximum is 0.9 = np2.val(0), attained twice (j = 0 and 2),
+    // so the cotangent reaches np2.val(0) in full; group 1's is 0.3 from nd.
+    assert_eq!(got, vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
+}

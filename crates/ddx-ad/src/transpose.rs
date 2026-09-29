@@ -136,6 +136,7 @@ impl<'a> Transposer<'a> {
         let count = self.ext.anchor("count");
         let sum = self.ext.anchor("sum");
         let equal = self.ext.anchor("equal");
+        let isnan = self.ext.anchor("isnan");
         let mut rel = rows;
         let mut next = rows_width;
         let mut stat_at = BTreeMap::new();
@@ -150,8 +151,17 @@ impl<'a> Transposer<'a> {
                     stat_at.insert(arg_col, at);
                 }
                 Rule::Extreme(name) => {
+                    // NaN arguments are left out. DataFusion's grouped MAX
+                    // skips a NaN where its ungrouped and window MAX return
+                    // it; a MAX that gave a finite value skipped them, so
+                    // leaving them out agrees with it, and a NaN row gets no
+                    // gradient, as a NULL one gets none.
                     let f = self.ext.anchor(name);
-                    windows.push(window(f, vec![field(arg_col)], keys.clone()));
+                    let arg = if_then(
+                        vec![(call(isnan, vec![field(arg_col)]), null_f64())],
+                        field(arg_col),
+                    );
+                    windows.push(window(f, vec![arg], keys.clone()));
                     extreme_at.insert(arg_col, at);
                 }
             }
