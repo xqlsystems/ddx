@@ -502,6 +502,45 @@ impl Conditioning {
     }
 }
 
+/// How much rounding alone can move a central difference of `f` in `wrt` at
+/// `(x0, y0)` with step `h`: an estimate of the difference quotient's noise
+/// floor, or `None` where `f` does not evaluate.
+///
+/// A finite difference divides `f(v + h) − f(v − h)` by `2h`, so any error in
+/// `f` of size `δ` becomes an error of `δ / h` in the quotient. The error that
+/// matters is not `ε · |f|`: an expression can round an *inner* value and pass
+/// that jitter through a steep outer function. `power(3, power((y + x + 2.5) -
+/// y, 2))` does not depend on `y`, but `(y + x) - y` rounds differently for
+/// each `y`, and the outer `3^(b²)` scales that ulp of jitter by `∂f/∂b ≈ 7e6`,
+/// so the quotient reads `5e-5` where the derivative is exactly `0` (#67). A
+/// Richardson gate does not see it: `fd(h)` and `fd(h/2)` carry noise of the
+/// same size.
+///
+/// So the floor is measured rather than modelled: move `v` by a few ulps, see
+/// how far `f` moves beyond what its slope `slope` accounts for, and divide by
+/// `h`. A point whose floor is not small next to the comparison tolerance
+/// cannot tell a correct derivative from a wrong one.
+pub fn fd_noise_floor(f: &Expr, x0: f64, y0: f64, wrt: Var, h: f64, slope: f64) -> Option<f64> {
+    let v0 = match wrt {
+        Var::X => x0,
+        Var::Y => y0,
+    };
+    let at = |v: f64| match wrt {
+        Var::X => eval(f, v, y0),
+        Var::Y => eval(f, x0, v),
+    };
+    let f0 = at(v0)?;
+    let mut worst: f64 = 0.0;
+    for k in 1..=8 {
+        for sign in [-1.0, 1.0] {
+            let v = v0 + sign * k as f64 * 4.0 * f64::EPSILON * v0.abs().max(1.0);
+            let moved = at(v)? - f0 - slope * (v - v0);
+            worst = worst.max(moved.abs());
+        }
+    }
+    Some(worst / h)
+}
+
 /// Do two floats agree to within `atol + rtol · scale`?
 ///
 /// **Tolerance is relative to the computation scale, not the result.** Two
