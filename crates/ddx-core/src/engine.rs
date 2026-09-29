@@ -303,8 +303,20 @@ fn linearize_binary(
         BinaryOperator::Multiply => Ok(add(mul(da, right.clone()), mul(left.clone(), db))),
         // tangent of (a / b) = (da*b - a*db) / b^2   (quotient rule)
         BinaryOperator::Divide => {
-            let numerator = sub(mul(da, right.clone()), mul(left.clone(), db));
-            Ok(div(numerator, square(right.clone())))
+            // d(u/v) = (du - (u/v)·dv)/v: the quotient rule divided by v
+            // once, through the quotient itself. The textbook (du·v - u·dv)/v²
+            // is the same number, but squares v: at v = ∞ (a value in the
+            // data) it is ∞/∞ = NaN where the limit is 0, and at a tiny v
+            // (1e-163) v² underflows to 0. Splitting it into du/v - u·dv/v²
+            // keeps the square, and at a tiny v its two terms of 1/v cancel
+            // to noise (u/sinh(u) there differentiates to ±1e159, not 0).
+            // Here neither happens. A denominator constant in the variable
+            // leaves just du/v.
+            if is_zero(&db) {
+                return Ok(div(da, right.clone()));
+            }
+            let quotient = div(left.clone(), right.clone());
+            Ok(div(sub(da, mul(quotient, db)), right.clone()))
         }
         other => Err(DiffError::NotImplemented(format!(
             "the operator `{other}` is not differentiable. {SUPPORTED}"
