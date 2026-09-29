@@ -640,7 +640,9 @@ softmax over the key axis → `A@V`) from the *same* rules and matches
 `jax.grad` on every weight and the input to ~1e-16; the causal mask is just
 elementwise and also passes. LayerNorm (mean/variance = group-reduce +
 elementwise), residual connections (elementwise add), and GELU/ReLU
-(elementwise) all reduce to the same primitive set.
+(elementwise) all reduce to the same primitive set. (ReLU as it is usually
+written, `CASE WHEN x > 0 …` or `greatest(x, 0)`, is differentiated by the
+branch taken; §4.3.)
 
 **Published precedent.** Tang et al. [2], *Auto-Differentiation of Relational
 Computations for Very Large Scale Machine Learning*, do exactly this — a
@@ -724,7 +726,7 @@ and v2 does the same:
 
 | Primitive | SQL | Transpose |
 |---|---|---|
-| **map** | a projected expression `y = f(x₁, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row, the partials from `ddx-core` |
+| **map** | a projected expression `y = f(x₁, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row, the partials from `ddx-core`; for `CASE`, `greatest` and `least`, the derivative of the branch the row takes |
 | **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
 | **broadcast** | a join | sum the cotangent back over the rows each input row was copied to |
 | **reduce** | grouped `SUM` | broadcast the group's cotangent to every row summed |
@@ -828,7 +830,11 @@ output. The row-local work between two saved aggregates is a **region**, and
 is recomputed inside each backward step, never written out, so a contraction's
 `N × D × H` join never is. A region is rebuilt with the same relations in the
 same order, so it produces the same rows, but with no projection dropping a
-column. Every intermediate value is then a column, defined as an expression
+column. "The same rows" is an assumption about the engine, not a property of
+the plan, and it is enforced where ddx knows it can fail: a window function
+recomputed in a region must rank totally (its `PARTITION BY` and `ORDER BY`
+include every dim of the rows it ranks), because SQL leaves ties unordered and
+a parallel engine may break them differently on each run. §4.6 lists the rest. Every intermediate value is then a column, defined as an expression
 over columns to its left, and reverse column order is a reverse topological
 order for the chain rule. This index is an implementation detail over the
 real Substrait plan, the same relationship v1's `ColRef` has to
@@ -856,16 +862,31 @@ cotangents are sparse, and an inner join of nn.py's three per-layer
 contributions to `weight` matches no rows at all, silently returning an empty
 gradient.
 
-**Gradients** are `__ddx_grad_{table}`: every row of the table, its dims, and
-each `wrt` value's gradient under the column's own name, `0` where no gradient
-reached. A gradient shaped like its table makes an SGD step a plain join.
+**Gradients** are one step per table: every row of the table, its dims, and
+each `wrt` value's gradient under the column's own name and in its type. Two
+conventions are pinned, whatever the loss: `0` where no gradient reached a
+row, and NULL where the row's value is NULL, as v1 pins it (#60). A gradient
+shaped like its table makes an SGD step a plain join.
+
+**Dims are checked, not assumed.** A gradient keyed by dims is only right if
+the dims identify rows, which a plan cannot show. So each program carries a
+check per `wrt` table, a plan that must return no rows (the dim tuples that
+repeat), and an adapter runs the checks before the steps and refuses the
+program if one returns a row. Without it, rows sharing dims got their summed
+gradient, and an SGD join then multiplied rows.
+
+**Every table a program materializes is named under a prefix fresh to that
+program** (`__ddx_{id}_`), so two programs on one engine never read or
+replace each other's tables, and a user's table is never replaced. An adapter
+drops a program's intermediate tables (the saved aggregates and cotangents)
+once it has run, and hands back the value and the gradients (`S11`).
 
 **Each step is a plain Substrait `Plan`,** handed to the engine's own consumer
 (`from_substrait`, `datafusion-substrait`) rather than converted to SQL text by
 ddx, and materialized under its name before the next step runs. For DuckDB,
 for example:
 ```sql
-CREATE TEMP TABLE __ddx_cotangent_7 AS SELECT * FROM from_substrait($1)
+CREATE TEMP TABLE __ddx_3f2a_cotangent_7 AS SELECT * FROM from_substrait($1)
 ```
 A step that reads an earlier one is emitted **unbound**: its read names the
 columns and leaves their types out. ddx does not know them without
@@ -922,6 +943,13 @@ pinned. No query carries a label.
 bug (workaround verified, no upstream-fix dependency).
 
 **Genuinely open:**
+- Recomputation's other engine assumptions. A region must produce the same
+  rows forward and backward. Rankings are checked for a total order (§4.4),
+  but a volatile function (`random()`, `now()`) in a recomputed region would
+  differ between runs and is not yet refused, and an engine whose plain
+  scans are not repeatable would break the assumption too. The alternative
+  to checking is saving: materialize a region instead of recomputing it,
+  which the save-or-recompute policy (`S6`) could allow per region.
 - The physical fused-contraction operator for BLAS-class performance on
   dense data (§4.1) — not yet spiked.
 - Higher-order AD over an already-emitted backward query (differentiating
@@ -1476,7 +1504,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S10`)
+### Building v2 (`S6`–`S11`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -1499,7 +1527,8 @@ know which columns identify a row. The XQL model already says: dims do, and a
 variable is a value at a coordinate. Naming the differentiated columns
 therefore names the dims too, and a cotangent or gradient has its primal's
 dims and values, the relational version of "a gradient has its argument's
-shape". → §4.4.
+shape". Because a plan cannot show that dims identify rows, each program
+checks it at run time before it runs, rather than trust it. → §4.4.
 
 **S9 — Functions are recognized by name.** DataFusion 54 declares every
 function, its own built-ins included, with a bare name and
@@ -1519,6 +1548,17 @@ changed no number, and made the SQL surface a place no JAX user would
 recognize. They were removed after review. What stays is the one annotation
 that does change the gradient, `ddx_stop_gradient`, which JAX has too.
 Principle 3 is restated accordingly. → §2, §4.3.
+
+**S11 — Each program's tables live under a prefix of their own.** The first
+adapters materialized every step under fixed names (`__ddx_value`,
+`__ddx_saved_0`) in the caller's catalog. An adversarial review showed what
+that costs: a user's table of the same name was replaced, activations stayed
+pinned in memory, and two programs on one context read each other's tables,
+giving a silently zero gradient, or failing with a missing table under
+`tokio::spawn`. Every name now starts with a prefix fresh to its program, and
+an adapter drops the intermediate tables once a run finishes. Running one
+program twice at once still shares its names, so a caller that runs
+concurrently builds a program per task, as `ad::sql` does per call. → §4.4.
 
 ## References
 
