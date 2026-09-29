@@ -661,3 +661,30 @@ async fn a_grouped_max_over_nan_data_finds_its_row() {
     // so the cotangent reaches np2.val(0) in full; group 1's is 0.3 from nd.
     assert_eq!(got, vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
 }
+
+#[tokio::test]
+async fn a_max_tie_that_rounding_breaks_is_still_shared() {
+    // From the v2 soak (seed 2101304): two groups that tie in exact
+    // arithmetic can differ in the last bit, and which one rounds higher can
+    // change from run to run (a sum over partitions), so the MAX gave its
+    // whole cotangent to either. Within a few ulps it is shared, as a tie:
+    // (p + 0.1) + 0.2 and p + 0.3 differ by one ulp.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE tp (i BIGINT, val DOUBLE) AS VALUES (0, 0.0), (1, 0.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE tc (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES (0, 0.1, 0.2), (1, 0.3, 0.0)",
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT MAX((tp.val + tc.a) + tc.b) AS l FROM tp JOIN tc ON tp.i = tc.i",
+        "tp",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 0.5], vec![1.0, 0.5]]);
+}

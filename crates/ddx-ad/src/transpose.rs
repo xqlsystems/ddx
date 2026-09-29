@@ -135,7 +135,6 @@ impl<'a> Transposer<'a> {
         // recomputed row equals would silently send no gradient at all.
         let count = self.ext.anchor("count");
         let sum = self.ext.anchor("sum");
-        let equal = self.ext.anchor("equal");
         let isnan = self.ext.anchor("isnan");
         let mut rel = rows;
         let mut next = rows_width;
@@ -174,7 +173,7 @@ impl<'a> Transposer<'a> {
             .iter()
             .map(|(&arg_col, &at)| {
                 let attains = if_then(
-                    vec![(call(equal, vec![field(arg_col), field(at)]), lit_f64(1.0))],
+                    vec![(self.attains(arg_col, at), lit_f64(1.0))],
                     lit_f64(0.0),
                 );
                 window(sum, vec![attains], keys.clone())
@@ -211,7 +210,7 @@ impl<'a> Transposer<'a> {
                 // an infinite value in the data that does not attain a MIN).
                 Rule::Extreme(_) => if_then(
                     vec![(
-                        call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),
+                        self.attains(arg_col, extreme_at[&arg_col]),
                         call(divide, vec![cot, field(stat_at[&arg_col])]),
                     )],
                     null_f64(),
@@ -255,6 +254,37 @@ impl<'a> Transposer<'a> {
             .reduce(|a, b| call(add, vec![a, b]))
             .expect("at least two terms");
         if_then(vec![(none, null_f64())], total)
+    }
+
+    /// Does the row's argument (column `arg`) attain the group's extreme
+    /// (column `extreme`)? Equal to it, or, where it is finite, within a few
+    /// ulps of it: the extreme and the arguments are recomputed, and two
+    /// groups that tie in exact arithmetic can differ in the last bit (a sum
+    /// over several partitions adds in arrival order), which would give the
+    /// whole cotangent to whichever rounded higher on that run. Within the
+    /// tolerance they share it, as at an exact tie, the same way every run.
+    fn attains(&mut self, arg: usize, extreme: usize) -> Expression {
+        let equal = self.ext.anchor("equal");
+        let or = self.ext.anchor("or");
+        let and = self.ext.anchor("and");
+        let lte = self.ext.anchor("lte");
+        let abs = self.ext.anchor("abs");
+        let subtract = self.ext.anchor("subtract");
+        let multiply = self.ext.anchor("multiply");
+        let size = call(abs, vec![field(extreme)]);
+        let finite = call(lte, vec![size.clone(), lit_f64(f64::MAX)]);
+        let gap = call(abs, vec![call(subtract, vec![field(arg), field(extreme)])]);
+        let close = call(
+            lte,
+            vec![gap, call(multiply, vec![lit_f64(8.0 * f64::EPSILON), size])],
+        );
+        call(
+            or,
+            vec![
+                call(equal, vec![field(arg), field(extreme)]),
+                call(and, vec![finite, close]),
+            ],
+        )
     }
 
     /// Join `left` (whose columns before `left_width` are a region's) to
