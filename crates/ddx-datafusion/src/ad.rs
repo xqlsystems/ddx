@@ -135,6 +135,13 @@ pub fn vjp_plan(
 /// Each loss's [`grad`] program runs first, once, however many calls use it,
 /// and each call is replaced by a query over the gradient it needs before the
 /// statement is planned. A statement with no such call is planned as it is.
+/// The programs' tables are dropped once the statement is planned; the
+/// returned DataFrame keeps what it reads.
+///
+/// A loss defined in a `WITH RECURSIVE` clause is refused, so a training loop
+/// cannot yet be written as one recursive statement (design.md §5). This is
+/// ddx's own limit, separate from DataFusion 54's recursive-CTE planning bug
+/// (design.md §3.6).
 pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
     let mut frames = sql_all(ctx, &[sql]).await?;
     Ok(frames.pop().expect("one statement in, one frame out"))
@@ -177,21 +184,36 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
         }
     }
 
-    // Run each, keeping its gradients under names of their own: the next
-    // program reuses the step names.
+    // Run each. Every program's tables carry its own prefix, so the gradients
+    // are read where the program wrote them.
+    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(programs.len());
     let mut kept: Vec<(usize, Vec<String>, String, Vec<String>)> = Vec::new();
     for (p, (query, wrt)) in programs.iter().enumerate() {
         let program = grad(ctx, query, wrt).await?;
         run(ctx, &program).await?;
         for g in &program.gradients {
-            let name = format!("__ddx_grad_{p}_{}", g.table.join("_"));
-            let provider = ctx.table_provider(g.step.as_str()).await?;
-            ctx.deregister_table(name.as_str())?;
-            ctx.register_table(name.as_str(), provider)?;
-            kept.push((p, g.table.clone(), name, g.columns.clone()));
+            kept.push((p, g.table.clone(), g.step.clone(), g.columns.clone()));
         }
+        ran.push(program);
     }
+    let frames = plan_statements(ctx, statements, &found, &programs, &program_of, &kept).await;
+    // A planned DataFrame holds the tables it reads, so the programs' tables
+    // can leave the catalog now.
+    for program in &ran {
+        release(ctx, program)?;
+    }
+    frames
+}
 
+/// Plan each statement, its `grad` calls replaced by reads of `kept`.
+async fn plan_statements(
+    ctx: &SessionContext,
+    statements: &[&str],
+    found: &[Option<GradCalls>],
+    programs: &[(String, Vec<ColumnRef>)],
+    program_of: &HashMap<(usize, usize), usize>,
+    kept: &[(usize, Vec<String>, String, Vec<String>)],
+) -> Result<Vec<DataFrame>> {
     let mut frames = Vec::with_capacity(statements.len());
     for (s, sql) in statements.iter().enumerate() {
         let Some(calls) = &found[s] else {

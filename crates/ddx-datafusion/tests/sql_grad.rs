@@ -143,21 +143,31 @@ async fn statements_sharing_a_loss_share_its_program() {
         "{loss} SELECT b.i, b.val - 0.5 * g.val AS val FROM b JOIN grad(loss, b.val) g ON b.i = g.i"
     );
     let frames = ad::sql_all(&ctx, &[&update_w, &update_b]).await.unwrap();
-    // Both gradients came from one program.
-    let names: Vec<String> = ctx
+    // Both gradients came from one program: the frames read tables with one
+    // program's prefix, and the catalog keeps none of them.
+    let prefix = |plan: String| -> Vec<String> {
+        plan.split("__ddx_")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('_').map(|(id, _)| id.to_string()))
+            .collect()
+    };
+    let mut ids: Vec<String> = frames
+        .iter()
+        .flat_map(|f| prefix(f.logical_plan().display_indent().to_string()))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let left: Vec<String> = ctx
         .catalog("datafusion")
         .unwrap()
         .schema("public")
         .unwrap()
         .table_names()
         .into_iter()
-        .filter(|n| n.starts_with("__ddx_grad_"))
+        .filter(|n| n.starts_with("__ddx_"))
         .collect();
-    assert!(
-        names.iter().any(|n| n.starts_with("__ddx_grad_0_"))
-            && !names.iter().any(|n| n.starts_with("__ddx_grad_1_")),
-        "{names:?}"
-    );
+    assert!(left.is_empty(), "{left:?}");
 
     let mut got = Vec::new();
     for df in frames {
@@ -194,7 +204,7 @@ async fn case_variants_of_a_column_keep_the_dims() {
 
 #[tokio::test]
 async fn tables_whose_names_join_alike_keep_their_own_gradients() {
-    // Adversarial review (🤖😈): `sql_all` keeps each gradient as
+    // Adversarial review (🤖😈): `sql_all` kept each gradient as
     // `__ddx_grad_{p}_{parts joined by _}`, so `a_b.c` and `a.b_c` share one
     // name and both calls read the second table's gradient: 20, 20 instead
     // of 2, 20, with no error.
