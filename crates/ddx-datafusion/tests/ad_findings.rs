@@ -28,7 +28,9 @@
 //!   silently 0. Found by the soak's big mode. MIN is built the same way. A
 //!   rank filter or a top-k orders the recomputed values rather than
 //!   comparing them with saved ones, so jitter can only move it at a
-//!   near-tie.
+//!   near-tie. *Fixed in #76:* the extreme and the rows attaining it are
+//!   windows over the recomputed rows themselves, never compared with the
+//!   saved value.
 //! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
@@ -162,7 +164,6 @@ async fn an_unoptimized_case_over_integer_data_runs() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: MAX finds its row by float equality with a recomputation that is not bit-reproducible"]
 async fn max_finds_its_row_when_the_recomputed_values_jitter() {
     // The MAX rule sends the cotangent to the rows whose recomputed value
     // equals the saved maximum. The region beneath it is recomputed, a

@@ -381,8 +381,9 @@ impl Modes {
                 nulls: null_pct() > 0 && r.below(100) < 10,
                 extreme: (r.below(100) < 8).then(|| extreme(&mut r)),
                 // Drawn either way, so seeds replay alike, but only a soak
-                // uses it: a big case is slow, and the recomputation bug it
-                // finds is not deterministic, which a PR gate must be.
+                // uses it: a big case is slow, and a bug found only in many
+                // partitions need not be deterministic, which a PR gate
+                // must be.
                 big: r.below(100) < 4 && SOAKING.load(Ordering::Relaxed),
             },
         };
