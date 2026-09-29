@@ -26,12 +26,22 @@
 //!   literals stay literals, because `ddx-core` reads them (`power(x, 2)` has a
 //!   rule only because the exponent is a known constant).
 //! - **Stop-gradient.** `ddx_stop_gradient(x)` is a constant, whatever `x` is.
+//! - **Piecewise functions.** `ddx-core` has no rule for `CASE`, `greatest` or
+//!   `least`. Over a varied value each becomes a *hole*: an identifier `hn`
+//!   that `ddx-core` differentiates as if it were a column, restored verbatim
+//!   on the way back. The hole's own derivative is the derivative of the branch
+//!   the row takes, with the conditions left as they are, the same piecewise
+//!   convention `abs` pins. So `CASE WHEN x > 0 THEN x ELSE 0 END` and
+//!   `greatest(x, 0)` (ReLU) differentiate to `1` above zero and `0` at and
+//!   below it, as `jax.nn.relu` does. `greatest(a, b)` takes `a` only when
+//!   `a > b`, so at a tie its derivative is `b`'s; a NULL argument is skipped,
+//!   as the engine skips it.
 //!
 //! A column is **varied** when it depends on a column the gradient is taken
 //! with respect to. The caller says which input fields are varied; a
 //! derivative is computed only for those.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ddx_core::build::{finite_num, func};
 use ddx_core::sqlparser::ast::{
@@ -79,22 +89,146 @@ impl<'a> Elementwise<'a> {
             varied,
             placeholders: Vec::new(),
             columns: BTreeSet::new(),
+            holes: Vec::new(),
         };
         let sql = to_sql.expr(e)?;
-        let mut out = Vec::new();
-        for &i in &to_sql.columns {
-            let d = self.ddx.differentiate(&sql, &ColRef::bare(column(i)))?;
+        let restore: Vec<Expression> = to_sql.holes.iter().map(|h| h.whole().clone()).collect();
+
+        // Each hole's own partials, and e's partial with respect to the hole.
+        let mut through_holes = Vec::new();
+        let mut columns = to_sql.columns.clone();
+        for (n, hole) in to_sql.holes.iter().enumerate() {
+            let inner = self.hole_partials(hole, varied, ext)?;
+            columns.extend(inner.keys().copied());
+            let d = self
+                .ddx
+                .differentiate(&sql, &ColRef::bare(format!("h{n}")))?;
             if is_zero(&d) {
                 continue;
             }
-            let back = FromSql {
+            let outer = FromSql {
                 placeholders: &to_sql.placeholders,
+                holes: &restore,
                 ext: &mut *ext,
             }
             .expr(&d)?;
-            out.push((i, back));
+            through_holes.push((outer, inner));
+        }
+
+        let mul = ext.anchor("multiply");
+        let add = ext.anchor("add");
+        let mut out = Vec::new();
+        for i in columns {
+            let mut terms = Vec::new();
+            if to_sql.columns.contains(&i) {
+                let d = self.ddx.differentiate(&sql, &ColRef::bare(column(i)))?;
+                if !is_zero(&d) {
+                    terms.push(
+                        FromSql {
+                            placeholders: &to_sql.placeholders,
+                            holes: &restore,
+                            ext: &mut *ext,
+                        }
+                        .expr(&d)?,
+                    );
+                }
+            }
+            for (outer, inner) in &through_holes {
+                if let Some(d) = inner.get(&i) {
+                    terms.push(call(mul, vec![outer.clone(), d.clone()]));
+                }
+            }
+            if let Some(total) = terms.into_iter().reduce(|a, b| call(add, vec![a, b])) {
+                out.push((i, total));
+            }
         }
         Ok(out)
+    }
+
+    /// The partials of a piecewise hole: the derivative of the branch each row
+    /// takes (see the module docs).
+    fn hole_partials(
+        &self,
+        hole: &Hole,
+        varied: &dyn Fn(usize) -> bool,
+        ext: &mut Extensions,
+    ) -> Result<BTreeMap<usize, Expression>> {
+        let partials_of =
+            |e: &Expression, ext: &mut Extensions| -> Result<BTreeMap<usize, Expression>> {
+                Ok(self.partials(e, varied, ext)?.into_iter().collect())
+            };
+        match hole {
+            Hole::Case {
+                clauses, otherwise, ..
+            } => {
+                let branches: Vec<BTreeMap<usize, Expression>> = clauses
+                    .iter()
+                    .map(|(_, then)| partials_of(then, ext))
+                    .collect::<Result<_>>()?;
+                let other = match otherwise {
+                    Some(e) => Some(partials_of(e, ext)?),
+                    None => None,
+                };
+                let fields: BTreeSet<usize> = branches
+                    .iter()
+                    .chain(other.iter())
+                    .flat_map(|m| m.keys().copied())
+                    .collect();
+                let mut out = BTreeMap::new();
+                for f in fields {
+                    let arms = clauses
+                        .iter()
+                        .zip(&branches)
+                        .map(|((cond, _), b)| {
+                            (
+                                cond.clone(),
+                                b.get(&f).cloned().unwrap_or_else(|| lit_f64(0.0)),
+                            )
+                        })
+                        .collect();
+                    // No ELSE: the value is NULL there, and so is its derivative.
+                    let else_d = match &other {
+                        Some(o) => o.get(&f).cloned().unwrap_or_else(|| lit_f64(0.0)),
+                        None => null_f64(),
+                    };
+                    out.insert(f, if_then(arms, else_d));
+                }
+                Ok(out)
+            }
+            Hole::Extreme {
+                greatest,
+                anchor,
+                args,
+                ..
+            } => {
+                // Fold left: ext(acc, b) takes acc when acc beats b or b is NULL.
+                let beats = ext.anchor(if *greatest { "gt" } else { "lt" });
+                let is_null = ext.anchor("is_null");
+                let or = ext.anchor("or");
+                let mut acc = args[0].clone();
+                let mut acc_d = partials_of(&args[0], ext)?;
+                for b in &args[1..] {
+                    let b_d = partials_of(b, ext)?;
+                    let keep = call(
+                        or,
+                        vec![
+                            call(is_null, vec![b.clone()]),
+                            call(beats, vec![acc.clone(), b.clone()]),
+                        ],
+                    );
+                    let fields: BTreeSet<usize> = acc_d.keys().chain(b_d.keys()).copied().collect();
+                    let mut next = BTreeMap::new();
+                    for f in fields {
+                        let a = acc_d.get(&f).cloned().unwrap_or_else(|| lit_f64(0.0));
+                        let bd = b_d.get(&f).cloned().unwrap_or_else(|| lit_f64(0.0));
+                        next.insert(f, if_then(vec![(keep.clone(), a)], bd));
+                    }
+                    acc = call(*anchor, vec![acc, b.clone()]);
+                    acc_d = next;
+                }
+                Ok(acc_d)
+            }
+        }
     }
 
     /// Does `e` depend on a varied field, outside `ddx_stop_gradient`?
@@ -143,6 +277,32 @@ fn is_zero(e: &Sql) -> bool {
     }
 }
 
+/// A piecewise subexpression over a varied value, kept whole (see the module
+/// docs).
+enum Hole {
+    /// `CASE WHEN c THEN r … [ELSE o] END`.
+    Case {
+        whole: Box<Expression>,
+        clauses: Vec<(Expression, Expression)>,
+        otherwise: Option<Box<Expression>>,
+    },
+    /// `greatest(…)` or `least(…)`, declared at `anchor`.
+    Extreme {
+        whole: Box<Expression>,
+        greatest: bool,
+        anchor: u32,
+        args: Vec<Expression>,
+    },
+}
+
+impl Hole {
+    fn whole(&self) -> &Expression {
+        match self {
+            Hole::Case { whole, .. } | Hole::Extreme { whole, .. } => whole,
+        }
+    }
+}
+
 /// Substrait → `sqlparser`.
 struct ToSql<'a> {
     functions: &'a Functions,
@@ -151,6 +311,8 @@ struct ToSql<'a> {
     placeholders: Vec<Expression>,
     /// The varied fields the translation references.
     columns: BTreeSet<usize>,
+    /// Piecewise subexpressions, by hole number.
+    holes: Vec<Hole>,
 }
 
 impl ToSql<'_> {
@@ -177,6 +339,22 @@ impl ToSql<'_> {
             RexType::ScalarFunction(f) => {
                 let name = self.functions.name(f.function_reference)?.to_string();
                 let args = scalar_args(f)?;
+                if matches!(name.as_str(), "greatest" | "least") && args.len() >= 2 {
+                    self.holes.push(Hole::Extreme {
+                        whole: Box::new(e.clone()),
+                        greatest: name == "greatest",
+                        anchor: f.function_reference,
+                        args: args.into_iter().cloned().collect(),
+                    });
+                    return Ok(ident(format!("h{}", self.holes.len() - 1)));
+                }
+                if matches!(name.as_str(), "modulus" | "mod") {
+                    return Err(AdError::NotImplemented(
+                        "`%` (modulus) of a value that carries gradient; if no gradient should \
+                         flow through it, wrap it in ddx_stop_gradient(...)"
+                            .into(),
+                    ));
+                }
                 let mut sql = args
                     .into_iter()
                     .map(|a| self.expr(a))
@@ -206,6 +384,25 @@ impl ToSql<'_> {
                     )));
                 }
                 Ok(func(&name, sql))
+            }
+            RexType::IfThen(it) => {
+                let mut clauses = Vec::with_capacity(it.ifs.len());
+                for c in &it.ifs {
+                    match (&c.r#if, &c.then) {
+                        (Some(cond), Some(then)) => clauses.push((cond.clone(), then.clone())),
+                        _ => {
+                            return Err(AdError::InvalidPlan(
+                                "a CASE clause with no condition or result".into(),
+                            ))
+                        }
+                    }
+                }
+                self.holes.push(Hole::Case {
+                    whole: Box::new(e.clone()),
+                    clauses,
+                    otherwise: it.r#else.clone(),
+                });
+                Ok(ident(format!("h{}", self.holes.len() - 1)))
             }
             RexType::Cast(c) => {
                 let input = c
@@ -344,6 +541,7 @@ fn substrait_type(t: &DataType) -> Result<Type> {
 /// `sqlparser` → Substrait, for the derivatives `ddx-core` returns.
 struct FromSql<'a> {
     placeholders: &'a [Expression],
+    holes: &'a [Expression],
     ext: &'a mut Extensions,
 }
 
@@ -445,6 +643,11 @@ impl FromSql<'_> {
         if let Some(i) = parse('c') {
             return Ok(field(i));
         }
+        if let Some(n) = parse('h') {
+            if let Some(h) = self.holes.get(n) {
+                return Ok(h.clone());
+            }
+        }
         if let Some(n) = parse('k') {
             if let Some(p) = self.placeholders.get(n) {
                 return Ok(p.clone());
@@ -470,7 +673,7 @@ mod tests {
         anchors: HashMap<&'static str, u32>,
     }
 
-    const NAMES: [&str; 15] = [
+    const NAMES: &[&str] = &[
         "add",
         "subtract",
         "multiply",
@@ -486,6 +689,10 @@ mod tests {
         "cos",
         "sin",
         "abs",
+        "greatest",
+        "least",
+        "lt",
+        "modulus",
     ];
 
     fn fixture() -> Fixture {
@@ -540,6 +747,18 @@ mod tests {
                     "cos" => a[0].cos(),
                     "abs" => a[0].abs(),
                     "gt" => (a[0] > a[1]) as u8 as f64,
+                    "greatest" => a
+                        .iter()
+                        .copied()
+                        .filter(|v| !v.is_nan())
+                        .fold(f64::NAN, f64::max),
+                    "least" => a
+                        .iter()
+                        .copied()
+                        .filter(|v| !v.is_nan())
+                        .fold(f64::NAN, f64::min),
+                    "is_null" => a[0].is_nan() as u8 as f64,
+                    "or" => (a[0] != 0.0 || a[1] != 0.0) as u8 as f64,
                     "lt" => (a[0] < a[1]) as u8 as f64,
                     "equal" => (a[0] == a[1]) as u8 as f64,
                     "ddx_stop_gradient" => a[0],
@@ -700,6 +919,84 @@ mod tests {
         // Over a constant it is a placeholder, and fine.
         let e = fx.f("multiply", vec![field(0), cast(field(1), bigint)]);
         assert_eq!(ew.partials(&e, &|i| i == 0, &mut ext).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relu_as_a_case_differentiates_by_the_branch_taken() {
+        let fx = fixture();
+        // (CASE WHEN c0 > 0 THEN c0 ELSE 0 END) * c1
+        let relu = if_then(
+            vec![(fx.f("gt", vec![field(0), lit_f64(0.0)]), field(0))],
+            lit_f64(0.0),
+        );
+        let e = fx.f("multiply", vec![relu, field(1)]);
+        check(&fx, &e, &[0, 1], &[0.7, 1.5], &[0, 1]);
+        check(&fx, &e, &[0, 1], &[-0.4, 1.5], &[0, 1]);
+    }
+
+    #[test]
+    fn relu_as_greatest_and_its_kink() {
+        let fx = fixture();
+        let e = fx.f("greatest", vec![field(0), lit_f64(0.0)]);
+        check(&fx, &e, &[0], &[0.7], &[0]);
+        check(&fx, &e, &[0], &[-0.7], &[0]);
+        // At the tie the derivative is the second argument's: 0, as
+        // jax.nn.relu'(0) is.
+        let ddx = Ddx::new();
+        let mut ext = Extensions::new(&fx.functions);
+        let p = Elementwise::new(&ddx, &fx.functions)
+            .partials(&e, &|_| true, &mut ext)
+            .unwrap();
+        assert_eq!(eval(&p[0].1, &[0.0], &names_of(&ext)), 0.0);
+    }
+
+    #[test]
+    fn a_three_way_least() {
+        let fx = fixture();
+        let e = fx.f("least", vec![field(0), field(1), lit_f64(2.0)]);
+        check(&fx, &e, &[0, 1], &[0.5, 1.5], &[0, 1]);
+        check(&fx, &e, &[0, 1], &[3.5, 1.5], &[0, 1]);
+        check(&fx, &e, &[0, 1], &[3.5, 4.5], &[0, 1]);
+    }
+
+    #[test]
+    fn a_case_with_no_else_has_a_null_derivative_where_its_value_is_null() {
+        let fx = fixture();
+        let e = if_then(
+            vec![(
+                fx.f("gt", vec![field(0), lit_f64(0.0)]),
+                fx.f("sin", vec![field(0)]),
+            )],
+            // placeholder, replaced below
+            lit_f64(0.0),
+        );
+        let Some(RexType::IfThen(mut it)) = e.rex_type else {
+            unreachable!()
+        };
+        it.r#else = None;
+        let e = Expression {
+            rex_type: Some(RexType::IfThen(it)),
+        };
+        let ddx = Ddx::new();
+        let mut ext = Extensions::new(&fx.functions);
+        let p = Elementwise::new(&ddx, &fx.functions)
+            .partials(&e, &|_| true, &mut ext)
+            .unwrap();
+        let names = names_of(&ext);
+        assert!((eval(&p[0].1, &[0.5], &names) - 0.5f64.cos()).abs() < 1e-12);
+        assert!(eval(&p[0].1, &[-0.5], &names).is_nan());
+    }
+
+    #[test]
+    fn a_modulus_is_refused_by_its_sql_name() {
+        let fx = fixture();
+        let e = fx.f("modulus", vec![field(0), lit_f64(3.0)]);
+        let ddx = Ddx::new();
+        let mut ext = Extensions::new(&fx.functions);
+        let err = Elementwise::new(&ddx, &fx.functions)
+            .partials(&e, &|_| true, &mut ext)
+            .unwrap_err();
+        assert!(err.to_string().contains("`%`"), "{err}");
     }
 
     #[test]
