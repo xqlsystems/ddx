@@ -156,14 +156,6 @@ impl KeyType {
     }
 }
 
-/// `DDX_V2_SKIP_KNOWN`: keep the soak off the variants that meet a known,
-/// pinned bug every time (big mode, a quoted name with capitals), for a run
-/// that must start clean, such as mutation testing's.
-#[allow(dead_code)]
-fn skip_known() -> bool {
-    std::env::var("DDX_V2_SKIP_KNOWN").is_ok()
-}
-
 /// Set by the soak, which alone runs `big` mode (see [`Modes::draw`]).
 static SOAKING: AtomicBool = AtomicBool::new(false);
 

@@ -46,19 +46,23 @@ MUTANTS = [
      "Rule::Mean => cot,",
      "AVG's transpose forgets to divide by the count"),
     ("mean-over-sum", f"{AD}/transpose.rs",
-     "Rule::Mean => measures.push((count, vec![field(arg_col)])),",
-     "Rule::Mean => measures.push((sum, vec![field(arg_col)])),",
+     "windows.push(window(count, vec![field(arg_col)], keys.clone()));",
+     "windows.push(window(sum, vec![field(arg_col)], keys.clone()));",
      "AVG divides by the sum of its argument, not the count"),
     ("tie-unshared", f"{AD}/transpose.rs",
-     "call(equal, vec![field(arg_col), field(tape_at + col)]),\n"
+     "call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),\n"
      "                        call(divide, vec![cot, field(stat_at[&arg_col])]),",
-     "call(equal, vec![field(arg_col), field(tape_at + col)]),\n"
+     "call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),\n"
      "                        cot,",
      "MAX/MIN give every tied row the whole cotangent (wrong only at ties)"),
     ("extreme-everyone", f"{AD}/transpose.rs",
-     "                    )],\n                    lit_f64(0.0),\n                ),\n            };",
+     "                    )],\n                    null_f64(),\n                ),\n            };",
      "                    )],\n                    field(cotangent_at + i),\n                ),\n            };",
      "MAX/MIN send the cotangent to rows that do not attain the extreme too"),
+    ("null-skip-leaks", f"{AD}/transpose.rs",
+     "vec![(call(is_null, vec![field(arg_col)]), null_f64())],",
+     "vec![(call(is_null, vec![lit_f64(0.0)]), null_f64())],",
+     "a row an aggregate skips as NULL still sends gradient to its other inputs"),
     ("partial-is-one", f"{AD}/transpose.rs",
      "if as_number(&d) == Some(1.0) {",
      "if as_number(&d).is_some() {",
@@ -68,12 +72,12 @@ MUTANTS = [
      "let mut aligned: Vec<Rel> = contribs\n        .into_iter()\n        .take(1)",
      "fan-in keeps only the first contribution to an input"),
     ("unreached-one", f"{AD}/program.rs",
-     "None => lit_f64(0.0),",
-     "None => lit_f64(1.0),",
+     "None => if_then(vec![null_value], lit_f64(0.0)),",
+     "None => if_then(vec![null_value], lit_f64(1.0)),",
      "a row no gradient reached gets 1, not 0"),
     ("null-row-zero", f"{AD}/program.rs",
-     "vec![(call(is_null, vec![field(k + n)]), null_f64())],",
-     "vec![(call(is_null, vec![field(k + n)]), lit_f64(0.0))],",
+     "let null_value = (call(is_null, vec![field(k + n)]), null_f64());",
+     "let null_value = (call(is_null, vec![field(k + n)]), lit_f64(0.0));",
      "a NULL value's gradient is 0, not NULL"),
     ("stop-gradient-ignored", f"{AD}/elementwise.rs",
      "        if functions.is_stop_gradient(f.function_reference)? {\n            return Ok(false);",
@@ -105,12 +109,11 @@ MUTANTS = [
 
 
 def run(budget, base, log, skip=None, stop=True):
-    # A clean baseline: none of the variants a known, pinned bug always
-    # fails (see ad_findings.rs), and the seeds that fail unmutated skipped,
-    # so a kill is the mutant's doing.
+    # A clean baseline: the seeds that fail unmutated are skipped, so a kill
+    # is the mutant's doing.
     env = dict(os.environ,
                DDX_SOAK_SECS=str(budget), DDX_SOAK_BASE=str(base),
-               DDX_SOAK_LOG=log, DDX_V2_SKIP_KNOWN="1")
+               DDX_SOAK_LOG=log)
     if stop:
         env["DDX_SOAK_STOP_ON_FAIL"] = "1"
     if skip:
