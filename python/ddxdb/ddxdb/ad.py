@@ -28,6 +28,12 @@ output. Nothing in the query is labelled for any of this; the one function ddx
 gives a meaning to is ``ddx_stop_gradient(x)``, JAX's ``lax.stop_gradient``
 (:func:`register_stop_gradient`).
 
+Every table a program writes is named with a prefix unique to that program,
+``__ddx_{id}_``, so two programs on one context never read each other's tables,
+and a user's table is never replaced unless its name starts with ``__ddx_``,
+which is reserved. After :func:`run`, only the value and the gradients remain on
+the context; :func:`release` drops those too.
+
 Importing this module requires DataFusion.
 """
 
@@ -44,6 +50,7 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.ad needs DataFusion: pip install 'ddxdb[datafusion]'") from e
 
 from ._ddxdb import (
+    InvalidColumn,
     _bind_reads,
     _find_grad_calls,
     _grad,
@@ -53,15 +60,16 @@ from ._ddxdb import (
 )
 
 __all__ = [
-    "COTANGENT",
     "STOP_GRADIENT",
-    "VALUE",
     "BackwardProgram",
+    "Check",
     "Gradient",
     "Step",
     "grad",
     "register_stop_gradient",
+    "release",
     "run",
+    "run_checks",
     "run_step",
     "sql",
     "sql_all",
@@ -70,10 +78,6 @@ __all__ = [
 
 #: The SQL name of the stop-gradient function.
 STOP_GRADIENT = "ddx_stop_gradient"
-#: The step holding a program's value: the query's own result.
-VALUE = "__ddx_value"
-#: The table a vjp program reads the output's cotangent from.
-COTANGENT = "__ddx_cotangent"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,11 +89,20 @@ class Step:
 
 
 @dataclasses.dataclass(frozen=True)
+class Check:
+    """A plan that must return no rows, and what a row means."""
+
+    plan: bytes  # a serialized Substrait plan
+    message: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Gradient:
     """Where a ``wrt`` table's gradient lands.
 
     ``columns`` are the table's dims, then its ``wrt`` values, named as in the
-    table; each value column holds the gradient, and ``0`` where none reached.
+    table; each value column holds the gradient: ``0`` where none reached, and
+    ``NULL`` where the value itself is ``NULL``.
     """
 
     table: str
@@ -103,7 +116,9 @@ class BackwardProgram:
 
     forward_steps: tuple[Step, ...]
     value: str  # the step holding the query's own result
-    cotangent: tuple[str, ...]  # vjp: the columns of the COTANGENT table it reads
+    cotangent_table: str  # vjp: the table the caller registers the cotangent as
+    cotangent: tuple[str, ...]  # vjp: that table's columns
+    checks: tuple[Check, ...]  # run before the steps; each must return no rows
     backward_steps: tuple[Step, ...]
     gradients: tuple[Gradient, ...]
 
@@ -112,23 +127,35 @@ class BackwardProgram:
         yield from self.forward_steps
         yield from self.backward_steps
 
+    def intermediate_steps(self) -> Iterator[Step]:
+        """The steps only other steps read: the saved aggregates and the
+        cotangents. :func:`run` drops them once the gradients are written."""
+        keep = {self.value, *(g.step for g in self.gradients)}
+        return (s for s in self.steps() if s.name not in keep)
+
 
 def register_stop_gradient(ctx: SessionContext) -> None:
     """Register ``ddx_stop_gradient`` on ``ctx`` as the identity on DOUBLE.
 
-    DataFusion keeps one UDF per name, so it takes one type; an argument of
-    another numeric type is cast to DOUBLE inside the call. That is harmless:
-    ddx treats the argument as a constant whatever it contains.
+    DataFusion keeps one UDF per name, and a Python UDF takes exact types, so
+    this one takes DOUBLE: an argument of another numeric type is cast to
+    DOUBLE, and so is the result. The gradient is unaffected, since ddx treats
+    the argument as a constant whatever it contains, but the type is not:
+    ``val - ddx_stop_gradient(val)`` on a ``REAL`` column is ``DOUBLE`` here,
+    where the Rust UDF (``ddx_datafusion::stop_gradient_udf``), which accepts
+    any type, keeps it ``REAL``. Cast back if the type matters.
     """
     ctx.register_udf(udf(lambda x: x, [pa.float64()], pa.float64(), "immutable", name=STOP_GRADIENT))
 
 
 def _program(raw) -> BackwardProgram:
-    forward, value, cotangent, backward, gradients = raw
+    forward, value, cotangent_table, cotangent, checks, backward, gradients = raw
     return BackwardProgram(
         forward_steps=tuple(Step(n, p) for n, p in forward),
         value=value,
+        cotangent_table=cotangent_table,
         cotangent=tuple(cotangent),
+        checks=tuple(Check(p, m) for p, m in checks),
         backward_steps=tuple(Step(n, p) for n, p in backward),
         gradients=tuple(Gradient(t, s, tuple(c)) for t, s, c in gradients),
     )
@@ -148,24 +175,54 @@ def grad(ctx: SessionContext, sql: str, wrt: Sequence[tuple[str, str]]) -> Backw
 
 def vjp(ctx: SessionContext, sql: str, wrt: Sequence[tuple[str, str]]) -> BackwardProgram:
     """The vector-Jacobian product of the query ``sql``. Before running the
-    backward steps, register the cotangent as the table :data:`COTANGENT`, with
-    the columns ``program.cotangent`` lists."""
+    backward steps, register the cotangent as the table
+    ``program.cotangent_table`` names, with the columns ``program.cotangent``
+    lists."""
     return _program(_vjp(Serde.serialize_bytes(sql, ctx), [tuple(w) for w in wrt]))
 
 
 def run(ctx: SessionContext, program: BackwardProgram) -> None:
-    """Run every step of ``program``, registering each result on ``ctx``.
+    """Run ``program``: its checks, then every step, registering each result on
+    ``ctx``. Once the gradients are written, the intermediate tables are
+    dropped; the value and the gradients stay until :func:`release` or the next
+    run replaces them.
+
+    Raises :class:`ddxdb.InvalidColumn` when a check fails: a ``wrt`` table's
+    rows are not what the program assumed, for instance two share their dims.
 
     A program depends on the tables' names and schemas, not their values, so
-    build it once and run it on every training step.
+    build it once and run it on every training step. One program's runs must
+    not overlap, since they write the same tables.
     """
+    run_checks(ctx, program)
+    try:
+        for step in program.steps():
+            run_step(ctx, step)
+    finally:
+        for step in program.intermediate_steps():
+            ctx.deregister_table(step.name)
+
+
+def run_checks(ctx: SessionContext, program: BackwardProgram) -> None:
+    """Run ``program``'s checks, raising :class:`ddxdb.InvalidColumn` on the
+    first that returns a row."""
+    for check in program.checks:
+        logical = Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(check.plan))
+        if ctx.create_dataframe_from_logical_plan(logical).limit(1).count() > 0:
+            raise InvalidColumn(f"invalid wrt column: {check.message}")
+
+
+def release(ctx: SessionContext, program: BackwardProgram) -> None:
+    """Drop every table ``program`` registered on ``ctx``, the value and the
+    gradients included."""
     for step in program.steps():
-        run_step(ctx, step)
+        ctx.deregister_table(step.name)
 
 
 def run_step(ctx: SessionContext, step: Step) -> None:
     """Run one step and register its result as a table, replacing any table of
-    that name. Every step it reads must already be registered."""
+    that name. Every step it reads must already be registered. Unlike
+    :func:`run`, this neither runs the checks nor drops anything."""
     # A step's reads of earlier steps name their columns but not their types;
     # the types come from the tables themselves, as the engine states them.
     schemas = {
@@ -204,7 +261,9 @@ def sql(ctx: SessionContext, statement: str):
     shaped like ``table``. Returns a DataFrame.
 
     Each loss's program runs first, once, however many calls use it. A
-    statement with no such call is planned as it is.
+    statement with no such call is planned as it is. The programs' tables are
+    dropped once the statement is planned; the DataFrame keeps what it reads.
+    A loss defined in a ``WITH RECURSIVE`` clause is refused.
     """
     return sql_all(ctx, [statement])[0]
 
@@ -236,17 +295,27 @@ def sql_all(ctx: SessionContext, statements: Sequence[str]) -> list:
                     wrts[p].append((t, c))
             program_of[(s, l)] = p
 
-    # Run each, keeping its gradients under names of their own: the next
-    # program reuses the step names.
+    # Run each. Every program's tables carry its own prefix, so the gradients
+    # are read where the program wrote them.
+    ran: list[BackwardProgram] = []
     kept: dict[tuple[int, str], tuple[str, tuple[str, ...]]] = {}
-    for p, (query, wrt) in enumerate(zip(queries, wrts)):
-        program = grad(ctx, query, wrt)
-        run(ctx, program)
-        for g in program.gradients:
-            name = f"__ddx_grad_{p}_{g.table.replace('.', '_')}"
-            _register(ctx, name, ctx.table(g.step).to_arrow_table())
-            kept[(p, g.table)] = (name, g.columns)
+    try:
+        for p, (query, wrt) in enumerate(zip(queries, wrts)):
+            program = grad(ctx, query, wrt)
+            ran.append(program)
+            run(ctx, program)
+            for g in program.gradients:
+                kept[(p, g.table)] = (g.step, g.columns)
+        return _plan_statements(ctx, statements, found, wrts, program_of, kept)
+    finally:
+        # A planned DataFrame holds the tables it reads, so the programs'
+        # tables can leave the catalog now.
+        for program in ran:
+            release(ctx, program)
 
+
+def _plan_statements(ctx, statements, found, wrts, program_of, kept) -> list:
+    """Plan each statement, its ``grad`` calls replaced by reads of ``kept``."""
     frames = []
     for s, statement in enumerate(statements):
         if found[s] is None:

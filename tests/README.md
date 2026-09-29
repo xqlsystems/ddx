@@ -95,7 +95,8 @@ traces to `log(x)/log(2)`, so no generated expression will ever render SQL's
 - **`test_v2_jax.py`** — query-level AD: the MLP, attention and max-pool
   fixtures of `docs/spikes/`, built with the spikes' seeds, each written as a
   plain SQL loss, with `grad(loss, table.val)` taken in SQL on DataFusion. Every
-  gradient entry must match `jax.grad` to 1e-12, `MAX` at a tie included.
+  gradient entry must match `jax.grad` to 1e-12, `MAX` at a tie included. So
+  must the gradients of the M4 example's network (nn.py's SQL, verbatim).
 
 ## Why points get skipped, and why the rate is asserted
 

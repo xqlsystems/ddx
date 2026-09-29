@@ -79,6 +79,12 @@ create_exception!(
     DdxError,
     "A wrt column names a table or column the query does not read."
 );
+create_exception!(
+    ddxdb._ddxdb,
+    InvalidColumn,
+    DdxError,
+    "A wrt column cannot be differentiated: it is not a float, its table has no dims, or two of its rows share their dims."
+);
 
 /// Map a [`DiffError`] onto a Python exception, one class per variant.
 ///
@@ -108,6 +114,7 @@ fn ad_to_py_err(e: AdError) -> PyErr {
         AdError::NotImplemented(_) => UnsupportedExpression::new_err(msg),
         AdError::NotScalar(_) => NotScalar::new_err(msg),
         AdError::UnknownWrt(_) => UnknownColumn::new_err(msg),
+        AdError::InvalidWrt(_) => InvalidColumn::new_err(msg),
         AdError::Diff(inner) => to_py_err(inner),
         AdError::InvalidPlan(_) | AdError::Internal(_) => DdxError::new_err(msg),
     }
@@ -263,13 +270,16 @@ fn bytes<'py>(py: Python<'py>, plan: &Plan) -> Bound<'py, PyBytes> {
 /// A step as `(name, plan bytes)`.
 type PyStep<'py> = (String, Bound<'py, PyBytes>);
 
-/// A program as `(forward_steps, value, cotangent, backward_steps, gradients)`:
-/// a step is `(name, plan bytes)`, `cotangent` the columns a vjp program's
-/// cotangent table needs, and a gradient `(table, step, columns)`.
+/// A program as `(forward_steps, value, cotangent_table, cotangent, checks,
+/// backward_steps, gradients)`: a step is `(name, plan bytes)`, `cotangent`
+/// the columns a vjp program's cotangent table needs, a check
+/// `(plan bytes, message)`, and a gradient `(table, step, columns)`.
 type PyProgram<'py> = (
     Vec<PyStep<'py>>,
     String,
+    String,
     Vec<String>,
+    Vec<(Bound<'py, PyBytes>, String)>,
     Vec<PyStep<'py>>,
     Vec<(String, String, Vec<String>)>,
 );
@@ -289,7 +299,13 @@ fn to_py_program<'py>(py: Python<'py>, program: ddx_ad::BackwardProgram) -> PyPr
     (
         steps(&program.forward_steps),
         program.value.clone(),
+        program.cotangent_table.clone(),
         program.cotangent.clone(),
+        program
+            .checks
+            .iter()
+            .map(|c| (bytes(py, &c.plan), c.message.clone()))
+            .collect(),
         steps(&program.backward_steps),
         gradients,
     )
@@ -376,7 +392,7 @@ fn _rewrite_grad_calls(sql: &str, relations: Vec<String>) -> PyResult<String> {
 /// depends on.
 #[pyfunction]
 fn _unbound_reads(plan: &[u8]) -> PyResult<Vec<String>> {
-    Ok(ddx_ad::emit::unbound_reads(&decode(plan)?))
+    Ok(ddx_ad::unbound_reads(&decode(plan)?))
 }
 
 /// Bind a step's reads. `schemas` maps each table it reads to the serialized
@@ -396,7 +412,7 @@ fn _bind_reads<'py>(
         })?;
         structs.insert(name, s);
     }
-    ddx_ad::emit::bind_reads(&mut plan, &mut |n| structs.get(n).cloned()).map_err(ad_to_py_err)?;
+    ddx_ad::bind_reads(&mut plan, &mut |n| structs.get(n).cloned()).map_err(ad_to_py_err)?;
     Ok(bytes(py, &plan))
 }
 
@@ -443,5 +459,6 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SqlParseError", m.py().get_type::<SqlParseError>())?;
     m.add("NotScalar", m.py().get_type::<NotScalar>())?;
     m.add("UnknownColumn", m.py().get_type::<UnknownColumn>())?;
+    m.add("InvalidColumn", m.py().get_type::<InvalidColumn>())?;
     Ok(())
 }

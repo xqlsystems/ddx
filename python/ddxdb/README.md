@@ -134,8 +134,8 @@ except ddxdb.AmbiguousColumn:
 
 All of them derive from `ddxdb.DdxError`. The full set is
 `UnsupportedExpression`, `InvalidMarker`, `AmbiguousColumn`,
-`ProjectionBoundary` and `SqlParseError`, plus `NotScalar` and
-`UnknownColumn` from whole-query `grad`.
+`ProjectionBoundary` and `SqlParseError`, plus `NotScalar`,
+`UnknownColumn` and `InvalidColumn` from whole-query `grad`.
 
 ## Gradients of whole queries: `grad(loss, table.column)`
 
@@ -167,8 +167,10 @@ to is `ddx_stop_gradient(x)`, JAX's `lax.stop_gradient`. On a plain
 `SessionContext`, `ddxdb.ad.sql(ctx, statement)` does the same, and
 `ddxdb.ad.sql_all` runs several statements that take `grad` of one loss for
 the price of one backward pass. `ddxdb.ad.grad` and `ddxdb.ad.vjp` give the
-underlying program. A query that is not a loss raises `NotScalar`, and a
-column the loss does not read raises `UnknownColumn`. This needs DataFusion.
+underlying program. A query that is not a loss raises `NotScalar`, a column
+the loss does not read raises `UnknownColumn`, and a column that cannot be
+differentiated (not a float, or in a table whose rows do not have unique
+dims) raises `InvalidColumn`. This needs DataFusion.
 
 ## One thing to know
 

@@ -111,7 +111,7 @@ def test_grad_as_a_program_can_be_rerun_after_the_table_changes(ad, ctx):
 def test_vjp_pulls_a_cotangent_back(ad, ctx):
     program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
     assert program.cotangent == ("i", "s")
-    ctx.register_record_batches(ad.COTANGENT, [pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 10.0, 100.0]}).to_batches()])
+    ctx.register_record_batches(program.cotangent_table, [pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 10.0, 100.0]}).to_batches()])
     ad.run(ctx, program)
     assert pairs(ctx.table(program.gradients[0].step)) == [(0, 2.0), (1, -40.0), (2, 100.0)]
 
@@ -123,5 +123,64 @@ def test_refusals_are_typed(ad, ctx):
         ad.grad(ctx, "SELECT SUM(val) AS loss FROM w", [("weights", "val")])
     with pytest.raises(ddxdb.UnsupportedExpression):
         ad.grad(ctx, "SELECT STDDEV(val) AS loss FROM w", [("w", "val")])
+    with pytest.raises(ddxdb.InvalidColumn, match="float"):
+        ad.grad(ctx, "SELECT SUM(i) AS loss FROM w", [("w", "i")])
     assert issubclass(ddxdb.NotScalar, ddxdb.DdxError)
     assert issubclass(ddxdb.UnknownColumn, ddxdb.DdxError)
+    assert issubclass(ddxdb.InvalidColumn, ddxdb.DdxError)
+
+
+def test_run_refuses_rows_that_share_their_dims(ad, ctx):
+    ctx.register_record_batches("d", [table([0, 0, 1], [1.0, 2.0, 3.0]).to_batches()])
+    program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM d", [("d", "val")])
+    with pytest.raises(ddxdb.InvalidColumn, match="share their dims"):
+        ad.run(ctx, program)
+
+
+def ddx_tables(ctx):
+    return sorted(n for n in ctx.catalog().schema().names() if n.startswith("__ddx_"))
+
+
+def test_run_keeps_the_value_and_gradients_and_release_drops_them(ad, ctx):
+    program = ad.grad(ctx, "SELECT MAX(val) * SUM(val) AS loss FROM w", [("w", "val")])
+    assert list(program.intermediate_steps())
+    ad.run(ctx, program)
+    assert ddx_tables(ctx) == sorted([program.value, program.gradients[0].step])
+    ad.release(ctx, program)
+    assert ddx_tables(ctx) == []
+
+
+def test_programs_do_not_share_tables(ad, ctx):
+    a = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
+    b = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM b", [("b", "val")])
+    assert not {s.name for s in a.steps()} & {s.name for s in b.steps()}
+    ad.run(ctx, a)
+    ad.run(ctx, b)
+    assert pairs(ctx.table(a.gradients[0].step)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_sql_leaves_no_tables_behind(ad, ctx):
+    df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)")
+    assert ddx_tables(ctx) == []
+    assert pairs(df) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_tables_whose_names_join_alike_keep_their_own_gradients(ad):
+    import datafusion
+
+    ctx = datafusion.SessionContext()
+    for statement in [
+        "CREATE SCHEMA a_b",
+        "CREATE SCHEMA a",
+        "CREATE TABLE a_b.c (i BIGINT, val DOUBLE) AS VALUES (0, 1.0)",
+        "CREATE TABLE a.b_c (i BIGINT, val DOUBLE) AS VALUES (0, 10.0)",
+    ]:
+        ctx.sql(statement).collect()
+    df = ad.sql(
+        ctx,
+        """WITH loss AS (SELECT SUM(p.val * p.val) + SUM(q.val * q.val) AS l
+                         FROM a_b.c p CROSS JOIN a.b_c q)
+           SELECT g1.i, g1.val * 1000.0 + g2.val AS v
+           FROM grad(loss, a_b.c.val) g1 CROSS JOIN grad(loss, a.b_c.val) g2""",
+    )
+    assert pairs(df) == [(0, 2020.0)]

@@ -35,6 +35,7 @@ from importlib import metadata as _metadata
 from ._ddxdb import (  # noqa: F401  (re-exported)
     AmbiguousColumn,
     DdxError,
+    InvalidColumn,
     InvalidMarker,
     ProjectionBoundary,
     NotScalar,
@@ -70,6 +71,7 @@ __all__ = [
     "SqlParseError",
     "NotScalar",
     "UnknownColumn",
+    "InvalidColumn",
     "__version__",
 ]
 
