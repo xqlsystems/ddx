@@ -89,9 +89,16 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_core::test_utils::{gen_expr, seeded, Failures, Rng};
 use ddx_datafusion::ad::{self, AdError, BackwardProgram, ColumnRef};
+
+#[path = "ad_simulation/mutate.rs"]
+mod mutate;
 
 // ---------------------------------------------------------------------------
 // Tables.
@@ -1179,6 +1186,29 @@ fn short(m: &str) -> String {
     m.split_whitespace().take(7).collect::<Vec<_>>().join(" ")
 }
 
+/// Did a step fail in DataFusion's *physical* planning, after its logical
+/// plan was accepted and typed? Such a failure is an engine bug that ddx's
+/// shape reaches, not a ddx bug: the optimizer variants find them in rule sets
+/// DataFusion does not ship (it cannot execute a query's own COALESCE unless
+/// SimplifyExpressions has rewritten it, and its ProjectionPushdown and
+/// sanity check reject some plans it planned itself). ddx's own steps no
+/// longer use COALESCE (#74). They are tallied by kind so a soak still shows
+/// them.
+fn engine_fault(msg: &str) -> Option<String> {
+    const PHYSICAL: &[&str] = &[
+        "should have been simplified",
+        "SanityCheckPlan",
+        "ProjectionPushdown",
+        "EnforceDistribution",
+        "EnforceSorting",
+        "LimitPushdown",
+    ];
+    PHYSICAL
+        .iter()
+        .find(|p| msg.contains(**p))
+        .map(|p| p.to_string())
+}
+
 /// Build and run `grad` of `sql`, and read every gradient.
 async fn grad_of(
     ctx: &SessionContext,
@@ -1469,6 +1499,11 @@ struct Outcome {
     fd_screened: u32,
     meta_compared: u32,
     kinds: BTreeSet<&'static str>,
+    /// Failures DataFusion's physical planning is responsible for (see
+    /// [`engine_fault`]): tallied, not failed.
+    engine: Vec<String>,
+    /// The plan rewrites that were compared, for coverage.
+    rewrites: Vec<String>,
 }
 
 impl Outcome {
@@ -1486,6 +1521,7 @@ struct Props {
     invariance: bool,
     contract: bool,
     surface: bool,
+    shapes: bool,
 }
 
 const ALL: Props = Props {
@@ -1495,6 +1531,7 @@ const ALL: Props = Props {
     invariance: true,
     contract: true,
     surface: true,
+    shapes: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -1749,6 +1786,190 @@ async fn check_case_inner(
 
     if props.surface {
         surface_checks(rng, case, &grads, out).await?;
+    }
+
+    if props.shapes {
+        optimizer_checks(rng, case, &grads, out).await?;
+        mutation_checks(rng, case, &ctx, &sql, l0, &grads, out).await?;
+    }
+    Ok(())
+}
+
+/// A context with the given optimizer rules, in the given order.
+fn ctx_with_rules(rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>) -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_config(SessionConfig::new().with_target_partitions(4))
+        .with_default_features()
+        .with_optimizer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ddx_datafusion::register_stop_gradient(&ctx);
+    ctx
+}
+
+/// The optimizer decides the plan ddx reads, and nothing about the gradient
+/// may depend on which rules it ran or in what order. Each variant must give
+/// the base gradient or refuse; the loss must first mean the same thing
+/// there, or the variant is skipped.
+async fn optimizer_checks(
+    rng: &mut Rng,
+    case: &Case,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let sql = case.loss_sql();
+    let wrt = case.wrt_refs();
+    let defaults = Optimizer::new().rules;
+    let mut variants: Vec<(String, Vec<Arc<dyn OptimizerRule + Send + Sync>>)> = Vec::new();
+    for _ in 0..2 {
+        let k = rng.below(defaults.len() as u64) as usize;
+        let mut rules = defaults.clone();
+        let gone = rules.remove(k);
+        variants.push((format!("without {}", gone.name()), rules));
+    }
+    let kept: Vec<_> = defaults
+        .iter()
+        .filter(|_| rng.below(10) >= 3)
+        .cloned()
+        .collect();
+    variants.push((
+        format!(
+            "only {:?}",
+            kept.iter()
+                .map(|r| r.name().to_string())
+                .collect::<Vec<_>>()
+        ),
+        kept,
+    ));
+    let mut shuffled = defaults.clone();
+    shuffle(rng, &mut shuffled);
+    variants.push(("rules shuffled".into(), shuffled));
+    variants.push(("no optimizer rules".into(), vec![]));
+
+    for (label, rules) in variants {
+        let fuses_limits = rules.iter().any(|r| r.name() == "push_down_limit");
+        let ctx = ctx_with_rules(rules);
+        for t in &case.tables {
+            t.register(&ctx).map_err(|e| e.to_string())?;
+        }
+        // The loss itself must plan and agree, or this variant says nothing.
+        let base = setup(case, 4).await?;
+        let (Ok(Some(want)), Ok(Some(got))) = (loss(&base, &sql).await, loss(&ctx, &sql).await)
+        else {
+            continue;
+        };
+        if (want - got).abs() > 1e-9 * want.abs().max(1.0) {
+            continue;
+        }
+        // DataFusion 54 drops a sort beneath a limit whose projection
+        // removes the sort key, when the limit sits under a join and
+        // push_down_limit did not fuse them (see ad_findings.rs, upstream).
+        // Its wrong rows are the engine's, whatever ddx does with them.
+        let limit_unsound = case.kinds().contains("limit") && !fuses_limits;
+        match grad_of(&ctx, &sql, &wrt).await {
+            Ok((_, g)) => {
+                out.meta_compared += 1;
+                if let Some(f) = compare("optimizer", grads, &g, 1.0, META_RTOL) {
+                    if limit_unsound {
+                        out.engine.push("sort dropped under a limit".into());
+                    } else {
+                        out.fail(format!("{f}\n  optimizer: {label}"));
+                    }
+                }
+            }
+            Err(Refusal::Bug(b)) => match engine_fault(&b) {
+                Some(kind) => out.engine.push(kind),
+                None => out.fail(format!("[optimizer] {b}\n  optimizer: {label}")),
+            },
+            Err(Refusal::Allowed(_)) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The Substrait plan rewritten into equivalent shapes (see `mutate`): each
+/// must give the base gradient or refuse. DataFusion first consumes the
+/// rewritten plan and computes the loss, so a rewrite that changed the
+/// query is the harness's mistake and is skipped.
+async fn mutation_checks(
+    rng: &mut Rng,
+    case: &Case,
+    ctx: &SessionContext,
+    sql: &str,
+    l0: f64,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let wrt = case.wrt_refs();
+    let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+    let optimized = df
+        .clone()
+        .into_optimized_plan()
+        .map_err(|e| e.to_string())?;
+    let unoptimized = df.into_unoptimized_plan();
+    for (k, lp) in [&optimized, &optimized, &optimized, &unoptimized]
+        .into_iter()
+        .enumerate()
+    {
+        let Ok(plan) = to_substrait_plan(lp, &ctx.state()) else {
+            continue;
+        };
+        let Some((mutated, kinds)) = mutate::mutate(&plan, rng) else {
+            continue;
+        };
+        let which = if k == 3 { "unoptimized" } else { "optimized" };
+        // Is it still the same query?
+        let same = match from_substrait_plan(&ctx.state(), &mutated).await {
+            Ok(lp) => match ctx.execute_logical_plan(lp).await {
+                Ok(df) => match df.collect().await {
+                    Ok(b) if b.iter().map(|b| b.num_rows()).sum::<usize>() == 1 => {
+                        let b = b.iter().find(|b| b.num_rows() == 1).unwrap();
+                        cell(b.column(0), 0)
+                            .is_some_and(|v| (v - l0).abs() <= 1e-9 * l0.abs().max(1.0))
+                    }
+                    _ => false,
+                },
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if !same {
+            out.rewrites.extend(
+                kinds
+                    .iter()
+                    .map(|k| format!("{k} (not equivalent to DataFusion)")),
+            );
+            continue;
+        }
+        let label = format!("{which} plan, rewritten by {kinds:?}");
+        match ddx_ad::grad(&mutated, &wrt) {
+            Ok(program) => match run_and_read(ctx, &program).await {
+                Ok(g) => {
+                    out.meta_compared += 1;
+                    out.rewrites.extend(kinds.iter().map(|k| k.to_string()));
+                    if let Some(f) = compare("plan-rewrite", grads, &g, 1.0, META_RTOL) {
+                        out.fail(format!("{f}\n  {label}"));
+                    }
+                    let _ = ad::release(ctx, &program);
+                }
+                Err(e) => match engine_fault(&e) {
+                    Some(kind) => out.engine.push(kind),
+                    None => out.fail(format!("[plan-rewrite] {e}\n  {label}")),
+                },
+            },
+            Err(e) => {
+                // A refusal is allowed, but an equivalent plan ddx refuses is
+                // coverage it lacks, so the tally shows which rewrite did it.
+                out.rewrites.extend(
+                    kinds
+                        .iter()
+                        .map(|k| format!("{k} (refused: {})", short(&e.to_string()))),
+                );
+                if let Refusal::Bug(b) = classify(DataFusionError::External(Box::new(e))) {
+                    out.fail(format!("[plan-rewrite] {b}\n  {label}"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2419,6 +2640,8 @@ struct Tally {
     meta_compared: u64,
     refusals: BTreeMap<String, u64>,
     kinds: BTreeMap<&'static str, u64>,
+    engine: BTreeMap<String, u64>,
+    rewrites: BTreeMap<String, u64>,
 }
 
 impl Tally {
@@ -2431,6 +2654,12 @@ impl Tally {
         self.meta_compared += o.meta_compared as u64;
         if let Some(r) = &o.refusal {
             *self.refusals.entry(r.clone()).or_default() += 1;
+        }
+        for e in &o.engine {
+            *self.engine.entry(e.clone()).or_default() += 1;
+        }
+        for r in &o.rewrites {
+            *self.rewrites.entry(r.clone()).or_default() += 1;
         }
         if o.accepted {
             for k in &o.kinds {
@@ -2450,6 +2679,12 @@ impl Tally {
             self.meta_compared
         );
         let _ = write!(s, "\n  accepted cases by primitive: {:?}", self.kinds);
+        if !self.rewrites.is_empty() {
+            let _ = write!(s, "\n  plan rewrites compared: {:?}", self.rewrites);
+        }
+        if !self.engine.is_empty() {
+            let _ = write!(s, "\n  DataFusion faults (not failures): {:?}", self.engine);
+        }
         let mut refusals: Vec<(&String, &u64)> = self.refusals.iter().collect();
         refusals.sort_by(|a, b| b.1.cmp(a.1));
         for (r, n) in refusals.iter().take(12) {
@@ -2503,6 +2738,7 @@ const NONE: Props = Props {
     invariance: false,
     contract: false,
     surface: false,
+    shapes: false,
 };
 
 #[test]
@@ -2570,6 +2806,20 @@ fn programs_keep_their_contract() {
 }
 
 #[test]
+fn gradients_do_not_depend_on_the_plans_shape() {
+    bounded(
+        "plan shapes",
+        6_000,
+        seeds(),
+        Props {
+            shapes: true,
+            ..NONE
+        },
+        seeds() / 3,
+    );
+}
+
+#[test]
 fn grad_in_sql_is_the_programs_gradient() {
     bounded(
         "sql surface",
@@ -2603,6 +2853,25 @@ fn replay_one_seed() {
     assert!(o.failures.is_empty());
 }
 
+/// The property groups a soak runs: all of them, or the comma-separated
+/// names in `DDX_V2_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
+/// shapes`), to spend a soak's budget on one surface.
+fn soak_props() -> Props {
+    let Ok(names) = std::env::var("DDX_V2_PROPS") else {
+        return ALL;
+    };
+    let on = |n: &str| names.split(',').any(|x| x.trim() == n);
+    Props {
+        fd: on("fd"),
+        calculus: on("calculus"),
+        vjp: on("vjp"),
+        invariance: on("invariance"),
+        contract: on("contract"),
+        surface: on("surface"),
+        shapes: on("shapes"),
+    }
+}
+
 /// The long-running soak: every property on fresh seeds for a wall-clock
 /// budget. Same knobs and log lines as ddx-core's soak.
 #[test]
@@ -2628,6 +2897,7 @@ fn soak_v2_query_ad() {
         }
     };
 
+    let props = soak_props();
     let rt = runtime();
     let start = Instant::now();
     let mut tally = Tally::default();
@@ -2642,7 +2912,7 @@ fn soak_v2_query_ad() {
     );
     while start.elapsed().as_secs() < budget {
         let seed = base.wrapping_add(iters);
-        let o = run_one(&rt, seed, ALL);
+        let o = run_one(&rt, seed, props);
         tally.add(&o);
         for f in &o.failures {
             logline(&format!("\nFAILURE (seed={seed}, base={base}):\n{f}"));

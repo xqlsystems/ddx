@@ -6,8 +6,9 @@
 //! shows it and pinned against a gradient worked by hand.
 //!
 //! Each was `#[ignore]`d as a known bug until its fix landed (CONTRIBUTING.md,
-//! "a failing test first"). Every one is now fixed, and runs as an ordinary
-//! test; each entry below names the fix.
+//! "a failing test first"). Every ddx bug here is now fixed, and runs as an
+//! ordinary test; each entry below names the fix. The upstream DataFusion
+//! bugs at the end stay ignored until an upgrade fixes them.
 //!
 //! - **NULL rows leak gradient.** SUM, AVG, MAX and MIN skip a row whose
 //!   argument is NULL, so nothing in that row can move the loss. ddx still
@@ -20,9 +21,10 @@
 //!   both window columns, and the optimizer has given them the same name, so
 //!   DataFusion's consumer refuses the step. The program was accepted.
 //!   *Fixed in #73:* a window column is renamed in place once computed.
-//! - **An unoptimized plan's join condition and a CASE.** `grad_plan` accepts
-//!   any `LogicalPlan`, a DataFrame's included; this unoptimized one is
-//!   accepted and its backward step then fails DataFusion's schema check.
+//! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
+//!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
+//!   between integer columns on a varied condition is accepted, and its
+//!   backward step then holds values of a type its schema does not declare.
 //!   *Fixed in #79:* a step's table takes the schema of the plan that ran.
 
 use datafusion::prelude::SessionContext;
@@ -130,25 +132,73 @@ async fn a_null_in_constant_data_sends_no_gradient_through_its_row() {
 }
 
 #[tokio::test]
-async fn an_unoptimized_join_with_a_constant_condition_under_a_case_runs() {
-    // grad_plan takes any LogicalPlan, a DataFrame's included, and this one is
-    // accepted, then its backward step does not match its own schema.
+async fn an_unoptimized_case_over_integer_data_runs() {
+    // grad_plan takes any LogicalPlan, a DataFrame's included. In this
+    // unoptimized one a CASE picks between integer data on a condition that
+    // depends on b.val: it has no derivative with respect to b (the branches
+    // are constant), so the gradient is 0. ddx accepts it, then its backward
+    // step fails "Mismatch between schema and batches": a column's declared
+    // type is not the type of the values it holds.
     let ctx = SessionContext::new();
     exec(
         &ctx,
-        "CREATE TABLE b (j BIGINT, val DOUBLE) AS VALUES (0, 0.5), (1, -0.25)",
+        "CREATE TABLE b (val DOUBLE, i BIGINT) AS VALUES (0.5, 0), (-0.25, 1)",
     )
     .await;
-    exec(
-        &ctx,
-        "CREATE TABLE m (i BIGINT, j BIGINT, val DOUBLE) AS VALUES (0, 0, 0.6), (1, 0, -0.5), (0, 1, 0.9)",
-    )
-    .await;
-    let sql = "WITH r0 AS (SELECT i, j, CAST(val * 10 AS BIGINT) AS v FROM m), \
-                    r2 AS (SELECT a.i, a.j, CASE WHEN b.val > 0 THEN a.v ELSE 0.5 * a.v END AS v \
-                           FROM r0 a JOIN b ON a.j = b.j AND a.j <> 1) \
-               SELECT SUM(v) AS loss FROM r2";
+    exec(&ctx, "CREATE TABLE m (val DOUBLE) AS VALUES (0.6), (-0.5)").await;
+    let sql = "SELECT SUM(CASE WHEN b.val > 0 THEN a.v ELSE 0.5 * a.v END) AS loss \
+               FROM (SELECT CAST(val * 10 AS BIGINT) AS v FROM m) a CROSS JOIN b";
     let plan = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
     let program = ad::grad_plan(&ctx, &plan, &[ColumnRef::new("b", "val")]).unwrap();
     ad::run(&ctx, &program).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Upstream: DataFusion bugs the soak reached, pinned with no ddx involved so an
+// upgrade shows at once whether they are fixed. Each is reached only with an
+// optimizer rule set DataFusion does not ship by default.
+
+/// A context whose logical optimizer runs only `rules`.
+fn ctx_with_only(rules: &[&str]) -> SessionContext {
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::optimizer::Optimizer;
+    let rules = Optimizer::new()
+        .rules
+        .into_iter()
+        .filter(|r| rules.contains(&r.name()))
+        .collect();
+    SessionContext::new_with_state(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rules(rules)
+            .build(),
+    )
+}
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54: a sort beneath a limit is dropped under a join"]
+async fn upstream_a_limit_keeps_its_sort_under_a_join() {
+    // Without push_down_limit to fuse the limit into the sort, the physical
+    // plan loses the sort once the projection above it drops the sort key,
+    // and the limit keeps the first rows in table order. ddx's backward steps
+    // recompute such a region under a join, so on a context configured like
+    // this its gradient lands on the wrong rows.
+    let ctx = ctx_with_only(&[]);
+    exec(
+        &ctx,
+        "CREATE TABLE u (i BIGINT, val DOUBLE) AS VALUES (1, -0.34), (2, -0.57), (0, 0.71)",
+    )
+    .await;
+    exec(&ctx, "CREATE TABLE one (c DOUBLE) AS VALUES (1.0)").await;
+    let batches = ctx
+        .sql("SELECT t.i FROM (SELECT i FROM u ORDER BY val DESC LIMIT 1) t CROSS JOIN one")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::Int64Type;
+    let i = batches[0].column(0).as_primitive::<Int64Type>().value(0);
+    assert_eq!(i, 0, "the row with the largest val is i = 0");
 }
