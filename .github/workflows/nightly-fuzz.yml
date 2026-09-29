@@ -1,10 +1,16 @@
-name: Nightly fuzz (ddx-core simulation soak)
+name: Nightly fuzz (ddx-core and v2 simulation soaks)
 
-# Runs the seed-reproducible property-fuzz soak (crates/ddx-core/tests/
-# simulation.rs :: soak_continuous_property_fuzz) over three disjoint random
-# seed regions in parallel, then files/updates a single GitHub issue if any
-# property (finite-difference numeric agreement, render fidelity, higher-order
-# self-consumption) fails.
+# Runs two seed-reproducible property-fuzz soaks over three disjoint random
+# seed regions each, in parallel, then files/updates a single GitHub issue if
+# any property fails:
+#
+# - v1: crates/ddx-core/tests/simulation.rs :: soak_continuous_property_fuzz
+#   (finite-difference numeric agreement, render fidelity, higher-order
+#   self-consumption of scalar derivatives).
+# - v2: crates/ddx-datafusion/tests/ad_simulation.rs :: soak_v2_query_ad
+#   (generated loss queries: gradients against finite differences of the
+#   query, the calculus and vjp identities, invariance, the program contract,
+#   and grad(loss, table.column) in SQL).
 #
 # Schedule: 08:00 America/Los_Angeles == 16:00 UTC (PST, UTC-8). GitHub cron is
 # fixed-UTC and does NOT observe daylight saving, so during PDT (roughly
@@ -89,9 +95,60 @@ jobs:
           path: soak-region-${{ matrix.region }}.log
           if-no-files-found: warn
 
+  soak-v2:
+    name: v2 soak region ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ddx-ad's `substrait` dependency generates its types from .proto files
+      # at build time.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build soak test binary
+        run: cargo test -p ddx-datafusion --test ad_simulation --release --no-run
+
+      - name: Run soak
+        run: |
+          set -o pipefail
+          SECS='${{ github.event.inputs.duration_secs || '300' }}'
+          OVERRIDE='${{ github.event.inputs.base_override }}'
+          REGION='${{ matrix.region }}'
+          # A case is a few hundred milliseconds, not microseconds, so a region
+          # explores thousands of seeds, far inside the 1e7-wide windows the v1
+          # soak uses; the same windows keep the arithmetic in one place.
+          if [ -n "$OVERRIDE" ]; then
+            BASE=$(( OVERRIDE + REGION * 10000000 ))
+          else
+            BASE=$(( GITHUB_RUN_NUMBER * 100000000 + REGION * 10000000 ))
+          fi
+          LOG="$PWD/soak-v2-region-${REGION}.log"
+          echo "ENV rustc=$(rustc --version) os=${RUNNER_OS} sha=${GITHUB_SHA}" > "$LOG"
+          set +e
+          DDX_SOAK_SECS="$SECS" DDX_SOAK_BASE="$BASE" DDX_SOAK_LOG="$LOG" \
+            cargo test -p ddx-datafusion --test ad_simulation --release \
+            -- --ignored --nocapture soak_v2_query_ad
+          echo "soak exit code: $?"
+          set -e
+          tail -n 12 "$LOG" || true
+
+      - name: Upload region log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-v2-log-${{ matrix.region }}
+          path: soak-v2-region-${{ matrix.region }}.log
+          if-no-files-found: warn
+
   report:
     name: triage & file issue
-    needs: soak
+    needs: [soak, soak-v2]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

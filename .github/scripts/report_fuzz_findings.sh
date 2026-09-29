@@ -21,7 +21,15 @@ set -euo pipefail
 LOG_DIR=${1:?"usage: report_fuzz_findings.sh <log-dir>"}
 
 shopt -s nullglob globstar
-logs=("$LOG_DIR"/**/soak-*.log "$LOG_DIR"/soak-*.log)
+# With globstar, `**/` also matches the top level, so a log there would be
+# listed twice and its failures counted twice; keep each path once.
+logs=()
+declare -A seen=()
+for f in "$LOG_DIR"/**/soak-*.log "$LOG_DIR"/soak-*.log; do
+  [ -n "${seen[$f]:-}" ] && continue
+  seen[$f]=1
+  logs+=("$f")
+done
 if [ ${#logs[@]} -eq 0 ]; then
   echo "No soak-*.log files found under $LOG_DIR; nothing to report."
   exit 0
@@ -89,6 +97,21 @@ echo "Found $total property failure(s) across ${#logs[@]} region log(s); prepari
 first_seed=$(printf '%s' "$blocks" | sed -n 's/^FAILURE (seed=\([0-9]*\).*/\1/p' | head -1)
 first_seed=${first_seed:-0}
 
+# Each soak writes a `REPRO <command>` line with a `{seed}` placeholder, so the
+# repro names the soak that failed. The first log with a failure supplies it; a
+# log without one (an older soak) falls back to ddx-core's command.
+repro=""
+for log in "${logs[@]}"; do
+  if grep -q '^FAILURE (seed' "$log" 2>/dev/null; then
+    repro=$(grep -m1 '^REPRO ' "$log" 2>/dev/null | sed 's/^REPRO //' || true)
+    break
+  fi
+done
+if [ -z "$repro" ]; then
+  repro='DDX_SOAK_SECS=15 DDX_SOAK_BASE={seed} cargo test -p ddx-core --test simulation --release -- --ignored --nocapture soak_continuous_property_fuzz'
+fi
+repro=${repro//\{seed\}/$first_seed}
+
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-xqlsystems/ddx}/actions/runs/${GITHUB_RUN_ID:-local}"
 date_utc=$(date -u '+%Y-%m-%d %H:%M UTC')
 
@@ -109,9 +132,7 @@ body_file=$(mktemp)
   echo "bit-identical across OS/toolchain):"
   echo
   echo '```bash'
-  echo "DDX_SOAK_SECS=15 DDX_SOAK_BASE=${first_seed} \\"
-  echo "  cargo test -p ddx-core --test simulation --release \\"
-  echo "  -- --ignored --nocapture soak_continuous_property_fuzz"
+  echo "$repro"
   echo '```'
   echo
   echo "The full per-region logs are attached to the workflow run as artifacts."
@@ -129,7 +150,9 @@ body_file=$(mktemp)
   echo "> cancellation (magnitude cap) and truncation/aliasing (Richardson"
   echo "> self-consistency), so a surviving \`[finite-diff]\` disagreement should be"
   echo "> a real rule bug — but confirm by reproducing before assuming. \`[render]\`"
-  echo "> and \`[self-consumption]\` failures are always real."
+  echo "> and \`[self-consumption]\` failures are always real. In the v2 soak, a"
+  echo "> \`[finite-diff]\` survived a kink screen and Richardson agreement; every other"
+  echo "> tag compares ddx with itself or checks a stated contract."
   echo
   echo "<!-- fuzz-run: ${GITHUB_RUN_ID:-local} -->"
 } > "$body_file"
@@ -155,7 +178,7 @@ if [ -n "$existing" ]; then
   } | gh issue comment "$existing" --body-file -
   echo "Commented on #${existing}."
 else
-  title="Nightly fuzz: ${total} property failure(s) in ddx-core simulation soak"
+  title="Nightly fuzz: ${total} property failure(s) in the simulation soaks"
   url=$(gh issue create --title "$title" \
     --label fuzz-finding --label needs-triage \
     --body-file "$body_file")

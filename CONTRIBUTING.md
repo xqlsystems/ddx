@@ -232,6 +232,18 @@ DDX_SOAK_SECS=120 cargo test -p ddx-core --test simulation --release \
   -- --ignored --nocapture soak_continuous_property_fuzz
 ```
 
+If you touched **query-level AD** (`ddx-ad`, or `ddx-datafusion`'s `ad` module),
+the v2 soak is its counterpart. It generates loss queries and checks their
+gradients against finite differences of the query, and against ddx itself:
+
+```bash
+DDX_SOAK_SECS=120 cargo test -p ddx-datafusion --test ad_simulation --release \
+  -- --ignored --nocapture soak_v2_query_ad
+```
+
+A failure prints its seed; `DDX_V2_SEED=<seed>` with the ignored
+`replay_one_seed` test prints that case's SQL and tables and reruns only it.
+
 ### 4. Open a pull request
 
 - Keep PRs focused; one logical change per PR is easiest to review.
@@ -260,6 +272,15 @@ Differentiation is a numerical-correctness feature, so tests are layered
   self-consumption (the engine must re-parse and re-differentiate its own
   output). Every failure prints the seed that produced it, so it reproduces
   exactly. New invariants are welcome here.
+
+For query-level AD, `crates/ddx-datafusion/tests/ad_simulation.rs` is the
+property suite: generated loss queries (joins, grouped SUM/AVG/MAX/MIN,
+filters, a rank filter, softmax, NULLs), each gradient checked against a
+screened finite difference of the query that DataFusion computes. Around that
+sit metamorphic relations: the calculus, `grad` = `vjp` seeded with 1,
+invariance to how the query is spelled and run, the program's contract with an
+adapter, and `grad(loss, t.col)` in SQL. `ad_findings.rs` holds the bugs it
+found, each reduced to a small query with a gradient worked out by hand.
 
 When you find a bug, the ideal contribution is: a failing test first (an
 `#[ignore]`-d "known bug" test is a fine way to record it), then the fix, then
