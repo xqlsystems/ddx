@@ -376,10 +376,20 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<Vec<String>> {
         keys,
         width,
     )?;
+    // An output row whose value is NULL does not move with anything in it,
+    // as an aggregate that skips it would say: its cotangent is NULL, so none
+    // flows through it to its other inputs (the `p` of `p + q`, `q` NULL).
+    let is_null = t.ext.anchor("is_null");
     let seeds = value_cols
         .iter()
         .enumerate()
-        .map(|(k, &i)| (out.outputs[i], field(width + dim_cols.len() + k)))
+        .map(|(k, &i)| {
+            let seed = if_then(
+                vec![(call(is_null, vec![field(out.outputs[i])]), null_f64())],
+                field(width + dim_cols.len() + k),
+            );
+            (out.outputs[i], seed)
+        })
         .collect();
     t.region(out, base, seeds)?;
     Ok(names)

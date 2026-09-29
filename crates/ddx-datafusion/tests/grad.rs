@@ -482,3 +482,45 @@ async fn a_program_runs_without_the_simplifier() {
     assert!(got[1][1].is_nan());
     assert_eq!(got[2], vec![2.0, 6.0]);
 }
+
+#[tokio::test]
+async fn vjp_sends_no_gradient_through_an_output_row_that_is_null() {
+    // From the v2 soak (seed 200886). Row 1's value, NULL + SUM(val), is NULL
+    // whatever the sum is, so its cotangent moves nothing: it must not
+    // reach the SUM, as grad(SUM(s · c)), which skips the row, agrees. Row
+    // 0 gets 3 directly and 3 more through the SUM.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE vp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, NULL)",
+    )
+    .await;
+    let plan = substrait_of(
+        &ctx,
+        "SELECT vp.i, vp.val + m.v AS s FROM vp CROSS JOIN (SELECT SUM(val) AS v FROM vp) m",
+        true,
+    )
+    .await;
+    let program = vjp(&plan, &[ColumnRef::new("vp", "val")]).unwrap();
+    Table {
+        name: Box::leak(program.cotangent_table.clone().into_boxed_str()),
+        columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
+        rows: vec![vec![0.0, 3.0], vec![1.0, 7.0]],
+    }
+    .create(&ctx)
+    .await;
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    assert_eq!(got[0], vec![0.0, 6.0]);
+    assert!(
+        got[1][1].is_nan(),
+        "a NULL value's gradient is NULL: {got:?}"
+    );
+}
