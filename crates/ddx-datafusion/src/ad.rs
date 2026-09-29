@@ -169,8 +169,14 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
     bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(to_df_err)?;
     let lp = from_substrait_plan(&ctx.state(), &plan).await?;
     let df = ctx.execute_logical_plan(lp).await?;
-    let schema = df.schema().inner().clone();
-    let batches = df.collect().await?;
+    // The schema of the plan that runs, not the logical one: a step read
+    // from an unanalyzed plan can be typed before type coercion (a CASE
+    // between BIGINT and DOUBLE branches), and the table must declare the
+    // types its batches hold.
+    let task = df.task_ctx();
+    let physical = df.create_physical_plan().await?;
+    let schema = physical.schema();
+    let batches = datafusion::physical_plan::collect(physical, Arc::new(task)).await?;
     // A MemTable, not a view: DataFusion's Substrait consumer can pick
     // columns out of a table scan, and a later step reads only some.
     let table = MemTable::try_new(schema, vec![batches])?;

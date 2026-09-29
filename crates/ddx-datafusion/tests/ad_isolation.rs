@@ -152,3 +152,31 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_unoptimized_case_over_integer_data_runs() {
+    // From the v2 soak (#89, #90). grad_plan takes any LogicalPlan, a
+    // DataFrame's included. In this unanalyzed one a CASE picks between a
+    // BIGINT and a DOUBLE branch on a condition that depends on b.val, so
+    // its type is settled only by type coercion; the step's declared
+    // schema disagreed with the batches it produced.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE b (val DOUBLE, i BIGINT) AS VALUES (0.5, 0), (-0.25, 1)",
+    )
+    .await;
+    exec(&ctx, "CREATE TABLE m (val DOUBLE) AS VALUES (0.6), (-0.5)").await;
+    let sql = "SELECT SUM(CASE WHEN b.val > 0 THEN a.v ELSE 0.5 * a.v END) AS loss \
+               FROM (SELECT CAST(val * 10 AS BIGINT) AS v FROM m) a CROSS JOIN b";
+    let plan = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
+    let program = ad::grad_plan(&ctx, &plan, &[ColumnRef::new("b", "val")]).unwrap();
+    ad::run(&ctx, &program).await.unwrap();
+    // The branches are constant, so the gradient is 0 at every row.
+    let got = f64s(
+        &ctx,
+        &format!("SELECT val FROM {} ORDER BY i", program.gradients[0].step),
+    )
+    .await;
+    assert_eq!(got, vec![0.0, 0.0]);
+}
