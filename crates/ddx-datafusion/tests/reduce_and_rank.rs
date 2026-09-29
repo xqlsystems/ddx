@@ -602,3 +602,33 @@ async fn a_volatile_function_in_a_recomputed_region_is_refused() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_infinite_row_that_does_not_attain_the_min_sends_no_nan() {
+    // From the v2 soak (seed 100534). The row with d = inf has v = inf,
+    // which the MIN skips over; its seed was 0, and 0 times the partial of
+    // sqrt(v·v + 1), ∞/∞ there, is NaN, which then summed into p's gradient.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE ip (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE id (i BIGINT, j BIGINT, v DOUBLE) AS \
+         VALUES (0, 0, 0.5), (0, 1, 'inf'::DOUBLE), (1, 0, 3.0)",
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT MIN(sqrt((id.v - ip.val) * (id.v - ip.val) + 1.0)) AS l \
+         FROM ip JOIN id ON ip.i = id.i",
+        "ip",
+    )
+    .await;
+    // The MIN is at (0, 0): v = 0.5 - 1 = -0.5, and d/dp sqrt(v² + 1) is
+    // -v / sqrt(v² + 1) = 0.5 / sqrt(1.25).
+    assert_eq!(got[1], vec![1.0, 0.0]);
+    assert!((got[0][1] - 0.5 / 1.25f64.sqrt()).abs() < 1e-12, "{got:?}");
+}

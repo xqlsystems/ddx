@@ -195,13 +195,16 @@ impl<'a> Transposer<'a> {
                 // A mean is a sum divided by the group's count.
                 Rule::Mean => call(divide, vec![cot, field(stat_at[&arg_col])]),
                 // Only the rows equal to the extreme get it, shared evenly
-                // among them: jax.grad's convention for jnp.max at a tie.
+                // among them: jax.grad's convention for jnp.max at a tie. The
+                // others get none, NULL rather than 0, so it stays none
+                // through a partial that is not finite there (0 · ∞ is NaN:
+                // an infinite value in the data that does not attain a MIN).
                 Rule::Extreme(_) => if_then(
                     vec![(
                         call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),
                         call(divide, vec![cot, field(stat_at[&arg_col])]),
                     )],
-                    lit_f64(0.0),
+                    null_f64(),
                 ),
             };
             // An aggregate skips a row whose argument is NULL, so nothing in
