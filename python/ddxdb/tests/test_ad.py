@@ -184,3 +184,24 @@ def test_tables_whose_names_join_alike_keep_their_own_gradients(ad):
            FROM grad(loss, a_b.c.val) g1 CROSS JOIN grad(loss, a.b_c.val) g2""",
     )
     assert pairs(df) == [(0, 2020.0)]
+
+
+def test_grad_in_sql_of_a_table_with_capitals(ad):
+    # From the v2 soak (#92): a gradient step named with the table's capitals
+    # was registered under a folded name and not found again.
+    import datafusion
+
+    ctx = datafusion.SessionContext()
+    ctx.sql('CREATE TABLE "W" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)').collect()
+    df = ad.sql(ctx, 'WITH loss AS (SELECT SUM(val * val) AS l FROM "W") SELECT i, val FROM grad(loss, "W".val)')
+    assert pairs(df) == [(0, 2.0), (1, 4.0)]
+
+
+def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
+    # From the v2 soak (#89): SUM skips row 1, whose term w + q is NULL.
+    ctx.register_record_batches("q", [table([0, 1, 2], [5.0, None, 1.0]).to_batches()])
+    df = ad.sql(
+        ctx,
+        "WITH loss AS (SELECT SUM(w.val + q.val) AS l FROM w JOIN q ON w.i = q.i) SELECT * FROM grad(loss, w.val)",
+    )
+    assert pairs(df) == [(0, 1.0), (1, 0.0), (2, 1.0)]
