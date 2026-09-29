@@ -524,3 +524,37 @@ async fn vjp_sends_no_gradient_through_an_output_row_that_is_null() {
         "a NULL value's gradient is NULL: {got:?}"
     );
 }
+
+#[tokio::test]
+async fn a_row_one_aggregate_skips_still_gets_another_aggregates_gradient() {
+    // A NULL seed is no contribution, and it must be skipped, not added:
+    // SUM(p + q) skips row 1 (q NULL), SUM(p) does not, so ∂/∂p(1) is 1.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE fp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE fq (i BIGINT, val DOUBLE) AS VALUES (0, 5.0), (1, NULL)",
+    )
+    .await;
+    let plan = substrait_of(
+        &ctx,
+        "SELECT SUM(fp.val + fq.val) + SUM(fp.val) AS l FROM fp JOIN fq ON fp.i = fq.i",
+        true,
+    )
+    .await;
+    let program = grad(&plan, &[ColumnRef::new("fp", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 2.0], vec![1.0, 1.0]]);
+}

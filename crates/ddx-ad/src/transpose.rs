@@ -197,6 +197,7 @@ impl<'a> Transposer<'a> {
         // (slot, input column) → the column holding its cotangent.
         let mut at_inputs: BTreeMap<usize, BTreeMap<usize, usize>> = BTreeMap::new();
         let add = self.ext.anchor("add");
+        let is_null = self.ext.anchor("is_null");
         for c in (0..region.defs.len()).rev() {
             let Some(terms) = pending.remove(&c) else {
                 continue;
@@ -208,10 +209,23 @@ impl<'a> Transposer<'a> {
                 continue;
             }
             // This column's cotangent: the sum over the columns that read it.
-            let sum = terms
-                .into_iter()
-                .reduce(|a, b| call(add, vec![a, b]))
-                .expect("an entry has at least one term");
+            // A NULL term is no contribution (a row an aggregate skipped), so
+            // it is skipped rather than added: NULL + t would lose t. Each
+            // term is a column first, so the fold repeats only references.
+            let mut terms = terms.into_iter();
+            let mut sum = terms.next().expect("an entry has at least one term");
+            for t in terms {
+                rel = project(rel, vec![sum, t]);
+                let (a, b) = (field(width), field(width + 1));
+                width += 2;
+                sum = if_then(
+                    vec![
+                        (call(is_null, vec![a.clone()]), b.clone()),
+                        (call(is_null, vec![b.clone()]), a.clone()),
+                    ],
+                    call(add, vec![a, b]),
+                );
+            }
             rel = project(rel, vec![sum]);
             let here = width;
             width += 1;
