@@ -202,3 +202,58 @@ async fn upstream_a_limit_keeps_its_sort_under_a_join() {
     let i = batches[0].column(0).as_primitive::<Int64Type>().value(0);
     assert_eq!(i, 0, "the row with the largest val is i = 0");
 }
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54: a union of aggregates over windows cannot be interleaved"]
+async fn upstream_a_union_of_aggregates_over_windows_plans() {
+    // With one target partition, EnforceSorting fails its own assertion
+    // ("Can not create InterleaveExec: new children can not be
+    // interleaved") on a UNION ALL of two aggregates, each over a window
+    // above a join. ddx's gradient step has this shape where two
+    // contributions to one table meet (a self-join) below a MAX, MIN or AVG,
+    // whose rule computes its statistics as windows.
+    use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+    use std::sync::Arc;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    // The table spread over several partitions, as a real one is.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, true),
+        Field::new("j", DataType::Int64, true),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let part = |j: Vec<i64>, v: Vec<f64>| {
+        vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    j.iter().map(|x| x + 10).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(j)),
+                Arc::new(Float64Array::from(v)),
+            ],
+        )
+        .unwrap()]
+    };
+    let t = MemTable::try_new(
+        schema.clone(),
+        vec![
+            part(vec![0, 1], vec![1.0, 2.0]),
+            part(vec![0], vec![3.0]),
+            part(vec![1], vec![4.0]),
+        ],
+    )
+    .unwrap();
+    ctx.register_table("t", Arc::new(t)).unwrap();
+    let sql = "SELECT i, j, SUM(g) FROM ( \
+                 SELECT a.i, a.j, SUM(a.c) AS g FROM (SELECT a.i, a.j, COUNT(a.v * b.v) \
+                   OVER (PARTITION BY a.j) AS c FROM t a JOIN t b ON a.i = b.i AND a.j = b.j) a \
+                 GROUP BY a.i, a.j \
+                 UNION ALL \
+                 SELECT a.i, a.j, SUM(a.c) AS g FROM (SELECT b.i, b.j, COUNT(a.v * b.v) \
+                   OVER (PARTITION BY a.j) AS c FROM t a JOIN t b ON a.i = b.i AND a.j = b.j) a \
+                 GROUP BY a.i, a.j) GROUP BY i, j";
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+}

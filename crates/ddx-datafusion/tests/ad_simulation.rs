@@ -1655,7 +1655,13 @@ async fn check_case_inner(
                     out.fail(f);
                 }
             }
-            Err(Refusal::Bug(b)) => out.fail(format!("[{label}] {b}")),
+            // A physical-planning fault is DataFusion's, tallied here as
+            // everywhere (a single-partition context reaches one ddx's
+            // fan-in union can trip, pinned in ad_findings.rs).
+            Err(Refusal::Bug(b)) => match engine_fault(&b) {
+                Some(kind) => out.engine.push(kind),
+                None => out.fail(format!("[{label}] {b}")),
+            },
             Err(Refusal::Allowed(why)) if strict => out.fail(format!(
                 "[{label}] refused a query equivalent to one it accepted: {why}"
             )),
