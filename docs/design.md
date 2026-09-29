@@ -752,6 +752,11 @@ differentiates as written.
 **Argmax, two ways.** `MAX`/`MIN` as an aggregate routes the cotangent to the
 rows that attain the extreme and shares it evenly at an exact tie, which is
 `jax.grad(jnp.max)`'s own convention, so it agrees with JAX everywhere. The
+extreme and the count of rows attaining it are windows over the recomputed
+rows themselves (`MAX(x) OVER (PARTITION BY` the group's keys`)`), never a
+comparison with the saved value: a recomputation need not match the forward
+pass to the last bit, and a saved maximum no recomputed row equals would send
+no gradient at all (`S12`). The
 other idiom, nn.py's, ranks and filters:
 ```sql
 WITH ranked AS (
@@ -831,10 +836,15 @@ is recomputed inside each backward step, never written out, so a contraction's
 `N × D × H` join never is. A region is rebuilt with the same relations in the
 same order, so it produces the same rows, but with no projection dropping a
 column. "The same rows" is an assumption about the engine, not a property of
-the plan, and it is enforced where ddx knows it can fail: a window function
+the plan, and it is enforced where ddx knows it can fail. A window function
 recomputed in a region must rank totally (its `PARTITION BY` and `ORDER BY`
 include every dim of the rows it ranks), because SQL leaves ties unordered and
-a parallel engine may break them differently on each run. §4.6 lists the rest. Every intermediate value is then a column, defined as an expression
+a parallel engine may break them differently on each run; so must a `LIMIT`'s
+`ORDER BY`, and a ranking on a semi-join's right side, which decides which
+rows are kept. A ranking or `LIMIT` inside constant data joined into a region,
+where ddx has no dims to check, and a volatile function (`random()`, `now()`)
+anywhere a region recomputes, are refused. Each refusal is made only if
+gradient reaches the region. §4.6 lists the rest. Every intermediate value is then a column, defined as an expression
 over columns to its left, and reverse column order is a reverse topological
 order for the chain rule. This index is an implementation detail over the
 real Substrait plan, the same relationship v1's `ColRef` has to
@@ -849,7 +859,9 @@ first, starting from the output. For each: join the region beneath it to its
 cotangent on the grouping keys (the reduce rule's broadcast); walk the region's
 columns right to left applying the map rule, each column's cotangent appended
 as a new column rather than inlined; and at each input, sum the cotangent by
-the input's dims (the broadcast rule's transpose). The result is the input's
+the input's dims (the broadcast rule's transpose). An aggregate skips a row
+whose argument is NULL, so that row's seed is NULL rather than the group's
+cotangent, and nothing in it gets gradient. The result is the input's
 contribution: a saved aggregate's cotangent, `__ddx_cotangent_{n}`, or a part
 of a table's gradient.
 
@@ -944,12 +956,15 @@ bug (workaround verified, no upstream-fix dependency).
 
 **Genuinely open:**
 - Recomputation's other engine assumptions. A region must produce the same
-  rows forward and backward. Rankings are checked for a total order (§4.4),
-  but a volatile function (`random()`, `now()`) in a recomputed region would
-  differ between runs and is not yet refused, and an engine whose plain
-  scans are not repeatable would break the assumption too. The alternative
-  to checking is saving: materialize a region instead of recomputing it,
-  which the save-or-recompute policy (`S6`) could allow per region.
+  rows forward and backward. Rankings and `LIMIT`s are checked for a total
+  order and volatile functions are refused (§4.4), but an engine whose plain
+  scans are not repeatable would break the assumption too, and so can
+  floating-point jitter at a near-tie (a filter or ranking on a value that a
+  multi-partition `SUM` computed, recomputed a bit differently). The
+  alternative to checking is saving: materialize a region instead of
+  recomputing it, which the save-or-recompute policy (`S6`) could allow per
+  region, and would let ddx accept the rankings over constant data it now
+  refuses.
 - The physical fused-contraction operator for BLAS-class performance on
   dense data (§4.1) — not yet spiked.
 - Higher-order AD over an already-emitted backward query (differentiating
@@ -1504,7 +1519,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S11`)
+### Building v2 (`S6`–`S12`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -1559,6 +1574,20 @@ giving a silently zero gradient, or failing with a missing table under
 an adapter drops the intermediate tables once a run finishes. Running one
 program twice at once still shares its names, so a caller that runs
 concurrently builds a program per task, as `ad::sql` does per call. → §4.4.
+
+**S12 — What the v2 soak found.** A generated-query soak (#89–#93) checked
+gradients against finite differences of the query and against ddx itself,
+and every failure was in how rows are identified, not in a derivative. An
+aggregate that skipped a NULL argument still sent gradient through the rest
+of that row; MAX and MIN compared recomputed values with the saved extreme,
+and a multi-partition `SUM` beneath them made that comparison fail about
+half the time, silently zeroing the gradient; stacked rank filters gave the
+engine two columns of one name; a gradient step's name had capitals the
+engine folded away; and an unanalyzed plan's step declared a type its rows
+did not have. Each is fixed where it arose (the reduce rules' NULL mask and
+windows, window columns renamed in place, lower-case step names, a step's
+table typed by the plan that ran). The soak's mutation test then measures how
+fast it catches each rule broken on purpose. → §4.3, §4.4, §5.
 
 ## References
 
