@@ -50,9 +50,9 @@ MUTANTS = [
      "windows.push(window(sum, vec![field(arg_col)], keys.clone()));",
      "AVG divides by the sum of its argument, not the count"),
     ("tie-unshared", f"{AD}/transpose.rs",
-     "call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),\n"
+     "self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),\n"
      "                        call(divide, vec![cot, field(stat_at[&arg_col])]),",
-     "call(equal, vec![field(arg_col), field(extreme_at[&arg_col])]),\n"
+     "self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),\n"
      "                        cot,",
      "MAX/MIN give every tied row the whole cotangent (wrong only at ties)"),
     ("extreme-everyone", f"{AD}/transpose.rs",
