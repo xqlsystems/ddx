@@ -173,7 +173,10 @@ impl<'a> Transposer<'a> {
             .iter()
             .map(|(&arg_col, &at)| {
                 let attains = if_then(
-                    vec![(self.attains(arg_col, at), lit_f64(1.0))],
+                    vec![(
+                        self.attains(arg_col, at, jitters(&region, arg_col)),
+                        lit_f64(1.0),
+                    )],
                     lit_f64(0.0),
                 );
                 window(sum, vec![attains], keys.clone())
@@ -210,7 +213,7 @@ impl<'a> Transposer<'a> {
                 // an infinite value in the data that does not attain a MIN).
                 Rule::Extreme(_) => if_then(
                     vec![(
-                        self.attains(arg_col, extreme_at[&arg_col]),
+                        self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),
                         call(divide, vec![cot, field(stat_at[&arg_col])]),
                     )],
                     null_f64(),
@@ -263,8 +266,15 @@ impl<'a> Transposer<'a> {
     /// over several partitions adds in arrival order), which would give the
     /// whole cotangent to whichever rounded higher on that run. Within the
     /// tolerance they share it, as at an exact tie, the same way every run.
-    fn attains(&mut self, arg: usize, extreme: usize) -> Expression {
+    /// Only an argument that can jitter gets the tolerance (see [`jitters`]):
+    /// one computed from table values alone is the same every run, and two
+    /// of its values a few ulps apart do not tie (MAX(1, 1 + 2 ulps) has
+    /// gradient (0, 1), as jax.grad gives).
+    fn attains(&mut self, arg: usize, extreme: usize, tolerant: bool) -> Expression {
         let equal = self.ext.anchor("equal");
+        if !tolerant {
+            return call(equal, vec![field(arg), field(extreme)]);
+        }
         let or = self.ext.anchor("or");
         let and = self.ext.anchor("and");
         let lte = self.ext.anchor("lte");
@@ -546,6 +556,34 @@ impl<'a> Transposer<'a> {
             });
         Ok(())
     }
+}
+
+/// Can column `col` of `region` differ in its last bits from one
+/// recomputation to the next? Only if it reads a recomputed aggregate: a
+/// saved one, or constant data (which can hold one), since a grouped sum
+/// over several partitions adds in arrival order. Table values, and
+/// elementwise functions of them, are the same every run.
+fn jitters(region: &Region, col: usize) -> bool {
+    let mut stack = vec![col];
+    let mut seen = vec![false; region.defs.len()];
+    while let Some(c) = stack.pop() {
+        if std::mem::replace(&mut seen[c], true) {
+            continue;
+        }
+        match &region.defs[c] {
+            Def::Input { slot, .. } => {
+                if !matches!(region.slots[*slot].input, Input::Table(_)) {
+                    return true;
+                }
+            }
+            Def::Expr(e) => match fields_of(e) {
+                Ok(fields) => stack.extend(fields),
+                Err(_) => return true,
+            },
+            Def::Window { .. } | Def::Const => return true,
+        }
+    }
+    false
 }
 
 /// Which reduce rule a measure has.

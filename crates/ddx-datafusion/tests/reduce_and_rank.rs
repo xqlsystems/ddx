@@ -688,3 +688,22 @@ async fn a_max_tie_that_rounding_breaks_is_still_shared() {
     .await;
     assert_eq!(got, vec![vec![0.0, 0.5], vec![1.0, 0.5]]);
 }
+
+#[tokio::test]
+async fn max_at_a_near_tie_of_table_values_sends_its_cotangent_to_the_larger() {
+    // From the v2 soak (#98): MAX(1, 1 + 2 ulps) is differentiable, with
+    // gradient (0, 1) as jax.grad gives. The tolerance that shares a tie
+    // rounding breaks applies only to values that can jitter (computed from
+    // a recomputed aggregate); table values are the same every run.
+    let ctx = ctx();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE nt (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    let got = gradient_of(&ctx, "SELECT MAX(val) AS l FROM nt", "nt").await;
+    assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, 1.0]]);
+}
