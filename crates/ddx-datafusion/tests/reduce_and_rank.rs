@@ -668,7 +668,8 @@ async fn a_max_tie_that_rounding_breaks_is_still_shared() {
     // arithmetic can differ in the last bit, and which one rounds higher can
     // change from run to run (a sum over partitions), so the MAX gave its
     // whole cotangent to either. Within a few ulps it is shared, as a tie:
-    // (p + 0.1) + 0.2 and p + 0.3 differ by one ulp.
+    // p + (0.1 + 0.2) and p + 0.3 differ by one ulp, and the sums are an
+    // aggregate's output.
     let ctx = ctx();
     exec(
         &ctx,
@@ -677,16 +678,46 @@ async fn a_max_tie_that_rounding_breaks_is_still_shared() {
     .await;
     exec(
         &ctx,
-        "CREATE TABLE tc (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES (0, 0.1, 0.2), (1, 0.3, 0.0)",
+        "CREATE TABLE tc (i BIGINT, a DOUBLE) AS VALUES (0, 0.1), (0, 0.2), (1, 0.3)",
     )
     .await;
     let got = gradient_of(
         &ctx,
-        "SELECT MAX((tp.val + tc.a) + tc.b) AS l FROM tp JOIN tc ON tp.i = tc.i",
+        "SELECT MAX(tp.val + s.a) AS l FROM tp \
+         JOIN (SELECT i, SUM(a) AS a FROM tc GROUP BY i) s ON tp.i = s.i",
         "tp",
     )
     .await;
     assert_eq!(got, vec![vec![0.0, 0.5], vec![1.0, 0.5]]);
+}
+
+#[tokio::test]
+async fn a_near_tie_of_constant_table_values_goes_to_the_larger() {
+    // From the v2 soak (#102): the tolerance keyed on "reads a table that is
+    // not differentiated", so p's gradient depended on whether d was in
+    // `wrt`. A table's values are the same every run, differentiated or not:
+    // MAX(p * d) with d = (1, 1 + 2 ulps) sends its cotangent to the larger.
+    let ctx = ctx();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        "CREATE TABLE np (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 1.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE nd (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT MAX(np.val * nd.val) AS l FROM np JOIN nd ON np.i = nd.i",
+        "np",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, b]]);
 }
 
 #[tokio::test]

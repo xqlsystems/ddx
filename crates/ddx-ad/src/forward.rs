@@ -91,6 +91,11 @@ pub struct Slot {
     /// Whether it is constant data computed with a window function or a
     /// `LIMIT`, which a recomputation need not repeat row for row.
     pub ordered: bool,
+    /// Whether it is constant data computed by an aggregate or a window: its
+    /// values can differ in their last bits between recomputations (a sum
+    /// over several partitions adds in arrival order). A table's values
+    /// cannot.
+    pub aggregated: bool,
 }
 
 /// Rows cut by an ordering: a `LIMIT` (after an `ORDER BY` on `keys`, or with
@@ -596,6 +601,7 @@ impl Builder<'_> {
                     width,
                     at_most_one_row: self.saved[n].groupings.is_empty(),
                     ordered: false,
+                    aggregated: false,
                 });
                 for c in 0..width {
                     let v = self.saved[n].varied[c];
@@ -625,6 +631,7 @@ impl Builder<'_> {
             width,
             at_most_one_row: at_most_one_row(rel),
             ordered: is_ordered(rel),
+            aggregated: is_aggregated(rel),
         });
         for _ in 0..width {
             s.push(Def::Const, false);
@@ -653,6 +660,7 @@ impl Builder<'_> {
             width,
             at_most_one_row: false,
             ordered: false,
+            aggregated: false,
         });
         for c in 0..width {
             let v = self.tables[table].values.contains(&c);
@@ -1145,6 +1153,27 @@ fn is_ordered(rel: &Rel) -> bool {
         })
     };
     rel_expressions(kind).into_iter().any(window) || rel_inputs(kind).into_iter().any(is_ordered)
+}
+
+/// Whether `rel` computes an aggregate or a window function anywhere in it,
+/// a subquery's included.
+fn is_aggregated(rel: &Rel) -> bool {
+    let Some(kind) = rel.rel_type.as_ref() else {
+        return false;
+    };
+    if matches!(kind, RelType::Aggregate(_) | RelType::Window(_)) {
+        return true;
+    }
+    let computes = |e: &Expression| {
+        contains(e, &|x| {
+            matches!(
+                x.rex_type,
+                Some(RexType::WindowFunction(_) | RexType::Subquery(_))
+            )
+        })
+    };
+    rel_expressions(kind).into_iter().any(computes)
+        || rel_inputs(kind).into_iter().any(is_aggregated)
 }
 
 fn empty(rel: Rel) -> Region {

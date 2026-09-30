@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 
 use ddx_core::Ddx;
 use substrait::proto::aggregate_function::AggregationInvocation;
+use substrait::proto::expression::RexType;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
@@ -49,7 +50,9 @@ use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
+use crate::expr::{
+    as_number, call, contains, field, fields_of, if_then, lit_f64, null_f64, window,
+};
 use crate::forward::{width, Def, Forward, Input, Output, Region};
 use crate::functions::Extensions;
 
@@ -559,10 +562,13 @@ impl<'a> Transposer<'a> {
 }
 
 /// Can column `col` of `region` differ in its last bits from one
-/// recomputation to the next? Only if it reads a recomputed aggregate: a
-/// saved one, or constant data (which can hold one), since a grouped sum
-/// over several partitions adds in arrival order. Table values, and
-/// elementwise functions of them, are the same every run.
+/// recomputation to the next? Only if it reads an aggregate's output: a
+/// saved aggregate, constant data an aggregate or window computed, or a
+/// scalar subquery, since a grouped sum over several partitions adds in
+/// arrival order. A table's values, whether or not the table is
+/// differentiated, and elementwise functions of them, are the same every
+/// run (#102: otherwise a table's gradient depended on which other tables
+/// were differentiated).
 fn jitters(region: &Region, col: usize) -> bool {
     let mut stack = vec![col];
     let mut seen = vec![false; region.defs.len()];
@@ -576,11 +582,24 @@ fn jitters(region: &Region, col: usize) -> bool {
                     return true;
                 }
             }
-            Def::Expr(e) => match fields_of(e) {
-                Ok(fields) => stack.extend(fields),
-                Err(_) => return true,
-            },
-            Def::Window { .. } | Def::Const => return true,
+            Def::Expr(e) => {
+                if contains(e, &|x| matches!(x.rex_type, Some(RexType::Subquery(_)))) {
+                    return true;
+                }
+                match fields_of(e) {
+                    Ok(fields) => stack.extend(fields),
+                    Err(_) => return true,
+                }
+            }
+            Def::Const => {
+                let slot = region.slots.iter().find(|s| {
+                    s.input == Input::Const && s.offset.is_some_and(|o| o <= c && c < o + s.width)
+                });
+                if slot.is_none_or(|s| s.aggregated) {
+                    return true;
+                }
+            }
+            Def::Window { .. } => return true,
         }
     }
     false
