@@ -389,9 +389,7 @@ impl Modes {
                 // partitions need not be deterministic, which a PR gate
                 // must be.
                 big: r.below(100) < 4 && SOAKING.load(Ordering::Relaxed),
-                // Soak-only while the constant-data near-tie finding
-                // (ad_findings.rs) is open: its metamorphic checks meet it.
-                ulps: r.below(100) < 8 && SOAKING.load(Ordering::Relaxed),
+                ulps: r.below(100) < 8,
             },
         };
         (modes, r)
@@ -2219,6 +2217,14 @@ async fn fd_check(
         } else {
             Fd::Screened
         });
+    }
+    // A tiny parameter added to an O(1) value is lost to rounding: m - (w +
+    // m) is exactly 0 for w near 1e-163 (seed 3400263), so the loss does not
+    // move at all while its derivative is -1, as jax.grad gives. No step
+    // tiny enough to follow w survives the addition; the exact oracle still
+    // compares such a gradient.
+    if case.modes.extreme == Some(Extreme::Tiny) && m2 == l0 && m1 == l0 && p1 == l0 && p2 == l0 {
+        return Ok(Fd::Screened);
     }
     let exact_ties = case.exact_ties();
     if (kink || (d1 - d2).abs() > 1e-3 * scale) && exact_ties {

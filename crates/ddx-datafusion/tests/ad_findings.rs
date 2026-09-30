@@ -718,14 +718,14 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
 // Round 3: found on the fixed stack by the soak aimed at today's changes.
 
 #[tokio::test]
-#[ignore = "known bug: a near-tie over a table not being differentiated is still shared"]
 async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
-    // The fix to the 8-ulp window (#76) gives the tolerance only to values
-    // that can jitter, and counts "constant data" among them. But a table
-    // outside wrt is constant data to ddx while its values are exactly as
+    // The fix to the 8-ulp window (#76) gave the tolerance only to values
+    // that can jitter, but counted all constant data among them. A table
+    // outside wrt is constant data to ddx, yet its values are exactly as
     // repeatable as a wrt table's: MAX(p.val * d.val) over products 2 ulps
     // apart is differentiable, with all the gradient on the larger (jax.grad
-    // gives (0, d(1))), and ddx still shares it.
+    // gives (0, d(1))). Now only constant data an aggregate or window
+    // computes can jitter (#76).
     let ctx = SessionContext::new();
     let b = f64::from_bits(1.0f64.to_bits() + 2);
     exec(
@@ -750,14 +750,15 @@ async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: a filter above an anti-join is lost when ddx recomputes the region"]
-async fn a_filter_above_an_anti_join_keeps_its_rows_out() {
+#[ignore = "upstream DataFusion 54 (#103): a filter above an anti-join is pushed into its right side"]
+async fn upstream_a_filter_above_an_anti_join_keeps_its_rows_out() {
     // From the round-three soak (seed 3000134, an optimizer variant). With
     // push_down_filter off, `j <> 2` stays above the anti-join NOT IN makes,
-    // and ddx's recomputed region sends gradient to b(2), a row the query
-    // excludes twice; the loss is unchanged, the gradient silently wrong.
-    // DataFusion's default rules push the filter down, but a context without
-    // them, or another engine's producer, need not.
+    // and the gradient reached b(2), a row the query excludes; the loss was
+    // unchanged, the gradient silently wrong. ddx's recomputed region is
+    // right: DataFusion 54's physical filter pushdown moves the filter into
+    // the anti-join's right input, which plain SQL shows without ddx (#103).
+    // Fixed in DataFusion 55.
     let mut got = Vec::new();
     for drop in [None, Some("push_down_filter")] {
         let ctx = SessionContext::new();
@@ -795,14 +796,15 @@ async fn a_filter_above_an_anti_join_keeps_its_rows_out() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a grouped MAX skips NaN for some groups and returns it for others"]
+#[ignore = "upstream DataFusion 54, 55 (#101): a grouped MAX skips NaN for some groups and returns it for others"]
 async fn upstream_a_grouped_max_treats_nan_the_same_in_every_group() {
     // Found by the round-three soak's big mode (seed 5008778), where the same
     // loss came out finite on some runs and NaN on others. DataFusion merges
     // a group's partial MAXes in the order the partitions deliver them, and
     // whether a NaN survives depends on that order: in one query, group 0
     // skips its NaN (5.0) and group 1 returns it. ddx's gradients over such
-    // data inherit the ambiguity. No ddx involved.
+    // data inherit the ambiguity. No ddx involved; still so in DataFusion 55
+    // (#101).
     use datafusion::arrow::array::{AsArray, Float64Array, Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
     use datafusion::datasource::MemTable;
