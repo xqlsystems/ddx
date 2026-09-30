@@ -248,3 +248,45 @@ async fn grad_in_sql_of_a_table_with_capitals() {
     .await;
     assert_eq!(got, vec![(0, 2.0), (1, 4.0)]);
 }
+
+#[tokio::test]
+async fn grad_in_sql_reads_comments_as_comments() {
+    // From the v2 soak (#98): the call's end was found by counting
+    // parentheses in the text, so one inside a comment cut the call short
+    // or never closed it, and a comment between `grad` and `(` hid the call.
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE cp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+        "CREATE TABLE cq (i BIGINT, val DOUBLE) AS VALUES (0, 3.0), (1, 4.0)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    for call in [
+        "grad(loss /* ) */, cp.val)",
+        "grad(loss, cp.val /* ( */)",
+        "grad(loss, -- )\n cp.val)",
+        "grad /* c */ (loss, cp.val)",
+        "GRAD\n(loss, cp.val)",
+    ] {
+        let got = pairs(
+            &ctx,
+            &format!(
+                "WITH loss AS (SELECT SUM(val * val) AS l FROM cp) \
+                 SELECT i, val FROM {call} ORDER BY i"
+            ),
+        )
+        .await;
+        assert_eq!(got, vec![(0, 2.0), (1, 4.0)], "{call:?}");
+    }
+    // Two calls, with a comment that opened a parenthesis inside the first:
+    // the first call's span ran into the second's, and rewriting panicked.
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(cp.val * cq.val) AS l FROM cp JOIN cq ON cp.i = cq.i) \
+         SELECT a.i, a.val + b.val AS v \
+         FROM grad(loss, cp.val /* ( */) a JOIN grad(loss, cq.val) b ON a.i = b.i /* ) */ \
+         ORDER BY a.i",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 4.0), (1, 6.0)]);
+}

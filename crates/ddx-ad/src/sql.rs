@@ -38,7 +38,7 @@ use ddx_core::sqlparser::ast::{
 };
 use ddx_core::sqlparser::dialect::Dialect;
 use ddx_core::sqlparser::parser::Parser;
-use ddx_core::sqlparser::tokenizer::Location;
+use ddx_core::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use crate::error::{AdError, Result};
 use crate::relation::ColumnRef;
@@ -88,7 +88,10 @@ impl GradCalls {
     /// `sqlparser` lacks, and if it does hold a `grad(loss, …)`, the engine
     /// refuses it loudly as an unknown table function.
     pub fn find(sql: &str, dialect: &dyn Dialect) -> Result<Option<GradCalls>> {
-        if !mentions_grad_call(sql) {
+        // Tokens, not text: a comment or a string can hold `(`, `)` or
+        // `grad(`, and a comment can sit between `grad` and its `(`.
+        let tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok();
+        if !mentions_grad_call(sql, tokens.as_deref()) {
             return Ok(None);
         }
         let Ok(statements) = Parser::parse_sql(dialect, sql) else {
@@ -143,10 +146,15 @@ impl GradCalls {
                 loss,
                 table,
                 columns: wrt.into_iter().map(|w| w.column).collect(),
-                span: call_span(sql, factor)?,
+                span: call_span(sql, tokens.as_deref(), factor)?,
             });
         }
         calls.sort_by_key(|c| c.span.0);
+        if calls.windows(2).any(|w| w[1].span.0 < w[0].span.1) {
+            return Err(AdError::Internal(
+                "two grad(…) calls whose spans overlap in the statement".into(),
+            ));
+        }
         Ok(Some(GradCalls {
             losses,
             calls,
@@ -170,12 +178,25 @@ impl GradCalls {
     }
 }
 
-/// Does `sql` contain `grad`, then optional whitespace, then `(`, in any case?
-fn mentions_grad_call(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    lower
-        .match_indices("grad")
-        .any(|(i, _)| lower[i + 4..].trim_start().starts_with('('))
+/// Does `sql` call `grad`: the word, then `(`, with any whitespace or
+/// comments between, in any case? Without tokens (the dialect's tokenizer
+/// failed), any mention of `grad` lets the parser decide.
+fn mentions_grad_call(sql: &str, tokens: Option<&[TokenWithSpan]>) -> bool {
+    if !sql.to_ascii_lowercase().contains("grad") {
+        return false;
+    }
+    let Some(tokens) = tokens else {
+        return true;
+    };
+    let significant: Vec<&Token> = tokens
+        .iter()
+        .map(|t| &t.token)
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    significant.windows(2).any(|w| {
+        matches!(w[0], Token::Word(word) if word.value.eq_ignore_ascii_case("grad"))
+            && *w[1] == Token::LParen
+    })
 }
 
 fn find_none(statements: &[Statement]) -> Result<Option<GradCalls>> {
@@ -292,22 +313,32 @@ fn no_cte(name: &str) -> AdError {
 }
 
 /// The byte range of `grad(…)` starting at `start`: through the matching
-/// closing parenthesis, skipping quoted text.
-fn call_span(sql: &str, start: Location) -> Result<(usize, usize)> {
+/// closing parenthesis, counted in tokens, so a parenthesis in a comment or
+/// a string does not count.
+fn call_span(
+    sql: &str,
+    tokens: Option<&[TokenWithSpan]>,
+    start: Location,
+) -> Result<(usize, usize)> {
     let begin = byte_offset(sql, start)
         .ok_or_else(|| AdError::Internal(format!("no byte offset for {start:?}")))?;
+    let tokens = tokens
+        .ok_or_else(|| AdError::Internal("a statement that parses but does not tokenize".into()))?;
+    let from = tokens
+        .iter()
+        .position(|t| t.span.start == start)
+        .ok_or_else(|| AdError::Internal(format!("no token at {start:?}")))?;
     let mut depth = 0;
-    let mut quote: Option<char> = None;
-    for (i, ch) in sql[begin..].char_indices() {
-        match (quote, ch) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '\'' | '"') => quote = Some(ch),
-            (None, '(') => depth += 1,
-            (None, ')') => {
+    for t in &tokens[from..] {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok((begin, begin + i + 1));
+                    let end = byte_offset(sql, t.span.end).ok_or_else(|| {
+                        AdError::Internal(format!("no byte offset for {:?}", t.span.end))
+                    })?;
+                    return Ok((begin, end));
                 }
             }
             _ => {}
