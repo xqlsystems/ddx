@@ -713,3 +713,141 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
         2
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 3: found on the fixed stack by the soak aimed at today's changes.
+
+#[tokio::test]
+#[ignore = "known bug: a near-tie over a table not being differentiated is still shared"]
+async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
+    // The fix to the 8-ulp window (#76) gives the tolerance only to values
+    // that can jitter, and counts "constant data" among them. But a table
+    // outside wrt is constant data to ddx while its values are exactly as
+    // repeatable as a wrt table's: MAX(p.val * d.val) over products 2 ulps
+    // apart is differentiable, with all the gradient on the larger (jax.grad
+    // gives (0, d(1))), and ddx still shares it.
+    let ctx = SessionContext::new();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 1.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE d (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    let got = grad(
+        &ctx,
+        "SELECT MAX(p.val * d.val) AS l FROM p JOIN d ON p.i = d.i",
+        "p",
+    )
+    .await;
+    assert_eq!(got, vec![(0, Some(0.0)), (1, Some(b))]);
+}
+
+#[tokio::test]
+#[ignore = "known bug: a filter above an anti-join is lost when ddx recomputes the region"]
+async fn a_filter_above_an_anti_join_keeps_its_rows_out() {
+    // From the round-three soak (seed 3000134, an optimizer variant). With
+    // push_down_filter off, `j <> 2` stays above the anti-join NOT IN makes,
+    // and ddx's recomputed region sends gradient to b(2), a row the query
+    // excludes twice; the loss is unchanged, the gradient silently wrong.
+    // DataFusion's default rules push the filter down, but a context without
+    // them, or another engine's producer, need not.
+    let mut got = Vec::new();
+    for drop in [None, Some("push_down_filter")] {
+        let ctx = SessionContext::new();
+        if let Some(rule) = drop {
+            assert!(ctx.remove_optimizer_rule(rule));
+        }
+        exec(
+            &ctx,
+            "CREATE TABLE b (j BIGINT, val DOUBLE) AS VALUES (0, -0.1), (1, 0.8), (2, 0.5), (90, 0.1)",
+        )
+        .await;
+        exec(
+            &ctx,
+            "CREATE TABLE y (j BIGINT, val DOUBLE) AS VALUES (0, 0.4), (2, 0.9), (1, -0.2)",
+        )
+        .await;
+        got.push(
+            grad(
+                &ctx,
+                "WITH r AS (SELECT j, val AS v FROM b WHERE j NOT IN (SELECT j FROM y WHERE val > 0.35)), \
+                      f AS (SELECT * FROM r WHERE j <> 2), \
+                      m AS (SELECT MAX(v) AS m FROM f), \
+                      e AS (SELECT f.j, exp(f.v - m.m) AS e FROM f CROSS JOIN m), \
+                      s AS (SELECT SUM(e) AS s FROM e) \
+                 SELECT SUM(e.e / s.s * e.e / s.s) AS loss FROM e CROSS JOIN s",
+                "b",
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        got[1], got[0],
+        "with push_down_filter off, the gradient changed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54: a grouped MAX skips NaN for some groups and returns it for others"]
+async fn upstream_a_grouped_max_treats_nan_the_same_in_every_group() {
+    // Found by the round-three soak's big mode (seed 5008778), where the same
+    // loss came out finite on some runs and NaN on others. DataFusion merges
+    // a group's partial MAXes in the order the partitions deliver them, and
+    // whether a NaN survives depends on that order: in one query, group 0
+    // skips its NaN (5.0) and group 1 returns it. ddx's gradients over such
+    // data inherit the ambiguity. No ddx involved.
+    use datafusion::arrow::array::{AsArray, Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let parts: Vec<Vec<(i64, f64)>> = vec![
+        vec![(0, 1.0), (1, 2.0)],
+        vec![(0, f64::NAN), (1, 3.0)],
+        vec![(0, 5.0), (1, f64::NAN)],
+        vec![(0, 0.5)],
+    ];
+    let batches = parts
+        .iter()
+        .map(|p| {
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(p.iter().map(|r| r.0).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        p.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()]
+        })
+        .collect();
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(MemTable::try_new(schema, batches).unwrap()))
+        .unwrap();
+    let b = ctx
+        .sql("SELECT g, MAX(v) AS m FROM t GROUP BY g ORDER BY g")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let m = b[0].column(1).as_primitive::<Float64Type>();
+    assert_eq!(
+        m.value(0).is_nan(),
+        m.value(1).is_nan(),
+        "group 0's MAX is {} and group 1's is {}: each holds a NaN",
+        m.value(0),
+        m.value(1)
+    );
+}
