@@ -205,3 +205,14 @@ def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
         "WITH loss AS (SELECT SUM(w.val + q.val) AS l FROM w JOIN q ON w.i = q.i) SELECT * FROM grad(loss, w.val)",
     )
     assert pairs(df) == [(0, 1.0), (1, 0.0), (2, 1.0)]
+
+
+def test_vjp_refuses_a_cotangent_whose_keys_repeat(ad, ctx):
+    # From the v2 soak (#98): a repeated key added its rows' cotangents.
+    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
+    ctx.register_record_batches(
+        program.cotangent_table,
+        [pa.table({"i": pa.array([0, 0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0, 1.0]}).to_batches()],
+    )
+    with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
+        ad.run(ctx, program)

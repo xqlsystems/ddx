@@ -34,6 +34,12 @@ and a user's table is never replaced unless its name starts with ``__ddx_``,
 which is reserved. After :func:`run`, only the value and the gradients remain on
 the context; :func:`release` drops those too.
 
+One limit Rust's ``ddx_datafusion::ad`` does not share: datafusion-python's
+Substrait consumer names a computed column by its whole expression, so a deep
+chain of row-wise maps that each read their input twice (twenty
+``sin(v) + 0.1 * v`` layers, say) makes a very large plan here. The Rust
+adapter consumes steps with short names.
+
 Importing this module requires DataFusion.
 """
 
@@ -207,8 +213,7 @@ def run_checks(ctx: SessionContext, program: BackwardProgram) -> None:
     """Run ``program``'s checks, raising :class:`ddxdb.InvalidColumn` on the
     first that returns a row."""
     for check in program.checks:
-        logical = Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(check.plan))
-        if ctx.create_dataframe_from_logical_plan(logical).limit(1).count() > 0:
+        if ctx.create_dataframe_from_logical_plan(_consume(ctx, check.plan)).limit(1).count() > 0:
             raise InvalidColumn(f"invalid wrt column: {check.message}")
 
 
@@ -223,16 +228,20 @@ def run_step(ctx: SessionContext, step: Step) -> None:
     """Run one step and register its result as a table, replacing any table of
     that name. Every step it reads must already be registered. Unlike
     :func:`run`, this neither runs the checks nor drops anything."""
-    # A step's reads of earlier steps name their columns but not their types;
-    # the types come from the tables themselves, as the engine states them.
+    table = ctx.create_dataframe_from_logical_plan(_consume(ctx, step.plan)).to_arrow_table()
+    _register(ctx, step.name, table)
+
+
+def _consume(ctx: SessionContext, plan: bytes):
+    """``plan`` (a step or a check) as a DataFusion logical plan. Its reads of
+    earlier steps, or of a vjp's cotangent, name their columns but not their
+    types; the types come from the tables themselves, as the engine states
+    them."""
     schemas = {
         name: Serde.serialize_bytes(f'SELECT * FROM "{name}"', ctx)
-        for name in _unbound_reads(step.plan)
+        for name in _unbound_reads(plan)
     }
-    bound = _bind_reads(step.plan, schemas)
-    logical = Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(bound))
-    table = ctx.create_dataframe_from_logical_plan(logical).to_arrow_table()
-    _register(ctx, step.name, table)
+    return Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(_bind_reads(plan, schemas)))
 
 
 def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
