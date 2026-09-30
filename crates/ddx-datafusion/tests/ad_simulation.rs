@@ -643,6 +643,10 @@ fn agg_tangent(agg: &str) -> Option<&'static str> {
     })
 }
 
+/// The tally for a metamorphic disagreement at the tie window's edge (see
+/// [`Case::windowed_extremes`]).
+const TIE_EDGE: &str = "ill-conditioned: a near-tie at the tie window's edge";
+
 /// An aggregate tangent whose MAX/MIN tie test must be exact: the values it
 /// compares cannot jitter, so ddx compares them exactly (`{maxx}`/`{minx}`),
 /// where one that can jitter gets the 8-ulp window (`{max}`/`{min}`).
@@ -930,9 +934,12 @@ impl Gen<'_> {
             lead(&self.nodes[c].dims, ""),
             f.replace("{v}", "v")
         );
-        // A scalar subquery is one constant within a computation, so a
-        // product with it cannot reorder rows: it inherits the child's jitter.
+        // A scalar subquery is one constant within a computation: it inherits
+        // the child's jitter, and adds its own if it sums (a sum adds in the
+        // order partitions arrive; a MAX never rounds), as ddx's rule does.
+        let rounds = f.contains("(SELECT SUM(") || f.contains("(SELECT AVG(");
         let n = self.derive(c, body, "map");
+        self.nodes[n].jitter |= rounds;
         if is_kinked(&f) {
             self.nodes[n].kinds.insert("kink");
         }
@@ -1603,6 +1610,20 @@ impl Case {
         Some(out)
     }
 
+    /// Whether some MAX or MIN it computes shares near-ties in ddx's 8-ulp
+    /// window (its values can jitter). Where values sit a few ulps apart
+    /// (ulps mode), a rounding that differs from one plan or row order to
+    /// another can move a row across the window's edge, and the gradient with
+    /// it: ill-conditioned, not wrong (seed 4100778).
+    fn windowed_extremes(&self) -> bool {
+        let windowed = |t: &str| t.contains("{max}") || t.contains("{min}");
+        let head = self.nodes[self.root].jitter && agg_tangent(&self.head).is_some_and(windowed);
+        head || self
+            .reachable()
+            .into_iter()
+            .any(|k| self.nodes[k].tan.as_deref().is_some_and(windowed))
+    }
+
     /// Whether the case holds exact ties by construction: its ties mode,
     /// or `-0.0` values.
     fn exact_ties(&self) -> bool {
@@ -1706,20 +1727,6 @@ impl Case {
             fill(&head_t),
             with_extremes(&format!("t{}", self.root), &[])
         ))
-    }
-
-    /// Does the loss read a table it is not differentiated with respect to
-    /// (constant data, to ddx)?
-    fn reads_constant_tables(&self) -> bool {
-        self.tables
-            .iter()
-            .filter(|t| !self.wrt.contains(&t.name))
-            .any(|t| {
-                self.nodes.iter().any(|n| {
-                    n.body.contains(&format!(" FROM {} ", t.name))
-                        || n.body.ends_with(&format!(" FROM {}", t.name))
-                })
-            })
     }
 
     /// The loss query as the user would write it.
@@ -2551,6 +2558,7 @@ async fn check_case_inner(
     }
 
     // Everything below compares ddx with itself.
+    let edge = case.modes.ulps && case.windowed_extremes();
     let meta = |label: &str,
                 r: Result<(BackwardProgram, BTreeMap<String, Grad>), Refusal>,
                 factor: f64,
@@ -2561,7 +2569,11 @@ async fn check_case_inner(
             Ok((_, g)) => {
                 out.meta_compared += 1;
                 if let Some(f) = compare(label, &grads, &g, factor, rtol) {
-                    out.fail(f);
+                    if edge {
+                        out.engine.push(TIE_EDGE.into());
+                    } else {
+                        out.fail(f);
+                    }
                 }
             }
             // A physical-planning fault is DataFusion's, tallied here as
@@ -3540,7 +3552,11 @@ async fn exact_checks(
             continue;
         }
         out.exact_compared += 1;
-        let tol = |a: f64, b: f64| 1e-8 * ad_abs.max(a.abs()).max(b.abs()).max(1e-300) + 1e-13;
+        // The absolute floor is for a derivative that cancels to about 0 (a
+        // log-softmax summed over its group): its rounding grows with the
+        // rows summed, thousands in big mode (seeds 3901113, 4100208).
+        let floor = if case.modes.big { 1e-11 } else { 1e-13 };
+        let tol = |a: f64, b: f64| 1e-8 * ad_abs.max(a.abs()).max(b.abs()).max(1e-300) + floor;
         if (dloss - ad_dot).abs() <= tol(dloss, ad_dot) {
             continue;
         }
@@ -3559,14 +3575,6 @@ async fn exact_checks(
         // Exact equality is jax.grad's convention, and right wherever the
         // values cannot jitter; ddx taking it where they might is no error.
         if agrees(exact_all) {
-            continue;
-        }
-        if agrees(window_all) && case.reads_constant_tables() {
-            // Known: ddx gives constant data the tolerance though a table's
-            // values do not jitter (ad_findings.rs,
-            // a_near_tie_over_constant_table_values_goes_to_the_larger).
-            out.engine
-                .push("known: a near-tie over constant data is shared".into());
             continue;
         }
         if agrees(window_all) {
@@ -3793,7 +3801,11 @@ async fn mutation_checks(
                     out.meta_compared += 1;
                     out.rewrites.extend(kinds.iter().map(|k| k.to_string()));
                     if let Some(f) = compare("plan-rewrite", grads, &g, 1.0, META_RTOL) {
-                        out.fail(format!("{f}\n  {label}"));
+                        if case.modes.ulps && case.windowed_extremes() {
+                            out.engine.push(TIE_EDGE.into());
+                        } else {
+                            out.fail(format!("{f}\n  {label}"));
+                        }
                     }
                     let _ = ad::release(ctx, &program);
                 }

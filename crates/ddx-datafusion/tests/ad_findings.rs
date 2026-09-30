@@ -312,7 +312,7 @@ fn ctx_with_only(rules: &[&str]) -> SessionContext {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a sort beneath a limit is dropped under a join"]
+#[ignore = "upstream DataFusion 54 (#99): a sort beneath a limit is dropped under a join"]
 async fn upstream_a_limit_keeps_its_sort_under_a_join() {
     // Without push_down_limit to fuse the limit into the sort, the physical
     // plan loses the sort once the projection above it drops the sort key,
@@ -340,7 +340,7 @@ async fn upstream_a_limit_keeps_its_sort_under_a_join() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a union of aggregates over windows cannot be interleaved"]
+#[ignore = "upstream DataFusion 54 (#100): a union of aggregates over windows cannot be interleaved"]
 async fn upstream_a_union_of_aggregates_over_windows_plans() {
     // With one target partition, EnforceSorting fails its own assertion
     // ("Can not create InterleaveExec: new children can not be
@@ -395,7 +395,7 @@ async fn upstream_a_union_of_aggregates_over_windows_plans() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
+#[ignore = "upstream DataFusion 54 (#101): a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
 async fn upstream_max_treats_nan_alike_grouped_or_not() {
     // The same values, the same MAX: grouped, it skips the NaN and gives
     // 0.9; as a window over the same group, and ungrouped, it gives NaN. A
@@ -750,7 +750,7 @@ async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54 (#103): a filter above an anti-join is pushed into its right side"]
+#[ignore = "upstream DataFusion 54 (#103, fixed in 55): a filter above an anti-join is pushed into its right side"]
 async fn upstream_a_filter_above_an_anti_join_keeps_its_rows_out() {
     // From the round-three soak (seed 3000134, an optimizer variant). With
     // push_down_filter off, `j <> 2` stays above the anti-join NOT IN makes,
@@ -758,7 +758,7 @@ async fn upstream_a_filter_above_an_anti_join_keeps_its_rows_out() {
     // unchanged, the gradient silently wrong. ddx's recomputed region is
     // right: DataFusion 54's physical filter pushdown moves the filter into
     // the anti-join's right input, which plain SQL shows without ddx (#103).
-    // Fixed in DataFusion 55.
+    // Fixed in DataFusion 55; ddx stays on 54 with datafusion-python.
     let mut got = Vec::new();
     for drop in [None, Some("push_down_filter")] {
         let ctx = SessionContext::new();
