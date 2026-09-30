@@ -426,3 +426,305 @@ async fn upstream_max_treats_nan_alike_grouped_or_not() {
         "grouped {grouped}, window {window}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 2: found on the fixed stack by the forward-mode oracle and by probes
+// past the generator's reach. Each is ignored as a known bug until its fix.
+
+/// The bytes of DataFusion's logical plans for `program`'s steps, as its
+/// Substrait consumer builds them: what a step costs to plan and run, which
+/// ddx's own (small) Substrait plans do not show. Runs the program.
+async fn consumed_plan_bytes(ctx: &SessionContext, program: &ad::BackwardProgram) -> usize {
+    let mut total = 0;
+    for step in program.steps() {
+        let mut plan = step.plan.clone();
+        let mut schemas = std::collections::HashMap::new();
+        for n in ddx_ad::unbound_reads(&plan) {
+            schemas.insert(n.clone(), ad::table_schema(ctx, &n).await.unwrap());
+        }
+        ddx_ad::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
+        let lp =
+            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &plan)
+                .await
+                .unwrap();
+        total += lp.display_indent().to_string().len();
+        ad::run_step(ctx, step).await.unwrap();
+    }
+    total
+}
+
+#[tokio::test]
+#[ignore = "known bug: MAX/MIN share their cotangent between rows within 8 ulps that do not tie"]
+async fn max_at_a_near_tie_sends_its_cotangent_to_the_larger() {
+    // MAX(a, b) at a < b is differentiable: its gradient is (0, 1), as
+    // jax.grad(jnp.max) gives. The 8-ulp attainment window (added so a tie
+    // that rounding breaks is shared the same way every run) also shares
+    // between two exact values a few ulps apart, which do not tie: (0.5,
+    // 0.5), not a subgradient at a point where the function is smooth. A
+    // finite difference cannot see this: any step crosses the near-tie.
+    let ctx = SessionContext::new();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    assert!(b > 1.0);
+    let got = grad(&ctx, "SELECT MAX(val) AS l FROM p", "p").await;
+    assert_eq!(got, vec![(0, Some(0.0)), (1, Some(1.0))]);
+}
+
+#[tokio::test]
+#[ignore = "known bug: fan-in's NULL-skipping fold makes a backward step exponential in its readers"]
+async fn a_value_many_columns_read_has_a_linear_backward_step() {
+    // `val` read by N projected columns gets N cotangent terms, folded so a
+    // NULL term is skipped: CASE WHEN acc IS NULL THEN t WHEN t IS NULL THEN
+    // acc ELSE acc + t END. Each fold names the accumulator three times, and
+    // DataFusion's Substrait consumer names a column by its expression, so
+    // the names, and the plan, triple per reader: 97 KB at 4 columns, 117 MB
+    // at 10, and 4 GB is not enough at 12, on a two-row table.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let n = 10;
+    let cols: Vec<String> = (1..=n)
+        .map(|k| format!("sin(val * {k}.0) AS c{k}"))
+        .collect();
+    let sum: Vec<String> = (1..=n).map(|k| format!("c{k}")).collect();
+    let loss = format!(
+        "WITH r AS (SELECT {} FROM p) SELECT SUM({}) AS l FROM r",
+        cols.join(", "),
+        sum.join(" + ")
+    );
+    let program = ad::grad(&ctx, &loss, &[ColumnRef::new("p", "val")])
+        .await
+        .unwrap();
+    let bytes = consumed_plan_bytes(&ctx, &program).await;
+    assert!(
+        bytes < 1_000_000,
+        "the backward steps plan to {bytes} bytes for {n} columns"
+    );
+}
+
+#[tokio::test]
+#[ignore = "known bug: a chain of row-wise maps makes a backward step exponential in its depth"]
+async fn a_deep_chain_of_maps_has_a_linear_backward_step() {
+    // Each layer `sin(v) + 0.1 * v` reads v twice. ddx rebuilds the region
+    // as appended, unnamed columns, and DataFusion names each by its
+    // expression, so every layer doubles the names: 0.4 MB of plan at 8
+    // layers, 60 MB at 14, and 20 layers exhaust 13 GB. The user's SQL
+    // names each layer `v`, so the forward query never sees this.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let depth = 14;
+    let mut ctes = vec!["c0 AS (SELECT i, val AS v FROM p)".to_string()];
+    for k in 1..depth {
+        ctes.push(format!(
+            "c{k} AS (SELECT i, sin(v) + 0.1 * v AS v FROM c{})",
+            k - 1
+        ));
+    }
+    let loss = format!(
+        "WITH {} SELECT SUM(v) AS l FROM c{}",
+        ctes.join(", "),
+        depth - 1
+    );
+    let program = ad::grad(&ctx, &loss, &[ColumnRef::new("p", "val")])
+        .await
+        .unwrap();
+    let bytes = consumed_plan_bytes(&ctx, &program).await;
+    assert!(
+        bytes < 2_000_000,
+        "the backward steps plan to {bytes} bytes for {depth} layers"
+    );
+}
+
+/// A loss whose Substrait plan repeats a CTE read twice per layer.
+async fn reused_cte_plan(depth: usize) -> ddx_ad::substrait::proto::Plan {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let mut ctes = vec!["c0 AS (SELECT i, val AS v FROM p)".to_string()];
+    for k in 1..depth {
+        ctes.push(format!(
+            "c{k} AS (SELECT a.i, a.v * b.v AS v FROM c{m} a JOIN c{m} b ON a.i = b.i)",
+            m = k - 1
+        ));
+    }
+    let loss = format!(
+        "WITH {} SELECT SUM(v) AS l FROM c{}",
+        ctes.join(", "),
+        depth - 1
+    );
+    let lp = ctx.sql(&loss).await.unwrap().into_optimized_plan().unwrap();
+    *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state()).unwrap()
+}
+
+#[test]
+#[ignore = "known bug: ddx_ad::grad recurses as deep as a region is wide and overflows a 2 MB stack"]
+fn grad_does_not_overflow_a_worker_threads_stack() {
+    // A tokio worker thread has a 2 MB stack. On a 66 KB plan (a CTE read
+    // twice per layer, nine layers), ddx_ad::grad clones a rebuilt region
+    // hundreds of relations deep, recursively (Transposer::region), and the
+    // stack overflow aborts the whole process: not an error, not a panic
+    // anything can catch. It runs in a child process so that abort fails
+    // this test rather than the test binary.
+    if std::env::var("DDX_FINDINGS_CHILD").is_ok() {
+        let plan = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(reused_cte_plan(9));
+        let t = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || ddx_ad::grad(&plan, &[ColumnRef::new("p", "val")]).map(|_| ()))
+            .unwrap();
+        t.join().unwrap().unwrap();
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "grad_does_not_overflow_a_worker_threads_stack",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("DDX_FINDINGS_CHILD", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "ddx_ad::grad on a 2 MB stack: {status}");
+}
+
+#[tokio::test]
+#[ignore = "known bug: grad(…) in SQL is cut at a parenthesis inside a comment"]
+async fn grad_in_sql_skips_comments_inside_the_call() {
+    // call_span finds grad(…)'s closing parenthesis by counting, skipping
+    // quoted text but not comments: `/* ) */` ends the call early and the
+    // statement no longer parses, and `/* ( */` never closes it, which ddx
+    // reports as an internal error (a bug, by its own description).
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    for call in [
+        "grad(loss /* ) */, p.val)",
+        "grad(loss, p.val /* ( */)",
+        "grad(loss, -- )\n p.val)",
+    ] {
+        let sql =
+            format!("WITH loss AS (SELECT SUM(val * val) AS l FROM p) SELECT i, val FROM {call}");
+        let df = ad::sql(&ctx, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("{call:?}: {e}"));
+        assert_eq!(
+            df.collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "known bug: vjp adds up a cotangent's repeated keys instead of refusing them"]
+async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
+    // A wrt table whose dims repeat is refused by the program's checks; a
+    // cotangent whose keys repeat is joined as it is, so the row's cotangent
+    // counts twice and its gradient silently doubles.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let program = ad::vjp(
+        &ctx,
+        "SELECT i, val * val AS s FROM p",
+        &[ColumnRef::new("p", "val")],
+    )
+    .await
+    .unwrap();
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE \"{}\" (i BIGINT, s DOUBLE) AS VALUES (0, 1.0), (0, 1.0), (1, 1.0)",
+            program.cotangent_table
+        ),
+    )
+    .await;
+    assert!(
+        ad::run(&ctx, &program).await.is_err(),
+        "a cotangent with two rows for i = 0 ran, and doubled that row's gradient"
+    );
+}
+
+#[tokio::test]
+#[ignore = "known bug: a simple CASE (CASE x WHEN …) is read as a malformed plan"]
+async fn a_simple_case_is_differentiated() {
+    // DataFusion writes `CASE i WHEN 0 THEN …` as a switch; ddx reports it as
+    // an invalid Substrait plan (which it classes as a producer bug) rather
+    // than reading or refusing it.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let got = grad(
+        &ctx,
+        "SELECT SUM(CASE i WHEN 0 THEN val * val ELSE 3.0 * val END) AS l FROM p",
+        "p",
+    )
+    .await;
+    assert_eq!(got, vec![(0, Some(2.0)), (1, Some(3.0))]);
+}
+
+#[tokio::test]
+#[ignore = "known bug: grad(…) in SQL panics when a comment makes one call's span overlap the next"]
+async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
+    // Found by ad_sql_text.rs, 18 panics in 3000 valid spellings. The first
+    // call's `/* ( */` keeps call_span counting past its real end, into the
+    // second call, until a `)` in a later comment closes it; the second
+    // call starts inside the first's span, and GradCalls::rewrite slices the
+    // statement from a later byte to an earlier one: a panic in the
+    // library, on valid SQL.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE q (i BIGINT, val DOUBLE) AS VALUES (0, 3.0), (1, 4.0)",
+    )
+    .await;
+    let sql = "WITH loss AS (SELECT SUM(p.val * q.val) AS l FROM p JOIN q ON p.i = q.i) \
+               SELECT a.i, a.val, b.val AS qv \
+               FROM grad(loss, p.val /* ( */) a JOIN grad(loss, q.val) b ON a.i = b.i /* ) */";
+    let df = ad::sql(&ctx, sql).await.unwrap();
+    assert_eq!(
+        df.collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        2
+    );
+}

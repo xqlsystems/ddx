@@ -76,7 +76,7 @@
 //! as iteration 0, and `DDX_V2_SEED=<seed>` with `replay_one_seed` prints the
 //! generated SQL and runs only that case.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -511,6 +511,10 @@ struct Node {
     shared: bool,
     /// A ranking that does not break ties, made here.
     nontotal: bool,
+    /// Its forward-mode twin (see `tangent_sql`): the same relation with a
+    /// tangent column `dv` beside `v`, referring to earlier twins as `§n§`.
+    /// `None` where the oracle has no rule.
+    tan: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -552,6 +556,87 @@ const UNARY: &[&str] = &[
     "least({v}, 0.4)",
     "abs({v})",
 ];
+
+/// Each `UNARY` map's tangent, `{v}` its argument and `{dv}` the argument's
+/// tangent: the forward-mode oracle's own rules, written by hand rather than
+/// taken from ddx-core, with the conventions ddx documents at a kink (a CASE
+/// takes the branch the row takes; `greatest(a, b)` is `a` only when `a > b`;
+/// `abs` is 0 at 0).
+const UNARY_TAN: &[&str] = &[
+    "(1.0 - tanh({v}) * tanh({v})) * {dv}",
+    "cos({v}) * {dv}",
+    "2.0 * {v} * {dv}",
+    "0.5 * {dv}",
+    "0.5 * exp(0.5 * {v}) * {dv}",
+    "{v} / sqrt({v} * {v} + 1.0) * {dv}",
+    "2.0 * {v} / ({v} * {v} + 1.0) * {dv}",
+    "{dv} / (1.0 + {v} * {v})",
+    "exp(-{v}) / ((1.0 + exp(-{v})) * (1.0 + exp(-{v}))) * {dv}",
+    "3.0 * {v} * {v} * {dv}",
+    "(-sin({v})) * {dv}",
+    "{dv}",
+    "(-{dv})",
+    "0.5 * {dv}",
+    "ln(2.0) * power(2.0, {v}) * {dv}",
+    "{dv}",
+    "{dv}",
+    "CASE WHEN {v} > 0 THEN {dv} ELSE 0.1 * {dv} END",
+    "CASE WHEN {v} > -0.3 THEN {dv} ELSE 0.0 END",
+    "CASE WHEN {v} < 0.4 THEN {dv} ELSE 0.0 END",
+    "CASE WHEN {v} > 0 THEN {dv} WHEN {v} < 0 THEN -{dv} ELSE 0.0 END",
+];
+
+/// Each `BINARY` op's tangent, in `{a}`, `{b}`, `{da}`, `{db}`.
+const BINARY_TAN: &[&str] = &[
+    "({da} + {db})",
+    "({da} * {b} + {a} * {db})",
+    "({da} - {db})",
+    "({da} * tanh({b}) + {a} * (1.0 - tanh({b}) * tanh({b})) * {db})",
+    "({da} / (1.0 + {b} * {b}) - {a} * 2.0 * {b} * {db} / ((1.0 + {b} * {b}) * (1.0 + {b} * {b})))",
+    "CASE WHEN {b} IS NULL THEN {da} WHEN {a} IS NULL THEN {db} WHEN {a} > {b} THEN {da} ELSE {db} END",
+];
+
+/// The tangent of an aggregate of `v` over rows that carry `dv`, `mx__` and
+/// `mn__` (the group's MAX and MIN as windows); `{max}`/`{min}` stand for
+/// "this row attains it". AVG is SUM over COUNT of the non-NULL values;
+/// MAX and MIN average the tangents of the rows attaining them, jax.grad's
+/// convention. `None` for an aggregate the oracle has no rule for.
+fn agg_tangent(agg: &str) -> Option<&'static str> {
+    Some(match agg {
+        "SUM(v)" => "SUM(dv)",
+        "AVG(v)" => "SUM(dv) / COUNT(v)",
+        "MAX(v)" => "AVG(CASE WHEN {max} THEN dv END)",
+        "MIN(v)" => "AVG(CASE WHEN {min} THEN dv END)",
+        "SUM(v * v)" => "SUM(2.0 * v * dv)",
+        "SUM(v) / COUNT(*)" => "SUM(dv) / COUNT(*)",
+        "AVG(tanh(v))" => "SUM((1.0 - tanh(v) * tanh(v)) * dv) / COUNT(v)",
+        "SUM(v) * MAX(v)" => "SUM(dv) * MAX(v) + SUM(v) * AVG(CASE WHEN {max} THEN dv END)",
+        "SUM(v) + 0.5 * SUM(v)" => "1.5 * SUM(dv)",
+        "AVG(v) - MIN(v)" => "SUM(dv) / COUNT(v) - AVG(CASE WHEN {min} THEN dv END)",
+        "SUM(v) / COUNT(v)" => "SUM(dv) / COUNT(v)",
+        "sin(SUM(v))" => "cos(SUM(v)) * SUM(dv)",
+        "AVG(v) + 0.5 * MAX(v)" => "SUM(dv) / COUNT(v) + 0.5 * AVG(CASE WHEN {max} THEN dv END)",
+        "-AVG(ln(v * v + 0.5))" => "-(SUM(2.0 * v * dv / (v * v + 0.5)) / COUNT(v))",
+        "SUM(v * v) * 0.1 + SUM(v)" => "SUM(2.0 * v * dv) * 0.1 + SUM(dv)",
+        _ => return None,
+    })
+}
+
+/// Rows of `from` with the window extremes an aggregate tangent reads.
+fn with_extremes(from: &str, part: &[&str]) -> String {
+    let over = if part.is_empty() {
+        "()".to_string()
+    } else {
+        format!("(PARTITION BY {})", list(part, ""))
+    };
+    format!("(SELECT c.*, MAX(v) OVER {over} AS mx__, MIN(v) OVER {over} AS mn__ FROM {from} c)")
+}
+
+/// `dv`, NULL wherever `v` is: SQL skips a NULL value, so its tangent must
+/// be skipped with it.
+fn masked(v: &str, dv: &str) -> String {
+    format!("CASE WHEN ({v}) IS NULL THEN NULL ELSE {dv} END")
+}
 
 /// Does a map expression have a kink: a branch, a clamp, or `abs`?
 fn is_kinked(f: &str) -> bool {
@@ -658,6 +743,7 @@ impl Gen<'_> {
         unique: bool,
     ) -> usize {
         self.nodes.push(Node {
+            tan: None,
             nontotal: false,
             body,
             unique,
@@ -700,7 +786,8 @@ impl Gen<'_> {
             74..=80 => self.softmax(depth),
             81..=86 => self.semi(depth),
             87..=91 => self.top_k(depth),
-            92..=96 => self.union(depth),
+            92..=94 => self.union(depth),
+            95..=97 => self.fan(depth),
             _ => self.distinct(depth),
         }
     }
@@ -729,23 +816,64 @@ impl Gen<'_> {
             "val"
         };
         let body = format!("SELECT {}{value} AS v FROM {name}", lead(&dims, ""));
-        self.push_u(body, dims, reads, BTreeSet::from(["read"]), unique)
+        // The tangent is the direction for a parameter (its `dir_` table,
+        // zero where it is not differentiated) and 0 for data.
+        let tan = if param {
+            let on: Vec<String> = dims.iter().map(|d| format!("t.{d} = dd.{d}")).collect();
+            format!(
+                "SELECT {}t.val AS v, {} AS dv FROM {name} t JOIN dir_{name} dd ON {}",
+                lead(&dims, "t."),
+                masked("t.val", "dd.d"),
+                on.join(" AND ")
+            )
+        } else {
+            format!(
+                "SELECT {}{value} AS v, {} AS dv FROM {name}",
+                lead(&dims, ""),
+                masked(value, "CAST(0.0 AS DOUBLE)")
+            )
+        };
+        let n = self.push_u(body, dims, reads, BTreeSet::from(["read"]), unique);
+        self.nodes[n].tan = Some(tan);
+        n
     }
 
     fn map(&mut self, depth: u32) -> usize {
         let c = self.node(depth - 1);
-        let f = match self.rng.below(100) {
+        let (f, t) = match self.rng.below(100) {
             // Occasionally, ddx-core's own generator: the whole v1 grammar,
-            // domain edges and all. A NaN loss is skipped, not compared.
-            0..=9 => rename_xy(&gen_expr(self.rng, 2), "{v}", "0.7"),
+            // domain edges and all. A NaN loss is skipped, not compared. Its
+            // tangent is ddx-core's jvp, the one rule the oracle borrows.
+            0..=9 => {
+                let f = rename_xy(&gen_expr(self.rng, 2), "{v}", "0.7");
+                let t = ddx_core::test_utils::try_parse(&f.replace("{v}", "v"))
+                    .ok()
+                    .and_then(|e| {
+                        let dv = ddx_core::test_utils::try_parse("dv").ok()?;
+                        ddx_core::Ddx::for_datafusion()
+                            .jvp(&e, &[(ddx_core::ColRef::bare("v"), dv)])
+                            .ok()
+                    })
+                    .map(|j| j.to_string().replace("dv", "{dv}"));
+                (f, t)
+            }
             // A constant subquery over data, as a scalar.
-            10..=14 => format!(
-                "({{v}} * (SELECT {}(val) FROM {}))",
-                self.rng.pick(&["AVG", "MAX", "SUM"]),
-                self.rng.pick(DATA).0
+            10..=14 => {
+                let q = format!(
+                    "(SELECT {}(val) FROM {})",
+                    self.rng.pick(&["AVG", "MAX", "SUM"]),
+                    self.rng.pick(DATA).0
+                );
+                (format!("({{v}} * {q})"), Some(format!("{{dv}} * {q}")))
+            }
+            15..=18 => (
+                "COALESCE({v}, 0.25)".to_string(),
+                Some("CASE WHEN {v} IS NULL THEN 0.0 ELSE {dv} END".to_string()),
             ),
-            15..=18 => "COALESCE({v}, 0.25)".to_string(),
-            _ => self.rng.pick(UNARY).to_string(),
+            _ => {
+                let k = self.rng.below(UNARY.len() as u64) as usize;
+                (UNARY[k].to_string(), Some(UNARY_TAN[k].to_string()))
+            }
         };
         let body = format!(
             "SELECT {}{} AS v FROM §{c}§ c",
@@ -755,6 +883,15 @@ impl Gen<'_> {
         let n = self.derive(c, body, "map");
         if is_kinked(&f) {
             self.nodes[n].kinds.insert("kink");
+        }
+        if let Some(t) = t {
+            let v = f.replace("{v}", "v");
+            let dv = t.replace("{v}", "v").replace("{dv}", "dv");
+            self.nodes[n].tan = Some(format!(
+                "SELECT {}{v} AS v, {} AS dv FROM §{c}§ c",
+                lead(&self.nodes[c].dims, ""),
+                masked(&v, &dv)
+            ));
         }
         n
     }
@@ -796,15 +933,27 @@ impl Gen<'_> {
         // COALESCE turns back into a number. Only on shared dims, so the
         // result's dims are `a`'s.
         let left = !shared.is_empty() && only_b.is_empty() && self.rng.below(100) < 15;
-        let op = if left {
+        let (op, top) = if left {
             kinds.insert("left-join");
-            "({a} + COALESCE({b}, 0.5))".to_string()
+            (
+                "({a} + COALESCE({b}, 0.5))".to_string(),
+                "({da} + CASE WHEN {b} IS NULL THEN 0.0 ELSE {db} END)".to_string(),
+            )
         } else if self.rng.below(100) < 8 {
             kinds.insert("case");
-            "CASE WHEN {b} > 0 THEN {a} ELSE 0.5 * {a} END".to_string()
+            (
+                "CASE WHEN {b} > 0 THEN {a} ELSE 0.5 * {a} END".to_string(),
+                "CASE WHEN {b} > 0 THEN {da} ELSE 0.5 * {da} END".to_string(),
+            )
         } else {
-            self.rng.pick(BINARY).to_string()
+            let k = self.rng.below(BINARY.len() as u64) as usize;
+            (BINARY[k].to_string(), BINARY_TAN[k].to_string())
         };
+        let top = top
+            .replace("{da}", "a.dv")
+            .replace("{db}", "b.dv")
+            .replace("{a}", "a.v")
+            .replace("{b}", "b.v");
         if is_kinked(&op) {
             kinds.insert("kink");
         }
@@ -827,9 +976,20 @@ impl Gen<'_> {
                 format!("{}, ", select.join(", "))
             }
         );
+        let tan = format!(
+            "SELECT {}{op} AS v, {} AS dv FROM {from}",
+            if select.is_empty() {
+                String::new()
+            } else {
+                format!("{}, ", select.join(", "))
+            },
+            masked(&op, &top)
+        );
         let reads = na.reads.union(&nb.reads).cloned().collect();
         kinds.insert(if shared.is_empty() { "cross" } else { "join" });
-        self.push_u(body, dims, reads, kinds, na.unique && nb.unique)
+        let n = self.push_u(body, dims, reads, kinds, na.unique && nb.unique);
+        self.nodes[n].tan = (na.tan.is_some() && nb.tan.is_some()).then_some(tan);
+        n
     }
 
     fn reduce(&mut self, depth: u32) -> usize {
@@ -878,7 +1038,17 @@ impl Gen<'_> {
             lead(&keep, ""),
             group_by(&keep)
         );
-        self.push_u(body, keep, n.reads.clone(), kinds, true)
+        let tan = agg_tangent(agg).map(|t| {
+            format!(
+                "SELECT {}{agg} AS v, {t} AS dv FROM {} c{}{having}",
+                lead(&keep, ""),
+                with_extremes(&format!("§{c}§"), &keep),
+                group_by(&keep)
+            )
+        });
+        let m = self.push_u(body, keep, n.reads.clone(), kinds, true);
+        self.nodes[m].tan = tan.filter(|_| n.tan.is_some());
+        m
     }
 
     fn filter(&mut self, depth: u32) -> usize {
@@ -901,7 +1071,9 @@ impl Gen<'_> {
             )
         };
         let body = format!("SELECT * FROM §{c}§ c WHERE {cond}");
-        self.derive(c, body, kind)
+        let n = self.derive(c, body.clone(), kind);
+        self.nodes[n].tan = self.nodes[c].tan.as_ref().map(|_| body);
+        n
     }
 
     /// ORDER BY … LIMIT: a top-k by value, broken by every dim.
@@ -917,7 +1089,52 @@ impl Gen<'_> {
             "SELECT * FROM §{c}§ c ORDER BY {order} LIMIT {}",
             1 + self.rng.below(3)
         );
-        self.derive(c, body, "limit")
+        let n = self.derive(c, body.clone(), "limit");
+        self.nodes[n].tan = self.nodes[c].tan.as_ref().map(|_| body);
+        n
+    }
+
+    /// One relation read by several projected columns, then summed: fan-in
+    /// within a region, which a column read in `k` places makes `k`
+    /// cotangent terms to add.
+    fn fan(&mut self, depth: u32) -> usize {
+        let c = self.node(depth - 1);
+        let dims = self.nodes[c].dims.clone();
+        // At most one fan per case, of at most four readers: fan-in's
+        // backward plan grows about 3× per reader today (ad_findings.rs), and
+        // two nested fans would multiply, past what a soak's memory allows.
+        let k = 2 + self.rng.below(3) as usize;
+        if self.nodes.iter().any(|n| n.kinds.contains("fan")) {
+            return c;
+        }
+        let mut inner = Vec::new();
+        let mut inner_t = Vec::new();
+        for m in 0..k {
+            // The smooth maps only: this is about fan-in, not kinks.
+            let f = self.rng.below(11) as usize;
+            let v = UNARY[f].replace("{v}", "v");
+            let dv = UNARY_TAN[f].replace("{v}", "v").replace("{dv}", "dv");
+            inner.push(format!("{v} AS a{m}"));
+            inner_t.push(format!("{v} AS a{m}, {} AS da{m}", masked(&v, &dv)));
+        }
+        let sum: Vec<String> = (0..k).map(|m| format!("a{m}")).collect();
+        let dsum: Vec<String> = (0..k).map(|m| format!("da{m}")).collect();
+        let body = format!(
+            "SELECT {d}{} AS v FROM (SELECT {d}{} FROM §{c}§ c) w",
+            sum.join(" + "),
+            inner.join(", "),
+            d = lead(&dims, "")
+        );
+        let tan = format!(
+            "SELECT {d}{} AS v, {} AS dv FROM (SELECT {d}{} FROM §{c}§ c) w",
+            sum.join(" + "),
+            dsum.join(" + "),
+            inner_t.join(", "),
+            d = lead(&dims, "")
+        );
+        let n = self.derive(c, body, "fan");
+        self.nodes[n].tan = self.nodes[c].tan.as_ref().map(|_| tan);
+        n
     }
 
     /// UNION ALL of two relations with the same dims: rows can then repeat
@@ -943,8 +1160,21 @@ impl Gen<'_> {
             kinds.clone(),
             false,
         );
+        if na.tan.is_some() && nb.tan.is_some() {
+            self.nodes[u].tan = Some(format!(
+                "SELECT {d}v, dv FROM §{a}§ a UNION ALL SELECT {d}v, dv FROM §{b}§ b",
+                d = lead(&dims, "")
+            ));
+        }
         kinds.insert("sum");
-        self.push_u(
+        let tan = self.nodes[u].tan.as_ref().map(|_| {
+            format!(
+                "SELECT {}SUM(v) AS v, SUM(dv) AS dv FROM §{u}§ c{}",
+                lead(&dims, ""),
+                group_by(&dims)
+            )
+        });
+        let n = self.push_u(
             format!(
                 "SELECT {}SUM(v) AS v FROM §{u}§ c{}",
                 lead(&dims, ""),
@@ -954,7 +1184,9 @@ impl Gen<'_> {
             reads,
             kinds,
             true,
-        )
+        );
+        self.nodes[n].tan = tan;
+        n
     }
 
     /// SELECT DISTINCT over a varied value: a GROUP BY on it.
@@ -990,7 +1222,9 @@ impl Gen<'_> {
                 self.rng.range(-0.5, 0.5)
             )
         };
-        self.derive(c, body, "semi")
+        let n = self.derive(c, body.clone(), "semi");
+        self.nodes[n].tan = self.nodes[c].tan.as_ref().map(|_| body);
+        n
     }
 
     fn rank(&mut self, depth: u32) -> usize {
@@ -1041,7 +1275,13 @@ impl Gen<'_> {
             lead(&dims, ""),
             lead(&dims, ""),
         );
+        let tan = format!(
+            "SELECT {}v, dv FROM (SELECT {}v, dv, ROW_NUMBER() OVER ({over}) AS rk FROM §{c}§ c) r WHERE {keep}",
+            lead(&dims, ""),
+            lead(&dims, ""),
+        );
         let n = self.derive(c, body, "rank");
+        self.nodes[n].tan = self.nodes[c].tan.as_ref().map(|_| tan);
         if !total {
             self.nodes[n].kinds.insert("nontotal-rank");
             self.nodes[n].nontotal = true;
@@ -1073,6 +1313,15 @@ impl Gen<'_> {
             n.reads.clone(),
             kinds.clone(),
         );
+        let has_tan = n.tan.is_some();
+        self.nodes[mx].tan = has_tan.then(|| {
+            format!(
+                "SELECT {}MAX(v) AS v, AVG(CASE WHEN {{max}} THEN dv END) AS dv FROM {} c{}",
+                lead(&g, ""),
+                with_extremes(&format!("§{c}§"), &g),
+                group_by(&g)
+            )
+        });
         let shift = if self.rng.below(2) == 0 {
             "ddx_stop_gradient(b.v)"
         } else {
@@ -1092,6 +1341,18 @@ impl Gen<'_> {
             kinds.clone(),
             n.unique,
         );
+        let dshift = if shift == "b.v" { "b.dv" } else { "0.0" };
+        self.nodes[e].tan = has_tan.then(|| {
+            format!(
+                "SELECT {}exp(a.v - b.v) AS v, {} AS dv FROM {}",
+                lead(&n.dims, "a."),
+                masked(
+                    "exp(a.v - b.v)",
+                    &format!("exp(a.v - b.v) * (a.dv - {dshift})")
+                ),
+                join_clause(c, mx, &g)
+            )
+        });
         let s = self.push(
             format!(
                 "SELECT {}SUM(v) AS v FROM §{e}§ c{}",
@@ -1102,6 +1363,13 @@ impl Gen<'_> {
             n.reads.clone(),
             kinds.clone(),
         );
+        self.nodes[s].tan = has_tan.then(|| {
+            format!(
+                "SELECT {}SUM(v) AS v, SUM(dv) AS dv FROM §{e}§ c{}",
+                lead(&g, ""),
+                group_by(&g)
+            )
+        });
         if shift != "b.v" {
             self.nodes[e].shared = false;
             self.nodes[s].shared = false;
@@ -1111,7 +1379,12 @@ impl Gen<'_> {
         } else {
             "a.v / b.v"
         };
-        self.push_u(
+        let dratio = if ratio.starts_with("ln") {
+            "a.dv / a.v - b.dv / b.v"
+        } else {
+            "(a.dv * b.v - a.v * b.dv) / (b.v * b.v)"
+        };
+        let r = self.push_u(
             format!(
                 "SELECT {}{ratio} AS v FROM {}",
                 lead(&n.dims, "a."),
@@ -1121,7 +1394,16 @@ impl Gen<'_> {
             n.reads.clone(),
             kinds,
             n.unique,
-        )
+        );
+        self.nodes[r].tan = has_tan.then(|| {
+            format!(
+                "SELECT {}{ratio} AS v, {} AS dv FROM {}",
+                lead(&n.dims, "a."),
+                masked(ratio, dratio),
+                join_clause(e, s, &g)
+            )
+        });
+        r
     }
 }
 
@@ -1302,6 +1584,52 @@ impl Case {
             }
         }
         c
+    }
+
+    /// The loss's forward-mode twin: one query whose row is the loss and its
+    /// directional derivative along the `dir_` tables, `(loss, dloss)`. It
+    /// shares no code with ddx-ad's transposes, so where it and reverse mode
+    /// agree, `⟨∇L, d⟩` is right to rounding, not to a finite difference's
+    /// truncation. `window` gives MAX and MIN ddx's 8-ulp attainment window
+    /// instead of exact equality. `None` if some relation has no twin.
+    fn tangent_sql(&self, window: bool) -> Option<String> {
+        let head_t = agg_tangent(&self.head)?;
+        let attains = |m: &str| {
+            if window {
+                format!(
+                    "(v = {m} OR (abs({m}) <= 1.7976931348623157e308 AND \
+                     abs(v - {m}) <= 8.0 * 2.220446049250313e-16 * abs({m})))"
+                )
+            } else {
+                format!("v = {m}")
+            }
+        };
+        let fill = |t: &str| {
+            t.replace("{max}", &attains("mx__"))
+                .replace("{min}", &attains("mn__"))
+        };
+        let mut ctes = Vec::new();
+        for (k, n) in self.nodes.iter().enumerate() {
+            let body = fill(n.tan.as_ref()?);
+            let mut out = String::new();
+            let mut rest = body.as_str();
+            while let Some(at) = rest.find('§') {
+                out.push_str(&rest[..at]);
+                let after = &rest[at + '§'.len_utf8()..];
+                let end = after.find('§')?;
+                write!(out, "t{}", &after[..end]).ok()?;
+                rest = &after[end + '§'.len_utf8()..];
+            }
+            out.push_str(rest);
+            ctes.push(format!("t{k} AS ({out})"));
+        }
+        Some(format!(
+            "WITH {} SELECT {} AS loss, {} AS dloss FROM {} c",
+            ctes.join(", "),
+            self.head,
+            fill(head_t),
+            with_extremes(&format!("t{}", self.root), &[])
+        ))
     }
 
     /// The loss query as the user would write it.
@@ -1946,6 +2274,7 @@ struct Outcome {
     fd_compared: u32,
     fd_screened: u32,
     fd_bracketed: u32,
+    exact_compared: u32,
     meta_compared: u32,
     kinds: BTreeSet<&'static str>,
     /// Failures DataFusion's physical planning is responsible for (see
@@ -1973,6 +2302,8 @@ struct Props {
     shapes: bool,
     names: bool,
     train: bool,
+    exact: bool,
+    cost: bool,
 }
 
 const ALL: Props = Props {
@@ -1985,6 +2316,8 @@ const ALL: Props = Props {
     shapes: true,
     names: true,
     train: true,
+    exact: true,
+    cost: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -2302,6 +2635,14 @@ async fn check_case_inner(
 
     if props.train {
         train_checks(case, &grads, out).await?;
+    }
+
+    if props.exact {
+        exact_checks(rng, case, &ctx, l0, &grads, out).await?;
+    }
+
+    if props.cost {
+        cost_checks(case, &sql, out).await?;
     }
     Ok(())
 }
@@ -2969,6 +3310,211 @@ const KINKY: &[&str] = &[
     "case",
     "having",
 ];
+
+/// Forward mode against reverse mode: `⟨∇L, d⟩` from ddx's gradient must
+/// equal the directional derivative the loss's forward-mode twin computes
+/// (`Case::tangent_sql`), to rounding. A finite difference cannot see an
+/// error below its truncation, nor a wrong convention at a point where the
+/// loss is differentiable but a kink lies within one step (a MAX over two
+/// values a few ulps apart); this can.
+async fn exact_checks(
+    rng: &mut Rng,
+    case: &Case,
+    ctx: &SessionContext,
+    l0: f64,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    // NaN and infinite data make tangents 0 · ∞, as they make reverse mode's.
+    if matches!(
+        case.modes.extreme,
+        Some(Extreme::NanData | Extreme::InfData)
+    ) {
+        return Ok(());
+    }
+    let Some(exact_sql) = case.tangent_sql(false) else {
+        return Ok(());
+    };
+    for _ in 0..3 {
+        // A direction over every non-NULL wrt value; 0 elsewhere.
+        let mut ad_dot = 0.0;
+        let mut ad_abs = 0.0;
+        for (name, _) in PARAMS {
+            let tb = case.table(name);
+            let wrt = case.wrt.iter().any(|w| w == name);
+            let d: Vec<Option<f64>> = tb
+                .vals
+                .iter()
+                .map(|v| {
+                    Some(if wrt && v.is_some() {
+                        rng.range(-1.0, 1.0)
+                    } else {
+                        0.0
+                    })
+                })
+                .collect();
+            if wrt {
+                for (key, dk) in tb.keys.iter().zip(&d) {
+                    let dk = dk.unwrap_or(0.0);
+                    if dk == 0.0 {
+                        continue;
+                    }
+                    if let Some(g) = grads.get(*name).and_then(|g| g.get(key)).copied().flatten() {
+                        ad_dot += g * dk;
+                        ad_abs += (g * dk).abs();
+                    }
+                }
+            }
+            let dir = Table {
+                name: format!("dir_{name}"),
+                vals: d,
+                chunks: Vec::new(),
+                ..tb.clone()
+            };
+            let batch = dir.batch();
+            let renamed = RecordBatch::try_new(
+                Arc::new(Schema::new(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            if f.name() == "val" {
+                                Field::new("d", DataType::Float64, true)
+                            } else {
+                                f.as_ref().clone()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                batch.columns().to_vec(),
+            )
+            .map_err(|e| e.to_string())?;
+            register_batch(ctx, &dir.name, renamed)?;
+        }
+        let row = |r: Rows| -> Option<(Option<f64>, Option<f64>)> {
+            match r.rows.as_slice() {
+                [row] if row.len() == 2 => Some((row[0], row[1])),
+                _ => None,
+            }
+        };
+        let got = match query(ctx, &exact_sql).await {
+            Ok(r) => row(r),
+            Err(e) => {
+                out.fail(format!(
+                    "[oracle] the forward-mode twin does not run: {e}\n  {exact_sql}"
+                ));
+                return Ok(());
+            }
+        };
+        let Some((Some(loss_t), dloss)) = got else {
+            return Ok(());
+        };
+        if (loss_t - l0).abs() > 1e-9 * l0.abs().max(1.0) {
+            out.fail(format!(
+                "[oracle] the forward-mode twin computes the loss {loss_t}, not {l0}\n  {exact_sql}"
+            ));
+            return Ok(());
+        }
+        let Some(dloss) = dloss.filter(|v| v.is_finite()) else {
+            continue;
+        };
+        if !ad_dot.is_finite() {
+            continue;
+        }
+        out.exact_compared += 1;
+        let tol = |a: f64, b: f64| 1e-8 * ad_abs.max(a.abs()).max(b.abs()).max(1e-300) + 1e-13;
+        if (dloss - ad_dot).abs() <= tol(dloss, ad_dot) {
+            continue;
+        }
+        // Disagreeing with exact equality: does ddx's window explain it?
+        let windowed = match case.tangent_sql(true) {
+            Some(q) => query(ctx, &q).await.ok().and_then(row).and_then(|(_, d)| d),
+            None => None,
+        };
+        if let Some(w) = windowed.filter(|w| (w - ad_dot).abs() <= tol(*w, ad_dot)) {
+            let _ = w;
+            out.engine
+                .push("near-tie shared by the 8-ulp window (jax.grad would not)".into());
+            if std::env::var("DDX_V2_STRICT_TIES").is_ok() {
+                out.fail(format!(
+                    "[near-tie] ⟨∇L, d⟩ = {ad_dot:.15e}; jax.grad's convention gives \
+                     {dloss:.15e}: a MAX/MIN shared its cotangent between rows within 8 ulps \
+                     that do not tie"
+                ));
+            }
+            continue;
+        }
+        out.fail(format!(
+            "[exact] reverse mode ⟨∇L, d⟩ = {ad_dot:.15e}, forward mode {dloss:.15e} \
+             (|Δ| {:.3e}, tol {:.3e}); windowed forward mode {windowed:?}\n  twin: {exact_sql}",
+            (dloss - ad_dot).abs(),
+            tol(dloss, ad_dot)
+        ));
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// A program's cost must stay proportionate to its query's. ddx's own plans
+/// are small, but DataFusion's Substrait consumer names a computed column by
+/// its expression, so a backward step whose expressions nest can plan to
+/// megabytes, grow exponentially, and exhaust memory on a two-row table. The
+/// bytes of the consumed plans are a deterministic measure of that, and they
+/// grow long before a run is slow; each step is run to bind the next.
+async fn cost_checks(case: &Case, sql: &str, out: &mut Outcome) -> Result<(), String> {
+    let ctx = setup(case, 4).await?;
+    let forward = match ctx.sql(sql).await {
+        Ok(df) => match df.into_optimized_plan() {
+            Ok(lp) => lp.display_indent().to_string().len(),
+            Err(_) => return Ok(()),
+        },
+        Err(_) => return Ok(()),
+    };
+    let Ok(program) = ad::grad(&ctx, sql, &case.wrt_refs()).await else {
+        return Ok(());
+    };
+    let mut total = 0usize;
+    let mut worst = (0usize, String::new());
+    for step in program.steps() {
+        let mut plan = step.plan.clone();
+        let mut schemas = HashMap::new();
+        for n in ddx_ad::unbound_reads(&plan) {
+            let Ok(schema) = ad::table_schema(&ctx, &n).await else {
+                return Ok(());
+            };
+            schemas.insert(n, schema);
+        }
+        if ddx_ad::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).is_err() {
+            return Ok(());
+        }
+        let Ok(lp) = from_substrait_plan(&ctx.state(), &plan).await else {
+            return Ok(());
+        };
+        let bytes = lp.display_indent().to_string().len();
+        total += bytes;
+        if bytes > worst.0 {
+            worst = (bytes, step.name.clone());
+        }
+        // Stop before a step that would take the process down with it.
+        if total > 20_000_000 {
+            break;
+        }
+        if ad::run_step(&ctx, step).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = ad::release(&ctx, &program);
+    let bound = (200 * forward).max(2_000_000);
+    if total > bound {
+        out.fail(format!(
+            "[cost] the backward program plans to {total} bytes in DataFusion (worst step {} \
+             at {} bytes) for a forward query of {forward}: more than {bound}",
+            worst.1, worst.0
+        ));
+    }
+    Ok(())
+}
 
 /// A context with the given optimizer rules, in the given order.
 fn ctx_with_rules(rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>) -> SessionContext {
@@ -3830,6 +4376,7 @@ struct Tally {
     fd_compared: u64,
     fd_screened: u64,
     fd_bracketed: u64,
+    exact_compared: u64,
     meta_compared: u64,
     refusals: BTreeMap<String, u64>,
     kinds: BTreeMap<&'static str, u64>,
@@ -3845,6 +4392,7 @@ impl Tally {
         self.fd_compared += o.fd_compared as u64;
         self.fd_screened += o.fd_screened as u64;
         self.fd_bracketed += o.fd_bracketed as u64;
+        self.exact_compared += o.exact_compared as u64;
         self.meta_compared += o.meta_compared as u64;
         if let Some(r) = &o.refusal {
             *self.refusals.entry(r.clone()).or_default() += 1;
@@ -3864,11 +4412,12 @@ impl Tally {
 
     fn summary(&self) -> String {
         let mut s = format!(
-            "cases={} accepted={} failures={} fd_compared={} fd_bracketed={} fd_screened={} \
-             meta_compared={}",
+            "cases={} accepted={} failures={} exact_compared={} fd_compared={} fd_bracketed={} \
+             fd_screened={} meta_compared={}",
             self.cases,
             self.accepted,
             self.failures,
+            self.exact_compared,
             self.fd_compared,
             self.fd_bracketed,
             self.fd_screened,
@@ -3941,6 +4490,8 @@ const NONE: Props = Props {
     shapes: false,
     names: false,
     train: false,
+    exact: false,
+    cost: false,
 };
 
 #[test]
@@ -4032,6 +4583,32 @@ fn grad_in_sql_survives_names_and_training_loops() {
             train: true,
             ..NONE
         },
+        seeds() / 3,
+    );
+}
+
+#[test]
+fn reverse_mode_agrees_with_a_forward_mode_twin() {
+    bounded(
+        "forward vs reverse",
+        8_000,
+        seeds(),
+        Props {
+            exact: true,
+            ..NONE
+        },
+        seeds() / 3,
+    );
+}
+
+#[test]
+#[ignore = "known bug: fan-in's backward plan grows about 3x per reader (ad_findings.rs); the soak runs this"]
+fn a_programs_cost_is_proportionate_to_its_query() {
+    bounded(
+        "cost",
+        9_000,
+        seeds(),
+        Props { cost: true, ..NONE },
         seeds() / 3,
     );
 }
@@ -4133,7 +4710,7 @@ fn replay_one_seed() {
 
 /// The property groups a soak runs: all of them, or the comma-separated
 /// names in `DDX_V2_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
-/// shapes,names,train`), to spend a soak's budget on one surface.
+/// shapes,names,train,exact,cost`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
     let Ok(names) = std::env::var("DDX_V2_PROPS") else {
         return ALL;
@@ -4149,6 +4726,8 @@ fn soak_props() -> Props {
         shapes: on("shapes"),
         names: on("names"),
         train: on("train"),
+        exact: on("exact"),
+        cost: on("cost"),
     }
 }
 

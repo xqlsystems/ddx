@@ -249,6 +249,26 @@ extreme,big` forces those data modes on every case, and `DDX_V2_DEBUG=1` with
 `replay_one_seed` prints each step's table and flags any relation that is not
 bit-reproducible from run to run.
 
+Two property groups go past a finite difference. `exact` checks reverse mode
+against a forward-mode twin of each generated query: the same SQL with a
+tangent column beside every value, written by hand from the rules, run by
+DataFusion. It agrees to rounding, not to a finite difference's step, so it
+sees a wrong tie convention or a small error that a step would hide. `cost`
+bounds the size of the plans DataFusion builds for a program's steps,
+relative to the forward query's, so a superlinear blowup fails as a finding
+instead of exhausting memory. `crates/ddx-datafusion/tests/ad_sql_text.rs`
+fuzzes the text of `grad(…)` in SQL: comments, whitespace, case and quoting
+between its tokens.
+
+Run a soak under a memory cap: a blowup can use all of a machine's memory,
+and the kernel then kills more than the test.
+
+```bash
+systemd-run --user --scope -p MemoryMax=8G \
+  cargo test -p ddx-datafusion --test ad_simulation --release \
+  -- --ignored --nocapture soak_v2_query_ad
+```
+
 To see how much a clean v2 soak proves, `.github/scripts/mutation_test.py`
 seeds one deliberate bug at a time into `ddx-ad` and the DataFusion adapter
 and measures how long the soak takes to catch it (it also runs weekly, in
