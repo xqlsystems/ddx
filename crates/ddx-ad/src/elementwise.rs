@@ -158,6 +158,30 @@ impl<'a> Elementwise<'a> {
                 Ok(self.partials(e, varied, ext)?.into_iter().collect())
             };
         match hole {
+            Hole::Switch {
+                whole,
+                operand,
+                clauses,
+                otherwise,
+            } => {
+                // The same CASE with its conditions spelled out.
+                let equal = ext.anchor("equal");
+                let clauses = clauses
+                    .iter()
+                    .map(|(value, then)| {
+                        (
+                            call(equal, vec![(**operand).clone(), value.clone()]),
+                            then.clone(),
+                        )
+                    })
+                    .collect();
+                let case = Hole::Case {
+                    whole: whole.clone(),
+                    clauses,
+                    otherwise: otherwise.clone(),
+                };
+                self.hole_partials(&case, varied, ext)
+            }
             Hole::Case {
                 clauses, otherwise, ..
             } => {
@@ -286,6 +310,15 @@ enum Hole {
         clauses: Vec<(Expression, Expression)>,
         otherwise: Option<Box<Expression>>,
     },
+    /// `CASE m WHEN v THEN r … [ELSE o] END`: a CASE on `m`'s value, which
+    /// DataFusion writes as a switch. It is the CASE whose conditions are
+    /// `m = v`.
+    Switch {
+        whole: Box<Expression>,
+        operand: Box<Expression>,
+        clauses: Vec<(Expression, Expression)>,
+        otherwise: Option<Box<Expression>>,
+    },
     /// `greatest(…)` or `least(…)`, declared at `anchor`.
     Extreme {
         whole: Box<Expression>,
@@ -298,7 +331,9 @@ enum Hole {
 impl Hole {
     fn whole(&self) -> &Expression {
         match self {
-            Hole::Case { whole, .. } | Hole::Extreme { whole, .. } => whole,
+            Hole::Case { whole, .. } | Hole::Switch { whole, .. } | Hole::Extreme { whole, .. } => {
+                whole
+            }
         }
     }
 }
@@ -385,6 +420,35 @@ impl ToSql<'_> {
                 }
                 Ok(func(&name, sql))
             }
+            // DataFusion writes `CASE x WHEN v THEN …` as an IfThen whose
+            // first clause is `x` with no result (its consumer reads it back
+            // so); the rest are the values. That is a CASE on a value.
+            RexType::IfThen(it)
+                if it
+                    .ifs
+                    .first()
+                    .is_some_and(|c| c.r#if.is_some() && c.then.is_none()) =>
+            {
+                let operand = it.ifs[0].r#if.clone().expect("checked above");
+                let mut clauses = Vec::with_capacity(it.ifs.len() - 1);
+                for c in &it.ifs[1..] {
+                    match (&c.r#if, &c.then) {
+                        (Some(value), Some(then)) => clauses.push((value.clone(), then.clone())),
+                        _ => {
+                            return Err(AdError::InvalidPlan(
+                                "a CASE clause with no value or result".into(),
+                            ))
+                        }
+                    }
+                }
+                self.holes.push(Hole::Switch {
+                    whole: Box::new(e.clone()),
+                    operand: Box::new(operand),
+                    clauses,
+                    otherwise: it.r#else.clone(),
+                });
+                Ok(ident(format!("h{}", self.holes.len() - 1)))
+            }
             RexType::IfThen(it) => {
                 let mut clauses = Vec::with_capacity(it.ifs.len());
                 for c in &it.ifs {
@@ -401,6 +465,34 @@ impl ToSql<'_> {
                     whole: Box::new(e.clone()),
                     clauses,
                     otherwise: it.r#else.clone(),
+                });
+                Ok(ident(format!("h{}", self.holes.len() - 1)))
+            }
+            RexType::SwitchExpression(sw) => {
+                let operand = sw.r#match.as_deref().ok_or_else(|| {
+                    AdError::InvalidPlan("a CASE on a value with no value".into())
+                })?;
+                let mut clauses = Vec::with_capacity(sw.ifs.len());
+                for c in &sw.ifs {
+                    match (&c.r#if, &c.then) {
+                        (Some(value), Some(then)) => clauses.push((
+                            Expression {
+                                rex_type: Some(RexType::Literal(value.clone())),
+                            },
+                            then.clone(),
+                        )),
+                        _ => {
+                            return Err(AdError::InvalidPlan(
+                                "a CASE clause with no value or result".into(),
+                            ))
+                        }
+                    }
+                }
+                self.holes.push(Hole::Switch {
+                    whole: Box::new(e.clone()),
+                    operand: Box::new(operand.clone()),
+                    clauses,
+                    otherwise: sw.r#else.clone(),
                 });
                 Ok(ident(format!("h{}", self.holes.len() - 1)))
             }
@@ -766,6 +858,15 @@ mod tests {
                 }
             }
             RexType::Cast(c) => eval(c.input.as_ref().unwrap(), row, names),
+            RexType::IfThen(it) if it.ifs[0].then.is_none() => {
+                let m = eval(it.ifs[0].r#if.as_ref().unwrap(), row, names);
+                for c in &it.ifs[1..] {
+                    if eval(c.r#if.as_ref().unwrap(), row, names) == m {
+                        return eval(c.then.as_ref().unwrap(), row, names);
+                    }
+                }
+                eval(it.r#else.as_ref().unwrap(), row, names)
+            }
             RexType::IfThen(it) => {
                 for c in &it.ifs {
                     if eval(c.r#if.as_ref().unwrap(), row, names) != 0.0 {
@@ -773,6 +874,18 @@ mod tests {
                     }
                 }
                 eval(it.r#else.as_ref().unwrap(), row, names)
+            }
+            RexType::SwitchExpression(sw) => {
+                let m = eval(sw.r#match.as_ref().unwrap(), row, names);
+                for c in &sw.ifs {
+                    let value = Expression {
+                        rex_type: Some(RexType::Literal(c.r#if.clone().unwrap())),
+                    };
+                    if eval(&value, row, names) == m {
+                        return eval(c.then.as_ref().unwrap(), row, names);
+                    }
+                }
+                eval(sw.r#else.as_ref().unwrap(), row, names)
             }
             other => panic!("no test evaluator for {}", rex_name(other)),
         }
@@ -932,6 +1045,50 @@ mod tests {
         let e = fx.f("multiply", vec![relu, field(1)]);
         check(&fx, &e, &[0, 1], &[0.7, 1.5], &[0, 1]);
         check(&fx, &e, &[0, 1], &[-0.4, 1.5], &[0, 1]);
+    }
+
+    #[test]
+    fn a_case_on_a_value_takes_the_branch_it_matches() {
+        // CASE c1 WHEN 0 THEN c0 * c0 ELSE 3 * c0 END, which DataFusion
+        // writes as a switch (#98).
+        use substrait::proto::expression::{
+            if_then, switch_expression::IfValue, IfThen, SwitchExpression,
+        };
+        let fx = fixture();
+        let Some(RexType::Literal(zero)) = lit_f64(0.0).rex_type else {
+            unreachable!()
+        };
+        let e = Expression {
+            rex_type: Some(RexType::SwitchExpression(Box::new(SwitchExpression {
+                r#match: Some(Box::new(field(1))),
+                ifs: vec![IfValue {
+                    r#if: Some(zero),
+                    then: Some(fx.f("multiply", vec![field(0), field(0)])),
+                }],
+                r#else: Some(Box::new(fx.f("multiply", vec![lit_f64(3.0), field(0)]))),
+            }))),
+        };
+        check(&fx, &e, &[0], &[0.7, 0.0], &[0]);
+        check(&fx, &e, &[0], &[0.7, 1.0], &[0]);
+        // The same CASE as DataFusion's producer writes it: an IfThen whose
+        // first clause is the operand, with no result.
+        let df = Expression {
+            rex_type: Some(RexType::IfThen(Box::new(IfThen {
+                ifs: vec![
+                    if_then::IfClause {
+                        r#if: Some(field(1)),
+                        then: None,
+                    },
+                    if_then::IfClause {
+                        r#if: Some(lit_f64(0.0)),
+                        then: Some(fx.f("multiply", vec![field(0), field(0)])),
+                    },
+                ],
+                r#else: Some(Box::new(fx.f("multiply", vec![lit_f64(3.0), field(0)]))),
+            }))),
+        };
+        check(&fx, &df, &[0], &[0.7, 0.0], &[0]);
+        check(&fx, &df, &[0], &[0.7, 1.0], &[0]);
     }
 
     #[test]
