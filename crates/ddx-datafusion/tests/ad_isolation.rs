@@ -180,3 +180,87 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     .await;
     assert_eq!(got, vec![0.0, 0.0]);
 }
+
+#[tokio::test]
+async fn a_deep_chain_of_maps_plans_to_a_small_plan() {
+    // From the v2 soak (#98): each layer `sin(v) + 0.1 * v` reads v twice,
+    // and DataFusion's Substrait consumer names a computed column by its
+    // expression, so every layer doubled the names: 60 MB of plan at 14
+    // layers, and 20 exhausted 13 GB. ad::run consumes a step with short
+    // names instead.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let depth = 20;
+    let mut ctes = vec!["c0 AS (SELECT i, val AS v FROM p)".to_string()];
+    for k in 1..depth {
+        ctes.push(format!(
+            "c{k} AS (SELECT i, sin(v) + 0.1 * v AS v FROM c{})",
+            k - 1
+        ));
+    }
+    let loss = format!(
+        "WITH {} SELECT SUM(v) AS l FROM c{}",
+        ctes.join(", "),
+        depth - 1
+    );
+    let program = ad::grad(&ctx, &loss, &[ColumnRef::new("p", "val")])
+        .await
+        .unwrap();
+    let mut bytes = 0;
+    for step in program.steps() {
+        let lp = ad::logical_plan(&ctx, &step.plan).await.unwrap();
+        bytes += lp.display_indent().to_string().len();
+        ad::run_step(&ctx, step).await.unwrap();
+    }
+    assert!(
+        bytes < 2_000_000,
+        "{bytes} bytes of plan for {depth} layers"
+    );
+    // And the gradient is the chain rule's: Π (cos(v_k) + 0.1).
+    let got = f64s(
+        &ctx,
+        &format!("SELECT val FROM {} ORDER BY i", program.gradients[0].step),
+    )
+    .await;
+    for (g, v0) in got.iter().zip([0.3f64, 0.5]) {
+        let (mut v, mut d) = (v0, 1.0);
+        for _ in 1..depth {
+            d *= v.cos() + 0.1;
+            v = v.sin() + 0.1 * v;
+        }
+        assert!((g - d).abs() < 1e-12, "{g} vs {d}");
+    }
+}
+
+#[tokio::test]
+async fn vjp_refuses_a_cotangent_whose_keys_repeat_through_ad_run() {
+    // The check reads the cotangent table, whose types ddx does not know;
+    // ad::run binds a check's reads as it binds a step's.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let program = ad::vjp(
+        &ctx,
+        "SELECT i, val * val AS s FROM p",
+        &[ColumnRef::new("p", "val")],
+    )
+    .await
+    .unwrap();
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE \"{}\" (i BIGINT, s DOUBLE) AS VALUES (0, 1.0), (0, 1.0), (1, 1.0)",
+            program.cotangent_table
+        ),
+    )
+    .await;
+    let err = ad::run(&ctx, &program).await.unwrap_err();
+    assert!(err.to_string().contains("share their keys"), "{err}");
+}

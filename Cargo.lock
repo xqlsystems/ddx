@@ -1365,6 +1365,7 @@ dependencies = [
 name = "ddx-datafusion"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "datafusion",
  "datafusion-substrait",
  "ddx-ad",

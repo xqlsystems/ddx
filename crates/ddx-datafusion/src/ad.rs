@@ -43,17 +43,27 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use datafusion::catalog::TableProvider;
+use datafusion::common::{DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::execution::{FunctionRegistry, SessionState};
+use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::prelude::SessionContext;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+use datafusion_substrait::extensions::Extensions;
+use datafusion_substrait::logical_plan::consumer::{
+    from_project_rel, from_substrait_plan_with_consumer, DefaultSubstraitConsumer,
+    SubstraitConsumer,
+};
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Rel};
+use ddx_ad::substrait::proto::{Plan, ProjectRel};
 use ddx_ad::{bind_reads, unbound_reads};
 
 pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
@@ -130,7 +140,7 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> 
 /// Run `program`'s checks, failing on the first that returns a row.
 pub async fn run_checks(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
     for check in &program.checks {
-        let lp = from_substrait_plan(&ctx.state(), &check.plan).await?;
+        let lp = logical_plan(ctx, &check.plan).await?;
         let rows: usize = ctx
             .execute_logical_plan(lp)
             .await?
@@ -160,14 +170,7 @@ pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
 /// Every step it reads must already be registered. Unlike [`run`], this
 /// neither runs the checks nor drops anything.
 pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
-    let mut plan = step.plan.clone();
-    let mut schemas = HashMap::new();
-    for name in unbound_reads(&plan) {
-        let schema = table_schema(ctx, &name).await?;
-        schemas.insert(name, schema);
-    }
-    bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(to_df_err)?;
-    let lp = from_substrait_plan(&ctx.state(), &plan).await?;
+    let lp = logical_plan(ctx, &step.plan).await?;
     let df = ctx.execute_logical_plan(lp).await?;
     // The schema of the plan that runs, not the logical one: a step read
     // from an unanalyzed plan can be typed before type coercion (a CASE
@@ -183,6 +186,93 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
     ctx.deregister_table(step.name.as_str())?;
     ctx.register_table(step.name.as_str(), Arc::new(table))?;
     Ok(())
+}
+
+/// The DataFusion plan [`run`] executes for one of a program's plans (a step
+/// or a check): its reads of earlier steps bound to the tables registered on
+/// `ctx`, and consumed with each computed column given a short name.
+///
+/// DataFusion's own Substrait consumer names a computed column by its whole
+/// expression, and ddx's plans compute each column from earlier ones, so a
+/// layer that reads its input twice (`sin(v) + 0.1 * v`) doubles every name
+/// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
+/// names mean nothing to ddx, whose plans refer to columns by position.
+pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
+    let mut plan = plan.clone();
+    let mut schemas = HashMap::new();
+    for name in unbound_reads(&plan) {
+        let schema = table_schema(ctx, &name).await?;
+        schemas.insert(name, schema);
+    }
+    bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(to_df_err)?;
+    let state = ctx.state();
+    let extensions = Extensions::try_from(&plan.extensions)?;
+    let consumer = ShortNames {
+        inner: DefaultSubstraitConsumer::new(&extensions, &state),
+        state: &state,
+        next: AtomicUsize::new(0),
+    };
+    from_substrait_plan_with_consumer(&consumer, &plan).await
+}
+
+/// DataFusion's Substrait consumer, but a projection's computed columns are
+/// named `__ddx_c{n}` rather than by their expressions (see [`logical_plan`]).
+struct ShortNames<'a> {
+    inner: DefaultSubstraitConsumer<'a>,
+    state: &'a SessionState,
+    next: AtomicUsize,
+}
+
+#[async_trait]
+impl SubstraitConsumer for ShortNames<'_> {
+    async fn resolve_table_ref(
+        &self,
+        table: &TableReference,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.resolve_table_ref(table).await
+    }
+
+    fn get_extensions(&self) -> &Extensions {
+        self.inner.get_extensions()
+    }
+
+    fn get_function_registry(&self) -> &impl FunctionRegistry {
+        self.state
+    }
+
+    fn push_outer_schema(&self, schema: Arc<DFSchema>) {
+        self.inner.push_outer_schema(schema)
+    }
+
+    fn pop_outer_schema(&self) {
+        self.inner.pop_outer_schema()
+    }
+
+    fn get_outer_schema(&self, steps_out: usize) -> Option<Arc<DFSchema>> {
+        self.inner.get_outer_schema(steps_out)
+    }
+
+    async fn consume_project(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
+        let LogicalPlan::Projection(p) = from_project_rel(self, rel).await? else {
+            return Err(DataFusionError::Internal(
+                "a Substrait projection consumed as something else".into(),
+            ));
+        };
+        let exprs = p
+            .expr
+            .into_iter()
+            .map(|e| match e {
+                Expr::Column(_) => e,
+                computed => {
+                    let n = self.next.fetch_add(1, Ordering::Relaxed);
+                    computed.unalias().alias(format!("__ddx_c{n}"))
+                }
+            })
+            .collect();
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs, p.input,
+        )?))
+    }
 }
 
 /// The Substrait schema of the registered table `name`, as DataFusion's
