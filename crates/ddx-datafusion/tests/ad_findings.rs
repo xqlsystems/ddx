@@ -429,24 +429,18 @@ async fn upstream_max_treats_nan_alike_grouped_or_not() {
 
 // ---------------------------------------------------------------------------
 // Round 2: found on the fixed stack by the forward-mode oracle and by probes
-// past the generator's reach. Each is ignored as a known bug until its fix.
+// past the generator's reach. Each was ignored as a known bug until its fix:
+// the MAX/MIN near-tie in #76; fan-in, the stack overflow and vjp cotangent
+// keys in #74; the deep chain in #79 (ad::logical_plan names computed columns
+// briefly); comments in grad(…) in #83; the simple CASE in #71.
 
-/// The bytes of DataFusion's logical plans for `program`'s steps, as its
-/// Substrait consumer builds them: what a step costs to plan and run, which
-/// ddx's own (small) Substrait plans do not show. Runs the program.
+/// The bytes of DataFusion's logical plans for `program`'s steps, as ad::run
+/// builds them: what a step costs to plan and run, which ddx's own (small)
+/// Substrait plans do not show. Runs the program.
 async fn consumed_plan_bytes(ctx: &SessionContext, program: &ad::BackwardProgram) -> usize {
     let mut total = 0;
     for step in program.steps() {
-        let mut plan = step.plan.clone();
-        let mut schemas = std::collections::HashMap::new();
-        for n in ddx_ad::unbound_reads(&plan) {
-            schemas.insert(n.clone(), ad::table_schema(ctx, &n).await.unwrap());
-        }
-        ddx_ad::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
-        let lp =
-            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &plan)
-                .await
-                .unwrap();
+        let lp = ad::logical_plan(ctx, &step.plan).await.unwrap();
         total += lp.display_indent().to_string().len();
         ad::run_step(ctx, step).await.unwrap();
     }
@@ -454,7 +448,6 @@ async fn consumed_plan_bytes(ctx: &SessionContext, program: &ad::BackwardProgram
 }
 
 #[tokio::test]
-#[ignore = "known bug: MAX/MIN share their cotangent between rows within 8 ulps that do not tie"]
 async fn max_at_a_near_tie_sends_its_cotangent_to_the_larger() {
     // MAX(a, b) at a < b is differentiable: its gradient is (0, 1), as
     // jax.grad(jnp.max) gives. The 8-ulp attainment window (added so a tie
@@ -477,7 +470,6 @@ async fn max_at_a_near_tie_sends_its_cotangent_to_the_larger() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: fan-in's NULL-skipping fold makes a backward step exponential in its readers"]
 async fn a_value_many_columns_read_has_a_linear_backward_step() {
     // `val` read by N projected columns gets N cotangent terms, folded so a
     // NULL term is skipped: CASE WHEN acc IS NULL THEN t WHEN t IS NULL THEN
@@ -512,7 +504,6 @@ async fn a_value_many_columns_read_has_a_linear_backward_step() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: a chain of row-wise maps makes a backward step exponential in its depth"]
 async fn a_deep_chain_of_maps_has_a_linear_backward_step() {
     // Each layer `sin(v) + 0.1 * v` reads v twice. ddx rebuilds the region
     // as appended, unnamed columns, and DataFusion names each by its
@@ -573,7 +564,6 @@ async fn reused_cte_plan(depth: usize) -> ddx_ad::substrait::proto::Plan {
 }
 
 #[test]
-#[ignore = "known bug: ddx_ad::grad recurses as deep as a region is wide and overflows a 2 MB stack"]
 fn grad_does_not_overflow_a_worker_threads_stack() {
     // A tokio worker thread has a 2 MB stack. On a 66 KB plan (a CTE read
     // twice per layer, nine layers), ddx_ad::grad clones a rebuilt region
@@ -596,7 +586,6 @@ fn grad_does_not_overflow_a_worker_threads_stack() {
         .args([
             "--exact",
             "grad_does_not_overflow_a_worker_threads_stack",
-            "--ignored",
             "--nocapture",
         ])
         .env("DDX_FINDINGS_CHILD", "1")
@@ -606,7 +595,6 @@ fn grad_does_not_overflow_a_worker_threads_stack() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: grad(…) in SQL is cut at a parenthesis inside a comment"]
 async fn grad_in_sql_skips_comments_inside_the_call() {
     // call_span finds grad(…)'s closing parenthesis by counting, skipping
     // quoted text but not comments: `/* ) */` ends the call early and the
@@ -641,7 +629,6 @@ async fn grad_in_sql_skips_comments_inside_the_call() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: vjp adds up a cotangent's repeated keys instead of refusing them"]
 async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
     // A wrt table whose dims repeat is refused by the program's checks; a
     // cotangent whose keys repeat is joined as it is, so the row's cotangent
@@ -674,7 +661,6 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: a simple CASE (CASE x WHEN …) is read as a malformed plan"]
 async fn a_simple_case_is_differentiated() {
     // DataFusion writes `CASE i WHEN 0 THEN …` as a switch; ddx reports it as
     // an invalid Substrait plan (which it classes as a producer bug) rather
@@ -695,7 +681,6 @@ async fn a_simple_case_is_differentiated() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: grad(…) in SQL panics when a comment makes one call's span overlap the next"]
 async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
     // Found by ad_sql_text.rs, 18 panics in 3000 valid spellings. The first
     // call's `/* ( */` keeps call_span counting past its real end, into the

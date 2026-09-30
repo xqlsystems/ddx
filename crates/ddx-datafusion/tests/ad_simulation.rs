@@ -76,7 +76,7 @@
 //! as iteration 0, and `DDX_V2_SEED=<seed>` with `replay_one_seed` prints the
 //! generated SQL and runs only that case.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3477,18 +3477,9 @@ async fn cost_checks(case: &Case, sql: &str, out: &mut Outcome) -> Result<(), St
     let mut total = 0usize;
     let mut worst = (0usize, String::new());
     for step in program.steps() {
-        let mut plan = step.plan.clone();
-        let mut schemas = HashMap::new();
-        for n in ddx_ad::unbound_reads(&plan) {
-            let Ok(schema) = ad::table_schema(&ctx, &n).await else {
-                return Ok(());
-            };
-            schemas.insert(n, schema);
-        }
-        if ddx_ad::bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).is_err() {
-            return Ok(());
-        }
-        let Ok(lp) = from_substrait_plan(&ctx.state(), &plan).await else {
+        // The plan ad::run builds for the step, which names computed columns
+        // briefly (ddx_datafusion::ad::logical_plan).
+        let Ok(lp) = ad::logical_plan(&ctx, &step.plan).await else {
             return Ok(());
         };
         let bytes = lp.display_indent().to_string().len();
@@ -4602,7 +4593,6 @@ fn reverse_mode_agrees_with_a_forward_mode_twin() {
 }
 
 #[test]
-#[ignore = "known bug: fan-in's backward plan grows about 3x per reader (ad_findings.rs); the soak runs this"]
 fn a_programs_cost_is_proportionate_to_its_query() {
     bounded(
         "cost",

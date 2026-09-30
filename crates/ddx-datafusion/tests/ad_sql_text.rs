@@ -188,7 +188,6 @@ fn variant(rng: &mut Rng, tokens: &[&str]) -> String {
 }
 
 #[test]
-#[ignore = "known bug: comments in grad(…) give internal errors and panics (ad_findings.rs)"]
 fn grad_in_sql_means_the_same_whatever_the_spelling() {
     let n: u64 = std::env::var("DDX_SQL_FUZZ_SEEDS")
         .ok()
