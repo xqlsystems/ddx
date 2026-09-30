@@ -91,11 +91,12 @@ pub struct Slot {
     /// Whether it is constant data computed with a window function or a
     /// `LIMIT`, which a recomputation need not repeat row for row.
     pub ordered: bool,
-    /// Whether it is constant data computed by an aggregate or a window: its
-    /// values can differ in their last bits between recomputations (a sum
-    /// over several partitions adds in arrival order). A table's values
-    /// cannot.
-    pub aggregated: bool,
+    /// Whether it is constant data computed by an aggregate or window
+    /// function that rounds (see [`Functions::rounds`]): its values can
+    /// differ in their last bits between recomputations (a sum over several
+    /// partitions adds in arrival order). A table's values cannot, nor a
+    /// maximum's.
+    pub rounds: bool,
 }
 
 /// Rows cut by an ordering: a `LIMIT` (after an `ORDER BY` on `keys`, or with
@@ -155,6 +156,9 @@ pub struct Region {
     /// Whether it calls a volatile function (`random()`, `now()`), which a
     /// recomputation would not repeat.
     pub volatile: bool,
+    /// For each column, whether its own expression reads a scalar subquery
+    /// computed by a function that rounds (see [`Slot::rounds`]).
+    pub rounds: Vec<bool>,
 }
 
 impl Region {
@@ -180,6 +184,7 @@ impl Region {
             });
         }
         self.varied.extend(other.varied);
+        self.rounds.extend(other.rounds);
         self.refusals.extend(other.refusals);
         self.slots.extend(other.slots.into_iter().map(|s| Slot {
             offset: s.offset.map(|o| o + shift),
@@ -193,6 +198,7 @@ impl Region {
 
     fn push(&mut self, def: Def, varied: bool) -> usize {
         self.defs.push(def);
+        self.rounds.push(false);
         self.varied.push(varied);
         self.refusals.push(None);
         self.defs.len() - 1
@@ -601,7 +607,7 @@ impl Builder<'_> {
                     width,
                     at_most_one_row: self.saved[n].groupings.is_empty(),
                     ordered: false,
-                    aggregated: false,
+                    rounds: false,
                 });
                 for c in 0..width {
                     let v = self.saved[n].varied[c];
@@ -631,7 +637,7 @@ impl Builder<'_> {
             width,
             at_most_one_row: at_most_one_row(rel),
             ordered: is_ordered(rel),
-            aggregated: is_aggregated(rel),
+            rounds: rounds_under(self.functions, rel)?,
         });
         for _ in 0..width {
             s.push(Def::Const, false);
@@ -660,7 +666,7 @@ impl Builder<'_> {
             width,
             at_most_one_row: false,
             ordered: false,
-            aggregated: false,
+            rounds: false,
         });
         for c in 0..width {
             let v = self.tables[table].values.contains(&c);
@@ -790,7 +796,9 @@ impl Builder<'_> {
                 ));
             } else {
                 let varied = depends(self.functions, &e, &|f| s.varied[f])?;
-                s.push(Def::Expr(e.clone()), varied)
+                let col = s.push(Def::Expr(e.clone()), varied);
+                s.rounds[col] = subquery_rounds(self.functions, &e)?;
+                col
             };
             direct.push(col);
             exprs.push(e);
@@ -1155,27 +1163,6 @@ fn is_ordered(rel: &Rel) -> bool {
     rel_expressions(kind).into_iter().any(window) || rel_inputs(kind).into_iter().any(is_ordered)
 }
 
-/// Whether `rel` computes an aggregate or a window function anywhere in it,
-/// a subquery's included.
-fn is_aggregated(rel: &Rel) -> bool {
-    let Some(kind) = rel.rel_type.as_ref() else {
-        return false;
-    };
-    if matches!(kind, RelType::Aggregate(_) | RelType::Window(_)) {
-        return true;
-    }
-    let computes = |e: &Expression| {
-        contains(e, &|x| {
-            matches!(
-                x.rex_type,
-                Some(RexType::WindowFunction(_) | RexType::Subquery(_))
-            )
-        })
-    };
-    rel_expressions(kind).into_iter().any(computes)
-        || rel_inputs(kind).into_iter().any(is_aggregated)
-}
-
 fn empty(rel: Rel) -> Region {
     Region {
         rel,
@@ -1186,6 +1173,7 @@ fn empty(rel: Rel) -> Region {
         slots: Vec::new(),
         cuts: Vec::new(),
         volatile: false,
+        rounds: Vec::new(),
     }
 }
 
@@ -1369,6 +1357,78 @@ pub fn width(rel: &Rel) -> Result<usize> {
     match common.and_then(|c| c.emit_kind.as_ref()) {
         Some(EmitKind::Emit(e)) => Ok(e.output_mapping.len()),
         _ => Ok(direct),
+    }
+}
+
+/// Does anything under `rel`, a subquery's included, call an aggregate or
+/// window function that rounds (see [`Functions::rounds`])?
+pub(crate) fn rounds_under(functions: &Functions, rel: &Rel) -> Result<bool> {
+    let Some(kind) = rel.rel_type.as_ref() else {
+        return Ok(false);
+    };
+    let calls = |anchor: u32| functions.rounds(anchor);
+    match kind {
+        RelType::Aggregate(a) => {
+            for m in &a.measures {
+                if let Some(f) = &m.measure {
+                    if calls(f.function_reference)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        RelType::Window(w) => {
+            for f in &w.window_functions {
+                if calls(f.function_reference)? {
+                    return Ok(true);
+                }
+            }
+        }
+        _ => {}
+    }
+    for e in rel_expressions(kind) {
+        let mut windows = Vec::new();
+        collect_window_functions(e, &mut windows);
+        for f in windows {
+            if calls(f)? {
+                return Ok(true);
+            }
+        }
+        if subquery_rounds(functions, e)? {
+            return Ok(true);
+        }
+    }
+    for r in rel_inputs(kind) {
+        if rounds_under(functions, r)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Does `e` read a subquery computed by a function that rounds? A
+/// subquery that is not an uncorrelated scalar one is assumed to.
+pub(crate) fn subquery_rounds(functions: &Functions, e: &Expression) -> Result<bool> {
+    let mut subqueries = Vec::new();
+    collect_subqueries(e, &mut subqueries);
+    for sq in subqueries {
+        match uncorrelated_scalar(sq) {
+            Some(inner) if !rounds_under(functions, inner)? => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// The function of every window function inside `e`; not inside subqueries.
+fn collect_window_functions(e: &Expression, out: &mut Vec<u32>) {
+    match &e.rex_type {
+        Some(RexType::WindowFunction(w)) => out.push(w.function_reference),
+        Some(RexType::Subquery(_)) => return,
+        _ => {}
+    }
+    for c in children(e) {
+        collect_window_functions(c, out);
     }
 }
 

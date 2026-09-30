@@ -738,3 +738,50 @@ async fn max_at_a_near_tie_of_table_values_sends_its_cotangent_to_the_larger() {
     let got = gradient_of(&ctx, "SELECT MAX(val) AS l FROM nt", "nt").await;
     assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, 1.0]]);
 }
+
+#[tokio::test]
+async fn a_near_tie_scaled_by_a_maximum_goes_to_the_larger() {
+    // From the v2 soak (seed 3501343): a MAX never rounds, so values scaled
+    // by `(SELECT MAX(..))` are as repeatable as the table's, and 2 ulps
+    // apart they do not tie. Only an aggregate that rounds (a sum) jitters.
+    let ctx = ctx();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE sp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    exec(&ctx, "CREATE TABLE sc (a DOUBLE) AS VALUES (0.5), (2.0)").await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT MAX(val * (SELECT MAX(a) FROM sc)) AS l FROM sp",
+        "sp",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 0.0], vec![1.0, 2.0]]);
+}
+
+#[tokio::test]
+async fn a_near_tie_scaled_by_a_sum_is_shared() {
+    // A scalar subquery that sums can round differently from run to run, so
+    // values it scales get the tolerance: 2 ulps apart, they share.
+    let ctx = ctx();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE sq (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    exec(&ctx, "CREATE TABLE ss (a DOUBLE) AS VALUES (0.5), (1.5)").await;
+    let got = gradient_of(
+        &ctx,
+        "SELECT MAX(val * (SELECT SUM(a) FROM ss)) AS l FROM sq",
+        "sq",
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 1.0], vec![1.0, 1.0]]);
+}
