@@ -756,7 +756,14 @@ extreme and the count of rows attaining it are windows over the recomputed
 rows themselves (`MAX(x) OVER (PARTITION BY` the group's keys`)`), never a
 comparison with the saved value: a recomputation need not match the forward
 pass to the last bit, and a saved maximum no recomputed row equals would send
-no gradient at all (`S12`). The
+no gradient at all (`S12`). For the same reason, where the argument reads the
+output of an aggregate that rounds (a saved aggregate, or constant data or a
+scalar subquery computed with a sum or average, not a maximum or count), a
+row within 8 ulps of the extreme attains it: two groups that tie in exact
+arithmetic can round apart differently from run to run. Any other argument,
+a table's values included whether or not the table is differentiated,
+compares exactly, so MAX(1, 1 + 2 ulps) has gradient
+(0, 1), as `jax.grad` gives (`S13`). The
 other idiom, nn.py's, ranks and filters:
 ```sql
 WITH ranked AS (
@@ -1607,7 +1614,8 @@ datafusion-python's consumer cannot be given short names, so a very deep
 chain is still large from Python. The same round found `grad(…)` in SQL
 counting parentheses inside comments (now found by tokens), a vjp cotangent
 whose keys repeat (now checked, like a wrt table's dims), and that the
-MAX/MIN tie tolerance must apply only to values that can jitter. → §4.4.
+MAX/MIN tie tolerance must apply only to values that can jitter: those
+read from an aggregate that rounds, not a table's, differentiated or not. → §4.4.
 
 ## References
 
