@@ -10,10 +10,10 @@ loss's gradient with respect to table columns:
 
 ```sql
 WITH h AS (
-  SELECT x.sample, w.out, SUM(x.val * w.val) AS z
+  SELECT x.sample, w.out, tanh(SUM(x.val * w.val)) AS val
   FROM x JOIN w ON x.inp = w.inp
   GROUP BY x.sample, w.out)
-SELECT SUM(power(tanh(h.z) - y.val, 2)) AS loss
+SELECT SUM(power(h.val - y.val, 2)) AS loss
 FROM h JOIN y ON h.sample = y.sample AND h.out = y.out
 ```
 
