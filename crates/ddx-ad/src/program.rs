@@ -207,13 +207,17 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         ),
     });
 
-    let cotangent = match seed {
+    let (cotangent, cotangent_check) = match seed {
         Seed::One => {
             let col = scalar_output(f)?;
             t.region(&f.output, f.output.rel.clone(), vec![(col, lit_f64(1.0))])?;
-            Vec::new()
+            (Vec::new(), None)
         }
-        Seed::Cotangent => seed_cotangent(&mut t, f)?,
+        Seed::Cotangent => {
+            let (names, dims) = seed_cotangent(&mut t, f)?;
+            let check = cotangent_check(&mut t, f, &names, dims);
+            (names, Some(check))
+        }
     };
 
     // Parents first: every saved aggregate that reads saved aggregate n comes
@@ -268,6 +272,7 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
             .tables
             .iter()
             .map(|table| dims_check(&mut t, table))
+            .chain(cotangent_check)
             .collect(),
         cotangent,
         backward_steps,
@@ -329,8 +334,9 @@ fn output_dims(f: &Forward) -> Vec<usize> {
 
 /// Seed [`vjp`]: join the output to the caller's cotangent on the output's
 /// dims, which must all be output columns so each output row is identified.
-/// Returns the cotangent table's columns.
-fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<Vec<String>> {
+/// Returns the cotangent table's columns, and how many of them (the first)
+/// are its keys.
+fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<(Vec<String>, usize)> {
     let out = &f.output;
     if out
         .slots
@@ -392,7 +398,7 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<Vec<String>> {
         })
         .collect();
     t.region(out, base, seeds)?;
-    Ok(names)
+    Ok((names, dim_cols.len()))
 }
 
 /// Add up an input's contributions: its dims, then one cotangent column per
@@ -525,18 +531,44 @@ fn set_nullable(ty: &mut substrait::proto::Type) {
 
 /// The check that table's dims identify its rows: the dim tuples that occur
 /// more than once. Must return no rows.
-fn dims_check(t: &mut Transposer, table: &Table) -> Check {
+/// The key tuples of `rel` (its columns `keys`) that more than one row has.
+fn repeated_keys(t: &mut Transposer, rel: Rel, keys: &[usize]) -> Rel {
     let count = t.ext.anchor("count");
     let gt = t.ext.anchor("gt");
-    let k = table.dims.len();
+    let k = keys.len();
     let grouped = aggregate(
-        read_table(table.names.clone(), table.schema.clone()),
-        table.dims.iter().map(|&d| field(d)).collect(),
+        rel,
+        keys.iter().map(|&d| field(d)).collect(),
         vec![(count, vec![lit_f64(1.0)])],
     );
-    let repeated = select(
+    select(
         crate::emit::filter(grouped, call(gt, vec![field(k), lit_f64(1.0)])),
         (0..k).collect(),
+    )
+}
+
+/// A check that a vjp's cotangent has one row per output row: a key that
+/// repeats would add its rows' cotangents together, and double that row's
+/// gradient without a word.
+fn cotangent_check(t: &mut Transposer, f: &Forward, names: &[String], keys: usize) -> Check {
+    let table = format!("{}cotangent", f.namespace);
+    let keys: Vec<usize> = (0..keys).collect();
+    let repeated = repeated_keys(t, read_step(&table, names.to_vec()), &keys);
+    Check {
+        plan: plan(repeated, names[..keys.len()].to_vec(), &t.ext),
+        message: format!(
+            "the cotangent table `{table}` has rows that share their keys ({}); it needs one \
+             row per output row",
+            names[..keys.len()].join(", ")
+        ),
+    }
+}
+
+fn dims_check(t: &mut Transposer, table: &Table) -> Check {
+    let repeated = repeated_keys(
+        t,
+        read_table(table.names.clone(), table.schema.clone()),
+        &table.dims,
     );
     let names: Vec<String> = table
         .dims

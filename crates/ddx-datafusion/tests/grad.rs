@@ -558,3 +558,114 @@ async fn a_row_one_aggregate_skips_still_gets_another_aggregates_gradient() {
     .await;
     assert_eq!(got, vec![vec![0.0, 2.0], vec![1.0, 1.0]]);
 }
+
+#[tokio::test]
+async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
+    // From the v2 soak (#98): a wrt table whose dims repeat is refused, and
+    // a cotangent whose keys repeat was joined as it is, doubling that row's
+    // gradient without a word.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE kp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT i, val * val AS s FROM kp", true).await;
+    let program = vjp(&plan, &[ColumnRef::new("kp", "val")]).unwrap();
+    Table {
+        name: Box::leak(program.cotangent_table.clone().into_boxed_str()),
+        columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
+        rows: vec![vec![0.0, 1.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+    }
+    .create(&ctx)
+    .await;
+    let err = common::ad::try_run(&ctx, &program).await.unwrap_err();
+    assert!(err.contains("share their keys"), "{err}");
+}
+
+#[tokio::test]
+async fn a_value_many_columns_read_has_a_small_backward_step() {
+    // From the v2 soak (#98): a value read by N columns gets N cotangent
+    // terms, which were folded by nesting the running sum; DataFusion names
+    // a column by its expression, so the step's names tripled per reader
+    // (117 MB at ten). They are one flat sum now.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE fn_ (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let n = 12;
+    let cols: Vec<String> = (1..=n)
+        .map(|k| format!("sin(val * {k}.0) AS c{k}"))
+        .collect();
+    let sum: Vec<String> = (1..=n).map(|k| format!("c{k}")).collect();
+    let loss = format!(
+        "WITH r AS (SELECT {} FROM fn_) SELECT SUM({}) AS l FROM r",
+        cols.join(", "),
+        sum.join(" + ")
+    );
+    let plan = substrait_of(&ctx, &loss, true).await;
+    let program = grad(&plan, &[ColumnRef::new("fn_", "val")]).unwrap();
+    run(&ctx, &program).await;
+    let mut bytes = 0;
+    for step in &program.backward_steps {
+        let mut p = step.plan.clone();
+        let mut schemas = std::collections::HashMap::new();
+        for name in ddx_ad::emit::unbound_reads(&p) {
+            let s = common::ad::schema_of(&ctx, &name).await;
+            schemas.insert(name, s);
+        }
+        ddx_ad::emit::bind_reads(&mut p, &mut |n| schemas.get(n).cloned()).unwrap();
+        let lp =
+            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &p)
+                .await
+                .unwrap();
+        bytes += lp.display_indent().to_string().len();
+    }
+    assert!(bytes < 200_000, "{bytes} bytes of plan for {n} readers");
+    // And the gradient is right: Σ k·cos(k·val).
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    for (row, v) in got.iter().zip([0.3f64, 0.5]) {
+        let want: f64 = (1..=n).map(|k| k as f64 * (k as f64 * v).cos()).sum();
+        assert!((row[1] - want).abs() < 1e-9, "{row:?} vs {want}");
+    }
+}
+
+#[tokio::test]
+async fn grad_fits_a_worker_threads_stack() {
+    // From the v2 soak (#98): a CTE read twice per layer, nine layers. The
+    // backward step appended one projection per column, hundreds deep, and
+    // cloning it overflowed a 2 MB stack (a tokio worker's), aborting the
+    // process. Cotangents are projected in batches now.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE sp (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5)",
+    )
+    .await;
+    let mut ctes = vec!["c0 AS (SELECT i, val AS v FROM sp)".to_string()];
+    for k in 1..9 {
+        ctes.push(format!(
+            "c{k} AS (SELECT a.i, a.v * b.v AS v FROM c{m} a JOIN c{m} b ON a.i = b.i)",
+            m = k - 1
+        ));
+    }
+    let loss = format!("WITH {} SELECT SUM(v) AS l FROM c8", ctes.join(", "));
+    let plan = substrait_of(&ctx, &loss, true).await;
+    let program = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || grad(&plan, &[ColumnRef::new("sp", "val")]).map(|p| p.backward_steps.len()))
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(program > 0);
+}

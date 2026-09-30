@@ -47,7 +47,7 @@ use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field, if_then, null_f64};
+use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64};
 use crate::forward::{width, Def, Forward, Input, Output, Region};
 use crate::functions::Extensions;
 
@@ -145,6 +145,33 @@ impl<'a> Transposer<'a> {
         self.region(&region, base, seeds)
     }
 
+    /// A column's cotangent: the sum of the terms from the columns that read
+    /// it. A NULL term is no contribution (a row an aggregate skipped), so
+    /// it is skipped rather than added, as NULL + t would lose t, and the sum
+    /// is NULL only if every term is. One flat expression, each term in it a
+    /// fixed number of times: a fold that nested the running sum named it
+    /// three times a step, and DataFusion's Substrait consumer names a column
+    /// by its expression, so ten readers made a 100 MB plan.
+    fn null_skipping_sum(&mut self, mut terms: Vec<Expression>) -> Expression {
+        if terms.len() == 1 {
+            return terms.pop().expect("one term");
+        }
+        let add = self.ext.anchor("add");
+        let and = self.ext.anchor("and");
+        let is_null = self.ext.anchor("is_null");
+        let none = terms
+            .iter()
+            .map(|t| call(is_null, vec![t.clone()]))
+            .reduce(|a, b| call(and, vec![a, b]))
+            .expect("at least two terms");
+        let total = terms
+            .into_iter()
+            .map(|t| if_then(vec![(call(is_null, vec![t.clone()]), lit_f64(0.0))], t))
+            .reduce(|a, b| call(add, vec![a, b]))
+            .expect("at least two terms");
+        if_then(vec![(none, null_f64())], total)
+    }
+
     /// Join `left` (whose columns before `left_width` are a region's) to
     /// `right` on `left_keys[i] = right column i`, null-safely; a cross join
     /// when there are no keys.
@@ -196,8 +223,13 @@ impl<'a> Transposer<'a> {
         }
         // (slot, input column) → the column holding its cotangent.
         let mut at_inputs: BTreeMap<usize, BTreeMap<usize, usize>> = BTreeMap::new();
-        let add = self.ext.anchor("add");
-        let is_null = self.ext.anchor("is_null");
+        // Cotangent columns are projected in batches: a column joins the
+        // current batch unless one of its terms reads a column still in it,
+        // which flushes the batch first. The step is then as deep as the
+        // chain of columns that read each other, not as the region is wide
+        // (one projection per column nested hundreds deep, and a clone of
+        // that overflowed a worker thread's stack).
+        let mut batch: Vec<Expression> = Vec::new();
         for c in (0..region.defs.len()).rev() {
             let Some(terms) = pending.remove(&c) else {
                 continue;
@@ -208,27 +240,16 @@ impl<'a> Transposer<'a> {
             if !region.varied[c] {
                 continue;
             }
-            // This column's cotangent: the sum over the columns that read it.
-            // A NULL term is no contribution (a row an aggregate skipped), so
-            // it is skipped rather than added: NULL + t would lose t. Each
-            // term is a column first, so the fold repeats only references.
-            let mut terms = terms.into_iter();
-            let mut sum = terms.next().expect("an entry has at least one term");
-            for t in terms {
-                rel = project(rel, vec![sum, t]);
-                let (a, b) = (field(width), field(width + 1));
-                width += 2;
-                sum = if_then(
-                    vec![
-                        (call(is_null, vec![a.clone()]), b.clone()),
-                        (call(is_null, vec![b.clone()]), a.clone()),
-                    ],
-                    call(add, vec![a, b]),
-                );
+            let mut reads_batch = false;
+            for t in &terms {
+                reads_batch |= fields_of(t)?.into_iter().any(|f| f >= width);
             }
-            rel = project(rel, vec![sum]);
-            let here = width;
-            width += 1;
+            if reads_batch {
+                width += batch.len();
+                rel = project(rel, std::mem::take(&mut batch));
+            }
+            let here = width + batch.len();
+            batch.push(self.null_skipping_sum(terms));
             match &region.defs[c] {
                 Def::Expr(e) => {
                     for (read, term) in self.map(e, here, &region.varied)? {
@@ -245,6 +266,9 @@ impl<'a> Transposer<'a> {
                     )))
                 }
             }
+        }
+        if !batch.is_empty() {
+            rel = project(rel, batch);
         }
         if !pending.is_empty() {
             return Err(AdError::Internal(format!(

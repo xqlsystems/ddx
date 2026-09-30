@@ -51,9 +51,15 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
 /// the program, with the check's message.
 pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<(), String> {
     for check in &program.checks {
-        let lp = from_substrait_plan(&ctx.state(), &check.plan)
-            .await
-            .unwrap();
+        // A check can read a table ddx has no types for (a vjp's cotangent).
+        let mut plan = check.plan.clone();
+        let mut schemas = HashMap::new();
+        for name in unbound_reads(&plan) {
+            let s = schema_of(ctx, &name).await;
+            schemas.insert(name, s);
+        }
+        bind_reads(&mut plan, &mut |n| schemas.get(n).cloned()).unwrap();
+        let lp = from_substrait_plan(&ctx.state(), &plan).await.unwrap();
         let rows: usize = ctx
             .execute_logical_plan(lp)
             .await
