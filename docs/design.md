@@ -1519,7 +1519,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S12`)
+### Building v2 (`S6`–`S13`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -1588,6 +1588,26 @@ did not have. Each is fixed where it arose (the reduce rules' NULL mask and
 windows, window columns renamed in place, lower-case step names, a step's
 table typed by the plan that ran). The soak's mutation test then measures how
 fast it catches each rule broken on purpose. → §4.3, §4.4, §5.
+
+**S13 — What the second round found: size, not calculus.** A forward-mode
+oracle (every relation's tangent computed beside its value, independent of
+the transposes) agreed with reverse mode on all eleven thousand comparisons
+it made. What broke was the size of the plans an engine builds from ddx's.
+DataFusion's Substrait consumer names a computed column by its whole
+expression, and ddx computes each column from earlier ones, so a map layer
+that reads its input twice doubled every name after it (twenty layers
+exhausted 13 GB), and a NULL-skipping fold that nested its running sum did
+the same per reader. One projection per cotangent column also made steps
+hundreds of relations deep, and cloning one overflowed a worker thread's
+stack. The fixes: the DataFusion adapter consumes a step with short column
+names (the names mean nothing to ddx, whose plans refer to columns by
+position); a column's cotangent terms are one flat sum; and cotangents are
+projected in batches, as deep as the chain of columns reading each other.
+datafusion-python's consumer cannot be given short names, so a very deep
+chain is still large from Python. The same round found `grad(…)` in SQL
+counting parentheses inside comments (now found by tokens), a vjp cotangent
+whose keys repeat (now checked, like a wrt table's dims), and that the
+MAX/MIN tie tolerance must apply only to values that can jitter. → §4.4.
 
 ## References
 
