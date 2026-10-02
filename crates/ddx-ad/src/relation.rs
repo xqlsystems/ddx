@@ -35,9 +35,16 @@ use substrait::proto::NamedStruct;
 /// to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
-    /// The table, as the plan names it: `weights`, or `schema.weights`. A bare
-    /// name also matches a qualified one with that last part, and case is
-    /// ignored.
+    /// The table, as the plan names it: `weights`, or `schema.weights`.
+    ///
+    /// It is matched against the names of the tables the plan reads, ignoring
+    /// case (a producer folds unquoted identifiers). A qualified name must
+    /// match all of a table's name; a bare name matches a table whose last
+    /// part it is, so `weights` matches `schema.weights`. A bare name that
+    /// matches tables in two schemas is refused, listing them: which rows get
+    /// a gradient is not guessed. Some producers drop the schema before ddx
+    /// sees the plan (Ibis writes `schema.weights` as `weights`), and then
+    /// only the bare name matches; the error says so.
     pub table: String,
     /// The column.
     pub column: String,

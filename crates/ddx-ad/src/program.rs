@@ -60,6 +60,7 @@ use crate::transpose::{Contribution, Transposer};
 /// One step of a program: a plan, and the name its result is materialized
 /// under.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Step {
     /// The table name to materialize the result as.
     pub name: String,
@@ -70,6 +71,7 @@ pub struct Step {
 
 /// A `wrt` table's gradient.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Gradient {
     /// The table, as the plan names it.
     pub table: Vec<String>,
@@ -81,7 +83,11 @@ pub struct Gradient {
 }
 
 /// The steps that compute a query's value and its gradient.
+///
+/// A program is data: plans, and the names to materialize their results
+/// under. Its fields will grow, so it is read, not built, outside this crate.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BackwardProgram {
     /// The saved aggregates, then the query's value.
     pub forward_steps: Vec<Step>,
@@ -125,11 +131,86 @@ impl BackwardProgram {
 
 /// A plan that must return no rows (see [`BackwardProgram::checks`]).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Check {
     /// The plan.
     pub plan: Plan,
     /// What a returned row means, for the error.
     pub message: String,
+}
+
+impl Step {
+    /// The plan as Substrait protobuf bytes, for a host that holds plans as
+    /// bytes rather than as this crate's `substrait` types (see
+    /// [`decode_plan`]).
+    pub fn plan_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.plan)
+    }
+}
+
+impl Check {
+    /// The plan as Substrait protobuf bytes (see [`Step::plan_bytes`]).
+    pub fn plan_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.plan)
+    }
+}
+
+/// A Substrait plan from its protobuf bytes.
+///
+/// [`grad`] and [`vjp`] take this crate's `substrait::proto::Plan`, so a host
+/// that links `substrait` must link the same version (it is re-exported as
+/// [`crate::substrait`]). Most of the Substrait ecosystem holds plans as
+/// bytes instead; such a host never names the type:
+/// `grad(&decode_plan(bytes)?, wrt)`, then [`Step::plan_bytes`].
+pub fn decode_plan(bytes: &[u8]) -> Result<Plan> {
+    <Plan as prost::Message>::decode(bytes)
+        .map_err(|e| AdError::InvalidPlan(format!("not a Substrait plan: {e}")))
+}
+
+/// How [`grad_with`] and [`vjp_with`] build a program.
+#[derive(Clone, Default)]
+pub struct Options {
+    ddx: Option<Ddx>,
+    namespace: Option<String>,
+}
+
+impl Options {
+    /// The defaults: [`Ddx::new`], and a fresh namespace per program.
+    pub fn new() -> Self {
+        Options::default()
+    }
+
+    /// Differentiate elementwise expressions with `ddx`, which may carry a
+    /// caller's own scalar rules.
+    pub fn ddx(mut self, ddx: Ddx) -> Self {
+        self.ddx = Some(ddx);
+        self
+    }
+
+    /// Name every table the program writes `{namespace}…` instead of under a
+    /// fresh prefix. The same plan and options then give the same program,
+    /// byte for byte, which a golden test of emitted plans, or a cache of
+    /// programs keyed by plan, needs. It must start with `__ddx_`, the prefix
+    /// ddx reserves, and contain only ASCII letters, digits and `_`. Two
+    /// programs on one engine must not share a namespace: they would write
+    /// the same tables.
+    pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    fn forward(&self, plan: &Plan, wrt: &[ColumnRef]) -> Result<Forward> {
+        let Some(ns) = &self.namespace else {
+            return Forward::new(plan, wrt);
+        };
+        if !ns.starts_with("__ddx_") || !ns.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(AdError::InvalidOptions(format!(
+                "namespace `{ns}` must start with `__ddx_` and hold only ASCII letters, digits \
+                 and `_`"
+            )));
+        }
+        Forward::in_namespace(plan, wrt, ns.clone())
+    }
 }
 
 fn cotangent_name(namespace: &str, n: usize) -> String {
@@ -159,14 +240,18 @@ fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
 
 /// The gradient of the loss `plan` computes with respect to the `wrt`
 /// columns. The query must return one row and one column.
+///
+/// Each [`ColumnRef`] names a table as [`ColumnRef::table`] describes, and a
+/// column of it, case-insensitively.
 pub fn grad(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    grad_with(&Ddx::new(), plan, wrt)
+    grad_with(plan, wrt, &Options::new())
 }
 
-/// [`grad`] with a caller's `ddx-core` engine, for custom scalar rules.
-pub fn grad_with(ddx: &Ddx, plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    let f = Forward::new(plan, wrt)?;
-    build(ddx, &f, Seed::One)
+/// [`grad`] with [`Options`]: a caller's `ddx-core` engine, for custom scalar
+/// rules, or a fixed namespace.
+pub fn grad_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<BackwardProgram> {
+    let f = options.forward(plan, wrt)?;
+    build(options.ddx.as_ref().unwrap_or(&Ddx::new()), &f, Seed::One)
 }
 
 /// The vector-Jacobian product of the query `plan` with respect to the `wrt`
@@ -174,13 +259,17 @@ pub fn grad_with(ddx: &Ddx, plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardPr
 /// [`BackwardProgram::cotangent_table`], with the columns
 /// [`BackwardProgram::cotangent`] lists.
 pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    vjp_with(&Ddx::new(), plan, wrt)
+    vjp_with(plan, wrt, &Options::new())
 }
 
-/// [`vjp`] with a caller's `ddx-core` engine.
-pub fn vjp_with(ddx: &Ddx, plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    let f = Forward::new(plan, wrt)?;
-    build(ddx, &f, Seed::Cotangent)
+/// [`vjp`] with [`Options`].
+pub fn vjp_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<BackwardProgram> {
+    let f = options.forward(plan, wrt)?;
+    build(
+        options.ddx.as_ref().unwrap_or(&Ddx::new()),
+        &f,
+        Seed::Cotangent,
+    )
 }
 
 enum Seed {

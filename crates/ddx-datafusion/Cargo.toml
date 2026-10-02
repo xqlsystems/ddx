@@ -34,3 +34,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ddx-core = { workspace = true, features = ["test-utils"] }
 ddx-ad = { workspace = true }
 datafusion-substrait = { workspace = true }
+prost = { workspace = true }

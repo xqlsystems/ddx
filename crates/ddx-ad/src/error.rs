@@ -28,6 +28,8 @@ pub enum AdError {
     /// floating-point column, or its table has no other column to identify
     /// its rows.
     InvalidWrt(String),
+    /// The options a program was asked to be built with are not usable.
+    InvalidOptions(String),
     /// The plan is not one ddx can read: malformed, or missing a field every
     /// producer fills in.
     InvalidPlan(String),
@@ -44,6 +46,7 @@ impl fmt::Display for AdError {
             AdError::NotScalar(m) => write!(f, "not a scalar loss: {m}"),
             AdError::UnknownWrt(m) => write!(f, "unknown wrt column: {m}"),
             AdError::InvalidWrt(m) => write!(f, "invalid wrt column: {m}"),
+            AdError::InvalidOptions(m) => write!(f, "invalid options: {m}"),
             AdError::InvalidPlan(m) => write!(f, "invalid Substrait plan: {m}"),
             AdError::Diff(e) => write!(f, "{e}"),
             AdError::Internal(m) => write!(f, "internal error in ddx-ad (a bug): {m}"),

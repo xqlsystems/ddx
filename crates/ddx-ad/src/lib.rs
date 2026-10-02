@@ -46,7 +46,9 @@ pub use elementwise::Elementwise;
 pub use error::{AdError, Result};
 pub use forward::Forward;
 pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
-pub use program::{grad, grad_with, vjp, vjp_with, BackwardProgram, Check, Gradient, Step};
+pub use program::{
+    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, Gradient, Options, Step,
+};
 pub use relation::{ColumnRef, Table};
 
 /// The exact `substrait` this crate was built against, re-exported so an

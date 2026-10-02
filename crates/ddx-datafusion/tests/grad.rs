@@ -669,3 +669,140 @@ async fn grad_fits_a_worker_threads_stack() {
         .unwrap();
     assert!(program > 0);
 }
+
+#[tokio::test]
+async fn a_fixed_namespace_makes_the_program_the_same_every_time() {
+    // Composability review (#74): a fresh namespace per call made the same
+    // plan give different programs, so emitted plans could not be
+    // snapshot-tested or a program cached by its plan.
+    use ddx_ad::{grad_with, Options};
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE nw (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM nw", true).await;
+    let wrt = [ColumnRef::new("nw", "val")];
+    let options = Options::new().namespace("__ddx_golden_");
+    let bytes = |p: &ddx_ad::BackwardProgram| -> Vec<(String, Vec<u8>)> {
+        p.steps()
+            .map(|s| (s.name.clone(), s.plan_bytes()))
+            .chain(p.checks.iter().map(|c| (c.message.clone(), c.plan_bytes())))
+            .collect()
+    };
+    let (a, b) = (
+        grad_with(&plan, &wrt, &options).unwrap(),
+        grad_with(&plan, &wrt, &options).unwrap(),
+    );
+    assert_eq!(bytes(&a), bytes(&b));
+    assert_eq!(a.value, "__ddx_golden_value");
+    // Without one, two programs never share a table name.
+    let (c, d) = (grad(&plan, &wrt).unwrap(), grad(&plan, &wrt).unwrap());
+    assert_ne!(c.value, d.value);
+    // A namespace outside ddx's reserved prefix could name a user's table.
+    for bad in ["value_", "__ddx_a b_"] {
+        let err = grad_with(&plan, &wrt, &Options::new().namespace(bad)).unwrap_err();
+        assert!(matches!(err, AdError::InvalidOptions(_)), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn a_host_can_hand_over_plans_as_bytes() {
+    // Composability review (#74): most Substrait hosts hold plans as
+    // protobuf bytes, not as this crate's types.
+    use datafusion::prelude::SessionContext;
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE bw (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM bw", true).await;
+    let bytes = prost::Message::encode_to_vec(&plan);
+    let program = grad(
+        &ddx_ad::decode_plan(&bytes).unwrap(),
+        &[ColumnRef::new("bw", "val")],
+    )
+    .unwrap();
+    for step in program.steps() {
+        assert_eq!(ddx_ad::decode_plan(&step.plan_bytes()).unwrap(), step.plan);
+    }
+    run(&ctx, &program).await;
+    let got = rows(
+        &ctx,
+        &format!(
+            "SELECT i, val FROM {} ORDER BY i",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    assert_eq!(got, vec![vec![0.0, 2.0], vec![1.0, 4.0]]);
+    let err = ddx_ad::decode_plan(b"not a plan").unwrap_err();
+    assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_bare_wrt_name_that_matches_two_schemas_is_refused() {
+    // Composability review (#74): which rows get a gradient must not be a
+    // guess. `t` matches both s1.t and s2.t.
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE SCHEMA s1",
+        "CREATE SCHEMA s2",
+        "CREATE TABLE s1.t (i BIGINT, val DOUBLE) AS VALUES (0, 1.0)",
+        "CREATE TABLE s2.t (i BIGINT, val DOUBLE) AS VALUES (0, 2.0)",
+    ] {
+        exec(&ctx, sql).await;
+    }
+    let plan = substrait_of(
+        &ctx,
+        "SELECT SUM(a.val * b.val) AS l FROM s1.t a JOIN s2.t b ON a.i = b.i",
+        true,
+    )
+    .await;
+    let err = grad(&plan, &[ColumnRef::new("t", "val")]).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
+    assert!(msg.contains("s1.t") && msg.contains("s2.t"), "{msg}");
+    // Qualified, each is fine.
+    grad(&plan, &[ColumnRef::new("s1.t", "val")]).unwrap();
+    // A schema the plan does not carry gets a hint: some producers drop it.
+    let plan = substrait_of(&ctx, "SELECT SUM(val) AS l FROM s1.t", true).await;
+    let mut unqualified = plan.clone();
+    for_each_named_table(&mut unqualified, &mut |names| {
+        let last = names.pop().unwrap();
+        *names = vec![last];
+    });
+    let err = grad(&unqualified, &[ColumnRef::new("s1.t", "val")]).unwrap_err();
+    assert!(err.to_string().contains("name it `t`"), "{err}");
+}
+
+/// Apply `f` to the names of every table `plan` reads.
+fn for_each_named_table(
+    plan: &mut ddx_ad::substrait::proto::Plan,
+    f: &mut dyn FnMut(&mut Vec<String>),
+) {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::read_rel::ReadType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::Rel;
+    fn walk(rel: &mut Rel, f: &mut dyn FnMut(&mut Vec<String>)) {
+        match rel.rel_type.as_mut() {
+            Some(RelType::Read(r)) => {
+                if let Some(ReadType::NamedTable(t)) = r.read_type.as_mut() {
+                    f(&mut t.names);
+                }
+            }
+            Some(RelType::Aggregate(r)) => walk(r.input.as_mut().unwrap(), f),
+            Some(RelType::Project(r)) => walk(r.input.as_mut().unwrap(), f),
+            Some(RelType::Filter(r)) => walk(r.input.as_mut().unwrap(), f),
+            _ => {}
+        }
+    }
+    for r in &mut plan.relations {
+        if let Some(PlanRelType::Root(root)) = r.rel_type.as_mut() {
+            walk(root.input.as_mut().unwrap(), f);
+        }
+    }
+}

@@ -257,6 +257,12 @@ pub fn step_columns(width: usize) -> Vec<String> {
 impl Forward {
     /// Read `plan`, with `wrt` naming the table columns that are values.
     pub fn new(plan: &Plan, wrt: &[ColumnRef]) -> Result<Forward> {
+        Forward::in_namespace(plan, wrt, new_namespace())
+    }
+
+    /// [`Forward::new`], naming every table the program writes under
+    /// `namespace` rather than a fresh one.
+    pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = root_of(plan)?;
         let root = &inline_references(root, &plan.relations)?;
@@ -265,7 +271,6 @@ impl Forward {
                 "no wrt columns were given; name at least one table column".into(),
             ));
         }
-        let namespace = new_namespace();
         let mut b = Builder {
             functions: &functions,
             namespace: namespace.clone(),
@@ -925,14 +930,41 @@ impl Builder<'_> {
 
     fn check_every_wrt_was_read(&self) -> Result<()> {
         for w in self.wrt {
+            // A bare name that matches tables in two schemas would take both
+            // as wrt tables; which rows get a gradient must not be a guess.
+            let matching: Vec<&String> = self
+                .seen
+                .iter()
+                .filter(|t| {
+                    table_matches(
+                        &w.table,
+                        &t.split('.').map(str::to_string).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            if matching.len() > 1 {
+                return Err(AdError::UnknownWrt(format!(
+                    "`{}` names more than one table the query reads: {matching:?}; \
+                     qualify it",
+                    w.table
+                )));
+            }
             let read = self
                 .tables
                 .iter()
                 .any(|t| table_matches(&w.table, &t.names));
             if !read {
+                // A producer may drop a schema qualifier (Ibis writes `s.t`
+                // as `t`), and then only the bare name can match.
+                let hint = match w.table.rsplit_once('.') {
+                    Some((_, last)) if self.seen.iter().any(|t| t.eq_ignore_ascii_case(last)) => {
+                        format!("; the plan names its tables without a schema, so name it `{last}`")
+                    }
+                    _ => String::new(),
+                };
                 return Err(AdError::UnknownWrt(format!(
                     "the query does not read a table `{}` (or reads it only where no gradient \
-                     can reach); it reads {:?}",
+                     can reach); it reads {:?}{hint}",
                     w.table, self.seen
                 )));
             }
