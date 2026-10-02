@@ -63,10 +63,10 @@ class Context(SessionContext):
         A statement with neither is passed through byte-identical and is never
         parsed by ddx, so routing every query through here is free.
         """
-        if not args and not kwargs and _Statements([query]).jobs():
+        if not args and not kwargs and _Statements([query], self._ddx_dialect).jobs():
             from . import ad
 
             # ad.sql runs the loss's program, then plans the rewritten
             # statement through this method again, for any v1 `grad`.
-            return ad.sql(self, query)
+            return ad.sql(self, query, dialect=self._ddx_dialect)
         return super().sql(rewrite_sql(query, self._ddx_dialect), *args, **kwargs)

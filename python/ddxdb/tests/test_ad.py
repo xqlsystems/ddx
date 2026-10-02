@@ -216,3 +216,79 @@ def test_vjp_refuses_a_cotangent_whose_keys_repeat(ad, ctx):
     )
     with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
         ad.run(ctx, program)
+
+
+class LoggingBackend:
+    """A Backend over DataFusion that logs what it is asked, and can fail."""
+
+    def __init__(self, ad, ctx, fail_on=None):
+        self.inner = ad.DataFusionBackend(ctx)
+        self.log = []
+        self.fail_on = fail_on
+
+    def select_all(self, name):
+        self.log.append(("schema", name))
+        return self.inner.select_all(name)
+
+    def returns_rows(self, plan):
+        self.log.append(("check",))
+        return self.inner.returns_rows(plan)
+
+    def materialize(self, name, plan):
+        self.log.append(("write", name))
+        if name == self.fail_on:
+            raise RuntimeError("disk full")
+        self.inner.materialize(name, plan)
+
+    def drop_table(self, name):
+        self.log.append(("drop", name))
+        self.inner.drop_table(name)
+
+
+def test_any_backend_runs_a_program(ad, ctx):
+    # Composability re-review (#81): the runner takes a Backend, not only a
+    # DataFusion context, and asks each table's schema once per write.
+    from ddxdb import program as p
+
+    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
+    backend = LoggingBackend(ad, ctx)
+    p.run(backend, prog)
+    kinds = [e[0] for e in backend.log]
+    assert kinds.index("check") < kinds.index("write")
+    assert [e[1] for e in backend.log if e[0] == "drop"] == [s.name for s in prog.intermediate_steps()]
+    asked = set()
+    for entry in backend.log:
+        if entry[0] == "write":
+            asked.discard(entry[1])
+        elif entry[0] == "schema":
+            assert entry[1] not in asked, backend.log
+            asked.add(entry[1])
+    got = ctx.sql(f'SELECT i, val FROM "{prog.gradients[0].step}"')
+    assert pairs(got) == pytest.approx([(0, 2.0 / 3), (1, -4.0 / 3), (2, 1.0 / 3)])
+
+
+def test_a_failed_run_leaves_none_of_the_programs_tables(ad, ctx):
+    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
+    ad.run(ctx, prog)  # an earlier run's value and gradient
+    backend = LoggingBackend(ad, ctx, fail_on=prog.gradients[0].step)
+    with pytest.raises(RuntimeError, match="disk full"):
+        ad.run(backend, prog)
+    assert not ddx_tables(ctx)
+
+
+def test_a_fixed_namespace_gives_the_same_program(ad, ctx):
+    q = "SELECT SUM(val * val) AS l FROM w"
+    a = ad.grad(ctx, q, [("w", "val")], namespace="__ddx_py_")
+    b = ad.grad(ctx, q, [("w", "val")], namespace="__ddx_py_")
+    assert a == b and a.value == "__ddx_py_value"
+    with pytest.raises(ddxdb.DdxError, match="namespace"):
+        ad.grad(ctx, q, [("w", "val")], namespace="__ddx_Py_")
+
+
+def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in():
+    from ddxdb._ddxdb import _Statements
+
+    stmt = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)"
+    assert len(_Statements([stmt], "duckdb").jobs()) == 1
+    with pytest.raises(ValueError, match="dialect"):
+        _Statements([stmt], "klingon")

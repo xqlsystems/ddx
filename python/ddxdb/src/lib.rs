@@ -15,7 +15,7 @@ use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, Rel};
 use ddx_ad::{AdError, ColumnRef};
-use ddx_core::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
+use ddx_core::sqlparser::dialect::{dialect_from_str, Dialect};
 use ddx_core::{Ddx, DiffError, IdentCasing};
 use prost::Message;
 use pyo3::create_exception;
@@ -313,6 +313,14 @@ fn to_py_program<'py>(py: Python<'py>, program: ddx_ad::BackwardProgram) -> PyPr
     )
 }
 
+/// `ddx_ad::Options` with an optional fixed namespace.
+fn options(namespace: Option<String>) -> ddx_ad::Options {
+    match namespace {
+        Some(ns) => ddx_ad::Options::new().namespace(ns),
+        None => ddx_ad::Options::new(),
+    }
+}
+
 fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
     wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
 }
@@ -325,18 +333,26 @@ struct Program(ddx_ad::BackwardProgram);
 impl Program {
     /// A run of this program (see `ddx_ad::Runner`).
     fn runner(&self) -> Runner {
-        Runner(Some(ddx_ad::Runner::new(&self.0)))
+        Runner {
+            inner: Some(ddx_ad::Runner::new(&self.0)),
+            checking: false,
+        }
     }
 }
 
 /// `ddx_ad::Runner`, the run protocol: Python asks what to do next and says
 /// how it went, so the order of a run and what it drops when are ddx-ad's.
 #[pyclass(module = "ddxdb._ddxdb", name = "_Runner")]
-struct Runner(Option<ddx_ad::Runner<PyErr>>);
+struct Runner {
+    inner: Option<ddx_ad::Runner<PyErr>>,
+    /// Whether the pending action is a check, so `fail` answers it the way
+    /// `ddx_ad::Runner` expects.
+    checking: bool,
+}
 
 impl Runner {
     fn inner(&mut self) -> PyResult<&mut ddx_ad::Runner<PyErr>> {
-        self.0
+        self.inner
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("the run is finished"))
     }
@@ -347,7 +363,9 @@ impl Runner {
     /// The next action: `("check", i)`, `("step", i)` (the index into
     /// `program.steps()`), `("drop", name)`, or `None` when the run is over.
     fn next(&mut self, py: Python<'_>) -> PyResult<Option<(&'static str, Py<PyAny>)>> {
-        Ok(match self.inner()?.next() {
+        let action = self.inner()?.next();
+        self.checking = matches!(action, Some(ddx_ad::Action::Check(_)));
+        Ok(match action {
             Some(ddx_ad::Action::Check(i)) => {
                 Some(("check", i.into_pyobject(py)?.into_any().unbind()))
             }
@@ -361,27 +379,41 @@ impl Runner {
         })
     }
 
-    /// The last action succeeded; for a check, whether it returned a row.
-    fn report(&mut self, rows: bool) -> PyResult<()> {
-        self.inner()?.report(Ok(rows));
+    /// The pending check ran: whether its plan returned a row.
+    fn checked(&mut self, rows: bool) -> PyResult<()> {
+        self.inner()?.checked(Ok(rows));
         Ok(())
     }
 
-    /// The last action raised `error`.
+    /// The pending step or drop succeeded.
+    fn done(&mut self) -> PyResult<()> {
+        self.inner()?.done(Ok(()));
+        Ok(())
+    }
+
+    /// The pending action raised `error`.
     fn fail(&mut self, error: Bound<'_, PyAny>) -> PyResult<()> {
-        self.inner()?.report(Err(PyErr::from_value(error)));
+        let error = PyErr::from_value(error);
+        let checking = self.checking;
+        let runner = self.inner()?;
+        if checking {
+            runner.checked(Err(error));
+        } else {
+            runner.done(Err(error));
+        }
         Ok(())
     }
 
     /// End the run: raises the first failure, if there was one.
     fn finish(&mut self) -> PyResult<()> {
         let runner = self
-            .0
+            .inner
             .take()
             .ok_or_else(|| PyValueError::new_err("the run is finished"))?;
         runner.finish().map_err(|e| match e {
             ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
             ddx_ad::RunError::Engine(e) => e,
+            other => DdxError::new_err(other.to_string()),
         })
     }
 }
@@ -393,11 +425,15 @@ struct Statements(ddx_ad::Statements);
 
 #[pymethods]
 impl Statements {
+    /// Plan `statements`, parsed as `dialect` writes SQL (the names
+    /// `rewrite_sql` accepts).
     #[new]
-    fn new(statements: Vec<String>) -> PyResult<Self> {
+    #[pyo3(signature = (statements, dialect = "datafusion"))]
+    fn new(statements: Vec<String>, dialect: &str) -> PyResult<Self> {
+        let (_, parser) = engine_for(dialect)?;
         let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
         Ok(Statements(
-            ddx_ad::Statements::plan(&refs, &GenericDialect {}).map_err(ad_to_py_err)?,
+            ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?,
         ))
     }
 
@@ -428,23 +464,29 @@ impl Statements {
 /// `grad` of a serialized Substrait plan (see `ddxdb.ad`): the program as
 /// plain values, and as a handle.
 #[pyfunction]
+#[pyo3(signature = (plan, wrt, namespace = None))]
 fn _grad<'py>(
     py: Python<'py>,
     plan: &[u8],
     wrt: Vec<(String, String)>,
+    namespace: Option<String>,
 ) -> PyResult<(PyProgram<'py>, Program)> {
-    let program = ddx_ad::grad(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
+    let program = ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+        .map_err(ad_to_py_err)?;
     Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
 /// `vjp` of a serialized Substrait plan (see `ddxdb.ad`).
 #[pyfunction]
+#[pyo3(signature = (plan, wrt, namespace = None))]
 fn _vjp<'py>(
     py: Python<'py>,
     plan: &[u8],
     wrt: Vec<(String, String)>,
+    namespace: Option<String>,
 ) -> PyResult<(PyProgram<'py>, Program)> {
-    let program = ddx_ad::vjp(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
+    let program = ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+        .map_err(ad_to_py_err)?;
     Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
