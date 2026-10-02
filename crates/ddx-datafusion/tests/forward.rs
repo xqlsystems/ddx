@@ -298,3 +298,132 @@ async fn a_subquery_that_reads_a_wrt_table_is_refused() {
     let err = Forward::new(&plan, &[ColumnRef::new("w", "val")]).unwrap_err();
     assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
 }
+
+/// `plan` with its largest subtree that appears more than once moved into
+/// its own entry of `relations` and read through `ReferenceRel`, the way
+/// DuckDB writes a CTE read twice (DataFusion writes it out each time).
+fn share_repeated(plan: &ddx_ad::substrait::proto::Plan) -> ddx_ad::substrait::proto::Plan {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{PlanRel, ReferenceRel, Rel};
+    use std::collections::HashMap;
+
+    fn inputs(rel: &mut Rel) -> Vec<&mut Rel> {
+        match rel.rel_type.as_mut() {
+            Some(RelType::Filter(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Aggregate(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Project(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Sort(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Fetch(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Join(r)) => r
+                .left
+                .as_deref_mut()
+                .into_iter()
+                .chain(r.right.as_deref_mut())
+                .collect(),
+            Some(RelType::Cross(r)) => r
+                .left
+                .as_deref_mut()
+                .into_iter()
+                .chain(r.right.as_deref_mut())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn count(rel: &mut Rel, seen: &mut HashMap<String, (usize, Rel)>) {
+        if !matches!(rel.rel_type, Some(RelType::Read(_))) {
+            let e = seen.entry(format!("{rel:?}")).or_insert((0, rel.clone()));
+            e.0 += 1;
+        }
+        for r in inputs(rel) {
+            count(r, seen);
+        }
+    }
+    fn replace(rel: &mut Rel, key: &str, ordinal: i32) {
+        if format!("{rel:?}") == key {
+            *rel = Rel {
+                rel_type: Some(RelType::Reference(ReferenceRel {
+                    subtree_ordinal: ordinal,
+                })),
+            };
+            return;
+        }
+        for r in inputs(rel) {
+            replace(r, key, ordinal);
+        }
+    }
+
+    let mut plan = plan.clone();
+    let Some(PlanRelType::Root(root)) = plan.relations[0].rel_type.as_mut() else {
+        panic!("one root")
+    };
+    let root_rel = root.input.as_mut().unwrap();
+    let mut seen = HashMap::new();
+    count(root_rel, &mut seen);
+    let (key, (_, shared)) = seen
+        .into_iter()
+        .filter(|(_, (n, _))| *n > 1)
+        .max_by_key(|(k, _)| k.len())
+        .expect("a subtree read twice");
+    replace(root_rel, &key, 1);
+    plan.relations.push(PlanRel {
+        rel_type: Some(PlanRelType::Rel(shared)),
+    });
+    plan
+}
+
+#[tokio::test]
+async fn a_subtree_shared_through_reference_rel_reads_as_the_tree() {
+    // From the second-engine spike (#73, B1): DuckDB shares a CTE read twice
+    // through ReferenceRel. ddx did not follow it, saw no reads at all, and
+    // said the query "reads {}". Each reference now reads as a copy of the
+    // subtree it names, so the analysis is the tree's.
+    let ctx = ctx().await;
+    let sql = "WITH a AS (SELECT o, val * val AS v FROM w), s AS (SELECT SUM(v) AS t FROM a) \
+               SELECT SUM(a.v / s.t) AS loss FROM a CROSS JOIN s";
+    let wrt = [ColumnRef::new("w", "val")];
+    for optimized in [false, true] {
+        let tree = substrait_of(&ctx, sql, optimized).await;
+        let shared = share_repeated(&tree);
+        assert_eq!(shared.relations.len(), 2);
+        // The analysis, less the function table (a HashMap, so its Debug
+        // order varies).
+        let analysis = |f: Forward| format!("{:?}", (f.tables, f.saved, f.output, f.output_names));
+        let want = analysis(Forward::new(&tree, &wrt).unwrap());
+        let got = analysis(Forward::new(&shared, &wrt).unwrap());
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn a_reference_rel_that_loops_or_points_nowhere_is_an_invalid_plan() {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{PlanRel, ReferenceRel, Rel};
+    let ctx = ctx().await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val) AS loss FROM w", true).await;
+    let wrt = [ColumnRef::new("w", "val")];
+    let reference = |ordinal| Rel {
+        rel_type: Some(RelType::Reference(ReferenceRel {
+            subtree_ordinal: ordinal,
+        })),
+    };
+    let with_root = |input: Rel| {
+        let mut p = plan.clone();
+        let Some(PlanRelType::Root(root)) = p.relations[0].rel_type.as_mut() else {
+            unreachable!()
+        };
+        root.input = Some(input);
+        p
+    };
+    // Nowhere: ordinal 7 in a plan of one relation.
+    let err = Forward::new(&with_root(reference(7)), &wrt).unwrap_err();
+    assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+    // A loop: relation 1 refers to itself.
+    let mut looped = with_root(reference(1));
+    looped.relations.push(PlanRel {
+        rel_type: Some(PlanRelType::Rel(reference(1))),
+    });
+    let err = Forward::new(&looped, &wrt).unwrap_err();
+    assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+}

@@ -50,7 +50,7 @@ use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::EmitKind;
 use substrait::proto::{
     AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, JoinRel, NamedStruct, Plan,
-    ProjectRel, ReadRel, Rel, RelCommon, SortRel,
+    PlanRel, ProjectRel, ReadRel, Rel, RelCommon, SortRel,
 };
 
 use crate::elementwise::depends;
@@ -240,6 +240,7 @@ impl Forward {
     pub fn new(plan: &Plan, wrt: &[ColumnRef]) -> Result<Forward> {
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = root_of(plan)?;
+        let root = &inline_references(root, &plan.relations)?;
         if wrt.is_empty() {
             return Err(AdError::UnknownWrt(
                 "no wrt columns were given; name at least one table column".into(),
@@ -283,6 +284,88 @@ fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
         .as_ref()
         .ok_or_else(|| AdError::InvalidPlan("the root relation is empty".into()))?;
     Ok((rel, root.names.clone()))
+}
+
+/// `root` with every `ReferenceRel` replaced by a copy of the relation it
+/// names. A producer shares a subtree read more than once this way (DuckDB, a
+/// CTE read twice), where DataFusion writes the tree out; ddx reads trees, and
+/// saves each distinct aggregate once whichever way it was written. A cycle
+/// or a missing ordinal is an invalid plan, and a reference inside a
+/// subquery expression is refused rather than read as reading nothing.
+fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel> {
+    fn inline(rel: &mut Rel, relations: &[PlanRel], path: &mut Vec<i32>) -> Result<()> {
+        if let Some(RelType::Reference(r)) = &rel.rel_type {
+            let ordinal = r.subtree_ordinal;
+            if path.contains(&ordinal) {
+                return Err(AdError::InvalidPlan(format!(
+                    "relation {ordinal} refers to itself through ReferenceRel"
+                )));
+            }
+            let target = usize::try_from(ordinal)
+                .ok()
+                .and_then(|i| relations.get(i))
+                .and_then(|r| match &r.rel_type {
+                    Some(PlanRelType::Rel(r)) => Some(r.clone()),
+                    Some(PlanRelType::Root(root)) => root.input.clone(),
+                    None => None,
+                })
+                .ok_or_else(|| {
+                    AdError::InvalidPlan(format!(
+                        "a ReferenceRel names relation {ordinal}, which the plan does not have"
+                    ))
+                })?;
+            *rel = target;
+            path.push(ordinal);
+            inline(rel, relations, path)?;
+            path.pop();
+            return Ok(());
+        }
+        if let Some(kind) = rel.rel_type.as_mut() {
+            for input in rel_inputs_mut(kind) {
+                inline(input, relations, path)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = root.clone();
+    inline(&mut out, relations, &mut Vec::new())?;
+    if mentions_reference(&out) {
+        return Err(AdError::NotImplemented(
+            "a ReferenceRel inside a subquery expression".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Does `rel` still hold a `ReferenceRel` anywhere, subqueries included?
+fn mentions_reference(rel: &Rel) -> bool {
+    use substrait::proto::expression::subquery::SubqueryType;
+    fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
+        if let Some(RexType::Subquery(sq)) = &e.rex_type {
+            match &sq.subquery_type {
+                Some(SubqueryType::Scalar(s)) => out.extend(s.input.as_deref()),
+                Some(SubqueryType::InPredicate(s)) => out.extend(s.haystack.as_deref()),
+                Some(SubqueryType::SetPredicate(s)) => out.extend(s.tuples.as_deref()),
+                Some(SubqueryType::SetComparison(s)) => out.extend(s.right.as_deref()),
+                None => {}
+            }
+        }
+        for c in children(e) {
+            subquery_rels(c, out);
+        }
+    }
+    let mut stack = vec![rel];
+    while let Some(r) = stack.pop() {
+        let Some(kind) = &r.rel_type else { continue };
+        if matches!(kind, RelType::Reference(_)) {
+            return true;
+        }
+        for e in rel_expressions(kind) {
+            subquery_rels(e, &mut stack);
+        }
+        stack.extend(rel_inputs(kind));
+    }
+    false
 }
 
 struct Builder<'a> {
@@ -1077,6 +1160,31 @@ pub(crate) fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
         RelType::Set(r) => r.inputs.iter().collect(),
         RelType::ExtensionSingle(r) => one(&r.input),
         RelType::ExtensionMulti(r) => r.inputs.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn rel_inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
+    fn one(r: &mut Option<Box<Rel>>) -> Vec<&mut Rel> {
+        r.as_deref_mut().into_iter().collect()
+    }
+    match kind {
+        RelType::Filter(r) => one(&mut r.input),
+        RelType::Fetch(r) => one(&mut r.input),
+        RelType::Aggregate(r) => one(&mut r.input),
+        RelType::Sort(r) => one(&mut r.input),
+        RelType::Project(r) => one(&mut r.input),
+        RelType::Join(r) => {
+            let (l, rt) = (&mut r.left, &mut r.right);
+            one(l).into_iter().chain(one(rt)).collect()
+        }
+        RelType::Cross(r) => {
+            let (l, rt) = (&mut r.left, &mut r.right);
+            one(l).into_iter().chain(one(rt)).collect()
+        }
+        RelType::Set(r) => r.inputs.iter_mut().collect(),
+        RelType::ExtensionSingle(r) => one(&mut r.input),
+        RelType::ExtensionMulti(r) => r.inputs.iter_mut().collect(),
         _ => Vec::new(),
     }
 }
