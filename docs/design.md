@@ -1018,7 +1018,10 @@ bug (workaround verified, no upstream-fix dependency).
   comparing a row with an extreme from a separate recomputation (which the
   tie tolerance covers only for values that can jitter). It waits for a
   DuckDB adapter to test it against and a cost measured with
-  `tests/ad_perf.rs`.
+  `tests/ad_perf.rs`. The choice has to reach `grad`, since a program is built
+  before anything runs it: an `Options` switch (window functions on by
+  default) that the adapter sets when it builds the program, not a `Backend`
+  capability.
 
 ---
 
