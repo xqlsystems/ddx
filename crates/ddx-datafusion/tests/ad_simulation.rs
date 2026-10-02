@@ -1163,6 +1163,9 @@ fn classify(e: DataFusionError) -> Refusal {
                 AdError::UnknownWrt(m) => Refusal::Allowed(format!("UnknownWrt: {}", short(m))),
                 AdError::InvalidWrt(m) => Refusal::Allowed(format!("InvalidWrt: {}", short(m))),
                 AdError::Diff(d) => Refusal::Allowed(format!("Diff: {}", short(&d.to_string()))),
+                // A kind of refusal the harness does not know yet (the soak
+                // sets no options, so InvalidOptions too) is worth a look.
+                _ => Refusal::Bug(format!("[unexpected refusal] {ad}")),
             };
         }
     }
