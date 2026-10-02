@@ -22,7 +22,7 @@ except ImportError as e:  # pragma: no cover - depends on the environment
         "the result to that engine yourself."
     ) from e
 
-from ._ddxdb import _find_grad_calls, rewrite_sql
+from ._ddxdb import _Statements, rewrite_sql
 
 __all__ = ["Context"]
 
@@ -63,7 +63,7 @@ class Context(SessionContext):
         A statement with neither is passed through byte-identical and is never
         parsed by ddx, so routing every query through here is free.
         """
-        if not args and not kwargs and _find_grad_calls(query) is not None:
+        if not args and not kwargs and _Statements([query]).jobs():
             from . import ad
 
             # ad.sql runs the loss's program, then plans the rewritten

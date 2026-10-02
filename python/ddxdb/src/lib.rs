@@ -317,77 +317,135 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
     wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
 }
 
-/// `grad` of a serialized Substrait plan (see `ddxdb.ad`).
+/// A program, kept on the Rust side for [`Runner`] and [`Statements`].
+#[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Program")]
+struct Program(ddx_ad::BackwardProgram);
+
+#[pymethods]
+impl Program {
+    /// A run of this program (see `ddx_ad::Runner`).
+    fn runner(&self) -> Runner {
+        Runner(Some(ddx_ad::Runner::new(&self.0)))
+    }
+}
+
+/// `ddx_ad::Runner`, the run protocol: Python asks what to do next and says
+/// how it went, so the order of a run and what it drops when are ddx-ad's.
+#[pyclass(module = "ddxdb._ddxdb", name = "_Runner")]
+struct Runner(Option<ddx_ad::Runner<PyErr>>);
+
+impl Runner {
+    fn inner(&mut self) -> PyResult<&mut ddx_ad::Runner<PyErr>> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("the run is finished"))
+    }
+}
+
+#[pymethods]
+impl Runner {
+    /// The next action: `("check", i)`, `("step", i)` (the index into
+    /// `program.steps()`), `("drop", name)`, or `None` when the run is over.
+    fn next(&mut self, py: Python<'_>) -> PyResult<Option<(&'static str, Py<PyAny>)>> {
+        Ok(match self.inner()?.next() {
+            Some(ddx_ad::Action::Check(i)) => {
+                Some(("check", i.into_pyobject(py)?.into_any().unbind()))
+            }
+            Some(ddx_ad::Action::Materialize(i)) => {
+                Some(("step", i.into_pyobject(py)?.into_any().unbind()))
+            }
+            Some(ddx_ad::Action::Drop(name)) => {
+                Some(("drop", name.into_pyobject(py)?.into_any().unbind()))
+            }
+            None => None,
+        })
+    }
+
+    /// The last action succeeded; for a check, whether it returned a row.
+    fn report(&mut self, rows: bool) -> PyResult<()> {
+        self.inner()?.report(Ok(rows));
+        Ok(())
+    }
+
+    /// The last action raised `error`.
+    fn fail(&mut self, error: Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner()?.report(Err(PyErr::from_value(error)));
+        Ok(())
+    }
+
+    /// End the run: raises the first failure, if there was one.
+    fn finish(&mut self) -> PyResult<()> {
+        let runner = self
+            .0
+            .take()
+            .ok_or_else(|| PyValueError::new_err("the run is finished"))?;
+        runner.finish().map_err(|e| match e {
+            ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
+            ddx_ad::RunError::Engine(e) => e,
+        })
+    }
+}
+
+/// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
+/// together.
+#[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Statements")]
+struct Statements(ddx_ad::Statements);
+
+#[pymethods]
+impl Statements {
+    #[new]
+    fn new(statements: Vec<String>) -> PyResult<Self> {
+        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+        Ok(Statements(
+            ddx_ad::Statements::plan(&refs, &GenericDialect {}).map_err(ad_to_py_err)?,
+        ))
+    }
+
+    /// The losses to differentiate, as `(query, [(table, column), …])`.
+    fn jobs(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.0
+            .jobs()
+            .iter()
+            .map(|j| {
+                let wrt = j
+                    .wrt
+                    .iter()
+                    .map(|w| (w.table.clone(), w.column.clone()))
+                    .collect();
+                (j.query.clone(), wrt)
+            })
+            .collect()
+    }
+
+    /// Each statement over the gradients `programs` (one per job, run)
+    /// computed.
+    fn rewrite(&self, programs: Vec<PyRef<'_, Program>>) -> PyResult<Vec<String>> {
+        let programs: Vec<&ddx_ad::BackwardProgram> = programs.iter().map(|p| &p.0).collect();
+        self.0.rewrite(&programs).map_err(ad_to_py_err)
+    }
+}
+
+/// `grad` of a serialized Substrait plan (see `ddxdb.ad`): the program as
+/// plain values, and as a handle.
 #[pyfunction]
 fn _grad<'py>(
     py: Python<'py>,
     plan: &[u8],
     wrt: Vec<(String, String)>,
-) -> PyResult<PyProgram<'py>> {
+) -> PyResult<(PyProgram<'py>, Program)> {
     let program = ddx_ad::grad(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
-    Ok(to_py_program(py, program))
+    Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
 /// `vjp` of a serialized Substrait plan (see `ddxdb.ad`).
 #[pyfunction]
-fn _vjp<'py>(py: Python<'py>, plan: &[u8], wrt: Vec<(String, String)>) -> PyResult<PyProgram<'py>> {
+fn _vjp<'py>(
+    py: Python<'py>,
+    plan: &[u8],
+    wrt: Vec<(String, String)>,
+) -> PyResult<(PyProgram<'py>, Program)> {
     let program = ddx_ad::vjp(&decode(plan)?, &wrt_of(wrt)).map_err(ad_to_py_err)?;
-    Ok(to_py_program(py, program))
-}
-
-/// The `grad(loss, table.column, …)` calls in a SQL statement, or `None`.
-///
-/// Returns `(losses, calls)`: a loss is `(name, query, wrt)`, a call
-/// `(loss index, table, columns)`, in source order.
-#[pyfunction]
-#[allow(clippy::type_complexity)]
-fn _find_grad_calls(
-    sql: &str,
-) -> PyResult<
-    Option<(
-        Vec<(String, String, Vec<(String, String)>)>,
-        Vec<(usize, String, Vec<String>)>,
-    )>,
-> {
-    let Some(found) = ddx_ad::GradCalls::find(sql, &GenericDialect {}).map_err(ad_to_py_err)?
-    else {
-        return Ok(None);
-    };
-    let losses = found
-        .losses
-        .iter()
-        .map(|l| {
-            let wrt = l
-                .wrt
-                .iter()
-                .map(|w| (w.table.clone(), w.column.clone()))
-                .collect();
-            (l.name.clone(), l.query.clone(), wrt)
-        })
-        .collect();
-    let calls = found
-        .calls
-        .iter()
-        .map(|c| (c.loss, c.table.clone(), c.columns.clone()))
-        .collect();
-    Ok(Some((losses, calls)))
-}
-
-/// `sql` with its `grad` calls replaced, in source order, by `relations`.
-#[pyfunction]
-fn _rewrite_grad_calls(sql: &str, relations: Vec<String>) -> PyResult<String> {
-    let found = ddx_ad::GradCalls::find(sql, &GenericDialect {})
-        .map_err(ad_to_py_err)?
-        .ok_or_else(|| PyValueError::new_err("the statement has no grad(loss, …) call"))?;
-    if relations.len() != found.calls.len() {
-        return Err(PyValueError::new_err(format!(
-            "{} replacements for {} grad calls",
-            relations.len(),
-            found.calls.len()
-        )));
-    }
-    let mut next = relations.into_iter();
-    Ok(found.rewrite(&mut |_| next.next().expect("counted above")))
+    Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
 /// The tables a step's plan reads without their types: the earlier steps it
@@ -442,8 +500,9 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
     m.add_function(wrap_pyfunction!(_grad, m)?)?;
     m.add_function(wrap_pyfunction!(_vjp, m)?)?;
-    m.add_function(wrap_pyfunction!(_find_grad_calls, m)?)?;
-    m.add_function(wrap_pyfunction!(_rewrite_grad_calls, m)?)?;
+    m.add_class::<Program>()?;
+    m.add_class::<Runner>()?;
+    m.add_class::<Statements>()?;
     m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
     m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;
 

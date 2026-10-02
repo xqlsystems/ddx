@@ -58,9 +58,8 @@ except ImportError as e:  # pragma: no cover - depends on the environment
 from ._ddxdb import (
     InvalidColumn,
     _bind_reads,
-    _find_grad_calls,
     _grad,
-    _rewrite_grad_calls,
+    _Statements,
     _unbound_reads,
     _vjp,
 )
@@ -127,6 +126,9 @@ class BackwardProgram:
     checks: tuple[Check, ...]  # run before the steps; each must return no rows
     backward_steps: tuple[Step, ...]
     gradients: tuple[Gradient, ...]
+    # The same program on the Rust side, which runs the run protocol
+    # (ddx_ad::Runner) and plans sql_all's statements.
+    _handle: object = dataclasses.field(default=None, repr=False, compare=False)
 
     def steps(self) -> Iterator[Step]:
         """Every step, in the order they must run."""
@@ -154,7 +156,8 @@ def register_stop_gradient(ctx: SessionContext) -> None:
     ctx.register_udf(udf(lambda x: x, [pa.float64()], pa.float64(), "immutable", name=STOP_GRADIENT))
 
 
-def _program(raw) -> BackwardProgram:
+def _program(raw_and_handle) -> BackwardProgram:
+    raw, handle = raw_and_handle
     forward, value, cotangent_table, cotangent, checks, backward, gradients = raw
     return BackwardProgram(
         forward_steps=tuple(Step(n, p) for n, p in forward),
@@ -164,6 +167,7 @@ def _program(raw) -> BackwardProgram:
         checks=tuple(Check(p, m) for p, m in checks),
         backward_steps=tuple(Step(n, p) for n, p in backward),
         gradients=tuple(Gradient(t, s, tuple(c)) for t, s, c in gradients),
+        _handle=handle,
     )
 
 
@@ -200,21 +204,36 @@ def run(ctx: SessionContext, program: BackwardProgram) -> None:
     build it once and run it on every training step. One program's runs must
     not overlap, since they write the same tables.
     """
-    run_checks(ctx, program)
-    try:
-        for step in program.steps():
-            run_step(ctx, step)
-    finally:
-        for step in program.intermediate_steps():
-            ctx.deregister_table(step.name)
+    # The order of a run, and what it drops when, are ddx_ad::Runner's: this
+    # loop only does what it is asked.
+    runner = program._handle.runner()
+    steps = list(program.steps())
+    while (action := runner.next()) is not None:
+        kind, arg = action
+        try:
+            if kind == "check":
+                runner.report(_returns_rows(ctx, program.checks[arg].plan))
+            elif kind == "step":
+                run_step(ctx, steps[arg])
+                runner.report(False)
+            else:
+                ctx.deregister_table(arg)
+                runner.report(False)
+        except Exception as e:  # handed to the runner, which raises it in finish()
+            runner.fail(e)
+    runner.finish()
 
 
 def run_checks(ctx: SessionContext, program: BackwardProgram) -> None:
     """Run ``program``'s checks, raising :class:`ddxdb.InvalidColumn` on the
     first that returns a row."""
     for check in program.checks:
-        if ctx.create_dataframe_from_logical_plan(_consume(ctx, check.plan)).limit(1).count() > 0:
+        if _returns_rows(ctx, check.plan):
             raise InvalidColumn(f"invalid wrt column: {check.message}")
+
+
+def _returns_rows(ctx: SessionContext, plan: bytes) -> bool:
+    return ctx.create_dataframe_from_logical_plan(_consume(ctx, plan)).limit(1).count() > 0
 
 
 def release(ctx: SessionContext, program: BackwardProgram) -> None:
@@ -252,18 +271,6 @@ def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
     ctx.register_record_batches(name, [batches])
 
 
-def _names_table(wanted: str, table: str) -> bool:
-    """Does the table name ``wanted``, as written in SQL, name the plan's
-    ``table``? A bare name matches a qualified table's last part; case is
-    ignored."""
-    wanted, table = wanted.lower(), table.lower()
-    return wanted == table or ("." not in wanted and table.split(".")[-1] == wanted)
-
-
-def _quote(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
 def sql(ctx: SessionContext, statement: str):
     """Run ``statement``, in which ``grad(loss, table.column, …)`` in a ``FROM``
     clause is the gradient of the loss the CTE ``loss`` computes, as a relation
@@ -282,71 +289,19 @@ def sql_all(ctx: SessionContext, statements: Sequence[str]) -> list:
     same loss query share one run of its program, so a training step can update
     each parameter table with its own statement and pay for the backward pass
     once."""
-    found = [_find_grad_calls(s) for s in statements]
-
-    # One program per distinct loss query, with respect to every column any
-    # statement asks about.
-    queries: list[str] = []
-    wrts: list[list[tuple[str, str]]] = []
-    program_of: dict[tuple[int, int], int] = {}
-    for s, calls in enumerate(found):
-        if calls is None:
-            continue
-        losses, _ = calls
-        for l, (_, query, wrt) in enumerate(losses):
-            if query not in queries:
-                queries.append(query)
-                wrts.append([])
-            p = queries.index(query)
-            for t, c in wrt:
-                # w.VAL and w.val are one column, as ddx_ad::grad compares them.
-                if not any(t.lower() == t2.lower() and c.lower() == c2.lower() for t2, c2 in wrts[p]):
-                    wrts[p].append((t, c))
-            program_of[(s, l)] = p
-
-    # Run each. Every program's tables carry its own prefix, so the gradients
-    # are read where the program wrote them.
+    # Which programs to run and how each statement reads their gradients are
+    # ddx_ad::sql::Statements'; running them and planning the result are
+    # DataFusion's.
+    planned = _Statements(list(statements))
     ran: list[BackwardProgram] = []
-    kept: dict[tuple[int, str], tuple[str, tuple[str, ...]]] = {}
     try:
-        for p, (query, wrt) in enumerate(zip(queries, wrts)):
+        for query, wrt in planned.jobs():
             program = grad(ctx, query, wrt)
             ran.append(program)
             run(ctx, program)
-            for g in program.gradients:
-                kept[(p, g.table)] = (g.step, g.columns)
-        return _plan_statements(ctx, statements, found, wrts, program_of, kept)
+        return [ctx.sql(s) for s in planned.rewrite([p._handle for p in ran])]
     finally:
         # A planned DataFrame holds the tables it reads, so the programs'
         # tables can leave the catalog now.
         for program in ran:
             release(ctx, program)
-
-
-def _plan_statements(ctx, statements, found, wrts, program_of, kept) -> list:
-    """Plan each statement, its ``grad`` calls replaced by reads of ``kept``."""
-    frames = []
-    for s, statement in enumerate(statements):
-        if found[s] is None:
-            frames.append(ctx.sql(statement))
-            continue
-        _, calls = found[s]
-        relations = []
-        for loss, table, columns in calls:
-            p = program_of[(s, loss)]
-            match = next(
-                ((t, v) for (q, t), v in kept.items() if q == p and _names_table(table, t)),
-                None,
-            )
-            if match is None:
-                raise RuntimeError(f"no gradient was computed for {table!r}")
-            plan_table, (name, all_columns) = match
-            # A column is one of the table's values when a wrt entry for the
-            # table names it; every other column is a dim.
-            value_names = {c.lower() for t, c in wrts[p] if _names_table(t, plan_table)}
-            dims = [c for c in all_columns if c.lower() not in value_names]
-            asked = [v for c in columns for v in all_columns if v.lower() in value_names and v.lower() == c.lower()]
-            picked = ", ".join(_quote(c) for c in dims + asked)
-            relations.append(f"(SELECT {picked} FROM {_quote(name)})")
-        frames.append(ctx.sql(_rewrite_grad_calls(statement, relations)))
-    return frames
