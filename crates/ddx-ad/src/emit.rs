@@ -255,7 +255,18 @@ pub fn bind_reads(
         for col in &base.names {
             match actual.names.iter().position(|n| n == col) {
                 Some(i) if i < types.len() => picked.push(types[i].clone()),
-                _ => {
+                // The schema names the column but types fewer columns than
+                // it names: an engine's schema with no struct, say.
+                Some(_) => {
+                    failure = Some(AdError::InvalidPlan(format!(
+                        "the schema given for step `{name}` names {} columns but types {}, \
+                         so `{col}` has no type",
+                        actual.names.len(),
+                        types.len()
+                    )));
+                    return;
+                }
+                None => {
                     failure = Some(AdError::InvalidPlan(format!(
                         "step `{name}` has no column `{col}` (it has {:?})",
                         actual.names
