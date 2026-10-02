@@ -86,7 +86,7 @@ use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
 pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
 
-use ddx_ad::GradCalls;
+use ddx_ad::Statements;
 
 fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -152,120 +152,33 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
 /// training step can update each parameter table with its own statement and
 /// pay for the backward pass once.
 pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<DataFrame>> {
-    let mut found = Vec::with_capacity(statements.len());
-    for sql in statements {
-        found.push(GradCalls::find(sql, &GenericDialect {}).map_err(to_df_err)?);
-    }
-
-    // One program per distinct loss query, differentiated with respect to
-    // every column any statement asks about.
-    let mut programs: Vec<(String, Vec<ColumnRef>)> = Vec::new();
-    let mut program_of: HashMap<(usize, usize), usize> = HashMap::new();
-    for (s, calls) in found.iter().enumerate() {
-        let Some(calls) = calls else { continue };
-        for (l, loss) in calls.losses.iter().enumerate() {
-            let p = match programs.iter().position(|(q, _)| *q == loss.query) {
-                Some(p) => p,
-                None => {
-                    programs.push((loss.query.clone(), Vec::new()));
-                    programs.len() - 1
-                }
-            };
-            for w in &loss.wrt {
-                let same = |x: &ColumnRef| {
-                    x.table.eq_ignore_ascii_case(&w.table)
-                        && x.column.eq_ignore_ascii_case(&w.column)
-                };
-                if !programs[p].1.iter().any(same) {
-                    programs[p].1.push(w.clone());
-                }
-            }
-            program_of.insert((s, l), p);
+    // Which programs to run, and how each statement reads their gradients,
+    // are ddx_ad::Statements'; running them and planning the result are
+    // DataFusion's.
+    let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
+    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
+    let result = async {
+        for job in planned.jobs() {
+            let program = grad(ctx, &job.query, &job.wrt).await?;
+            ran.push(program);
+            run(ctx, ran.last().expect("just pushed")).await?;
         }
-    }
-
-    // Run each. Every program's tables carry its own prefix, so the gradients
-    // are read where the program wrote them.
-    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(programs.len());
-    let mut kept: Vec<(usize, Vec<String>, String, Vec<String>)> = Vec::new();
-    for (p, (query, wrt)) in programs.iter().enumerate() {
-        let program = grad(ctx, query, wrt).await?;
-        run(ctx, &program).await?;
-        for g in &program.gradients {
-            kept.push((p, g.table.clone(), g.step.clone(), g.columns.clone()));
+        let rewritten = planned
+            .rewrite(&ran.iter().collect::<Vec<_>>())
+            .map_err(to_df_err)?;
+        let mut frames = Vec::with_capacity(rewritten.len());
+        for sql in &rewritten {
+            frames.push(ctx.sql(sql).await?);
         }
-        ran.push(program);
+        Ok(frames)
     }
-    let frames = plan_statements(ctx, statements, &found, &programs, &program_of, &kept).await;
+    .await;
     // A planned DataFrame holds the tables it reads, so the programs' tables
     // can leave the catalog now.
     for program in &ran {
         release(ctx, program)?;
     }
-    frames
-}
-
-/// Plan each statement, its `grad` calls replaced by reads of `kept`.
-async fn plan_statements(
-    ctx: &SessionContext,
-    statements: &[&str],
-    found: &[Option<GradCalls>],
-    programs: &[(String, Vec<ColumnRef>)],
-    program_of: &HashMap<(usize, usize), usize>,
-    kept: &[(usize, Vec<String>, String, Vec<String>)],
-) -> Result<Vec<DataFrame>> {
-    let mut frames = Vec::with_capacity(statements.len());
-    for (s, sql) in statements.iter().enumerate() {
-        let Some(calls) = &found[s] else {
-            frames.push(ctx.sql(sql).await?);
-            continue;
-        };
-        let mut failure = None;
-        let rewritten = calls.rewrite(&mut |call| {
-            let p = program_of[&(s, call.loss)];
-            let found = kept
-                .iter()
-                .find(|(q, table, _, _)| *q == p && names_table(&call.table, table));
-            let Some((_, table, name, columns)) = found else {
-                failure = Some(format!("no gradient was computed for `{}`", call.table));
-                return String::new();
-            };
-            // The table's dims, then the columns this call asked for.
-            // A column is one of this table's values when some wrt entry for
-            // the table names it; every other column is a dim.
-            let is_value = |c: &String| {
-                programs[p]
-                    .1
-                    .iter()
-                    .any(|w| names_table(&w.table, table) && w.column.eq_ignore_ascii_case(c))
-            };
-            let dims: Vec<&String> = columns.iter().filter(|c| !is_value(c)).collect();
-            let picked: Vec<String> = dims
-                .into_iter()
-                .cloned()
-                .chain(call.columns.iter().filter_map(|c| {
-                    columns
-                        .iter()
-                        .find(|v| is_value(v) && v.eq_ignore_ascii_case(c))
-                        .cloned()
-                }))
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-                .collect();
-            format!("(SELECT {} FROM \"{name}\")", picked.join(", "))
-        });
-        if let Some(msg) = failure {
-            return Err(DataFusionError::Internal(msg));
-        }
-        frames.push(ctx.sql(&rewritten).await?);
-    }
-    Ok(frames)
-}
-
-/// Does the table name `wanted`, as written in SQL, name the plan's `table`?
-/// A bare name matches a qualified table's last part; case is ignored.
-fn names_table(wanted: &str, table: &[String]) -> bool {
-    table.join(".").eq_ignore_ascii_case(wanted)
-        || (!wanted.contains('.') && table.last().is_some_and(|t| t.eq_ignore_ascii_case(wanted)))
+    result
 }
 
 /// Run `program`: its [`checks`](BackwardProgram::checks), then every step,

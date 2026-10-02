@@ -25,6 +25,17 @@
 //! holding each gradient in place of each call, by source span, leaving the
 //! rest of the statement byte-identical.
 //!
+//! An adapter runs several statements at once with [`Statements`]: it plans
+//! one job per distinct loss query, differentiated with respect to every
+//! column any statement asks about, so statements that update different
+//! tables from one loss pay for one backward pass. The adapter runs each
+//! job's program and hands the programs back to [`Statements::rewrite`]. Only
+//! those two calls need the engine.
+//!
+//! This is the one part of `ddx-ad` about SQL text rather than Substrait, so
+//! its API names `sqlparser` (a [`Dialect`]), through the `ddx-core` this
+//! crate re-exports; the rest of the crate needs only `substrait`.
+//!
 //! The scalar `grad(expr, column)` of v1 is an expression, in a select list;
 //! this one is a relation, in a `FROM` clause. The rewriter tells them apart by
 //! where they appear.
@@ -41,7 +52,8 @@ use ddx_core::sqlparser::parser::Parser;
 use ddx_core::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use crate::error::{AdError, Result};
-use crate::relation::ColumnRef;
+use crate::program::BackwardProgram;
+use crate::relation::{table_matches, ColumnRef};
 
 /// A loss CTE some `grad` call differentiates.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +90,145 @@ pub struct GradCalls {
     /// The calls, in source order.
     pub calls: Vec<GradCall>,
     sql: String,
+}
+
+/// One loss to differentiate for [`Statements`]: a query, and every column
+/// any statement takes its gradient with respect to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    /// The loss query.
+    pub query: String,
+    /// The columns, each once, compared case-insensitively.
+    pub wrt: Vec<ColumnRef>,
+}
+
+/// Several statements' `grad` calls, planned together (see the module docs).
+#[derive(Debug, Clone)]
+pub struct Statements {
+    statements: Vec<String>,
+    found: Vec<Option<GradCalls>>,
+    jobs: Vec<Job>,
+    /// (statement, loss within it) → job.
+    job_of: BTreeMap<(usize, usize), usize>,
+}
+
+impl Statements {
+    /// Find every statement's calls, and the jobs they need: one per
+    /// distinct loss query.
+    pub fn plan(statements: &[&str], dialect: &dyn Dialect) -> Result<Statements> {
+        let mut found = Vec::with_capacity(statements.len());
+        for sql in statements {
+            found.push(GradCalls::find(sql, dialect)?);
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut job_of = BTreeMap::new();
+        for (s, calls) in found.iter().enumerate() {
+            let Some(calls) = calls else { continue };
+            for (l, loss) in calls.losses.iter().enumerate() {
+                let j = match jobs.iter().position(|j| j.query == loss.query) {
+                    Some(j) => j,
+                    None => {
+                        jobs.push(Job {
+                            query: loss.query.clone(),
+                            wrt: Vec::new(),
+                        });
+                        jobs.len() - 1
+                    }
+                };
+                for w in &loss.wrt {
+                    let same = |x: &ColumnRef| {
+                        x.table.eq_ignore_ascii_case(&w.table)
+                            && x.column.eq_ignore_ascii_case(&w.column)
+                    };
+                    if !jobs[j].wrt.iter().any(same) {
+                        jobs[j].wrt.push(w.clone());
+                    }
+                }
+                job_of.insert((s, l), j);
+            }
+        }
+        Ok(Statements {
+            statements: statements.iter().map(|s| s.to_string()).collect(),
+            found,
+            jobs,
+            job_of,
+        })
+    }
+
+    /// The losses to differentiate, in the order [`Statements::rewrite`]
+    /// expects their programs.
+    pub fn jobs(&self) -> &[Job] {
+        &self.jobs
+    }
+
+    /// Each statement with its calls replaced by reads of the gradients
+    /// `programs` computed, one program per [job](Statements::jobs) in order,
+    /// each already run so its gradient tables exist. A statement with no
+    /// call comes back as it was.
+    ///
+    /// A call reads its table's dims, then the columns it named, from the
+    /// table its job's program wrote. A column is one of the table's values
+    /// when some `wrt` entry of the job names it; every other is a dim.
+    pub fn rewrite(&self, programs: &[&BackwardProgram]) -> Result<Vec<String>> {
+        if programs.len() != self.jobs.len() {
+            return Err(AdError::Internal(format!(
+                "{} programs for {} jobs",
+                programs.len(),
+                self.jobs.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(self.statements.len());
+        for (s, sql) in self.statements.iter().enumerate() {
+            let Some(calls) = &self.found[s] else {
+                out.push(sql.clone());
+                continue;
+            };
+            let mut failure = None;
+            let rewritten = calls.rewrite(&mut |call| {
+                let j = self.job_of[&(s, call.loss)];
+                let found = programs[j]
+                    .gradients
+                    .iter()
+                    .find(|g| table_matches(&call.table, &g.table));
+                let Some(g) = found else {
+                    failure = Some(AdError::Internal(format!(
+                        "no gradient was computed for `{}`",
+                        call.table
+                    )));
+                    return String::new();
+                };
+                let is_value = |c: &String| {
+                    self.jobs[j].wrt.iter().any(|w| {
+                        table_matches(&w.table, &g.table) && w.column.eq_ignore_ascii_case(c)
+                    })
+                };
+                let picked: Vec<String> = g
+                    .columns
+                    .iter()
+                    .filter(|c| !is_value(c))
+                    .cloned()
+                    .chain(call.columns.iter().filter_map(|c| {
+                        g.columns
+                            .iter()
+                            .find(|v| is_value(v) && v.eq_ignore_ascii_case(c))
+                            .cloned()
+                    }))
+                    .map(|c| quote(&c))
+                    .collect();
+                format!("(SELECT {} FROM {})", picked.join(", "), quote(&g.step))
+            });
+            if let Some(e) = failure {
+                return Err(e);
+            }
+            out.push(rewritten);
+        }
+        Ok(out)
+    }
+}
+
+/// `name` as a quoted SQL identifier.
+fn quote(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 impl GradCalls {
