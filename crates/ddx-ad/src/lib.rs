@@ -49,6 +49,7 @@ mod functions;
 mod program;
 #[doc(hidden)]
 pub mod relation;
+mod run;
 mod transpose;
 
 #[doc(hidden)]
@@ -66,6 +67,7 @@ pub use program::{
 pub use relation::ColumnRef;
 #[doc(hidden)]
 pub use relation::Table;
+pub use run::{run, Action, Backend, RunError, Runner};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.

@@ -64,7 +64,7 @@ use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Rel};
 use ddx_ad::substrait::proto::{Plan, ProjectRel};
-use ddx_ad::{bind_reads, unbound_reads};
+use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
 pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
 
@@ -123,38 +123,46 @@ pub fn vjp_plan(
 /// not overlap: they write the same tables. Build a program per concurrent
 /// caller instead.
 pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
-    run_checks(ctx, program).await?;
-    let result = async {
-        for step in program.steps() {
-            run_step(ctx, step).await?;
-        }
-        Ok(())
+    // The order, and what is dropped when, are ddx_ad::Runner's.
+    let mut runner = ddx_ad::Runner::new(program);
+    while let Some(action) = runner.next() {
+        let result = match &action {
+            Action::Check(i) => returns_rows(ctx, &program.checks[*i].plan).await,
+            Action::Materialize(i) => run_step(ctx, program.step(*i)).await.map(|()| false),
+            Action::Drop(name) => ctx.deregister_table(name.as_str()).map(|_| false),
+        };
+        runner.report(result);
     }
-    .await;
-    for step in program.intermediate_steps() {
-        ctx.deregister_table(step.name.as_str())?;
-    }
-    result
+    runner.finish().map_err(|e| match e {
+        RunError::Refused(e) => to_df_err(e),
+        RunError::Engine(e) => e,
+    })
 }
 
 /// Run `program`'s checks, failing on the first that returns a row.
 pub async fn run_checks(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
     for check in &program.checks {
-        let lp = logical_plan(ctx, &check.plan).await?;
-        let rows: usize = ctx
-            .execute_logical_plan(lp)
-            .await?
-            .limit(0, Some(1))?
-            .collect()
-            .await?
-            .iter()
-            .map(|b| b.num_rows())
-            .sum();
-        if rows > 0 {
+        if returns_rows(ctx, &check.plan).await? {
             return Err(to_df_err(AdError::InvalidWrt(check.message.clone())));
         }
     }
     Ok(())
+}
+
+/// Does `plan` (a check) return any row? The returns-rows primitive of
+/// [`ddx_ad::Backend`].
+pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
+    let lp = logical_plan(ctx, plan).await?;
+    let rows: usize = ctx
+        .execute_logical_plan(lp)
+        .await?
+        .limit(0, Some(1))?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    Ok(rows > 0)
 }
 
 /// Drop every table `program` registered on `ctx`, the value and the
@@ -170,7 +178,13 @@ pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
 /// Every step it reads must already be registered. Unlike [`run`], this
 /// neither runs the checks nor drops anything.
 pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
-    let lp = logical_plan(ctx, &step.plan).await?;
+    materialize(ctx, &step.name, &step.plan).await
+}
+
+/// Run `plan` and register its rows as the table `name`, replacing one: the
+/// materialize primitive of [`ddx_ad::Backend`].
+pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Result<()> {
+    let lp = logical_plan(ctx, plan).await?;
     let df = ctx.execute_logical_plan(lp).await?;
     // The schema of the plan that runs, not the logical one: a step read
     // from an unanalyzed plan can be typed before type coercion (a CASE
@@ -183,8 +197,8 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
     // A MemTable, not a view: DataFusion's Substrait consumer can pick
     // columns out of a table scan, and a later step reads only some.
     let table = MemTable::try_new(schema, vec![batches])?;
-    ctx.deregister_table(step.name.as_str())?;
-    ctx.register_table(step.name.as_str(), Arc::new(table))?;
+    ctx.deregister_table(name)?;
+    ctx.register_table(name, Arc::new(table))?;
     Ok(())
 }
 
