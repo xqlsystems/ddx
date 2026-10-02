@@ -116,7 +116,9 @@ fn ad_to_py_err(e: AdError) -> PyErr {
         AdError::UnknownWrt(_) => UnknownColumn::new_err(msg),
         AdError::InvalidWrt(_) => InvalidColumn::new_err(msg),
         AdError::Diff(inner) => to_py_err(inner),
-        AdError::InvalidPlan(_) | AdError::Internal(_) => DdxError::new_err(msg),
+        // InvalidPlan, Internal, InvalidOptions, and any kind of refusal
+        // ddx-ad adds later.
+        _ => DdxError::new_err(msg),
     }
 }
 
