@@ -16,12 +16,15 @@ use tokio::runtime::Runtime;
 struct Sync {
     ctx: SessionContext,
     rt: Runtime,
+    /// Every table_schema call, and every table written, in order.
+    log: Vec<String>,
 }
 
 impl Backend for Sync {
     type Error = DataFusionError;
 
     fn table_schema(&mut self, name: &str) -> Result<NamedStruct, Self::Error> {
+        self.log.push(format!("schema {name}"));
         self.rt.block_on(ad::table_schema(&self.ctx, name))
     }
 
@@ -30,6 +33,7 @@ impl Backend for Sync {
     }
 
     fn materialize(&mut self, name: &str, plan: &Plan) -> Result<(), Self::Error> {
+        self.log.push(format!("write {name}"));
         self.rt.block_on(ad::materialize(&self.ctx, name, plan))
     }
 
@@ -42,6 +46,7 @@ fn backend(rows: &str) -> Sync {
     let b = Sync {
         ctx: SessionContext::new(),
         rt: Runtime::new().unwrap(),
+        log: Vec::new(),
     };
     let sql = format!("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES {rows}");
     b.rt.block_on(async { b.ctx.sql(&sql).await?.collect().await })
@@ -87,6 +92,21 @@ fn a_synchronous_backend_gets_the_gradient_and_drops_the_intermediates() {
     );
     for step in program.intermediate_steps() {
         assert!(!b.ctx.table_exist(step.name.as_str()).unwrap());
+    }
+    // Each table's schema is asked for at most once per write of it: for an
+    // engine, asking is a round trip (composability re-review on #79).
+    let mut asked = std::collections::BTreeSet::new();
+    for entry in &b.log {
+        if let Some(name) = entry.strip_prefix("write ") {
+            asked.remove(name);
+        } else {
+            let name = entry.strip_prefix("schema ").unwrap();
+            assert!(
+                asked.insert(name.to_string()),
+                "asked twice for {name}: {:?}",
+                b.log
+            );
+        }
     }
 }
 

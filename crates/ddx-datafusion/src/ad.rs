@@ -126,16 +126,16 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> 
     // The order, and what is dropped when, are ddx_ad::Runner's.
     let mut runner = ddx_ad::Runner::new(program);
     while let Some(action) = runner.next() {
-        let result = match &action {
-            Action::Check(i) => returns_rows(ctx, &program.checks[*i].plan).await,
-            Action::Materialize(i) => run_step(ctx, program.step(*i)).await.map(|()| false),
-            Action::Drop(name) => ctx.deregister_table(name.as_str()).map(|_| false),
-        };
-        runner.report(result);
+        match &action {
+            Action::Check(i) => runner.checked(returns_rows(ctx, &program.checks[*i].plan).await),
+            Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
+            Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
+        }
     }
     runner.finish().map_err(|e| match e {
         RunError::Refused(e) => to_df_err(e),
         RunError::Engine(e) => e,
+        other => DataFusionError::Internal(other.to_string()),
     })
 }
 

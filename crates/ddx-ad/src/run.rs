@@ -10,8 +10,12 @@
 //! table's schema (to bind a plan's reads of earlier steps; see
 //! [`crate::bind_reads`]). The rest is the same everywhere and lives here: the
 //! checks run first and a row from any refuses the program, then every step in
-//! order, and the intermediate tables are dropped whether the steps succeed or
-//! fail, leaving the value and the gradients.
+//! order. A run that succeeds drops the intermediate tables and leaves the
+//! value and the gradients. A run that fails, at a check or a step, leaves
+//! none of the program's tables, so a loop that reruns one program (under a
+//! fixed [namespace](crate::Options::namespace), say) never finds this run's
+//! value beside an earlier run's gradient. Two programs that share a namespace
+//! write the same tables, so they must not run on one engine.
 //!
 //! [`Runner`] is that protocol without I/O: it says what to do next and is
 //! told how it went, so a synchronous engine, an asynchronous one and a
@@ -26,17 +30,17 @@
 //! fn run(program: &BackwardProgram) -> Result<(), ddx_ad::RunError<String>> {
 //!     let mut runner = Runner::new(program);
 //!     while let Some(action) = runner.next() {
-//!         let result = match &action {
-//!             Action::Check(i) => engine_check(&program.checks[*i]),
-//!             Action::Materialize(i) => engine_materialize(program.step(*i)).map(|()| false),
-//!             Action::Drop(name) => engine_drop(name).map(|()| false),
-//!         };
-//!         runner.report(result);
+//!         match &action {
+//!             Action::Check(i) => runner.checked(engine_check(&program.checks[*i])),
+//!             Action::Materialize(i) => runner.done(engine_materialize(program.step(*i))),
+//!             Action::Drop(name) => runner.done(engine_drop(name)),
+//!         }
 //!     }
 //!     runner.finish()
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 
 use substrait::proto::{NamedStruct, Plan};
@@ -51,19 +55,20 @@ use crate::program::BackwardProgram;
 /// breaking change on purpose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Run [`BackwardProgram::checks`]`[i]` and report whether its plan
-    /// returned any row (`Ok(true)`), which refuses the program.
+    /// Run [`BackwardProgram::checks`]`[i]` and say whether its plan returned
+    /// any row, with [`Runner::checked`]; a row refuses the program.
     Check(usize),
     /// Run [`BackwardProgram::step`]`(i)` and materialize its rows as the
-    /// table its name gives, replacing any table of that name; report
-    /// `Ok(false)`.
+    /// table its name gives, replacing any table of that name; then
+    /// [`Runner::done`].
     Materialize(usize),
-    /// Drop the table of this name if it exists; report `Ok(false)`.
+    /// Drop the table of this name if it exists; then [`Runner::done`].
     Drop(String),
 }
 
 /// Why a program's run failed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RunError<E> {
     /// A check returned a row ([`AdError::InvalidWrt`]: a `wrt` table's rows
     /// are not what the program assumed), or a plan's reads could not be
@@ -105,8 +110,11 @@ enum Phase {
 #[derive(Debug)]
 pub struct Runner<E> {
     messages: Vec<String>,
-    steps: usize,
+    steps: Vec<String>,
     intermediates: Vec<String>,
+    /// What the drop phase drops: the intermediates after a success, every
+    /// step's table after a failure.
+    dropping: Vec<String>,
     phase: Phase,
     waiting: bool,
     failure: Option<RunError<E>>,
@@ -117,11 +125,12 @@ impl<E> Runner<E> {
     pub fn new(program: &BackwardProgram) -> Self {
         let mut runner = Runner {
             messages: program.checks.iter().map(|c| c.message.clone()).collect(),
-            steps: program.steps().count(),
+            steps: program.steps().map(|s| s.name.clone()).collect(),
             intermediates: program
                 .intermediate_steps()
                 .map(|s| s.name.clone())
                 .collect(),
+            dropping: Vec::new(),
             phase: Phase::Check(0),
             waiting: false,
             failure: None,
@@ -131,73 +140,74 @@ impl<E> Runner<E> {
     }
 
     /// The next action, or `None` once the run is over; then call
-    /// [`Runner::finish`]. Each action must be [reported](Runner::report)
-    /// before the next is asked for.
+    /// [`Runner::finish`]. Each action must be answered, with
+    /// [`Runner::checked`] for a check and [`Runner::done`] otherwise, before
+    /// the next is asked for.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Action> {
         assert!(
             !self.waiting,
-            "report the last action before asking for the next"
+            "answer the last action before asking for the next"
         );
         let action = match self.phase {
             Phase::Check(i) => Action::Check(i),
             Phase::Step(i) => Action::Materialize(i),
-            Phase::Drop(i) => Action::Drop(self.intermediates[i].clone()),
+            Phase::Drop(i) => Action::Drop(self.dropping[i].clone()),
             Phase::Done => return None,
         };
         self.waiting = true;
         Some(action)
     }
 
-    /// How the last action went: for a check, whether its plan returned a
-    /// row; `Ok(false)` for any other action that succeeded.
-    pub fn report(&mut self, result: Result<bool, E>) {
-        assert!(self.waiting, "report follows an action");
-        self.waiting = false;
-        match (self.phase, result) {
-            (Phase::Check(i), Ok(false)) => self.phase = Phase::Check(i + 1),
-            (Phase::Check(i), Ok(true)) => {
-                // Nothing has been written yet, so there is nothing to drop.
-                self.failure = Some(RunError::Refused(AdError::InvalidWrt(
-                    self.messages[i].clone(),
-                )));
-                self.phase = Phase::Done;
-            }
-            (Phase::Check(_), Err(e)) => {
-                self.failure = Some(RunError::Engine(e));
-                self.phase = Phase::Done;
-            }
-            (Phase::Step(i), Ok(_)) => self.phase = Phase::Step(i + 1),
-            (Phase::Step(_), Err(e)) => {
-                self.failure = Some(RunError::Engine(e));
-                self.phase = Phase::Drop(0);
-            }
-            // Every intermediate is dropped even after a failed drop; the
-            // first failure is the one reported.
+    /// How the pending [`Action::Check`] went: whether its plan returned a
+    /// row.
+    pub fn checked(&mut self, result: Result<bool, E>) {
+        let Phase::Check(i) = self.answer("checked", true) else {
+            unreachable!()
+        };
+        match result {
+            Ok(false) => self.phase = Phase::Check(i + 1),
+            Ok(true) => self.fail(RunError::Refused(AdError::InvalidWrt(
+                self.messages[i].clone(),
+            ))),
+            Err(e) => self.fail(RunError::Engine(e)),
+        }
+        self.settle();
+    }
+
+    /// How the pending [`Action::Materialize`] or [`Action::Drop`] went.
+    pub fn done(&mut self, result: Result<(), E>) {
+        match (self.answer("done", false), result) {
+            (Phase::Step(i), Ok(())) => self.phase = Phase::Step(i + 1),
+            (Phase::Step(_), Err(e)) => self.fail(RunError::Engine(e)),
+            // Every table is dropped even after a failed drop; the first
+            // failure is the one reported.
             (Phase::Drop(i), result) => {
                 if let (Err(e), None) = (result, &self.failure) {
                     self.failure = Some(RunError::Engine(e));
                 }
                 self.phase = Phase::Drop(i + 1);
             }
-            (Phase::Done, _) => unreachable!("no action is pending once the run is done"),
+            _ => unreachable!(),
         }
         self.settle();
     }
 
-    /// Abandon the last action with a refusal of ddx's own (a plan's reads
-    /// that could not be bound, say), as if the engine had failed it.
+    /// Abandon the pending action with a refusal of ddx's own (a plan's
+    /// reads that could not be bound, say), as if the engine had failed it.
     pub fn refuse(&mut self, e: AdError) {
-        assert!(self.waiting, "refuse follows an action");
+        assert!(self.waiting, "refuse answers an action");
         self.waiting = false;
-        if self.failure.is_none() {
-            self.failure = Some(RunError::Refused(e));
+        match self.phase {
+            Phase::Check(_) | Phase::Step(_) => self.fail(RunError::Refused(e)),
+            Phase::Drop(i) => {
+                if self.failure.is_none() {
+                    self.failure = Some(RunError::Refused(e));
+                }
+                self.phase = Phase::Drop(i + 1);
+            }
+            Phase::Done => unreachable!("no action is pending once the run is done"),
         }
-        self.phase = match self.phase {
-            Phase::Check(_) | Phase::Done => Phase::Done,
-            Phase::Step(_) => Phase::Drop(0),
-            Phase::Drop(i) => Phase::Drop(i + 1),
-        };
         self.settle();
     }
 
@@ -207,13 +217,36 @@ impl<E> Runner<E> {
         self.failure.map_or(Ok(()), Err)
     }
 
+    /// Take the answer to the pending action, which must be a check exactly
+    /// when `check`.
+    fn answer(&mut self, how: &str, check: bool) -> Phase {
+        assert!(self.waiting, "{how} answers an action");
+        assert_eq!(
+            matches!(self.phase, Phase::Check(_)),
+            check,
+            "a check is answered with `checked`, any other action with `done`"
+        );
+        self.waiting = false;
+        self.phase
+    }
+
+    /// A check or a step failed: drop every table of the program.
+    fn fail(&mut self, failure: RunError<E>) {
+        self.failure = Some(failure);
+        self.dropping = self.steps.clone();
+        self.phase = Phase::Drop(0);
+    }
+
     /// Move past phases with nothing left in them.
     fn settle(&mut self) {
         loop {
             self.phase = match self.phase {
                 Phase::Check(i) if i >= self.messages.len() => Phase::Step(0),
-                Phase::Step(i) if i >= self.steps => Phase::Drop(0),
-                Phase::Drop(i) if i >= self.intermediates.len() => Phase::Done,
+                Phase::Step(i) if i >= self.steps.len() => {
+                    self.dropping = self.intermediates.clone();
+                    Phase::Drop(0)
+                }
+                Phase::Drop(i) if i >= self.dropping.len() => Phase::Done,
                 _ => return,
             };
         }
@@ -229,6 +262,7 @@ pub trait Backend {
     /// states it: the `base_schema` of the read in its plan of
     /// `SELECT * FROM name`. ddx binds a plan's reads of earlier steps with
     /// it, so names and types must be the ones the engine's consumer expects.
+    /// [`run`] asks once per table, and again after the table is rewritten.
     fn table_schema(&mut self, name: &str) -> Result<NamedStruct, Self::Error>;
 
     /// Run `plan` and say whether it returned any row.
@@ -248,32 +282,41 @@ pub fn run<B: Backend>(
     program: &BackwardProgram,
 ) -> Result<(), RunError<B::Error>> {
     let mut runner = Runner::new(program);
+    let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     while let Some(action) = runner.next() {
         let plan = match &action {
-            Action::Check(i) => Some(&program.checks[*i].plan),
-            Action::Materialize(i) => Some(&program.step(*i).plan),
-            Action::Drop(_) => None,
+            Action::Check(i) => &program.checks[*i].plan,
+            Action::Materialize(i) => &program.step(*i).plan,
+            Action::Drop(name) => {
+                schemas.remove(name);
+                runner.done(backend.drop_table(name));
+                continue;
+            }
         };
-        let bound = match plan.map(|p| bind(backend, p)).transpose() {
-            Ok(bound) => bound,
+        let plan = match bind(backend, plan, &mut schemas) {
+            Ok(plan) => plan,
             Err(Bind::Refused(e)) => {
                 runner.refuse(e);
                 continue;
             }
             Err(Bind::Engine(e)) => {
-                runner.report(Err(e));
+                match action {
+                    Action::Check(_) => runner.checked(Err(e)),
+                    _ => runner.done(Err(e)),
+                }
                 continue;
             }
         };
-        let result = match (&action, bound) {
-            (Action::Check(_), Some(plan)) => backend.returns_rows(&plan),
-            (Action::Materialize(i), Some(plan)) => backend
-                .materialize(&program.step(*i).name, &plan)
-                .map(|()| false),
-            (Action::Drop(name), _) => backend.drop_table(name).map(|()| false),
-            _ => unreachable!("checks and steps have plans"),
-        };
-        runner.report(result);
+        match action {
+            Action::Check(_) => runner.checked(backend.returns_rows(&plan)),
+            Action::Materialize(i) => {
+                let name = &program.step(i).name;
+                // A table rewritten has the schema of this run's plan.
+                schemas.remove(name);
+                runner.done(backend.materialize(name, &plan));
+            }
+            Action::Drop(_) => unreachable!("handled above"),
+        }
     }
     runner.finish()
 }
@@ -283,12 +326,17 @@ enum Bind<E> {
     Engine(E),
 }
 
-fn bind<B: Backend>(backend: &mut B, plan: &Plan) -> Result<Plan, Bind<B::Error>> {
+fn bind<B: Backend>(
+    backend: &mut B,
+    plan: &Plan,
+    schemas: &mut HashMap<String, NamedStruct>,
+) -> Result<Plan, Bind<B::Error>> {
     let mut plan = plan.clone();
-    let mut schemas = std::collections::HashMap::new();
     for name in unbound_reads(&plan) {
-        let schema = backend.table_schema(&name).map_err(Bind::Engine)?;
-        schemas.insert(name, schema);
+        if let std::collections::hash_map::Entry::Vacant(slot) = schemas.entry(name) {
+            let schema = backend.table_schema(slot.key()).map_err(Bind::Engine)?;
+            slot.insert(schema);
+        }
     }
     bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(Bind::Refused)?;
     Ok(plan)
@@ -298,7 +346,8 @@ fn bind<B: Backend>(backend: &mut B, plan: &Plan) -> Result<Plan, Bind<B::Error>
 mod tests {
     use super::*;
 
-    /// The actions a runner takes when every action gets `outcome(action)`.
+    /// The actions a runner takes when every action gets `outcome(action)`
+    /// (for a check, whether it returned a row).
     fn trace(
         checks: usize,
         steps: &[&str],
@@ -307,8 +356,9 @@ mod tests {
     ) -> (Vec<Action>, Result<(), String>) {
         let mut runner: Runner<&'static str> = Runner {
             messages: (0..checks).map(|i| format!("check {i}")).collect(),
-            steps: steps.len(),
+            steps: steps.iter().map(|s| s.to_string()).collect(),
             intermediates: intermediates.iter().map(|s| s.to_string()).collect(),
+            dropping: Vec::new(),
             phase: Phase::Check(0),
             waiting: false,
             failure: None,
@@ -316,7 +366,10 @@ mod tests {
         runner.settle();
         let mut seen = Vec::new();
         while let Some(a) = runner.next() {
-            runner.report(outcome(&a));
+            match a {
+                Action::Check(_) => runner.checked(outcome(&a)),
+                _ => runner.done(outcome(&a).map(|_| ())),
+            }
             seen.push(a);
         }
         (seen, runner.finish().map_err(|e| e.to_string()))
@@ -341,14 +394,24 @@ mod tests {
     }
 
     #[test]
-    fn a_check_that_returns_a_row_refuses_before_anything_is_written() {
-        let (seen, result) = trace(2, &["s0"], &["s0"], &|a| Ok(*a == Action::Check(1)));
-        assert_eq!(seen, vec![Action::Check(0), Action::Check(1)]);
+    fn a_check_that_returns_a_row_refuses_and_leaves_none_of_the_programs_tables() {
+        // An earlier run's value and gradients may still be there; a failed
+        // run leaves none, so they never sit beside a different run's.
+        let (seen, result) = trace(2, &["s0", "v"], &["s0"], &|a| Ok(*a == Action::Check(1)));
+        assert_eq!(
+            seen,
+            vec![
+                Action::Check(0),
+                Action::Check(1),
+                Action::Drop("s0".into()),
+                Action::Drop("v".into()),
+            ]
+        );
         assert_eq!(result, Err("invalid wrt column: check 1".into()));
     }
 
     #[test]
-    fn a_failed_step_still_drops_every_intermediate_and_reports_the_step() {
+    fn a_failed_step_drops_every_table_and_reports_the_step() {
         let (seen, result) = trace(0, &["s0", "s1", "v"], &["s0", "s1"], &|a| match a {
             Action::Materialize(1) => Err("disk full"),
             Action::Drop(n) if n == "s0" => Err("busy"),
@@ -361,8 +424,26 @@ mod tests {
                 Action::Materialize(1),
                 Action::Drop("s0".into()),
                 Action::Drop("s1".into()),
+                Action::Drop("v".into()),
             ]
         );
         assert_eq!(result, Err("disk full".into()));
+    }
+
+    #[test]
+    #[should_panic(expected = "a check is answered with `checked`")]
+    fn a_step_answered_as_a_check_is_a_bug_in_the_engine_loop() {
+        let mut runner: Runner<()> = Runner {
+            messages: Vec::new(),
+            steps: vec!["v".into()],
+            intermediates: Vec::new(),
+            dropping: Vec::new(),
+            phase: Phase::Check(0),
+            waiting: false,
+            failure: None,
+        };
+        runner.settle();
+        assert_eq!(runner.next(), Some(Action::Materialize(0)));
+        runner.checked(Ok(true));
     }
 }
