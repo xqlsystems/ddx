@@ -196,6 +196,7 @@ pub fn union_all(inputs: Vec<Rel>) -> Rel {
 pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
     Plan {
         version: Some(substrait::version::version_with_producer("ddx")),
+        extension_urns: ext.urns(),
         extensions: ext.declarations(),
         relations: vec![PlanRel {
             rel_type: Some(PlanRelType::Root(RelRoot {

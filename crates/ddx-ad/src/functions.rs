@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use substrait::proto::extensions::simple_extension_declaration::{ExtensionFunction, MappingType};
-use substrait::proto::extensions::SimpleExtensionDeclaration;
+use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
 use substrait::proto::Plan;
 
 use crate::error::{AdError, Result};
@@ -48,6 +48,11 @@ pub fn normalize(name: &str) -> String {
 pub struct Functions {
     names: HashMap<u32, String>,
     declarations: Vec<ExtensionFunction>,
+    /// The plan's other declarations (types, type variations), which an
+    /// expression copied out of it may still refer to.
+    others: Vec<SimpleExtensionDeclaration>,
+    /// The extension URNs the plan's declarations point into.
+    urns: Vec<SimpleExtensionUrn>,
 }
 
 impl Functions {
@@ -58,23 +63,28 @@ impl Functions {
     pub fn from_plan(plan: &Plan) -> Result<Self> {
         let mut names = HashMap::new();
         let mut declarations = Vec::new();
+        let mut others = Vec::new();
         for ext in &plan.extensions {
-            if let Some(MappingType::ExtensionFunction(f)) = &ext.mapping_type {
-                declarations.push(f.clone());
-                if names
-                    .insert(f.function_anchor, normalize(&f.name))
-                    .is_some()
-                {
-                    return Err(AdError::InvalidPlan(format!(
-                        "function anchor {} is declared twice",
-                        f.function_anchor
-                    )));
-                }
+            let Some(MappingType::ExtensionFunction(f)) = &ext.mapping_type else {
+                others.push(ext.clone());
+                continue;
+            };
+            declarations.push(f.clone());
+            if names
+                .insert(f.function_anchor, normalize(&f.name))
+                .is_some()
+            {
+                return Err(AdError::InvalidPlan(format!(
+                    "function anchor {} is declared twice",
+                    f.function_anchor
+                )));
             }
         }
         Ok(Functions {
             names,
             declarations,
+            others,
+            urns: plan.extension_urns.clone(),
         })
     }
 
@@ -106,6 +116,8 @@ impl Functions {
 #[derive(Debug, Clone)]
 pub struct Extensions {
     declarations: Vec<ExtensionFunction>,
+    others: Vec<SimpleExtensionDeclaration>,
+    urns: Vec<SimpleExtensionUrn>,
     by_name: HashMap<String, u32>,
     next: u32,
 }
@@ -127,6 +139,8 @@ impl Extensions {
             .unwrap_or(0);
         Extensions {
             declarations: functions.declarations().to_vec(),
+            others: functions.others.clone(),
+            urns: functions.urns.clone(),
             by_name,
             next,
         }
@@ -152,14 +166,22 @@ impl Extensions {
         anchor
     }
 
-    /// The declarations, for a plan's `extensions` list.
+    /// The declarations, for a plan's `extensions` list: the input plan's,
+    /// functions and otherwise, then those ddx added.
     pub fn declarations(&self) -> Vec<SimpleExtensionDeclaration> {
         self.declarations
             .iter()
             .map(|d| SimpleExtensionDeclaration {
                 mapping_type: Some(MappingType::ExtensionFunction(d.clone())),
             })
+            .chain(self.others.iter().cloned())
             .collect()
+    }
+
+    /// The input plan's extension URNs, for a plan's `extension_urns` list,
+    /// so a declaration copied from it still points at its URN.
+    pub fn urns(&self) -> Vec<SimpleExtensionUrn> {
+        self.urns.clone()
     }
 }
 
@@ -181,6 +203,40 @@ pub(crate) mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_plan_written_from_another_keeps_its_extension_urns_and_declarations() {
+        // From the composability review (#72): emitted plans had no
+        // `extension_urns`, so a function copied from the input pointed into a
+        // table that was not there, and a strict consumer rejects that.
+        use substrait::proto::extensions::simple_extension_declaration::ExtensionType;
+        let mut plan = plan_declaring(&[(0, "sum:fp64")]);
+        let MappingType::ExtensionFunction(f) = plan.extensions[0].mapping_type.as_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        f.extension_urn_reference = 1;
+        plan.extension_urns = vec![SimpleExtensionUrn {
+            extension_urn_anchor: 1,
+            urn: "extension:io.substrait:functions_arithmetic".into(),
+        }];
+        let ty = SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionType(ExtensionType {
+                extension_urn_reference: 1,
+                type_anchor: 5,
+                name: "point".into(),
+            })),
+        };
+        plan.extensions.push(ty.clone());
+        let functions = Functions::from_plan(&plan).unwrap();
+        let mut ext = Extensions::new(&functions);
+        ext.anchor("multiply");
+        assert_eq!(ext.urns(), plan.extension_urns);
+        let declared = ext.declarations();
+        assert_eq!(declared[0], plan.extensions[0]);
+        assert!(declared.contains(&ty));
+        assert_eq!(declared.len(), 3);
     }
 
     #[test]
