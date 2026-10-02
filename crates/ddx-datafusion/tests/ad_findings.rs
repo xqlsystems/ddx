@@ -853,3 +853,51 @@ async fn upstream_a_grouped_max_treats_nan_the_same_in_every_group() {
         m.value(1)
     );
 }
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54, 55 (#104): NOT IN over a NULL becomes a plain anti-join through Substrait"]
+async fn upstream_not_in_over_a_null_keeps_no_rows_through_substrait() {
+    // From the round-four soak (seed 4600388, NULL data): the program's value
+    // step disagreed with the loss. `s NOT IN (0, NULL)` is never true, so no
+    // row is kept, as DataFusion computes directly; its own Substrait round
+    // trip writes a plain anti-join, which keeps s = 1 and s = 2. No ddx
+    // involved.
+    use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+    use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE ny (s BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0), (2, 4.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE nx (s BIGINT, val DOUBLE) AS VALUES (0, 0.5), (NULL, 0.9), (1, -0.2)",
+    )
+    .await;
+    let q = "SELECT SUM(val) AS l FROM ny WHERE s NOT IN (SELECT s FROM nx WHERE val > 0.05)";
+    let sum = |b: Vec<datafusion::arrow::record_batch::RecordBatch>| {
+        use datafusion::arrow::array::{Array, AsArray};
+        let c = b[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Float64Type>()
+            .clone();
+        (!c.is_null(0)).then(|| c.value(0))
+    };
+    let direct = sum(ctx.sql(q).await.unwrap().collect().await.unwrap());
+    let lp = ctx.sql(q).await.unwrap().into_optimized_plan().unwrap();
+    let plan = to_substrait_plan(&lp, &ctx.state()).unwrap();
+    let back = from_substrait_plan(&ctx.state(), &plan).await.unwrap();
+    let round_trip = sum(ctx
+        .execute_logical_plan(back)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap());
+    assert_eq!(direct, None);
+    assert_eq!(
+        round_trip, direct,
+        "the round trip kept rows a NULL excludes"
+    );
+}

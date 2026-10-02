@@ -2468,6 +2468,22 @@ async fn check_case_inner(
         }
     };
 
+    // Over NaN data, DataFusion's grouped MAX or MIN keeps or skips a NaN by
+    // the order partial aggregates merge (#101), so the loss itself can change
+    // from run to run (seed 4500386), and every program run would see a
+    // different query. Such a case is ill-conditioned before ddx is involved.
+    if case.modes.extreme == Some(Extreme::NanData)
+        && (sql.contains("MAX(") || sql.contains("MIN("))
+    {
+        for _ in 0..4 {
+            if loss(&ctx, &sql).await.ok().flatten() != Some(l0) {
+                out.engine
+                    .push("upstream #101: MAX/MIN over NaN depends on merge order".into());
+                return Ok(());
+            }
+        }
+    }
+
     let (program, grads) = match grad_of(&ctx, &sql, &wrt).await {
         Ok(ok) => ok,
         Err(Refusal::Allowed(why)) => {
@@ -2501,9 +2517,31 @@ async fn check_case_inner(
             [row]
                 if row.len() == 1
                     && row[0].is_some_and(|v| (v - l0).abs() <= 1e-9 * l0.abs().max(1.0)) => {}
-            rows => out.fail(format!(
-                "[value] the value step holds {rows:?}, the loss is {l0}"
-            )),
+            rows => {
+                // Two upstream DataFusion bugs make the program compute a
+                // different query, before ddx does anything: NOT IN over a
+                // subquery holding a NULL becomes a plain anti-join through
+                // Substrait (#104, seed 4600388), and a grouped MAX or MIN
+                // over NaN keeps or skips the NaN by merge order (#101, seed
+                // 4500386). Everything after would disagree too.
+                let loss = case.loss_sql();
+                let upstream = if case.modes.nulls && loss.contains("NOT IN") {
+                    Some("upstream #104: NOT IN over a NULL loses its NULL semantics")
+                } else if case.modes.extreme == Some(Extreme::NanData)
+                    && (loss.contains("MAX(") || loss.contains("MIN("))
+                {
+                    Some("upstream #101: MAX/MIN over NaN depends on merge order")
+                } else {
+                    None
+                };
+                if let Some(kind) = upstream {
+                    out.engine.push(kind.into());
+                    return Ok(());
+                }
+                out.fail(format!(
+                    "[value] the value step holds {rows:?}, the loss is {l0}"
+                ));
+            }
         },
         Err(e) => out.fail(format!("[value] cannot read the value step: {e}")),
     }
