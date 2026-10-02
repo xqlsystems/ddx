@@ -191,9 +191,10 @@ impl Options {
     /// fresh prefix. The same plan and options then give the same program,
     /// byte for byte, which a golden test of emitted plans, or a cache of
     /// programs keyed by plan, needs. It must start with `__ddx_`, the prefix
-    /// ddx reserves, and contain only ASCII letters, digits and `_`. Two
-    /// programs on one engine must not share a namespace: they would write
-    /// the same tables.
+    /// ddx reserves, end with `_` (so `{namespace}value` reads as two parts),
+    /// and hold only lower-case ASCII letters, digits and `_` (an engine folds
+    /// an unquoted name to lower case). Two programs on one engine must not
+    /// share a namespace: they would write the same tables.
     pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
@@ -203,10 +204,11 @@ impl Options {
         let Some(ns) = &self.namespace else {
             return Forward::new(plan, wrt);
         };
-        if !ns.starts_with("__ddx_") || !ns.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+        if !ns.starts_with("__ddx_") || !ns.ends_with('_') || !ns.chars().all(allowed) {
             return Err(AdError::InvalidOptions(format!(
-                "namespace `{ns}` must start with `__ddx_` and hold only ASCII letters, digits \
-                 and `_`"
+                "namespace `{ns}` must start with `__ddx_`, end with `_`, and hold only \
+                 lower-case ASCII letters, digits and `_`"
             )));
         }
         Forward::in_namespace(plan, wrt, ns.clone())

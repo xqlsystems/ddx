@@ -701,7 +701,9 @@ async fn a_fixed_namespace_makes_the_program_the_same_every_time() {
     let (c, d) = (grad(&plan, &wrt).unwrap(), grad(&plan, &wrt).unwrap());
     assert_ne!(c.value, d.value);
     // A namespace outside ddx's reserved prefix could name a user's table.
-    for bad in ["value_", "__ddx_a b_"] {
+    // `__ddx_a` would run into its step names (`__ddx_asaved_0`), and an
+    // engine folds `__ddx_Foo_` to lower case (composability re-review, #74).
+    for bad in ["value_", "__ddx_a b_", "__ddx_a", "__ddx_Foo_"] {
         let err = grad_with(&plan, &wrt, &Options::new().namespace(bad)).unwrap_err();
         assert!(matches!(err, AdError::InvalidOptions(_)), "{err}");
     }
