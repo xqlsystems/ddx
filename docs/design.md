@@ -713,6 +713,27 @@ before trusting it, verify a workaround rather than wait for an upstream
 fix) is the template for handling this class of risk as more rules get
 built `[S4]`/`[S5]`.
 
+**What ddx needs from a Substrait producer, and from a consumer.** A
+second-engine spike (DuckDB 1.5.6 producing the plan and running the steps,
+alongside Ibis's producer) learned each of these the hard way:
+
+| Producer or consumer behavior | Seen | What ddx does |
+|---|---|---|
+| Constants folded, or not | DataFusion's optimized plans fold; DuckDB only with its optimizer on; Ibis does not | folds a cast of a literal and literal arithmetic itself, so `power(x, cast(2 AS DOUBLE))` is `power(x, 2)` |
+| Shared subtrees | DuckDB: `ReferenceRel` into an entry of `Plan.relations`; DataFusion: the tree written out | follows `ReferenceRel` by copying the subtree it names, and saves each distinct aggregate once either way |
+| Function names | DataFusion: bare (`sum`); DuckDB: compound (`sum:fp64`), bare for its own | compares normalized names (`S9`) |
+| Extension declarations | DataFusion 54 and 55: no URN (`u32::MAX`); DuckDB: a real `extension_urns` table | an emitted plan carries the input's URNs and declarations; a function ddx adds has no URN, as DataFusion writes it. A consumer that resolves only by URN (Acero) is not yet a target |
+| Table names | some producers drop the schema (`s.t` arrives as `t`) | matches a `wrt` table name as `ColumnRef::table` states, refuses a bare name two schemas share, and hints at the bare name when the schema is missing |
+| Consumer coverage | DuckDB's consumer rejects a `window_function` expression | open: the `AVG`, `MAX` and `MIN` rules emit windows (§4.6) |
+
+A host that holds plans as protobuf bytes, as most of the Substrait ecosystem
+does, needs no `substrait` crate of its own: `decode_plan` takes the bytes and
+each step and check gives its plan back as bytes. Running a program is a
+protocol written once, in `ddx-ad` (`Runner`, without I/O, or `Backend` for a
+synchronous engine); an engine supplies four primitives: whether a plan
+returns rows, materialize a plan as a table, drop a table, and a table's
+schema in its own producer's terms.
+
 `ddx-ad`'s dependencies stay symmetric with v1's: `substrait`, plus `ddx-core`
 for the elementwise rule, and no `datafusion` or `duckdb`. `substrait` is pinned
 exactly to the version `datafusion-substrait` uses, for the reason §6 gives for
@@ -781,7 +802,11 @@ split). The ranking is recomputed in the backward pass, so its `ORDER BY`
 should break ties deterministically. Both idioms are checked, math against
 `jax.grad` away from ties in `spikes/route_ad_spike.py` and the Substrait side
 in `spikes/duckdb_substrait_window_bug.py`: a plain window column round-trips
-through DuckDB, but the full top-1-per-group idiom round-trips **silently
+through DuckDB, in the sense that DuckDB produces a plan for it (by rewriting
+the window into an aggregate joined back to the rows); DuckDB's consumer
+rejects a `window_function` expression, so the other direction does not hold,
+and neither do ddx's own windows in the `AVG`, `MAX` and `MIN` rules (§4.6).
+The full top-1-per-group idiom round-trips **silently
 wrong** there — `from_substrait` returns every row instead of the top-1 rows —
 because DuckDB's optimizer rewrites the idiom into an `arg_max`-join before
 export. This reproduces with no ddx function involved; DataFusion round-trips
@@ -982,8 +1007,18 @@ bug (workaround verified, no upstream-fix dependency).
   1.5.4 — an ongoing-maintenance signal to watch, separate from the
   correctness bug already found and worked around.
 - Whether a third engine (beyond DataFusion and DuckDB) would tolerate the
-  non-spec-conformant extension-URI form both current producers emit is
-  untested and only matters if/when a third engine is targeted.
+  non-spec-conformant extension-URI form DataFusion emits, and ddx keeps for
+  the functions it adds, is untested and only matters if/when a third engine
+  is targeted.
+- The `AVG`, `MAX` and `MIN` rules compute a group's count and extreme with
+  window functions over the recomputed rows (`S12`), which DuckDB's consumer
+  does not read. A grouped aggregate joined back on the group keys
+  (`IS NOT DISTINCT FROM`, for a NULL key) is the portable form, at the cost
+  of recomputing the region two or three times in that step, and of
+  comparing a row with an extreme from a separate recomputation (which the
+  tie tolerance covers only for values that can jitter). It waits for a
+  DuckDB adapter to test it against and a cost measured with
+  `tests/ad_perf.rs`.
 
 ---
 
@@ -1565,7 +1600,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S13`)
+### Building v2 (`S6`–`S14`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -1655,6 +1690,26 @@ counting parentheses inside comments (now found by tokens), a vjp cotangent
 whose keys repeat (now checked, like a wrt table's dims), and that the
 MAX/MIN tie tolerance must apply only to values that can jitter: those
 read from an aggregate that rounds, not a table's, differentiated or not. → §4.4.
+
+**S14 — ddx composes: what a second engine needs is in `ddx-ad`.** A design
+review aimed at ddx as a library for other engines, and a spike that ran it
+on DuckDB, found that what is neither calculus nor engine had been written
+once per adapter: the run protocol (checks first, steps in order, drop the
+intermediates on success and failure) and `sql_all`'s planning (one program
+per loss query, each call's dims and value columns). Both now live in
+`ddx-ad` (`Runner` and `Backend`; `sql::Statements`), and the DataFusion and
+Python adapters drive them. The spike also found two producer gaps, now
+closed (a `ReferenceRel` was not followed; a cast of a literal was opaque, so
+`x ** 2` from an unoptimized plan was refused), and that emitted plans
+dropped the input's extension URNs. The API got the promises a published
+crate needs: `AdError` and the program types are `non_exhaustive`, the
+plan-reading modules are behind an `internals` feature, `Options` gives a
+fixed namespace (the same plan then gives the same program, for golden tests
+and caches), plans can cross as bytes, and how a `wrt` table name matches is
+stated, with an ambiguous one refused. Two suggestions wait for a second
+in-repo adapter: emitting the portable form of the windows in the reduce
+rules (§4.6), and putting the simulation harness behind an engine trait so
+it doubles as a conformance suite. → §4.2.
 
 ## References
 
