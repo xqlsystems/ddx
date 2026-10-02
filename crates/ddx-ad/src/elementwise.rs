@@ -24,7 +24,9 @@
 //!   never needs to understand it: `CASE WHEN label = out THEN 1.0 ELSE 0.0 END`
 //!   in a softmax loss has no rule in `ddx-core`, and needs none. Numeric
 //!   literals stay literals, because `ddx-core` reads them (`power(x, 2)` has a
-//!   rule only because the exponent is a known constant).
+//!   rule only because the exponent is a known constant), and so does anything
+//!   computed from literals alone: a producer that does not fold constants
+//!   writes `x ** 2` as `power(x, cast(2 AS DOUBLE))`, which is `power(x, 2)`.
 //! - **Stop-gradient.** `ddx_stop_gradient(x)` is a constant, whatever `x` is.
 //! - **Piecewise functions.** `ddx-core` has no rule for `CASE`, `greatest` or
 //!   `least`. Over a varied value each becomes a *hole*: an identifier `hn`
@@ -338,6 +340,58 @@ impl Hole {
     }
 }
 
+/// The number `e` computes from literals alone, and whether its type is a
+/// floating-point one: a numeric literal, a cast of one, or the arithmetic of
+/// such. A producer that does not fold constants hands these over as they
+/// were written (`cast(2 AS DOUBLE)`). A cast to an integer type folds only a
+/// value that is already whole, and a division only when an operand is
+/// floating-point, since SQL divides integers with truncation.
+fn fold(functions: &Functions, e: &Expression) -> Option<(f64, bool)> {
+    if let Some(v) = as_number(e) {
+        let float = matches!(
+            &e.rex_type,
+            Some(RexType::Literal(substrait::proto::expression::Literal {
+                literal_type: Some(
+                    substrait::proto::expression::literal::LiteralType::Fp64(_)
+                        | substrait::proto::expression::literal::LiteralType::Fp32(_)
+                ),
+                ..
+            }))
+        );
+        return Some((v, float));
+    }
+    match e.rex_type.as_ref()? {
+        RexType::Cast(c) => {
+            let (v, _) = fold(functions, c.input.as_deref()?)?;
+            match c.r#type.as_ref()?.kind.as_ref()? {
+                Kind::Fp64(_) | Kind::Fp32(_) => Some((v, true)),
+                Kind::I8(_) | Kind::I16(_) | Kind::I32(_) | Kind::I64(_) if v.fract() == 0.0 => {
+                    Some((v, false))
+                }
+                _ => None,
+            }
+        }
+        RexType::ScalarFunction(f) => {
+            let args: Vec<(f64, bool)> = scalar_args(f)
+                .ok()?
+                .into_iter()
+                .map(|a| fold(functions, a))
+                .collect::<Option<_>>()?;
+            let float = args.iter().any(|(_, fl)| *fl);
+            let v = match (functions.name(f.function_reference).ok()?, args.as_slice()) {
+                ("add", [(a, _), (b, _)]) => a + b,
+                ("subtract", [(a, _), (b, _)]) => a - b,
+                ("multiply", [(a, _), (b, _)]) => a * b,
+                ("divide", [(a, _), (b, _)]) if float && *b != 0.0 => a / b,
+                ("negate" | "negative", [(a, _)]) => -a,
+                _ => return None,
+            };
+            v.is_finite().then_some((v, float))
+        }
+        _ => None,
+    }
+}
+
 /// Substrait → `sqlparser`.
 struct ToSql<'a> {
     functions: &'a Functions,
@@ -352,7 +406,7 @@ struct ToSql<'a> {
 
 impl ToSql<'_> {
     fn expr(&mut self, e: &Expression) -> Result<Sql> {
-        if let Some(v) = as_number(e) {
+        if let Some((v, _)) = fold(self.functions, e) {
             return Ok(finite_num(v)?);
         }
         if !depends(self.functions, e, self.varied)? {
@@ -754,6 +808,7 @@ impl FromSql<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::fp64;
     use crate::functions::normalize;
     use crate::functions::tests::plan_declaring;
     use std::collections::HashMap;
@@ -816,6 +871,9 @@ mod tests {
         }
         if let Some(RexType::Literal(_)) = &e.rex_type {
             return f64::NAN; // the typed NULL
+        }
+        if let Some(RexType::Cast(c)) = &e.rex_type {
+            return eval(c.input.as_deref().unwrap(), row, names);
         }
         match e.rex_type.as_ref().unwrap() {
             RexType::ScalarFunction(f) => {
@@ -1168,6 +1226,53 @@ mod tests {
         );
         check(&fx, &e, &[0, 1], &[1.3, -0.4], &[0, 1]);
         check(&fx, &e, &[0, 1], &[1.3, 0.4], &[0, 1]);
+    }
+
+    /// An integer literal, as a producer that does not fold constants writes
+    /// one.
+    fn lit_i8(v: i8) -> Expression {
+        use substrait::proto::expression::literal::LiteralType;
+        use substrait::proto::expression::Literal;
+        Expression {
+            rex_type: Some(RexType::Literal(Literal {
+                literal_type: Some(LiteralType::I8(v as i32)),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn a_constant_written_as_a_cast_of_a_literal_is_still_a_number() {
+        // From the composability review (#71): Ibis, and DuckDB with its
+        // optimizer off, write `w.val ** 2` as power(c0, cast(2 AS DOUBLE)),
+        // which was opaque, so `ddx-core` saw power(c0, k0) and refused it.
+        let fx = fixture();
+        let two = cast(lit_i8(2), fp64());
+        check(
+            &fx,
+            &fx.f("power", vec![field(0), two.clone()]),
+            &[0],
+            &[1.3],
+            &[0],
+        );
+        // Literal arithmetic folds too: c0 * (0.5 + 0.25), c0 ** (-2).
+        let e = fx.f(
+            "multiply",
+            vec![field(0), fx.f("add", vec![lit_f64(0.5), lit_f64(0.25)])],
+        );
+        check(&fx, &e, &[0], &[1.3], &[0]);
+        let e = fx.f("power", vec![field(0), fx.f("negate", vec![two])]);
+        check(&fx, &e, &[0], &[1.3], &[0]);
+    }
+
+    #[test]
+    fn integer_division_of_literals_is_not_folded() {
+        // 7 / 2 is 3 in SQL; folding it to 3.5 would change the exponent.
+        let fx = fixture();
+        let seven_halves = fx.f("divide", vec![lit_i8(7), lit_i8(2)]);
+        assert_eq!(fold(&fx.functions, &seven_halves), None);
+        let float = fx.f("divide", vec![lit_i8(7), cast(lit_i8(2), fp64())]);
+        assert_eq!(fold(&fx.functions, &float), Some((3.5, true)));
     }
 
     #[test]
