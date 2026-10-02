@@ -37,3 +37,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # derivable expression".
 ddx-core = { workspace = true, features = ["test-utils"] }
 prost = { workspace = true }
+# The tests read ddx-ad's internals (the forward analysis, the plan builder).
+ddx-ad = { workspace = true, features = ["internals"] }

@@ -20,3 +20,8 @@ rust-version.workspace = true
 ddx-core = { workspace = true }
 prost = { workspace = true }
 substrait = { workspace = true }
+
+[features]
+# The plan-reading and plan-writing modules (`forward`, `emit`, `expr`,
+# `relation`), public for this workspace's tests only; not a stable API.
+internals = []

@@ -10,7 +10,7 @@
 //!
 //! | Primitive | SQL | Transpose |
 //! |---|---|---|
-//! | **map** | a projected expression `y = f(x₁, x₂, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row ([`crate::Elementwise`]) |
+//! | **map** | a projected expression `y = f(x₁, x₂, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row ([`crate::elementwise::Elementwise`]) |
 //! | **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
 //! | **broadcast** | a join, which pairs each row with every row it matches | sum the cotangent back over the rows each input row was copied to |
 //! | **reduce** | a grouped `SUM` | broadcast the group's cotangent to every row that was summed |
@@ -625,7 +625,7 @@ enum Reduce {
 
 /// The reduce rule for an aggregate function, or a refusal naming what ddx
 /// has rules for.
-fn reduce_rule(functions: &crate::Functions, f: &AggregateFunction) -> Result<Reduce> {
+fn reduce_rule(functions: &crate::functions::Functions, f: &AggregateFunction) -> Result<Reduce> {
     let name = functions.name(f.function_reference)?;
     let args: Vec<&Expression> = f
         .arguments

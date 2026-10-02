@@ -258,6 +258,7 @@ impl<'a> Elementwise<'a> {
     }
 
     /// Does `e` depend on a varied field, outside `ddx_stop_gradient`?
+    #[cfg_attr(not(feature = "internals"), allow(dead_code))] // tests only
     pub fn depends(&self, e: &Expression, varied: &dyn Fn(usize) -> bool) -> Result<bool> {
         depends(self.functions, e, varied)
     }
