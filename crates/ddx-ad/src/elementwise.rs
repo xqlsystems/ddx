@@ -715,7 +715,12 @@ impl FromSql<'_> {
                 if let Some(v) = as_number(&inner) {
                     return Ok(lit_f64(-v));
                 }
-                Ok(call(self.ext.anchor("negate"), vec![inner]))
+                // Not `negate`: DuckDB's Substrait consumer has no function
+                // of that name, and x · -1 is -x, -0.0 and NaN included.
+                Ok(call(
+                    self.ext.anchor("multiply"),
+                    vec![inner, lit_f64(-1.0)],
+                ))
             }
             Sql::UnaryOp {
                 op: UnaryOperator::Plus,
@@ -1273,6 +1278,96 @@ mod tests {
         assert_eq!(fold(&fx.functions, &seven_halves), None);
         let float = fx.f("divide", vec![lit_i8(7), cast(lit_i8(2), fp64())]);
         assert_eq!(fold(&fx.functions, &float), Some((3.5, true)));
+    }
+
+    /// The functions ddx may write into a plan, each found by name on both
+    /// DataFusion's and DuckDB 1.5.6's Substrait consumers (the composability
+    /// review on #71 checked each against DuckDB with a one-function plan;
+    /// `negate` was the one it did not know). A name not here is one an
+    /// engine may refuse; add it only once it has been checked.
+    const PORTABLE: &[&str] = &[
+        // Scalar functions.
+        "multiply",
+        "add",
+        "subtract",
+        "divide",
+        "abs",
+        "lt",
+        "lte",
+        "gt",
+        "gte",
+        "equal",
+        "is_null",
+        "is_not_distinct_from",
+        "and",
+        "or",
+        "isnan",
+        "sqrt",
+        "ln",
+        "exp",
+        "sin",
+        "cos",
+        "tan",
+        "tanh",
+        "sinh",
+        "cosh",
+        "asin",
+        "acos",
+        "atan",
+        "power",
+        "log2",
+        "log10",
+        "sign",
+        // Aggregate and window functions.
+        "sum",
+        "count",
+        "max",
+        "min",
+        "avg",
+    ];
+
+    #[test]
+    fn every_function_ddx_writes_is_one_both_engines_know() {
+        // Names written as literals anywhere in the crate.
+        let mut names = std::collections::BTreeSet::new();
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        for entry in std::fs::read_dir(src).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for part in text.split("anchor(\"").skip(1) {
+                let name: String = part.chars().take_while(|c| *c != '"').collect();
+                names.insert(normalize(&name));
+            }
+        }
+        // Names in derivatives: of each ddx-core rule, and of the operators.
+        let ddx = Ddx::new();
+        let mut cases: Vec<(String, Vec<Expression>)> = ddx
+            .unary_rule_names()
+            .into_iter()
+            .map(|n| (n, vec![field(0)]))
+            .collect();
+        for op in ["add", "subtract", "multiply", "divide"] {
+            cases.push((op.to_string(), vec![field(0), field(1)]));
+        }
+        cases.push(("power".into(), vec![field(0), lit_f64(2.5)]));
+        cases.push(("power".into(), vec![lit_f64(2.5), field(0)]));
+        for (name, args) in cases {
+            let functions = Functions::from_plan(&plan_declaring(&[(0, name.as_str())])).unwrap();
+            let mut ext = Extensions::new(&functions);
+            Elementwise::new(&ddx, &functions)
+                .partials(&call(0, args), &|_| true, &mut ext)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            names.extend(names_of(&ext).into_values().filter(|n| *n != name));
+        }
+        // The reduce rules' extremes, anchored by a variable name.
+        names.extend(["max".to_string(), "min".to_string()]);
+        let unknown: Vec<&String> = names
+            .iter()
+            .filter(|n| !PORTABLE.contains(&n.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "functions not checked on both engines: {unknown:?}"
+        );
     }
 
     #[test]
