@@ -2,8 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! nn.py (xarray-sql#196) with ddx: nn.py's forward pass and loss as SQL, the
-//! data, and an SGD step that takes `grad` in SQL.
+//! A small neural network written entirely in SQL, trained with ddx: its
+//! forward pass and loss as SQL, the data, and an SGD step that takes `grad`
+//! in SQL. It is adapted from a pure-SQL demo in xarray-sql
+//! (<https://github.com/xqlsystems/xarray-sql/pull/196>), nn.py below, which
+//! wrote its backward pass by hand.
 //!
 //! Shared by the `nn` example, which trains it, and by `tests/nn.rs`, which
 //! checks its gradients against nn.py's hand-written backward pass.

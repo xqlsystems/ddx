@@ -62,10 +62,43 @@ On DataFusion, `ddx-datafusion` installs an `AnalyzerRule` so bare `grad()` work
 in ordinary SQL *and* through the DataFrame API, with columns resolved by the
 planner rather than syntactically.
 
+## Training: gradients of whole queries
+
+A model's gradient is a gradient of a whole query, and in ddx that is `grad`
+too, in a `FROM` clause. `grad(loss, table.column)` is the gradient of the loss
+a CTE computes, as a relation shaped like the table, so an SGD step,
+`params - lr * grad(loss)(params)`, is a join:
+
+```sql
+WITH h AS (
+  SELECT x.sample, w.out, tanh(SUM(x.val * w.val)) AS val
+  FROM x JOIN w ON x.inp = w.inp GROUP BY x.sample, w.out),
+loss AS (
+  SELECT SUM(power(h.val - y.val, 2)) AS l
+  FROM h JOIN y ON h.sample = y.sample AND h.out = y.out)
+SELECT w.inp, w.out, w.val - 0.1 * g.val AS val
+FROM w JOIN grad(loss, w.val) g ON w.inp = g.inp AND w.out = g.out
+```
+
+That runs as written through `ddxdb.Context` in Python and
+`ddx_datafusion::ad::sql` in Rust. The loss is ordinary SQL: ddx differentiates
+it the way `jax.grad` differentiates a function, reverse mode, one transpose
+rule per relational operator (joins, sums, averages, max and min, window
+rankings), and nothing in it is labelled. The backward pass is a sequence of
+plain Substrait plans the engine runs.
+[`examples/nn`](crates/ddx-datafusion/examples/nn) trains a small classifier
+this way: a two-layer MLP over 6×6 images, adapted from [a neural network written entirely in SQL](https://github.com/xqlsystems/xarray-sql/pull/196)
+in xarray-sql, which computed its gradients with hand-written backward queries.
+Here its loss query is used unchanged, and ddx's gradients equal those
+hand-written ones to 1e-12. The spikes' MLP, attention and max-pool gradients
+equal `jax.grad` to 1e-12.
+
 ## Status
 
-**M2 landed and released.** The scalar engine, the DataFusion adapter and the
-Python wheel are all published.
+**M2 is released; M3 and M4 are built.** The scalar engine, the DataFusion
+adapter and the Python wheel are published. Query-level AD (`ddx-ad`, with
+`ddx_datafusion::ad` and `ddxdb.ad` on top) trains an MLP on DataFusion and
+matches `jax.grad`, and ships with the next release.
 
 **DataFusion is the engine with native support**: `ddx-datafusion` installs an
 `AnalyzerRule`, so bare `grad()` works in ordinary SQL and through the DataFrame
@@ -76,13 +109,13 @@ extension, with `grad()` understood in-database, comes eventually (M5).
 | | | |
 |---|---|---|
 | [`ddx-core`](crates/ddx-core) | the v1 engine | [crates.io](https://crates.io/crates/ddx-core) |
-| [`ddxdb`](python/ddxdb) | Python wheel — `rewrite_sql` + a DataFusion `Context` | [PyPI](https://pypi.org/project/ddxdb/) |
-| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `AnalyzerRule` + `ddx_sql` | [crates.io](https://crates.io/crates/ddx-datafusion) |
-| [`ddx-ad`](crates/ddx-ad) | v2 — query-level reverse-mode AD over Substrait | M3/M4 |
+| [`ddxdb`](python/ddxdb) | Python wheel — `rewrite_sql`, a DataFusion `Context`, and `ad` | [PyPI](https://pypi.org/project/ddxdb/) |
+| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `AnalyzerRule` + `ddx_sql` + `ad` | [crates.io](https://crates.io/crates/ddx-datafusion) |
+| [`ddx-ad`](crates/ddx-ad) | v2 — query-level reverse-mode AD over Substrait | next release |
 | `ddx-duckdb` | DuckDB community extension | M5 |
 
-Next is **M3/M4** — reverse-mode AD over whole *queries*, where a gradient step
-becomes a query rather than a column. See [docs/design.md](docs/design.md) §8.
+Next is **M5**, DuckDB: the `ddx('<sql>')` extension, and v2's backward program
+run through DuckDB's Substrait consumer. See [docs/design.md](docs/design.md) §8.
 
 ## Correctness
 
@@ -108,8 +141,8 @@ a plausible number. What backs that up:
 crates/
   ddx-core/         # v1 engine — differentiate sqlparser::ast::Expr + rewrite_sql
   ddx-ad/           # v2 engine — query-level reverse-mode AD over Substrait
-  ddx-datafusion/   # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql
-python/ddxdb/       # PyO3/maturin wheel: rewrite_sql + a DataFusion Context
+  ddx-datafusion/   # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql + ad (v2)
+python/ddxdb/       # PyO3/maturin wheel: rewrite_sql + a DataFusion Context + ad (v2)
 tests/              # cross-engine numeric-agreement suites (vs JAX)
 docs/spikes/        # runnable evidence for every design claim
 docs/design.md      # the design

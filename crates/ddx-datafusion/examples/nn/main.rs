@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Train nn.py's MLP (xarray-sql#196) with `grad` in SQL.
+//! Train a small neural network written entirely in SQL, with `grad` in SQL.
 //!
-//! nn.py trains a small network entirely in SQL, but writes its backward pass
-//! by hand: a query per layer for the error, and one per weight and bias
+//! The network is a two-layer MLP classifying 6×6 images, adapted from a
+//! pure-SQL demo in xarray-sql (<https://github.com/xqlsystems/xarray-sql/pull/196>,
+//! called nn.py in the comments here). That demo writes its backward pass by
+//! hand: a query per layer for the error, and one per weight and bias
 //! gradient. Here the backward pass is one expression per parameter table,
-//! `grad(loss, weight.val)`, where `loss` is nn.py's own loss query, and a
+//! `grad(loss, weight.val)`, where `loss` is the demo's own loss query, and a
 //! training step is the SGD update written as a join:
 //!
 //! ```sql
