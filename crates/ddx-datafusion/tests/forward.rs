@@ -1,0 +1,429 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! `ddx_ad::Forward` on plans DataFusion produces: what is saved, which
+//! columns carry gradient, and what is refused.
+
+mod common;
+
+use common::substrait_of;
+use datafusion::prelude::SessionContext;
+use ddx_ad::forward::{Def, Input, Output};
+use ddx_ad::{AdError, ColumnRef, Forward};
+
+async fn ctx() -> SessionContext {
+    let ctx = SessionContext::new();
+    ddx_datafusion::register_stop_gradient(&ctx);
+    for sql in [
+        // pixels(sample, i, x): data. w(i, o, val) and b(o, val): parameters.
+        "CREATE TABLE pixels (sample BIGINT, i BIGINT, x DOUBLE) AS VALUES \
+         (0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)",
+        "CREATE TABLE w (i BIGINT, o BIGINT, val DOUBLE) AS VALUES \
+         (0, 0, 0.1), (0, 1, 0.2), (1, 0, 0.3), (1, 1, 0.4)",
+        "CREATE TABLE b (o BIGINT, val DOUBLE) AS VALUES (0, 0.5), (1, -0.5)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    ctx
+}
+
+const LAYER: &str = "WITH c AS ( \
+       SELECT p.sample, w.o, SUM(p.x * w.val) AS z \
+       FROM pixels p JOIN w ON p.i = w.i GROUP BY p.sample, w.o) \
+     SELECT SUM(tanh(c.z + b.val)) AS loss FROM c JOIN b ON c.o = b.o";
+
+async fn both(sql: &str, wrt: &[ColumnRef]) -> Vec<Forward> {
+    let ctx = ctx().await;
+    let mut out = Vec::new();
+    for optimized in [false, true] {
+        let plan = substrait_of(&ctx, sql, optimized).await;
+        out.push(Forward::new(&plan, wrt).unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_layer_saves_its_two_aggregates() {
+    let wrt = [ColumnRef::new("w", "val"), ColumnRef::new("b", "val")];
+    for g in both(LAYER, &wrt).await {
+        assert_eq!(g.saved.len(), 2, "the contraction and the loss");
+        let contraction = &g.saved[0];
+        assert_eq!(
+            contraction.outputs,
+            vec![Output::Dim(0), Output::Dim(1), Output::Value(0)]
+        );
+        assert_eq!(contraction.varied, vec![false, false, true]);
+        let loss = &g.saved[1];
+        assert_eq!(loss.varied, vec![true]);
+        assert!(loss.groupings.is_empty());
+
+        // The contraction reads w as a wrt table and pixels as constant data.
+        let leaves: Vec<Input> = contraction.input.slots.iter().map(|s| s.input).collect();
+        assert!(leaves.contains(&Input::Const), "{leaves:?}");
+        assert!(
+            leaves.iter().any(|l| matches!(l, Input::Table(_))),
+            "{leaves:?}"
+        );
+        // The loss reads the saved contraction and b.
+        let leaves: Vec<Input> = loss.input.slots.iter().map(|s| s.input).collect();
+        assert!(leaves.contains(&Input::Saved(0)), "{leaves:?}");
+
+        // The output reads the saved loss, and only it.
+        assert_eq!(g.output.slots.len(), 1);
+        assert_eq!(g.output.slots[0].input, Input::Saved(1));
+        assert_eq!(g.output_names, vec!["loss"]);
+    }
+}
+
+#[tokio::test]
+async fn a_wrt_tables_dims_are_every_other_column() {
+    let wrt = [ColumnRef::new("w", "val"), ColumnRef::new("b", "VAL")];
+    for g in both(LAYER, &wrt).await {
+        let w = g.tables.iter().find(|t| t.names == ["w"]).unwrap();
+        assert_eq!(w.values, vec![2]);
+        assert_eq!(w.dims, vec![0, 1]);
+        let b = g.tables.iter().find(|t| t.names == ["b"]).unwrap();
+        assert_eq!(b.values, vec![1], "matched case-insensitively");
+    }
+}
+
+#[tokio::test]
+async fn expressions_are_renumbered_onto_the_rebuilt_region() {
+    // The loss sums tanh(c.z + b.val). Wherever the producer computed that
+    // (inside the measure, or in a projection below it), it now reads the
+    // saved contraction and the table b, and every expression column
+    // reads only columns to its left.
+    let wrt = [ColumnRef::new("w", "val"), ColumnRef::new("b", "val")];
+    for g in both(LAYER, &wrt).await {
+        let s = &g.saved[1].input;
+        assert_eq!(s.defs.len(), s.varied.len());
+        for (c, d) in s.defs.iter().enumerate() {
+            if let Def::Expr(e) = d {
+                for f in ddx_ad::expr::fields_of(e).unwrap() {
+                    assert!(f < c, "column {c} reads column {f}");
+                }
+            }
+        }
+        let arg = match &g.saved[1].measures[0].arguments[0].arg_type {
+            Some(ddx_ad::substrait::proto::function_argument::ArgType::Value(e)) => e,
+            other => panic!("{other:?}"),
+        };
+        // Follow the measure argument down to leaf columns.
+        let mut leaves = std::collections::BTreeSet::new();
+        let mut stack = ddx_ad::expr::fields_of(arg).unwrap();
+        while let Some(f) = stack.pop() {
+            match &s.defs[f] {
+                Def::Input { slot, .. } => {
+                    leaves.insert(s.slots[*slot].input);
+                }
+                Def::Expr(e) => stack.extend(ddx_ad::expr::fields_of(e).unwrap()),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(leaves.contains(&Input::Saved(0)), "{leaves:?}");
+        assert!(
+            leaves.iter().any(|l| matches!(l, Input::Table(_))),
+            "{leaves:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wrt_typo_lists_what_the_query_reads() {
+    let ctx = ctx().await;
+    let plan = substrait_of(&ctx, LAYER, true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("weights", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("weights") && msg.contains("\"pixels\""),
+        "{msg}"
+    );
+
+    let err = Forward::new(&plan, &[ColumnRef::new("w", "value")]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no column `value`") && msg.contains("\"val\""),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_gradient_makes_a_column_constant() {
+    let sql = "SELECT SUM(val * ddx_stop_gradient(val)) AS s, \
+                      SUM(ddx_stop_gradient(val)) AS t FROM w";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        assert_eq!(g.saved[0].varied, vec![true, false]);
+    }
+}
+
+#[tokio::test]
+async fn a_rank_is_refused_but_what_it_ranks_is_not() {
+    // Ranking rows by a value that carries gradient is fine: the rows the
+    // filter keeps carry it on. Only the rank itself, which has no
+    // derivative, refuses gradient.
+    let sql = "WITH r AS (SELECT i, o, val, \
+                 ROW_NUMBER() OVER (PARTITION BY i ORDER BY val DESC) AS rk FROM w) \
+               SELECT SUM(val) AS s FROM r WHERE rk = 1";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        let s = &g.saved[0].input;
+        for (c, d) in s.defs.iter().enumerate() {
+            let refused = s.refusals[c].is_some();
+            assert_eq!(
+                refused,
+                matches!(d, Def::Window { .. }),
+                "column {c}: {d:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_outer_joins_null_side_is_refused() {
+    let sql = "SELECT SUM(COALESCE(b.val, 0.0) * p.x) AS s \
+               FROM pixels p LEFT JOIN b ON p.i = b.o";
+    for g in both(sql, &[ColumnRef::new("b", "val")]).await {
+        let s = &g.saved[0].input;
+        let refused: Vec<usize> = (0..s.defs.len())
+            .filter(|&c| s.refusals[c].is_some())
+            .collect();
+        assert!(!refused.is_empty());
+        for c in refused {
+            assert!(matches!(s.defs[c], Def::Input { .. }), "{:?}", s.defs[c]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_query_that_reads_no_wrt_table_is_refused() {
+    let ctx = ctx().await;
+    let plan = substrait_of(&ctx, "SELECT SUM(x) AS s FROM pixels", true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("w", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::UnknownWrt(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_wrt_table_with_no_dims_is_refused() {
+    // Every column is a wrt value: nothing tells one row's gradient from
+    // another's, so each row would get the sum of all of them.
+    let ctx = ctx().await;
+    ctx.sql("CREATE TABLE v (val DOUBLE) AS VALUES (1.0), (2.0), (3.0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = substrait_of(&ctx, "SELECT SUM(val * val) AS l FROM v", true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("v", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::InvalidWrt(_)), "{err}");
+    assert!(
+        err.to_string().contains("no column identifies its"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn inputs_record_whether_they_are_one_row() {
+    // The output reads the loss (one row) and a constant one-row count; the
+    // aggregate grouped by i reads w, which is many rows.
+    let sql = "SELECT s.t / c.n AS l \
+               FROM (SELECT SUM(val) AS t FROM w) s CROSS JOIN (SELECT COUNT(*) AS n FROM pixels) c";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        assert!(
+            g.output.slots.iter().all(|s| s.at_most_one_row),
+            "{:?}",
+            g.output.slots
+        );
+        assert!(g.saved[0].input.slots.iter().all(|s| !s.at_most_one_row));
+    }
+}
+
+#[tokio::test]
+async fn a_wrt_table_matches_regardless_of_case() {
+    // DataFusion folds the unquoted `W` to `w`; the wrt names it as written.
+    let wrt = [ColumnRef::new("W", "val"), ColumnRef::new("B", "Val")];
+    for g in both(&LAYER.replace("JOIN w ON", "JOIN W ON"), &wrt).await {
+        assert!(g
+            .tables
+            .iter()
+            .any(|t| t.names == ["w"] && t.values == vec![2]));
+        assert!(g
+            .tables
+            .iter()
+            .any(|t| t.names == ["b"] && t.values == vec![1]));
+    }
+}
+
+#[tokio::test]
+async fn an_integer_wrt_column_is_refused() {
+    // Adversarial review (🤖😈): a gradient with respect to an integer column
+    // has no meaning. jax.grad raises TypeError for integer inputs ("grad
+    // requires real- or complex-valued inputs"), and ddx should too: the
+    // engine evaluates `val / 2` as integer division, which is piecewise
+    // constant (derivative 0), while ddx-core differentiates real division
+    // (derivative 0.5), a silently wrong gradient (#87). Unlike v1, v2 can
+    // see this: the read's base schema carries the column's type.
+    let ctx = ctx().await;
+    ctx.sql("CREATE TABLE wi (i BIGINT, val BIGINT) AS VALUES (0, 3), (1, 5)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = substrait_of(&ctx, "SELECT SUM(val / 2) AS l FROM wi", true).await;
+    let got = Forward::new(&plan, &[ColumnRef::new("wi", "val")]);
+    assert!(
+        got.is_err(),
+        "a wrt column of integer type was accepted; its gradient would be computed \
+         for real division while the engine runs integer division"
+    );
+}
+
+#[tokio::test]
+async fn an_uncorrelated_subquery_over_data_is_a_constant() {
+    // The mean over the dataset, written the natural way.
+    let sql = "SELECT SUM(val * val) / (SELECT COUNT(*) FROM pixels) AS l FROM w";
+    for g in both(sql, &[ColumnRef::new("w", "val")]).await {
+        assert_eq!(g.saved.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_subquery_that_reads_a_wrt_table_is_refused() {
+    // Treating it as a constant would drop the gradient through it.
+    let ctx = ctx().await;
+    let sql = "SELECT SUM(val) / (SELECT SUM(val) FROM w) AS l FROM w";
+    let plan = substrait_of(&ctx, sql, true).await;
+    let err = Forward::new(&plan, &[ColumnRef::new("w", "val")]).unwrap_err();
+    assert!(matches!(err, AdError::NotImplemented(_)), "{err}");
+}
+
+/// `plan` with its largest subtree that appears more than once moved into
+/// its own entry of `relations` and read through `ReferenceRel`, the way
+/// DuckDB writes a CTE read twice (DataFusion writes it out each time).
+fn share_repeated(plan: &ddx_ad::substrait::proto::Plan) -> ddx_ad::substrait::proto::Plan {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{PlanRel, ReferenceRel, Rel};
+    use std::collections::HashMap;
+
+    fn inputs(rel: &mut Rel) -> Vec<&mut Rel> {
+        match rel.rel_type.as_mut() {
+            Some(RelType::Filter(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Aggregate(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Project(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Sort(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Fetch(r)) => r.input.as_deref_mut().into_iter().collect(),
+            Some(RelType::Join(r)) => r
+                .left
+                .as_deref_mut()
+                .into_iter()
+                .chain(r.right.as_deref_mut())
+                .collect(),
+            Some(RelType::Cross(r)) => r
+                .left
+                .as_deref_mut()
+                .into_iter()
+                .chain(r.right.as_deref_mut())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn count(rel: &mut Rel, seen: &mut HashMap<String, (usize, Rel)>) {
+        if !matches!(rel.rel_type, Some(RelType::Read(_))) {
+            let e = seen.entry(format!("{rel:?}")).or_insert((0, rel.clone()));
+            e.0 += 1;
+        }
+        for r in inputs(rel) {
+            count(r, seen);
+        }
+    }
+    fn replace(rel: &mut Rel, key: &str, ordinal: i32) {
+        if format!("{rel:?}") == key {
+            *rel = Rel {
+                rel_type: Some(RelType::Reference(ReferenceRel {
+                    subtree_ordinal: ordinal,
+                })),
+            };
+            return;
+        }
+        for r in inputs(rel) {
+            replace(r, key, ordinal);
+        }
+    }
+
+    let mut plan = plan.clone();
+    let Some(PlanRelType::Root(root)) = plan.relations[0].rel_type.as_mut() else {
+        panic!("one root")
+    };
+    let root_rel = root.input.as_mut().unwrap();
+    let mut seen = HashMap::new();
+    count(root_rel, &mut seen);
+    let (key, (_, shared)) = seen
+        .into_iter()
+        .filter(|(_, (n, _))| *n > 1)
+        .max_by_key(|(k, _)| k.len())
+        .expect("a subtree read twice");
+    replace(root_rel, &key, 1);
+    plan.relations.push(PlanRel {
+        rel_type: Some(PlanRelType::Rel(shared)),
+    });
+    plan
+}
+
+#[tokio::test]
+async fn a_subtree_shared_through_reference_rel_reads_as_the_tree() {
+    // From the second-engine spike (#73, B1): DuckDB shares a CTE read twice
+    // through ReferenceRel. ddx did not follow it, saw no reads at all, and
+    // said the query "reads {}". Each reference now reads as a copy of the
+    // subtree it names, so the analysis is the tree's.
+    let ctx = ctx().await;
+    let sql = "WITH a AS (SELECT o, val * val AS v FROM w), s AS (SELECT SUM(v) AS t FROM a) \
+               SELECT SUM(a.v / s.t) AS loss FROM a CROSS JOIN s";
+    let wrt = [ColumnRef::new("w", "val")];
+    for optimized in [false, true] {
+        let tree = substrait_of(&ctx, sql, optimized).await;
+        let shared = share_repeated(&tree);
+        assert_eq!(shared.relations.len(), 2);
+        // The analysis, less the function table (a HashMap, so its Debug
+        // order varies).
+        let analysis = |f: Forward| format!("{:?}", (f.tables, f.saved, f.output, f.output_names));
+        let want = analysis(Forward::new(&tree, &wrt).unwrap());
+        let got = analysis(Forward::new(&shared, &wrt).unwrap());
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn a_reference_rel_that_loops_or_points_nowhere_is_an_invalid_plan() {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{PlanRel, ReferenceRel, Rel};
+    let ctx = ctx().await;
+    let plan = substrait_of(&ctx, "SELECT SUM(val) AS loss FROM w", true).await;
+    let wrt = [ColumnRef::new("w", "val")];
+    let reference = |ordinal| Rel {
+        rel_type: Some(RelType::Reference(ReferenceRel {
+            subtree_ordinal: ordinal,
+        })),
+    };
+    let with_root = |input: Rel| {
+        let mut p = plan.clone();
+        let Some(PlanRelType::Root(root)) = p.relations[0].rel_type.as_mut() else {
+            unreachable!()
+        };
+        root.input = Some(input);
+        p
+    };
+    // Nowhere: ordinal 7 in a plan of one relation.
+    let err = Forward::new(&with_root(reference(7)), &wrt).unwrap_err();
+    assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+    // A loop: relation 1 refers to itself.
+    let mut looped = with_root(reference(1));
+    looped.relations.push(PlanRel {
+        rel_type: Some(PlanRelType::Rel(reference(1))),
+    });
+    let err = Forward::new(&looped, &wrt).unwrap_err();
+    assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+}

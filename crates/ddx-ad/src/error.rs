@@ -21,6 +21,10 @@ pub enum AdError {
     NotImplemented(String),
     /// A `wrt` column names a table or column the plan does not read.
     UnknownWrt(String),
+    /// A `wrt` column cannot be differentiated with respect to: it is not a
+    /// floating-point column, or its table has no other column to identify
+    /// its rows.
+    InvalidWrt(String),
     /// The plan is not one ddx can read: malformed, or missing a field every
     /// producer fills in.
     InvalidPlan(String),
@@ -35,6 +39,7 @@ impl fmt::Display for AdError {
         match self {
             AdError::NotImplemented(m) => write!(f, "not supported by ddx-ad yet: {m}"),
             AdError::UnknownWrt(m) => write!(f, "unknown wrt column: {m}"),
+            AdError::InvalidWrt(m) => write!(f, "invalid wrt column: {m}"),
             AdError::InvalidPlan(m) => write!(f, "invalid Substrait plan: {m}"),
             AdError::Diff(e) => write!(f, "{e}"),
             AdError::Internal(m) => write!(f, "internal error in ddx-ad (a bug): {m}"),

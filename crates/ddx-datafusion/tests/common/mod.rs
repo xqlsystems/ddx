@@ -39,3 +39,18 @@ pub fn f64_column(batches: &[RecordBatch]) -> Vec<f64> {
 pub fn column_type(batches: &[RecordBatch]) -> DataType {
     batches[0].schema().field(0).data_type().clone()
 }
+
+/// The Substrait plan DataFusion produces for `sql`, optimized or not.
+pub async fn substrait_of(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+    optimized: bool,
+) -> ddx_ad::substrait::proto::Plan {
+    let df = ctx.sql(sql).await.unwrap();
+    let lp = if optimized {
+        df.into_optimized_plan().unwrap()
+    } else {
+        df.into_unoptimized_plan()
+    };
+    *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state()).unwrap()
+}
