@@ -96,6 +96,7 @@ mod error;
 mod markers;
 mod replan;
 mod sql;
+mod stop_gradient;
 
 use std::sync::Arc;
 
@@ -104,6 +105,7 @@ use datafusion::prelude::SessionContext;
 pub use analyzer::DdxAnalyzer;
 pub use markers::{grad_udf, jvp_udf, GRAD, JVP};
 pub use sql::{ddx_sql, ddx_sql_with, rewrite_sql, rewrite_sql_with};
+pub use stop_gradient::{register_stop_gradient, stop_gradient_udf, STOP_GRADIENT};
 
 /// The engine this adapter drives, re-exported so downstream code links the
 /// same version — and, through it, the same `sqlparser`.

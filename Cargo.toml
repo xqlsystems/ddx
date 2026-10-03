@@ -53,6 +53,9 @@ datafusion = { version = "54" }
 # `substrait::proto::Plan` would be two unrelated Rust types and the adapter
 # would stop compiling.
 substrait = { version = "=0.63.0" }
+# DataFusion's Substrait producer and consumer, for the v2 adapter. Its
+# `substrait` requirement is what the pin above follows.
+datafusion-substrait = { version = "54.1" }
 
 # Internal crates, referenced by path within the workspace.
 #
