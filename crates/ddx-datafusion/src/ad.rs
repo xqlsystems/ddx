@@ -4,13 +4,24 @@
 
 //! Query-level reverse-mode AD (ddx v2) on DataFusion.
 //!
-//! Write the forward pass as one SQL query whose result is a loss. [`grad`]
-//! turns it into a [`BackwardProgram`], and [`run`] runs it: every step is
-//! materialized as a table on the context, the loss ends up in
-//! [`BackwardProgram::value`], and each `wrt` table's gradient, shaped like the
-//! table, in the table [`BackwardProgram::gradients`] names. [`vjp`] does the
-//! same for a query with any output, pulling back a cotangent the caller
-//! registers as the table [`BackwardProgram::cotangent_table`] names.
+//! The simplest way in is SQL itself. [`sql`] runs a statement in which
+//! `grad(f, table.column)` is the gradient of the number a CTE computes (its
+//! objective: a loss, a likelihood, an energy, …), as a relation shaped like
+//! the table:
+//!
+//! ```sql
+//! WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+//! SELECT w.i, w.val - 0.1 * g.val AS val
+//! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+//! ```
+//!
+//! Underneath, [`grad`] turns a query whose result is one number into a
+//! [`BackwardProgram`], and [`run`] runs it: every step is materialized as a
+//! table on the context, the number ends up in [`BackwardProgram::value`], and
+//! each `wrt` table's gradient, shaped like the table, in the table
+//! [`BackwardProgram::gradients`] names. [`vjp`] does the same for a query with
+//! any output, pulling back a cotangent the caller registers as the table
+//! [`BackwardProgram::cotangent_table`] names.
 //!
 //! Every table a program writes is named with a prefix unique to that program,
 //! `__ddx_{id}_`, so two programs on one context never read each other's
@@ -30,14 +41,21 @@
 //!     .collect()
 //!     .await?;
 //!
+//! // In SQL: d/dval of Σ val² is 2·val.
+//! let df = ad::sql(
+//!     &ctx,
+//!     "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+//!      SELECT i, val FROM grad(loss, w.val) ORDER BY i",
+//! )
+//! .await?;
+//! # let _ = df.collect().await?;
+//!
+//! // The same, as a program.
 //! let loss = "SELECT SUM(val * val) AS loss FROM w";
 //! let program = ad::grad(&ctx, loss, &[ColumnRef::new("w", "val")]).await?;
 //! ad::run(&ctx, &program).await?;
-//!
-//! // d/dval of Σ val² is 2·val.
 //! let grad = &program.gradients[0].step;
-//! let df = ctx.sql(&format!("SELECT i, val FROM {grad} ORDER BY i")).await?;
-//! # let _ = df.collect().await?;
+//! # let _ = ctx.sql(&format!("SELECT i, val FROM {grad}")).await?.collect().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -53,7 +71,8 @@ use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     from_project_rel, from_substrait_plan_with_consumer, DefaultSubstraitConsumer,
@@ -68,12 +87,15 @@ use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
 pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
 
+use ddx_ad::Statements;
+
 fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
-/// The gradient of the loss the SQL query `sql` computes, with respect to the
-/// `wrt` columns. The query must return one row and one column.
+/// The gradient of the number the SQL query `sql` computes (a loss, a
+/// likelihood, an energy, …), with respect to the `wrt` columns. The query
+/// must return one row and one column.
 ///
 /// The query is planned and optimized by `ctx`, converted to Substrait, and
 /// handed to [`ddx_ad::grad`]. A refusal arrives as
@@ -88,6 +110,7 @@ pub fn grad_plan(
     plan: &LogicalPlan,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
+    refuse_what_substrait_loses(plan)?;
     ddx_ad::grad(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
 }
 
@@ -105,7 +128,116 @@ pub fn vjp_plan(
     plan: &LogicalPlan,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
+    refuse_what_substrait_loses(plan)?;
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// Refuse a plan whose meaning DataFusion's Substrait producer does not
+/// keep, so ddx would differentiate a different query, silently.
+///
+/// One case, upstream bug #104: `x NOT IN (subquery)` keeps no row when the
+/// subquery returns a NULL. DataFusion plans it as a null-aware anti-join
+/// (as an `IN` subquery expression before optimization), and its producer
+/// writes a plain anti-join, which keeps those rows. ddx-ad cannot tell from
+/// the Substrait plan, which reads as `NOT EXISTS`; only this plan can. As
+/// DataFusion does, a `NOT IN` whose two sides cannot be NULL is let through.
+fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::ExprSchemable;
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Join(j) = node {
+            found |= j.null_aware;
+        }
+        let schema = node.inputs().first().map_or(node.schema(), |i| i.schema());
+        node.apply_expressions(|e| {
+            e.apply(|x| {
+                if let Expr::InSubquery(sq) = x {
+                    if sq.negated {
+                        let needle = sq.expr.nullable(schema).unwrap_or(true);
+                        let haystack = sq
+                            .subquery
+                            .subquery
+                            .schema()
+                            .fields()
+                            .first()
+                            .is_none_or(|f| f.is_nullable());
+                        found |= needle || haystack;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    if found {
+        return Err(to_df_err(AdError::NotImplemented(
+            "`NOT IN` over a subquery whose values may be NULL: DataFusion's Substrait \
+             producer writes it as a plain anti-join, which keeps the rows a NULL in the \
+             subquery should exclude (ddx issue #104). Write `NOT EXISTS`, or filter the \
+             NULLs out of the subquery"
+                .into(),
+        )));
+    }
+    Ok(())
+}
+
+/// Run the SQL statement `sql`, in which `grad(f, table.column, …)` in a
+/// `FROM` clause is the gradient of the number the CTE `f` computes (see
+/// [`ddx_ad::sql`]): a relation shaped like `table`, its dims and the named
+/// columns' gradients.
+///
+/// Each objective's [`grad`] program runs first, once, however many calls use it,
+/// and each call is replaced by a query over the gradient it needs before the
+/// statement is planned. A statement with no such call is planned as it is.
+/// The programs' tables are dropped once the statement is planned; the
+/// returned DataFrame keeps what it reads.
+///
+/// An objective defined in a `WITH RECURSIVE` clause is refused, so a training loop
+/// cannot yet be written as one recursive statement (design.md §5). This is
+/// ddx's own limit, separate from DataFusion 54's recursive-CTE planning bug
+/// (design.md §3.6).
+pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
+    let mut frames = sql_all(ctx, &[sql]).await?;
+    Ok(frames.pop().expect("one statement in, one frame out"))
+}
+
+/// [`sql`] for several statements at once. Statements whose `grad` calls
+/// differentiate the same objective share one run of its program, so a
+/// training step can update each parameter table with its own statement and
+/// pay for the backward pass once.
+pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<DataFrame>> {
+    // Which programs to run, and how each statement reads their gradients,
+    // are ddx_ad::Statements'; running them and planning the result are
+    // DataFusion's.
+    let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
+    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
+    let result = async {
+        for job in planned.jobs() {
+            let program = grad(ctx, &job.query, &job.wrt).await?;
+            ran.push(program);
+            run(ctx, ran.last().expect("just pushed")).await?;
+        }
+        let rewritten = planned
+            .rewrite(&ran.iter().collect::<Vec<_>>())
+            .map_err(to_df_err)?;
+        let mut frames = Vec::with_capacity(rewritten.len());
+        for sql in &rewritten {
+            frames.push(ctx.sql(sql).await?);
+        }
+        Ok(frames)
+    }
+    .await;
+    // A planned DataFrame holds the tables it reads, so the programs' tables
+    // can leave the catalog now.
+    for program in &ran {
+        release(ctx, program)?;
+    }
+    result
 }
 
 /// Run `program`: its [`checks`](BackwardProgram::checks), then every step,
