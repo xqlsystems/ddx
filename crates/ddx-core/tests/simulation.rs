@@ -55,10 +55,10 @@ use std::io::Write as _;
 use ddx_core::sqlparser::ast::Expr;
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::test_utils::{
-    central_diff, divides_by_noise, eval, gen_adversarial_sql, gen_expr, gen_expr_and_wrt,
-    gen_marker_free_stmt, gen_marker_statement, has_residual_marker, max_intermediate_mag,
-    metamorphic_mismatch, min_domain_margin, parse_expr, run_bounded, seeded, try_parse,
-    try_parse_stmt, Rng, Var,
+    central_diff, divides_by_noise, eval, fd_noise_floor, gen_adversarial_sql, gen_expr,
+    gen_expr_and_wrt, gen_marker_free_stmt, gen_marker_statement, has_residual_marker,
+    max_intermediate_mag, metamorphic_mismatch, min_domain_margin, parse_expr, run_bounded, seeded,
+    try_parse, try_parse_stmt, Rng, Var,
 };
 use ddx_core::{ColRef, Ddx, DiffError};
 
@@ -93,6 +93,8 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
                                // Max relative gap between fd(h) and fd(h/2) for the difference to count as
                                // "in its convergent regime" and therefore trustworthy as an oracle.
     const RICHARDSON_TOL: f64 = 1e-4;
+    // How far under the tolerance a point's rounding-noise floor must sit.
+    const NOISE_SAFETY: f64 = 4.0;
     // Above this, some intermediate value is too large for f64 to resolve an
     // O(1) perturbation against — the point is unfit for numeric comparison
     // (total cancellation passes Richardson because *both* fd(h) and fd(h/2)
@@ -155,10 +157,17 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
         if (fd_h - fd_h2).abs() > RICHARDSON_TOL * fd_h2.abs().max(1.0) {
             continue;
         }
-        comparable += 1;
         // fd(h/2) is the more accurate estimate at a convergent point.
         let fd = fd_h2;
-        if (fd - dv).abs() > ATOL + RTOL * dv.abs().max(fd.abs()) {
+        let tolerance = ATOL + RTOL * dv.abs().max(fd.abs());
+        // Noise gate: skip points where rounding inside f alone could move the
+        // difference by a fair share of the tolerance (#67).
+        match fd_noise_floor(&f, x0, y0, wrt, H / 2.0, fd) {
+            Some(noise) if NOISE_SAFETY * noise < tolerance => {}
+            _ => continue,
+        }
+        comparable += 1;
+        if (fd - dv).abs() > tolerance {
             disagree += 1;
             if first_bad.is_empty() {
                 first_bad = format!(
@@ -831,6 +840,58 @@ fn differentiation_is_linear_and_obeys_the_product_rule() {
         let (text, wrt) = gen_expr_and_wrt(rng);
         linearity_failure(rng, &ddx, &text, wrt)
     });
+}
+
+/// The noise gate must be narrow too: it skips points where rounding inside
+/// `f` can move a finite difference by a fair share of the tolerance, and
+/// nothing else (#67).
+#[test]
+fn noise_gate_skips_only_rounding_dominated_points() {
+    let ddx = Ddx::new();
+    // The nightly soak's false positive: `f` does not depend on `y`, but
+    // `(y + x) + 2.5 - y` rounds differently for each `y`, and `3^(b²)` scales
+    // that jitter up past the tolerance. The derivative is 0, and correct.
+    let text = "CAST(power(3, power((((y + x) + abs(2.5)) - y), 2)) AS DOUBLE)";
+    let f = parse_expr(text);
+    let floor = fd_noise_floor(&f, 1.029904, 0.859873, Var::Y, 5e-5, 0.0).unwrap();
+    assert!(
+        floor > 1e-5,
+        "rounding alone moves the quotient by {floor:e}"
+    );
+    let d = ddx.differentiate(&f, &ColRef::bare("y")).unwrap();
+    for seed in 0..32 {
+        let mut rng = seeded(5820328895, seed);
+        assert_eq!(fd_failure(&mut rng, text, &d, Var::Y), None, "seed {seed}");
+    }
+
+    // And the oracle keeps its teeth: a wrong derivative of a well-conditioned
+    // expression is still reported.
+    for (text, wrong) in [("sin(x) * y", "sin(x) * y"), ("exp(x) / y", "exp(x)")] {
+        let mut rng = seeded(1, 0);
+        assert!(
+            fd_failure(&mut rng, text, &parse_expr(wrong), Var::X).is_some(),
+            "d/dx {text} = {wrong} must be caught"
+        );
+    }
+
+    // Well-conditioned expressions keep a floor far under the tolerance, so
+    // the oracle still compares them.
+    for healthy in [
+        "x * y",
+        "sin(x) * exp(y)",
+        "power(x, 3) / y",
+        "ln(x + y) * x",
+    ] {
+        let e = parse_expr(healthy);
+        let floor = fd_noise_floor(&e, 1.029904, 0.859873, Var::X, 5e-5, 0.0).unwrap();
+        let slope = central_diff(&e, 1.029904, 0.859873, Var::X, 5e-5).unwrap();
+        let floor_beyond_slope =
+            fd_noise_floor(&e, 1.029904, 0.859873, Var::X, 5e-5, slope).unwrap();
+        assert!(
+            floor_beyond_slope < 1e-7,
+            "`{healthy}`: floor {floor_beyond_slope:e} (before removing the slope, {floor:e})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
