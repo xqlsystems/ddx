@@ -248,11 +248,9 @@ class LoggingBackend:
 def test_any_backend_runs_a_program(ad, ctx):
     # Composability re-review (#81): the runner takes a Backend, not only a
     # DataFusion context, and asks each table's schema once per write.
-    from ddxdb import program as p
-
     prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
     backend = LoggingBackend(ad, ctx)
-    p.run(backend, prog)
+    ddxdb.run(backend, prog)
     kinds = [e[0] for e in backend.log]
     assert kinds.index("check") < kinds.index("write")
     assert [e[1] for e in backend.log if e[0] == "drop"] == [s.name for s in prog.intermediate_steps()]
@@ -281,12 +279,10 @@ def test_a_fixed_namespace_gives_the_same_program(ad, ctx):
     # query's functions differently from one call to the next.
     from datafusion.substrait import Serde
 
-    from ddxdb import program as p
-
     q = "SELECT SUM(val * val) AS l FROM w"
     plan = Serde.serialize_bytes(q, ctx)
-    a = p.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
-    b = p.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
+    a = ddxdb.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
+    b = ddxdb.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
     assert a == b and a.value == "__ddx_py_value"
     with pytest.raises(ddxdb.DdxError, match="namespace"):
         ad.grad(ctx, q, [("w", "val")], namespace="__ddx_Py_")

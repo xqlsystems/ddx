@@ -62,16 +62,9 @@ from ._ddxdb import (
     _Statements,
     _unbound_reads,
 )
-from .program import (
-    Backend,
-    BackwardProgram,
-    Check,
-    Gradient,
-    Step,
-    grad_plan,
-    vjp_plan,
-)
-from .program import run as _run
+from . import Backend
+from ._ddxdb import BackwardProgram, Check, Gradient, Step, grad_plan, vjp_plan
+from ._ddxdb import run as _run
 
 __all__ = [
     "STOP_GRADIENT",
@@ -125,7 +118,7 @@ def grad(
     the query: :class:`ddxdb.NotScalar` for a query that is not a loss,
     :class:`ddxdb.UnknownColumn` for a ``wrt`` it does not read, and so on.
     ``namespace`` fixes the prefix of the tables the program writes (see
-    :func:`ddxdb.program.grad_plan`). The same plan then gives the same
+    :func:`ddxdb.grad_plan`). The same plan then gives the same
     program; the same query need not, since DataFusion's producer can number
     its functions differently from one call to the next.
     """
@@ -162,7 +155,7 @@ def _refuse_not_in(sql: str) -> None:
 
 
 class DataFusionBackend:
-    """A DataFusion ``SessionContext`` as a :class:`ddxdb.program.Backend`:
+    """A DataFusion ``SessionContext`` as a :class:`ddxdb.Backend`:
     each step's result is registered as an in-memory table."""
 
     def __init__(self, ctx: SessionContext):
@@ -185,7 +178,7 @@ class DataFusionBackend:
 
 def run(target: Union[SessionContext, Backend], program: BackwardProgram) -> None:
     """Run ``program`` on a DataFusion context, or on any
-    :class:`ddxdb.program.Backend`: its checks, then every step, registering
+    :class:`ddxdb.Backend`: its checks, then every step, registering
     each result. Once the gradients are written, the intermediate tables are
     dropped; the value and the gradients stay until :func:`release` or the next
     run replaces them. A run that fails leaves none of the program's tables.
@@ -277,7 +270,7 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
             program = grad(ctx, query, wrt)
             ran.append(program)
             run(ctx, program)
-        return [ctx.sql(s) for s in planned.rewrite([p._handle for p in ran])]
+        return [ctx.sql(s) for s in planned.rewrite(ran)]
     finally:
         # A planned DataFrame holds the tables it reads, so the programs'
         # tables can leave the catalog now.

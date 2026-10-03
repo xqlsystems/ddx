@@ -21,7 +21,7 @@ use prost::Message;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyTuple};
 
 // The first argument names the module the class claims to live in, and it must
 // be the *importable* path (`ddxdb._ddxdb`), not the bare crate name. Python
@@ -269,48 +269,203 @@ fn bytes<'py>(py: Python<'py>, plan: &Plan) -> Bound<'py, PyBytes> {
     PyBytes::new(py, &plan.encode_to_vec())
 }
 
-/// A step as `(name, plan bytes)`.
-type PyStep<'py> = (String, Bound<'py, PyBytes>);
+/// One step of a program: a plan, and the table name to materialize its
+/// result under (`ddx_ad::Step`).
+#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "Step")]
+#[derive(Clone, PartialEq)]
+struct Step {
+    #[pyo3(get)]
+    name: String,
+    plan: Vec<u8>,
+}
 
-/// A program as `(forward_steps, value, cotangent_table, cotangent, checks,
-/// backward_steps, gradients)`: a step is `(name, plan bytes)`, `cotangent`
-/// the columns a vjp program's cotangent table needs, a check
-/// `(plan bytes, message)`, and a gradient `(table, step, columns)`.
-type PyProgram<'py> = (
-    Vec<PyStep<'py>>,
-    String,
-    String,
-    Vec<String>,
-    Vec<(Bound<'py, PyBytes>, String)>,
-    Vec<PyStep<'py>>,
-    Vec<(String, String, Vec<String>)>,
-);
+#[pymethods]
+impl Step {
+    /// The plan, as serialized Substrait.
+    #[getter]
+    fn plan<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.plan)
+    }
 
-fn to_py_program<'py>(py: Python<'py>, program: ddx_ad::BackwardProgram) -> PyProgram<'py> {
-    let steps = |steps: &[ddx_ad::Step]| {
-        steps
-            .iter()
-            .map(|s| (s.name.clone(), bytes(py, &s.plan)))
-            .collect::<Vec<_>>()
-    };
-    let gradients = program
-        .gradients
+    fn __repr__(&self) -> String {
+        format!(
+            "Step(name={:?}, plan=<{} bytes>)",
+            self.name,
+            self.plan.len()
+        )
+    }
+}
+
+/// A plan that must return no rows, and what a row means (`ddx_ad::Check`).
+#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "Check")]
+#[derive(Clone, PartialEq)]
+struct Check {
+    plan: Vec<u8>,
+    #[pyo3(get)]
+    message: String,
+}
+
+#[pymethods]
+impl Check {
+    /// The plan, as serialized Substrait.
+    #[getter]
+    fn plan<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.plan)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Check(message={:?})", self.message)
+    }
+}
+
+/// Where a `wrt` table's gradient lands (`ddx_ad::Gradient`): the step's
+/// table has the table's dims, then its `wrt` values, named as in the table;
+/// each value column holds the gradient, `0` where none reached and `NULL`
+/// where the value itself is `NULL`.
+#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "Gradient")]
+#[derive(Clone, PartialEq)]
+struct Gradient {
+    #[pyo3(get)]
+    table: String,
+    #[pyo3(get)]
+    step: String,
+    columns: Vec<String>,
+}
+
+#[pymethods]
+impl Gradient {
+    #[getter]
+    fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.columns)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Gradient(table={:?}, step={:?}, columns={:?})",
+            self.table, self.step, self.columns
+        )
+    }
+}
+
+/// The steps that compute a query's value and its gradient: the Rust
+/// `ddx_ad::BackwardProgram` itself, read from Python.
+#[pyclass(frozen, module = "ddxdb", name = "BackwardProgram")]
+struct BackwardProgram(ddx_ad::BackwardProgram);
+
+fn to_steps(steps: &[ddx_ad::Step]) -> Vec<Step> {
+    steps
         .iter()
-        .map(|g| (g.table.join("."), g.step.clone(), g.columns.clone()))
-        .collect();
-    (
-        steps(&program.forward_steps),
-        program.value.clone(),
-        program.cotangent_table.clone(),
-        program.cotangent.clone(),
-        program
+        .map(|s| Step {
+            name: s.name.clone(),
+            plan: s.plan_bytes(),
+        })
+        .collect()
+}
+
+#[pymethods]
+impl BackwardProgram {
+    /// The saved aggregates, then the query's value.
+    #[getter]
+    fn forward_steps(&self) -> Vec<Step> {
+        to_steps(&self.0.forward_steps)
+    }
+
+    /// The cotangents, then the gradients.
+    #[getter]
+    fn backward_steps(&self) -> Vec<Step> {
+        to_steps(&self.0.backward_steps)
+    }
+
+    /// The step holding the query's own result.
+    #[getter]
+    fn value(&self) -> &str {
+        &self.0.value
+    }
+
+    /// For a vjp program: the table the caller registers the cotangent as.
+    #[getter]
+    fn cotangent_table(&self) -> &str {
+        &self.0.cotangent_table
+    }
+
+    /// For a vjp program: that table's columns.
+    #[getter]
+    fn cotangent<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.0.cotangent)
+    }
+
+    /// Plans that must return no rows, run before the steps.
+    #[getter]
+    fn checks(&self) -> Vec<Check> {
+        self.0
             .checks
             .iter()
-            .map(|c| (bytes(py, &c.plan), c.message.clone()))
-            .collect(),
-        steps(&program.backward_steps),
-        gradients,
-    )
+            .map(|c| Check {
+                plan: c.plan_bytes(),
+                message: c.message.clone(),
+            })
+            .collect()
+    }
+
+    /// One per `wrt` table.
+    #[getter]
+    fn gradients(&self) -> Vec<Gradient> {
+        self.0
+            .gradients
+            .iter()
+            .map(|g| Gradient {
+                table: g.table.join("."),
+                step: g.step.clone(),
+                columns: g.columns.clone(),
+            })
+            .collect()
+    }
+
+    /// Every step, in the order they must run.
+    fn steps(&self) -> Vec<Step> {
+        let mut out = self.forward_steps();
+        out.extend(self.backward_steps());
+        out
+    }
+
+    /// The steps only other steps read: the saved aggregates and the
+    /// cotangents. `run` drops them once the gradients are written.
+    fn intermediate_steps(&self) -> Vec<Step> {
+        self.0
+            .intermediate_steps()
+            .map(|s| Step {
+                name: s.name.clone(),
+                plan: s.plan_bytes(),
+            })
+            .collect()
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        let key = |p: &Self| {
+            (
+                p.steps(),
+                p.checks(),
+                p.gradients(),
+                p.0.value.clone(),
+                p.0.cotangent_table.clone(),
+                p.0.cotangent.clone(),
+            )
+        };
+        key(self) == key(other)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BackwardProgram(value={:?}, steps={}, checks={}, gradients={:?})",
+            self.0.value,
+            self.0.steps().count(),
+            self.0.checks.len(),
+            self.gradients()
+                .iter()
+                .map(|g| g.table.clone())
+                .collect::<Vec<_>>()
+        )
+    }
 }
 
 /// `ddx_ad::Options` with an optional fixed namespace.
@@ -325,97 +480,94 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
     wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
 }
 
-/// A program, kept on the Rust side for [`Runner`] and [`Statements`].
-#[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Program")]
-struct Program(ddx_ad::BackwardProgram);
-
-#[pymethods]
-impl Program {
-    /// A run of this program (see `ddx_ad::Runner`).
-    fn runner(&self) -> Runner {
-        Runner {
-            inner: Some(ddx_ad::Runner::new(&self.0)),
-            checking: false,
-        }
-    }
+/// The gradient of the number the serialized Substrait `plan` computes, with
+/// respect to the `(table, column)` pairs in `wrt` (`ddx_ad::grad`).
+///
+/// `namespace` names every table the program writes `{namespace}…` instead of
+/// under a fresh prefix, so the same plan gives the same program. It must
+/// start with `__ddx_`, end with `_`, and hold only lower-case ASCII letters,
+/// digits and `_`.
+#[pyfunction]
+#[pyo3(signature = (plan, wrt, *, namespace = None))]
+fn grad_plan(
+    plan: &[u8],
+    wrt: Vec<(String, String)>,
+    namespace: Option<String>,
+) -> PyResult<BackwardProgram> {
+    ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+        .map(BackwardProgram)
+        .map_err(ad_to_py_err)
 }
 
-/// `ddx_ad::Runner`, the run protocol: Python asks what to do next and says
-/// how it went, so the order of a run and what it drops when are ddx-ad's.
-#[pyclass(module = "ddxdb._ddxdb", name = "_Runner")]
-struct Runner {
-    inner: Option<ddx_ad::Runner<PyErr>>,
-    /// Whether the pending action is a check, so `fail` answers it the way
-    /// `ddx_ad::Runner` expects.
-    checking: bool,
+/// The vector-Jacobian product of the query the serialized Substrait `plan`
+/// computes (`ddx_ad::vjp`; see `grad_plan`).
+#[pyfunction]
+#[pyo3(signature = (plan, wrt, *, namespace = None))]
+fn vjp_plan(
+    plan: &[u8],
+    wrt: Vec<(String, String)>,
+    namespace: Option<String>,
+) -> PyResult<BackwardProgram> {
+    ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+        .map(BackwardProgram)
+        .map_err(ad_to_py_err)
 }
 
-impl Runner {
-    fn inner(&mut self) -> PyResult<&mut ddx_ad::Runner<PyErr>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("the run is finished"))
-    }
-}
+/// A Python engine object as a `ddx_ad::Backend`: the four primitives, with
+/// plans crossing as serialized Substrait.
+struct PyBackend<'py>(Bound<'py, PyAny>);
 
-#[pymethods]
-impl Runner {
-    /// The next action: `("check", i)`, `("step", i)` (the index into
-    /// `program.steps()`), `("drop", name)`, or `None` when the run is over.
-    fn next(&mut self, py: Python<'_>) -> PyResult<Option<(&'static str, Py<PyAny>)>> {
-        let action = self.inner()?.next();
-        self.checking = matches!(action, Some(ddx_ad::Action::Check(_)));
-        Ok(match action {
-            Some(ddx_ad::Action::Check(i)) => {
-                Some(("check", i.into_pyobject(py)?.into_any().unbind()))
-            }
-            Some(ddx_ad::Action::Materialize(i)) => {
-                Some(("step", i.into_pyobject(py)?.into_any().unbind()))
-            }
-            Some(ddx_ad::Action::Drop(name)) => {
-                Some(("drop", name.into_pyobject(py)?.into_any().unbind()))
-            }
-            None => None,
+impl ddx_ad::Backend for PyBackend<'_> {
+    type Error = PyErr;
+
+    fn table_schema(&mut self, name: &str) -> PyResult<NamedStruct> {
+        let plan: Vec<u8> = self.0.call_method1("select_all", (name,))?.extract()?;
+        base_schema(&decode(&plan)?).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "select_all({name:?}) returned a plan with no table read in it"
+            ))
         })
     }
 
-    /// The pending check ran: whether its plan returned a row.
-    fn checked(&mut self, rows: bool) -> PyResult<()> {
-        self.inner()?.checked(Ok(rows));
+    fn returns_rows(&mut self, plan: &Plan) -> PyResult<bool> {
+        let py = self.0.py();
+        self.0
+            .call_method1("returns_rows", (bytes(py, plan),))?
+            .extract()
+    }
+
+    fn materialize(&mut self, name: &str, plan: &Plan) -> PyResult<()> {
+        let py = self.0.py();
+        self.0
+            .call_method1("materialize", (name, bytes(py, plan)))?;
         Ok(())
     }
 
-    /// The pending step or drop succeeded.
-    fn done(&mut self) -> PyResult<()> {
-        self.inner()?.done(Ok(()));
+    fn drop_table(&mut self, name: &str) -> PyResult<()> {
+        self.0.call_method1("drop_table", (name,))?;
         Ok(())
     }
+}
 
-    /// The pending action raised `error`.
-    fn fail(&mut self, error: Bound<'_, PyAny>) -> PyResult<()> {
-        let error = PyErr::from_value(error);
-        let checking = self.checking;
-        let runner = self.inner()?;
-        if checking {
-            runner.checked(Err(error));
-        } else {
-            runner.done(Err(error));
-        }
-        Ok(())
-    }
-
-    /// End the run: raises the first failure, if there was one.
-    fn finish(&mut self) -> PyResult<()> {
-        let runner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("the run is finished"))?;
-        runner.finish().map_err(|e| match e {
-            ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
-            ddx_ad::RunError::Engine(e) => e,
-            other => DdxError::new_err(other.to_string()),
-        })
-    }
+/// Run `program` on `backend`: `ddx_ad::run`, the same protocol the Rust
+/// adapters follow. Its checks run first, then every step. A run that
+/// succeeds drops the intermediate tables and leaves the value and the
+/// gradients; one that fails leaves none of the program's tables.
+///
+/// `backend` is any object with four methods (see `ddxdb.Backend`):
+/// `select_all(name) -> bytes` (the engine's serialized Substrait plan of
+/// `SELECT * FROM name`, whose read gives the table's schema; asked once per
+/// table, and again after the table is rewritten), `returns_rows(plan) ->
+/// bool`, `materialize(name, plan)` and `drop_table(name)`. Plans arrive as
+/// serialized Substrait with their reads of earlier steps bound. Raises
+/// `InvalidColumn` when a check returns a row, or what the backend raised.
+#[pyfunction]
+fn run(backend: Bound<'_, PyAny>, program: PyRef<'_, BackwardProgram>) -> PyResult<()> {
+    ddx_ad::run(&mut PyBackend(backend), &program.0).map_err(|e| match e {
+        ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
+        ddx_ad::RunError::Engine(e) => e,
+        other => DdxError::new_err(other.to_string()),
+    })
 }
 
 /// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
@@ -437,7 +589,7 @@ impl Statements {
         ))
     }
 
-    /// The losses to differentiate, as `(query, [(table, column), …])`.
+    /// The objectives to differentiate, as `(query, [(table, column), …])`.
     fn jobs(&self) -> Vec<(String, Vec<(String, String)>)> {
         self.0
             .jobs()
@@ -455,39 +607,10 @@ impl Statements {
 
     /// Each statement over the gradients `programs` (one per job, run)
     /// computed.
-    fn rewrite(&self, programs: Vec<PyRef<'_, Program>>) -> PyResult<Vec<String>> {
+    fn rewrite(&self, programs: Vec<PyRef<'_, BackwardProgram>>) -> PyResult<Vec<String>> {
         let programs: Vec<&ddx_ad::BackwardProgram> = programs.iter().map(|p| &p.0).collect();
         self.0.rewrite(&programs).map_err(ad_to_py_err)
     }
-}
-
-/// `grad` of a serialized Substrait plan (see `ddxdb.ad`): the program as
-/// plain values, and as a handle.
-#[pyfunction]
-#[pyo3(signature = (plan, wrt, namespace = None))]
-fn _grad<'py>(
-    py: Python<'py>,
-    plan: &[u8],
-    wrt: Vec<(String, String)>,
-    namespace: Option<String>,
-) -> PyResult<(PyProgram<'py>, Program)> {
-    let program = ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
-        .map_err(ad_to_py_err)?;
-    Ok((to_py_program(py, program.clone()), Program(program)))
-}
-
-/// `vjp` of a serialized Substrait plan (see `ddxdb.ad`).
-#[pyfunction]
-#[pyo3(signature = (plan, wrt, namespace = None))]
-fn _vjp<'py>(
-    py: Python<'py>,
-    plan: &[u8],
-    wrt: Vec<(String, String)>,
-    namespace: Option<String>,
-) -> PyResult<(PyProgram<'py>, Program)> {
-    let program = ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
-        .map_err(ad_to_py_err)?;
-    Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
 /// Does `sql` hold `x NOT IN (subquery)`? DataFusion's Substrait producer
@@ -567,11 +690,14 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rewrite_sql, m)?)?;
     m.add_function(wrap_pyfunction!(differentiate_sql, m)?)?;
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
-    m.add_function(wrap_pyfunction!(_grad, m)?)?;
-    m.add_function(wrap_pyfunction!(_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(grad_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(vjp_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(_not_in_subquery, m)?)?;
-    m.add_class::<Program>()?;
-    m.add_class::<Runner>()?;
+    m.add_class::<BackwardProgram>()?;
+    m.add_class::<Step>()?;
+    m.add_class::<Check>()?;
+    m.add_class::<Gradient>()?;
     m.add_class::<Statements>()?;
     m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
     m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;

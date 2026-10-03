@@ -31,6 +31,7 @@ you can act on rather than matching on message text.
 """
 
 from importlib import metadata as _metadata
+from typing import Protocol
 
 from ._ddxdb import (  # noqa: F401  (re-exported)
     AmbiguousColumn,
@@ -46,6 +47,41 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     rewrite_sql,
     supported_functions,
 )
+from ._ddxdb import (  # noqa: F401  (re-exported)
+    BackwardProgram,
+    Check,
+    Gradient,
+    Step,
+    grad_plan,
+    run,
+    vjp_plan,
+)
+
+
+class Backend(Protocol):
+    """An engine :func:`run` can run a program on: the four primitives of
+    ``ddx_ad::Backend``. Plans cross as serialized Substrait, with their reads
+    of earlier steps already bound. :class:`ddxdb.ad.DataFusionBackend` is
+    one; any object with these methods is another."""
+
+    def select_all(self, name: str) -> bytes:
+        """The engine's own serialized Substrait plan of ``SELECT * FROM
+        name``, whose read gives the table's schema in the engine's terms."""
+        ...
+
+    def returns_rows(self, plan: bytes) -> bool:
+        """Run ``plan`` and say whether it returned any row."""
+        ...
+
+    def materialize(self, name: str, plan: bytes) -> None:
+        """Run ``plan`` and store its rows as the table ``name``, replacing
+        one."""
+        ...
+
+    def drop_table(self, name: str) -> None:
+        """Drop the table ``name`` if it exists."""
+        ...
+
 
 # Single-sourced from the installed distribution metadata, which maturin fills
 # from pyproject.toml. Hardcoding it here would be a third copy of the version
@@ -72,6 +108,14 @@ __all__ = [
     "NotScalar",
     "UnknownColumn",
     "InvalidColumn",
+    "Backend",
+    "BackwardProgram",
+    "Check",
+    "Gradient",
+    "Step",
+    "grad_plan",
+    "run",
+    "vjp_plan",
     "__version__",
 ]
 

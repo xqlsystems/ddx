@@ -172,12 +172,13 @@ the loss does not read raises `UnknownColumn`, and a column that cannot be
 differentiated (not a float, or in a table whose rows do not have unique
 dims) raises `InvalidColumn`. This needs DataFusion.
 
-Another engine needs no DataFusion: `ddxdb.program.grad_plan(plan_bytes, wrt)`
+Another engine needs no DataFusion: `ddxdb.grad_plan(plan_bytes, wrt)`
 differentiates the serialized Substrait plan its producer writes, and
-`ddxdb.program.run(backend, program)` runs the result on any object with four
-methods, `select_all`, `returns_rows`, `materialize` and `drop_table` (the
-`ddxdb.program.Backend` protocol). Pass `namespace="__ddx_mine_"` to get the
-same program from the same plan every time.
+`ddxdb.run(backend, program)` runs the result on any object with four methods,
+`select_all`, `returns_rows`, `materialize` and `drop_table` (the
+`ddxdb.Backend` protocol). Both are ddx-ad's own Rust, the same code the Rust
+adapter runs. Pass `namespace="__ddx_mine_"` to get the same program from the
+same plan every time.
 
 ## One thing to know
 
