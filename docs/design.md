@@ -3,7 +3,7 @@
 _author_: Alex Merose
 _co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
 _status_: Design — iterating toward implementation
-_last updated_: 2026-07-20
+_last updated_: 2026-09-24
 
 ---
 
@@ -62,10 +62,10 @@ differentiation engine:
   derivations does not scale, which is the reason ML left symbolic
   differentiation for reverse-mode AD in the first place (Baydin et al. [1]).
 - **v2 — query-level reverse-mode AD** (§4), the ML headline. The scalar
-  engine from v1 becomes the *elementwise leaf* of a system that
-  differentiates whole queries — not expressions — by applying transpose
-  rules to relational operators (contraction, elementwise, reduce, route,
-  stop-gradient). Sharing that scalar mode lacks happens through materialized
+  engine from v1 becomes the *map rule* of a system that differentiates
+  whole queries — not expressions — the way JAX differentiates functions: one
+  transpose rule per relational primitive (map, select, broadcast, reduce),
+  composed. Sharing that scalar mode lacks happens through materialized
   intermediate relations (the tape) instead of inside expressions. Verified
   machine-exact against `jax.grad` on an MLP and on attention.
 
@@ -116,15 +116,19 @@ depends on `substrait` and v1's core. Neither depends on `datafusion` or `duckdb
    rewritten away before execution — never functions that run per row. Every
    integration is fundamentally "find the marker, differentiate what it
    wraps, splice the result back, hand plain output onward."
-3. **Tag explicitly; never infer.** Recognizing what a piece of SQL means (a
-   join is a contraction, an aggregate is a reduction) is never done by
-   pattern-matching plan shape — the same shape means different things in
-   different queries, and a misclassification is a silently wrong gradient.
-   Every semantically special operation is marked, by the user, with a
-   function ddx has claimed the name of.
+3. **Never guess; derive, or be told.** A derivative follows from what an
+   operator computes: a `SUM` is linear whatever it sums, a join broadcasts
+   whatever it pairs. ddx reads that off the operator, never off a guess about
+   the query's intent, because a wrong guess is a silently wrong gradient.
+   Where intent genuinely cannot be read off the plan, the user says it with a
+   function ddx has claimed the name of: `grad`/`jvp` in v1, and
+   `ddx_stop_gradient` in v2. (This principle first read "tag explicitly;
+   never infer", and asked for a tag on every contraction and reduction.
+   Building v2 showed those tags classified nothing the rules needed; see
+   decision `S10`.)
 4. **SQL (or its plan) is the portable surface.** v1's `grad`/`jvp` are
-   ordinary SQL function calls; v2's markers are the same, one layer down in
-   the plan. No project-specific interchange format carries meaning between
+   ordinary SQL function calls; v2's `grad` is the same one level up, taking a
+   query instead of an expression. No project-specific interchange format carries meaning between
    engines — each engine's own SQL-to-plan machinery does.
 5. **Fail loud, never silently wrong.** An unsupported construct is a typed
    error, not an approximate or silently-zero derivative. This is a
@@ -636,7 +640,9 @@ softmax over the key axis → `A@V`) from the *same* rules and matches
 `jax.grad` on every weight and the input to ~1e-16; the causal mask is just
 elementwise and also passes. LayerNorm (mean/variance = group-reduce +
 elementwise), residual connections (elementwise add), and GELU/ReLU
-(elementwise) all reduce to the same primitive set.
+(elementwise) all reduce to the same primitive set. (ReLU as it is usually
+written, `CASE WHEN x > 0 …` or `greatest(x, 0)`, is differentiated by the
+branch taken; §4.3.)
 
 **Published precedent.** Tang et al. [2], *Auto-Differentiation of Relational
 Computations for Very Large Scale Machine Learning*, do exactly this — a
@@ -658,7 +664,7 @@ the top; engine-specific performance lives underneath, unchanged by it. This
 operator is still to be spiked — the one open piece of the performance
 story.
 
-### 4.2 The mechanism: Substrait + extension-function markers
+### 4.2 The mechanism: Substrait
 
 v2 needs a real relational plan representation in a way v1 never did. v1
 differentiates a scalar expression and splices *text* back into the source
@@ -680,37 +686,27 @@ it breaks the "engine-independent core" success criterion outright `[S1]`.
 Substrait is genuinely engine-neutral: both DataFusion and DuckDB produce and
 consume it.
 
-The remaining requirement — tag explicitly, never infer (§2, principle 3) —
-is realized the same way v1's `grad()` already works, one layer down:
-**extension-function markers**. Instead of writing `SUM(a.val * b.val)`, a
-user (or a model-definition helper built on top) writes
-`SUM(ddx_contract_mark(a.val * b.val))` — an identity scalar function whose
-only job is to survive planning and mark that specific aggregate as a
-contraction. Substrait's extension mechanism (`extension_uris` +
-`simple_extension_declaration`) gives every custom function a plan-local
-anchor, independent of whatever base relational shape it sits inside — this
-is mature, standard Substrait usage for custom *functions* specifically
-(custom *relation* types are a much less mature corner of Substrait, and
-`ddx` never needs one — only tagged functions inside ordinary relations).
-
-**This is verified, not just architecturally plausible.**
-`spikes/substrait_ad_marker_spike.py` wraps a contraction's operand in
-`ddx_contract_mark(...)` and confirms it survives as a distinguishable
-extension-function anchor through a same-engine round-trip *and* a genuine
-cross-engine hop: a plan **produced by DataFusion**, containing the marker,
-is **consumed and executed correctly by DuckDB**, matching DataFusion's own
-result exactly. The reverse direction (DuckDB produces, DataFusion consumes)
-deserializes cleanly; execution in that direction wasn't exercised — an
-honest scope boundary, not a claim. One nuance: neither engine's producer
-emits a fully spec-conformant extension URI for the custom marker (both use
-a bare anchor + name), which didn't break either tested engine but is
-unverified for a third `[S2]`.
+**Custom functions survive the trip.** Substrait's extension mechanism
+(`extension_uris` + `simple_extension_declaration`) gives every function a
+plan-local anchor, so a function ddx has claimed the name of, like
+`ddx_stop_gradient`, is found in the plan wherever it sits.
+`spikes/substrait_ad_marker_spike.py` checks this with a custom identity
+function (it tried `ddx_contract_mark`, from an earlier draft that tagged every
+contraction). The function survives a same-engine round-trip *and* a genuine
+cross-engine hop: a plan **produced by DataFusion** is **consumed and executed
+correctly by DuckDB**, matching DataFusion's own result exactly. The reverse
+direction (DuckDB produces, DataFusion consumes) deserializes cleanly;
+execution in that direction wasn't exercised — an honest scope boundary, not a
+claim. Neither engine's producer emits a fully spec-conformant extension URI
+for a custom function (both use a bare anchor + name), which didn't break
+either tested engine but is unverified for a third `[S2]`, and is why ddx
+matches functions by name (`S9`).
 
 **A recurring cost of this choice, found once already and worth budgeting
 for.** v2 is now bounded by whatever relation vocabulary Substrait itself,
 and each engine's producer/consumer, actually implement — the same
 coverage-gatekeeper pattern v1 lives with for `sqlparser`'s dialect coverage,
-recurring one layer up. §4.3's Route rule found a concrete instance: DuckDB's
+recurring one layer up. §4.3's rank-select found a concrete instance: DuckDB's
 own optimizer silently mangles a specific idiom before Substrait export. The
 resolution there (spike each rule's forward idiom against both engines
 before trusting it, verify a workaround rather than wait for an upstream
@@ -722,176 +718,266 @@ for the elementwise rule, and no `datafusion` or `duckdb`. `substrait` is pinned
 exactly to the version `datafusion-substrait` uses, for the reason §6 gives for
 `sqlparser`.
 
-### 4.3 The five transpose rules
+### 4.3 One transpose rule per relational primitive
 
-Each backward step ddx-core emits is **plain, unmarked** Substrait — ddx only
-needs markers to recognize the *user's* input, never to tag its own output
-(unless a second round of differentiation is wanted over an already-emitted
-backward query — open, §4.6).
+JAX differentiates a function by giving each primitive a JVP or transpose
+rule and composing them. A query is a composition of relational primitives,
+and v2 does the same:
 
-**Contraction.** Forward, as the user writes it:
-```sql
-SELECT a.{batch...}, b.{out...}, SUM(ddx_contract_mark(a.val * b.val)) AS val
-FROM {a} a JOIN {b} b ON a.j = b.j
-GROUP BY a.{batch...}, b.{out...}
-```
-ddx recognizes the marker inside an `AggregateRel`'s measure and reads the
-contracted dim and surviving dims directly off the enclosing `JoinRel`
-condition and `GROUP BY` — no separate shape argument, since the plan the
-user wrote already contains it. Transpose: given cotangent `C̄`, `Ā = Σ_out
-C̄·B` and `B̄ = Σ_batch A·C̄` — both themselves contractions, so the rule's own
-backward pass never needs a sixth primitive. Verified against `nn.py`'s
-`g2`/`g1`/`g0` and `relational_ad_spike.py`.
+| Primitive | SQL | Transpose |
+|---|---|---|
+| **map** | a projected expression `y = f(x₁, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row, the partials from `ddx-core`; for `CASE`, `greatest` and `least`, the derivative of the branch the row takes |
+| **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
+| **broadcast** | a join | sum the cotangent back over the rows each input row was copied to |
+| **reduce** | grouped `SUM` | broadcast the group's cotangent to every row summed |
+| | `AVG` | the same, divided by the group's count |
+| | `MAX`, `MIN` | the group's cotangent to the rows attaining it, shared evenly at a tie |
+| | `COUNT` | nothing: it does not change when its argument does |
 
-**Elementwise.** No marker at all — any projection expression not wrapped in
-one of the other markers is, by default, an elementwise map, and its local
-derivative is one call into `ddx-core`'s existing v1 `differentiate` on the
-same underlying expression type. Transpose: `X̄ = Ȳ · f'(X)`. This is the
-literal seam between v1 and v2 — nothing new is built here.
+**Map is the seam between v1 and v2.** A projected column is a scalar function
+of other columns of the same row, and its local derivatives are one call into
+`ddx-core`'s v1 `differentiate` per input column. Nothing new is built here.
 
-**Reduce, with broadcast as its transpose.** Forward:
-`SUM(ddx_reduce_mark(val)) GROUP BY {surviving dims}` — distinguished from
-Contraction by the absence of an enclosing join feeding the aggregate.
-Transpose: a broadcast join, fanning the cotangent back out to every row
-that was summed. Mean is deliberately *not* a separate variant: `nn.py`
-always divides by `N` as a separate elementwise step after a plain `SUM`,
-and the design follows that pattern rather than threading a global `N`
-through the transpose rule.
+**A contraction is not a primitive.** `SUM(a.val * b.val) … GROUP BY` over a
+join is broadcast, map and reduce, and composing their transposes gives the
+familiar rule, `Ā = Σ_out C̄·B` and `B̄ = Σ_batch A·C̄`, both contractions
+themselves. Verified against `nn.py`'s `g2`/`g1`/`g0` and
+`relational_ad_spike.py`. The physical fused-contraction operator (§4.1) is
+where a contraction becomes a unit again, for speed, not for the math.
 
-**Route** (argmax/argmin — needed for max-pooling; not yet used for a
-gradient in the prototype, only for reporting accuracy). Forward:
+**Mean is a reduce rule, not a separate division.** `AVG(x)` is `SUM(x)` over
+the group's count, and its transpose is too; nn.py's `-AVG(ln p)` loss
+differentiates as written.
+
+**Argmax, two ways.** `MAX`/`MIN` as an aggregate routes the cotangent to the
+rows that attain the extreme and shares it evenly at an exact tie, which is
+`jax.grad(jnp.max)`'s own convention, so it agrees with JAX everywhere. The
+extreme and the count of rows attaining it are windows over the recomputed
+rows themselves (`MAX(x) OVER (PARTITION BY` the group's keys`)`), never a
+comparison with the saved value: a recomputation need not match the forward
+pass to the last bit, and a saved maximum no recomputed row equals would send
+no gradient at all (`S12`). For the same reason, where the argument reads the
+output of an aggregate that rounds (a saved aggregate, or constant data or a
+scalar subquery computed with a sum or average, not a maximum or count), a
+row within 8 ulps of the extreme attains it: two groups that tie in exact
+arithmetic can round apart differently from run to run. Any other argument,
+a table's values included whether or not the table is differentiated,
+compares exactly, so MAX(1, 1 + 2 ulps) has gradient
+(0, 1), as `jax.grad` gives (`S13`). The
+other idiom, nn.py's, ranks and filters:
 ```sql
 WITH ranked AS (
-  SELECT {group_dims}, {route_dim}, ddx_route_mark(val) AS val,
-         ROW_NUMBER() OVER (PARTITION BY {group_dims} ORDER BY val DESC) AS rk
+  SELECT {group_dims}, {route_dim}, val,
+         ROW_NUMBER() OVER (PARTITION BY {group_dims} ORDER BY val DESC, {route_dim}) AS rk
   FROM {input}
 )
 SELECT {group_dims}, {route_dim}, val FROM ranked WHERE rk = 1
 ```
-Transpose: a scatter — cotangent flows only to the winning row, zero
-elsewhere. Verified two ways, both closed by spike:
-- *Math*, `spikes/route_ad_spike.py`: machine-exact (0.00e+00) against
-  `jax.grad` for a max-pool-style layer, away from ties. At an exact tie the
-  conventions genuinely differ — this rule's deterministic first-index
-  tiebreak (matching SQL's own `ROW_NUMBER()` ordering) routes the whole
-  cotangent to the first winner, while `jax.grad(jnp.max)` splits it evenly
-  across every tied entry. Both are standard, defensible conventions; they
-  are not the same one, and the rule pins its own rather than claiming JAX
-  agreement at ties.
-- *Substrait feasibility*, `spikes/duckdb_substrait_window_bug.py`: a plain
-  window function as an output column round-trips correctly through DuckDB.
-  The *full* top-1-per-group idiom above round-trips **silently wrong** — no
-  exception, but `from_substrait` returns every row instead of the filtered
-  top-1 rows — because DuckDB's own optimizer rewrites the idiom into an
-  `arg_max`-join before Substrait export, and that rewritten form doesn't
-  survive the round-trip. This reproduces with no ddx marker involved at
-  all — a pre-existing DuckDB bug. DataFusion round-trips the identical
-  idiom correctly, isolating this as DuckDB-specific, not a general gap in
-  Substrait's window-relation support. A verified two-step workaround —
-  round-trip only the window-column computation through Substrait, then
-  apply the `rk = 1` filter as a second, plain, engine-native SQL statement
-  ddx authors directly — produces the correct result on DuckDB with no need
-  to wait on an upstream fix `[S3]`/`[S4]`.
+That is select, and needs no rule of its own: only the kept row carries the
+cotangent back. The rank itself has no derivative, and gradient reaching it is
+refused. At a tie the query has picked one winner, so the whole cotangent goes
+to it (the convention `spikes/route_ad_spike.py` pins, which differs from JAX's
+split). The ranking is recomputed in the backward pass, so its `ORDER BY`
+should break ties deterministically. Both idioms are checked, math against
+`jax.grad` away from ties in `spikes/route_ad_spike.py` and the Substrait side
+in `spikes/duckdb_substrait_window_bug.py`: a plain window column round-trips
+through DuckDB, but the full top-1-per-group idiom round-trips **silently
+wrong** there — `from_substrait` returns every row instead of the top-1 rows —
+because DuckDB's optimizer rewrites the idiom into an `arg_max`-join before
+export. This reproduces with no ddx function involved; DataFusion round-trips
+the identical idiom correctly. A verified two-step workaround (round-trip only
+the window-column computation, then apply the `rk = 1` filter as plain
+engine-native SQL) produces the correct result on DuckDB `[S3]`/`[S4]`.
 
-**StopGradient.** An explicit marker, `ddx_stop_gradient(x)`, cutting
-cotangent flow past a subexpression. Needed for one specific, easy-to-miss
-case: `nn.py`'s softmax subtracts a per-row max purely for numerical
-stability before `exp`, which is mathematically a no-op for the gradient
-(the standard log-sum-exp identity), but a naive rule walk would — correctly,
-per Route's own rule — try to route gradient into that max, which is wrong.
-The stop-gradient marker prevents it explicitly rather than relying on the
-walker to special-case numerical-stability shifts.
+**Stop-gradient** is the one thing a query tells ddx. `ddx_stop_gradient(x)`
+is `x` at runtime and a constant to differentiation, as `lax.stop_gradient` is
+in JAX. It is for when a stop is actually meant. nn.py's softmax subtracts a
+per-row max before `exp`; with the `MAX` rule that shift's contribution
+cancels exactly, so the loss differentiates correctly without it, and
+stopping it just skips work.
 
-### 4.4 The backward-program emitter and the tape
+Each backward step ddx emits is **plain** Substrait, with no ddx functions in
+it (differentiating an emitted backward program a second time is open, §4.6).
+
+### 4.4 `grad`, `vjp` and the tape
 
 ```rust
-pub fn vjp_query(
-    &self,
-    plan: &Plan,              // a substrait::proto::Plan, already containing
-                               // ddx's marker functions — recognized, not built
-    wrt: &[RelRef],            // which Source relations to differentiate w.r.t.
-) -> Result<BackwardProgram, DiffError>;
+pub fn grad(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
+pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
+
+pub struct ColumnRef { pub table: String, pub column: String }
+
+pub struct BackwardProgram {
+    pub forward_steps: Vec<Step>,   // the saved aggregates, then the value
+    pub value: String,              // the step holding the query's own result
+    pub cotangent: Vec<String>,     // vjp: the columns of the cotangent it reads
+    pub backward_steps: Vec<Step>,  // cotangents, then one gradient per table
+    pub gradients: Vec<Gradient>,   // which step holds each table's gradient
+}
+pub struct Step { pub name: String, pub plan: Plan }
 ```
 
-`vjp_query` first walks the plan once to locate every ddx marker anchor and
-build a lightweight annotated-node index (which aggregates are contractions
-vs. reduces, where the stop-gradient edges are) — this index is purely an
-implementation detail of the walker over the real Substrait plan, the same
-relationship v1's `ColRef` has to `sqlparser::ast::Expr`, not a competing IR.
-It then walks in reverse topological order, applying each node's transpose
-rule and accumulating cotangents.
+As in JAX, `vjp` pulls a cotangent of the output back to the inputs, and
+`grad` is `vjp` of a loss seeded with 1. `grad` requires one row and one
+column, as `jax.grad` requires a scalar; anything else is an error that points
+at `vjp`. `vjp` reads the cotangent from a table the caller supplies
+(`__ddx_cotangent`), keyed like the output.
+
+**Dims and values.** A gradient has the shape of what it is taken with
+respect to, and ddx's version of shape is the XQL model (§1). A relation's
+columns are **dims**, coordinates that identify a row and are never
+differentiated, or **values**, the numbers at a coordinate. A tangent or
+cotangent has its primal's dims and values, so a gradient comes back shaped
+like its table, as `jax.grad` returns a pytree shaped like its argument. For a
+table the query reads, the `wrt` columns are its values and the others its
+dims. For a relation the query computes, the plan says: a `GROUP BY` key is a
+dim, an aggregate a value, and a join's dims are both sides'. A table the loss
+reads but no `wrt` names is constant data.
+
+**Saved and recomputed.** Like any AD system, ddx chooses which forward values
+to save and which to recompute (JAX exposes the same choice as `jax.checkpoint`
+policies). It saves the output of every aggregate that depends on a `wrt`
+column, once, as `__ddx_saved_{n}`: no saved relation is bigger than a layer's
+output. The row-local work between two saved aggregates is a **region**, and
+is recomputed inside each backward step, never written out, so a contraction's
+`N × D × H` join never is. A region is rebuilt with the same relations in the
+same order, so it produces the same rows, but with no projection dropping a
+column. "The same rows" is an assumption about the engine, not a property of
+the plan, and it is enforced where ddx knows it can fail. A window function
+recomputed in a region must rank totally (its `PARTITION BY` and `ORDER BY`
+include every dim of the rows it ranks), because SQL leaves ties unordered and
+a parallel engine may break them differently on each run; so must a `LIMIT`'s
+`ORDER BY`, and a ranking on a semi-join's right side, which decides which
+rows are kept. A ranking or `LIMIT` inside constant data joined into a region,
+where ddx has no dims to check, and a volatile function (`random()`, `now()`)
+anywhere a region recomputes, are refused. Each refusal is made only if
+gradient reaches the region. §4.6 lists the rest. Every intermediate value is then a column, defined as an expression
+over columns to its left, and reverse column order is a reverse topological
+order for the chain rule. This index is an implementation detail over the
+real Substrait plan, the same relationship v1's `ColRef` has to
+`sqlparser::ast::Expr`, not a competing IR.
+
+Because Substrait plans are trees, a CTE read twice arrives as two identical
+subtrees; attention's plan holds eighteen aggregates for the eight the query
+writes. Identical aggregates are saved once and share one cotangent.
+
+**One saved aggregate's backward step.** Saved aggregates are processed parents
+first, starting from the output. For each: join the region beneath it to its
+cotangent on the grouping keys (the reduce rule's broadcast); walk the region's
+columns right to left applying the map rule, each column's cotangent appended
+as a new column rather than inlined; and at each input, sum the cotangent by
+the input's dims (the broadcast rule's transpose). An aggregate skips a row
+whose argument is NULL, so that row's seed is NULL rather than the group's
+cotangent, and nothing in it gets gradient. The result is the input's
+contribution: a saved aggregate's cotangent, `__ddx_cotangent_{n}`, or a part
+of a table's gradient.
 
 **Fan-in accumulation is real, not hypothetical.** When a relation feeds more
 than one consumer — attention's `X` feeding `Wq`, `Wk`, and `Wv` — each
-consumer's contribution is summed via an ordinary elementwise-add step,
-verified in `attention_ad_spike.py` (`Xbar = Xq + Xk + Xv`, matching
-`jax.grad` to 1e-16). This is why the walk must process a node only once
-every one of its consumers has contributed — the standard reverse-mode-AD
-scheduling discipline, applied to a relational-node graph instead of a
-tensor-op graph.
+consumer's contribution is summed, verified in `attention_ad_spike.py` (`Xbar =
+Xq + Xk + Xv`, matching `jax.grad` to 1e-16). Relationally the sum is a `UNION
+ALL` of the contributions, then `GROUP BY` the dims and `SUM`, never a join:
+cotangents are sparse, and an inner join of nn.py's three per-layer
+contributions to `weight` matches no rows at all, silently returning an empty
+gradient.
 
-**The tape** is a sequence of named, materialized relations —
-`__ddx_fwd_{node_id}` / `__ddx_bwd_{node_id}` — exactly matching the
-projection-boundary contract in §3.5, which already forces pre-activations
-to exist as real columns, and `nn.py`'s own `.cache()`/`register_table`
-pattern, just auto-named instead of hand-named. Each backward step is a
-plain, unmarked Substrait `Plan`, handed to *the engine's own* Substrait
-consumer (`from_substrait`, `datafusion-substrait`) rather than converted to
-SQL text by `ddx-core` itself — one less thing for ddx to get right per
-engine, reusing machinery both target engines already ship. Materialization
-wraps that consumer call in ordinary SQL/DataFrame code, e.g. for DuckDB:
+**Gradients** are one step per table: every row of the table, its dims, and
+each `wrt` value's gradient under the column's own name and in its type. Two
+conventions are pinned, whatever the loss: `0` where no gradient reached a
+row, and NULL where the row's value is NULL, as v1 pins it (#60). A gradient
+shaped like its table makes an SGD step a plain join.
+
+**Dims are checked, not assumed.** A gradient keyed by dims is only right if
+the dims identify rows, which a plan cannot show. So each program carries a
+check per `wrt` table, a plan that must return no rows (the dim tuples that
+repeat), and an adapter runs the checks before the steps and refuses the
+program if one returns a row. Without it, rows sharing dims got their summed
+gradient, and an SGD join then multiplied rows.
+
+**Every table a program materializes is named under a prefix fresh to that
+program** (`__ddx_{id}_`), so two programs on one engine never read or
+replace each other's tables, and a user's table is never replaced. An adapter
+drops a program's intermediate tables (the saved aggregates and cotangents)
+once it has run, and hands back the value and the gradients (`S11`).
+
+**Each step is a plain Substrait `Plan`,** handed to the engine's own consumer
+(`from_substrait`, `datafusion-substrait`) rather than converted to SQL text by
+ddx, and materialized under its name before the next step runs. For DuckDB,
+for example:
 ```sql
-CREATE TEMP TABLE __ddx_bwd_7 AS SELECT * FROM from_substrait($1)
+CREATE TEMP TABLE __ddx_3f2a_cotangent_7 AS SELECT * FROM from_substrait($1)
 ```
-
-```rust
-pub struct BackwardProgram {
-    pub forward_steps: Vec<(Ident, Plan)>,
-    pub backward_steps: Vec<(Ident, Plan)>,
-    pub gradients: HashMap<RelRef, Ident>,
-}
-```
-
-A loss is not a special type — it's simply the plan's terminal
-(no-further-consumer) relation, ordinarily a `ddx_reduce_mark`-tagged `SUM`
-over an elementwise residual or cross-entropy term, seeded with cotangent
-`1.0`.
+A step that reads an earlier one is emitted **unbound**: its read names the
+columns and leaves their types out. ddx does not know them without
+re-implementing each engine's typing rules, and by the time the engine runs
+the step, the table it reads exists. The adapter fills the types in from it
+(`ddx_ad::emit::bind_reads`), so they are the engine's own by construction
+(`S7`).
 
 ### 4.5 Worked example
 
-The literal SQL a user writes for `nn.py`'s layer-2 weight gradient, changed
-by exactly one thing from the hand-written original — the marker:
+nn.py writes its forward pass as a chain of queries, then its backward pass
+by hand: `delta2`, then `g2`, `gb2`, `delta1`, and so on, a query per error
+and per gradient. With v2 the forward pass is one query, unchanged, and the
+backward pass is gone:
 
 ```sql
-SELECT a.out AS inp, d.out AS out, SUM(ddx_contract_mark(a.val * d.val)) AS val
-FROM (SELECT sample, out, val FROM fwd1) a
-JOIN delta2 d ON a.sample = d.sample
-GROUP BY a.out, d.out
+WITH c0 AS (
+  SELECT a.sample, w.out, SUM(a.val * w.val) AS z
+  FROM (SELECT sample, height * 28 + width AS inp, images AS val FROM pixels) a
+  JOIN weight w ON a.inp = w.inp AND w.layer = 0
+  GROUP BY a.sample, w.out),
+     fwd0 AS (SELECT c0.sample, c0.out, tanh(c0.z + b.val) AS val
+              FROM c0 JOIN bias b ON c0.out = b.out AND b.layer = 0),
+     ...                                          -- layers 1 and 2 alike
+     m AS (SELECT sample, MAX(z) AS m FROM logits GROUP BY sample),
+     e AS (SELECT logits.sample, logits.out, exp(logits.z - m.m) AS e
+           FROM logits JOIN m ON logits.sample = m.sample),
+     s AS (SELECT sample, SUM(e) AS s FROM e GROUP BY sample)
+SELECT -AVG(ln(e.e / s.s)) AS loss
+FROM e JOIN s ON e.sample = s.sample JOIN labels y ON y.sample = e.sample
+WHERE e.out = y.labels
 ```
 
-This shape is spike-confirmed to round-trip through both engines' Substrait
-producers/consumers and execute to the numerically correct contraction. The
-concrete, honest migration cost: existing hand-written SQL like `nn.py`'s
-needs exactly one function-name change per contraction (`SUM(x)` →
-`SUM(ddx_contract_mark(x))`) to opt into v2's automatic differentiation — a
-small, mechanical, per-query cost worth stating plainly rather than implying
-v2 is a drop-in replacement for hand-written backprop.
+`grad` of that loss with respect to `weight.val` and `bias.val` equals nn.py's
+hand-written `g*` and `gb*` to 1e-12 (M4). There is no migration cost: the
+query is the one nn.py already runs to report its loss.
 
 ### 4.6 What's verified, what's still open
 
 **Verified, machine-exact against `jax.grad`:** the MLP's all six parameter
 gradients; attention's four (including the causal mask); Route's math away
-from ties. **Verified cross-engine:** the marker-tagging mechanism itself.
+from ties. **Verified cross-engine:** a ddx-claimed function surviving the
+Substrait round-trip.
+
+**Built (M3):** `grad`, `vjp` and the rules, run on DataFusion, with every
+gradient entry checked against a finite difference of the query computed by
+DataFusion: a matrix product, nn.py's two-layer network in one query (both
+layers' weights in one table), the same network with respect to its input,
+nn.py's softmax cross-entropy as nn.py writes it (which also equals
+`(softmax - onehot)/N` to 1e-12), single-head attention with respect to all
+four inputs, `MAX`/`MIN` pooling and a rank filter, with both tie conventions
+pinned. No query carries a label.
 **Found and closed, not left as a risk:** the DuckDB Substrait window-idiom
 bug (workaround verified, no upstream-fix dependency).
 
 **Genuinely open:**
+- Recomputation's other engine assumptions. A region must produce the same
+  rows forward and backward. Rankings and `LIMIT`s are checked for a total
+  order and volatile functions are refused (§4.4), but an engine whose plain
+  scans are not repeatable would break the assumption too, and so can
+  floating-point jitter at a near-tie (a filter or ranking on a value that a
+  multi-partition `SUM` computed, recomputed a bit differently). The
+  alternative to checking is saving: materialize a region instead of
+  recomputing it, which the save-or-recompute policy (`S6`) could allow per
+  region, and would let ddx accept the rankings over constant data it now
+  refuses.
 - The physical fused-contraction operator for BLAS-class performance on
   dense data (§4.1) — not yet spiked.
 - Higher-order AD over an already-emitted backward query (differentiating
-  ddx's own generated plan a second time) — the backward output is currently
-  unmarked by design (§4.3); whether it needs markers for this case is
-  undecided.
+  ddx's own generated plan a second time) — the backward output reads saved
+  relations by name (§4.4), so differentiating it again would need a way to
+  differentiate through such a read; undecided.
 - The DuckDB Substrait extension is community-maintained, not core, as of
   1.5.4 — an ongoing-maintenance signal to watch, separate from the
   correctness bug already found and worked around.
@@ -965,9 +1051,9 @@ ddx/                               (repo; crates published under the ddx-* names
 ├── crates/
 │   ├── ddx-core/                   # v1 engine — differentiate sqlparser::ast::Expr
 │   │                               #   + rewrite_sql; dep: sqlparser only
-│   ├── ddx-ad/                      # v2 engine — vjp_query over substrait::proto
+│   ├── ddx-ad/                      # v2 engine — grad/vjp over substrait::proto
 │   │                               #   deps: substrait, ddx-core
-│   ├── ddx-datafusion/             # markers + AnalyzerRule (Path B) + ddx_sql helper
+│   ├── ddx-datafusion/             # grad/jvp UDFs + AnalyzerRule (Path B) + ddx_sql + v2
 │   │                               #   deps: ddx-core, ddx-ad, datafusion
 │   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` + v2 table fn
 ├── python/
@@ -1053,21 +1139,26 @@ breadth, not de-risking.
   harness pulled forward from M6, since the exit gate depends on it. *Exit:*
   xarray-sql green on `ddx-core` (vs. JAX, no regressions), and bare `grad()`
   runs end-to-end through the `AnalyzerRule` in a native DataFusion test.
-- **M3 — Relational reverse-mode AD, phase 1: the rules + Substrait
-  markers.** Register the extension-function markers
-  (`ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark`,
-  `ddx_stop_gradient`) and implement the five transpose rules. Clean up
+- **M3 — Relational reverse-mode AD, phase 1: the rules.** (Planned as "the
+  rules + Substrait markers": four extension-function markers,
+  `ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark` and
+  `ddx_stop_gradient`, and five transpose rules. Built instead as one rule per
+  relational primitive, with only `ddx_stop_gradient` kept; see `S10`.)
+  **Built:** `ddx-ad`'s `grad`/`vjp` and the rules, checked on DataFusion
+  against finite differences for the MLP, attention and max-pool fixtures
+  (§4.6). Clean up
   `nn.py` into the canonical relational-backprop example and regression
   fixture; `spikes/` are the acceptance tests. *Exit:* the rules reproduce
   `jax.grad` on the MLP, attention, and Route fixtures (already machine-exact
-  by hand), and markers round-trip through both engines' Substrait
-  implementations (already verified).
-- **M4 — `vjp` over queries, phase 2: the ML headline.** `vjp_query(plan,
-  wrt)` takes a marker-tagged Substrait `Plan` and emits the backward
-  program — a sequence of named, materializable `Plan`s (the tape). Stays
+  by hand), and a ddx-claimed function round-trips through both engines'
+  Substrait implementations (already verified).
+- **M4 — `grad` over queries, phase 2: the ML headline.** `grad(plan, wrt)`
+  and `vjp(plan, wrt)` take a Substrait `Plan` and emit the backward
+  program — a sequence of named, materializable `Plan`s (the tape) — exposed
+  in the engines' own terms, down to `grad(loss, table.column)` in SQL. Stays
   pure-logical; performance is a separate, physical concern (the
   fused-contraction operator, still to spike). Runs first on DataFusion.
-  *Exit:* train the `nn.py` MLP with gradients *emitted by* `ddx.vjp`, not
+  *Exit:* train the `nn.py` MLP with gradients *emitted by* `ddx`'s `grad`, not
   hand-written, matching the demo and JAX.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
@@ -1434,6 +1525,97 @@ both engines before trusting a rule, and prefer a verified workaround over
 waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
+
+### Building v2 (`S6`–`S13`)
+
+**S6 — The tape is cut at aggregates, and nothing between them is
+materialized.** Materializing every relation's output, or every relation's
+cotangent, would write a contraction's whole join, `N × D × H` rows for
+nn.py's first layer. Saving only aggregate outputs keeps each saved relation
+no larger than a layer's output. The row-local work between two saved
+aggregates is rebuilt inside each backward step, with every intermediate value
+kept as a column so the chain rule can read it. → §4.4.
+
+**S7 — Reads of earlier steps are bound late rather than typed by ddx.** A
+Substrait read must state its column types. DataFusion's producer does not
+fill in function output types, so ddx would have to derive them, which means
+re-implementing each engine's typing rules and turning every mismatch into a
+consumer error. The engine runs steps in order, so each table a step reads
+exists before the step is consumed; the adapter binds the read's types from
+it. → §4.4.
+
+**S8 — Relations are dims and values; `wrt` names values.** The rules need to
+know which columns identify a row. The XQL model already says: dims do, and a
+variable is a value at a coordinate. Naming the differentiated columns
+therefore names the dims too, and a cotangent or gradient has its primal's
+dims and values, the relational version of "a gradient has its argument's
+shape". Because a plan cannot show that dims identify rows, each program
+checks it at run time before it runs, rather than trust it. → §4.4.
+
+**S9 — Functions are recognized by name.** DataFusion 54 declares every
+function, its own built-ins included, with a bare name and
+`extension_urn_reference = u32::MAX`, so there is no URN to match. Names are
+case-folded and a `:signature` suffix is ignored, as the spec's compound names
+would have it. This extends `S2`'s observation to the producer side. → §4.2.
+
+**S10 — The markers were dropped; the rules are per primitive.** The design
+had users tag every contraction (`ddx_contract_mark`), reduction
+(`ddx_reduce_mark`) and argmax (`ddx_route_mark`), on the reasoning of
+principle 3: a misclassified operation is a silently wrong gradient. Building
+the rules showed nothing was being classified. A `SUM` has the same transpose
+whether one calls it a contraction or a reduction; an argmax by rank filter is
+the select rule; and `MAX` has a rule of its own. The first implementation
+kept the tags as required checks, which made users write annotations that
+changed no number, and made the SQL surface a place no JAX user would
+recognize. They were removed after review. What stays is the one annotation
+that does change the gradient, `ddx_stop_gradient`, which JAX has too.
+Principle 3 is restated accordingly. → §2, §4.3.
+
+**S11 — Each program's tables live under a prefix of their own.** The first
+adapters materialized every step under fixed names (`__ddx_value`,
+`__ddx_saved_0`) in the caller's catalog. An adversarial review showed what
+that costs: a user's table of the same name was replaced, activations stayed
+pinned in memory, and two programs on one context read each other's tables,
+giving a silently zero gradient, or failing with a missing table under
+`tokio::spawn`. Every name now starts with a prefix fresh to its program, and
+an adapter drops the intermediate tables once a run finishes. Running one
+program twice at once still shares its names, so a caller that runs
+concurrently builds a program per task, as `ad::sql` does per call. → §4.4.
+
+**S12 — What the v2 soak found.** A generated-query soak (#89–#93) checked
+gradients against finite differences of the query and against ddx itself,
+and every failure was in how rows are identified, not in a derivative. An
+aggregate that skipped a NULL argument still sent gradient through the rest
+of that row; MAX and MIN compared recomputed values with the saved extreme,
+and a multi-partition `SUM` beneath them made that comparison fail about
+half the time, silently zeroing the gradient; stacked rank filters gave the
+engine two columns of one name; a gradient step's name had capitals the
+engine folded away; and an unanalyzed plan's step declared a type its rows
+did not have. Each is fixed where it arose (the reduce rules' NULL mask and
+windows, window columns renamed in place, lower-case step names, a step's
+table typed by the plan that ran). The soak's mutation test then measures how
+fast it catches each rule broken on purpose. → §4.3, §4.4, §5.
+
+**S13 — What the second round found: size, not calculus.** A forward-mode
+oracle (every relation's tangent computed beside its value, independent of
+the transposes) agreed with reverse mode on all eleven thousand comparisons
+it made. What broke was the size of the plans an engine builds from ddx's.
+DataFusion's Substrait consumer names a computed column by its whole
+expression, and ddx computes each column from earlier ones, so a map layer
+that reads its input twice doubled every name after it (twenty layers
+exhausted 13 GB), and a NULL-skipping fold that nested its running sum did
+the same per reader. One projection per cotangent column also made steps
+hundreds of relations deep, and cloning one overflowed a worker thread's
+stack. The fixes: the DataFusion adapter consumes a step with short column
+names (the names mean nothing to ddx, whose plans refer to columns by
+position); a column's cotangent terms are one flat sum; and cotangents are
+projected in batches, as deep as the chain of columns reading each other.
+datafusion-python's consumer cannot be given short names, so a very deep
+chain is still large from Python. The same round found `grad(…)` in SQL
+counting parentheses inside comments (now found by tokens), a vjp cotangent
+whose keys repeat (now checked, like a wrt table's dims), and that the
+MAX/MIN tie tolerance must apply only to values that can jitter: those
+read from an aggregate that rounds, not a table's, differentiated or not. → §4.4.
 
 ## References
 
