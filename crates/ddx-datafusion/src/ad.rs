@@ -132,6 +132,15 @@ pub fn vjp_plan(
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
 }
 
+/// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for
+/// [`ddx_ad::Options::restrict`]; `None` if it does not plan, and then every
+/// row of the gradient is computed, which is always right.
+async fn restriction_plan(ctx: &SessionContext, table: &str, predicate: &str) -> Option<Plan> {
+    let sql = format!("SELECT * FROM {table} WHERE {predicate}");
+    let lp = ctx.sql(&sql).await.ok()?.into_unoptimized_plan();
+    to_substrait_plan(&lp, &ctx.state()).ok().map(|p| *p)
+}
+
 /// Refuse a plan whose meaning DataFusion's Substrait producer does not
 /// keep, so ddx would differentiate a different query, silently.
 ///
@@ -218,7 +227,18 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
     let result = async {
         for job in planned.jobs() {
-            let program = grad(ctx, &job.query, &job.wrt).await?;
+            // Only the gradient rows the statements read, where they say.
+            let mut options = ddx_ad::Options::new();
+            for (table, predicate) in &job.restrict {
+                if let Some(select) = restriction_plan(ctx, table, predicate).await {
+                    options = options.restrict(table.clone(), select);
+                }
+            }
+            let lp = ctx.sql(&job.query).await?.into_optimized_plan()?;
+            refuse_what_substrait_loses(&lp)?;
+            let program =
+                ddx_ad::grad_with(&*to_substrait_plan(&lp, &ctx.state())?, &job.wrt, &options)
+                    .map_err(to_df_err)?;
             ran.push(program);
             run(ctx, ran.last().expect("just pushed")).await?;
         }
