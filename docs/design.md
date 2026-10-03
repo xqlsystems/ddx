@@ -1075,6 +1075,19 @@ layered:
 - **Real-integration acceptance** — end-to-end gradient descent and a
   recursive-CTE training loop converging to closed-form solutions, inside
   xarray-sql and duckdb-zarr.
+- **v2: generated queries against a finite difference of the query.** The
+  loss is a query the engine can run with no ddx involved, so the independent
+  oracle for a gradient is the query itself, perturbed:
+  `⟨∇L, d⟩ ≈ (L(θ + hd) − L(θ − hd))/2h` along random directions and single
+  entries, screened at kinks (the second difference must shrink like `h²`) and
+  Richardson-extrapolated. `ddx-datafusion/tests/ad_simulation.rs` generates
+  loss queries from the §4.3 primitives and adds metamorphic relations that
+  need no oracle: `∇(cL) = c∇L`, `∇(L·sg(L)) = L∇L`, `grad` = `vjp` seeded
+  with 1, `vjp(R, c)` = `grad(Σ R·c)`, and invariance to CTE inlining, the
+  unoptimized plan, row order, partition count, dim storage type, the `wrt`
+  list, reuse of a program on new values, and concurrent programs. It also
+  checks that `grad(loss, t.col)` in SQL matches the program. It runs nightly
+  beside v1's soak.
 - **v2-specific: spike each rule's forward idiom against both engines'
   actual Substrait implementations before trusting it** — the coverage
   discipline §4.2 commits to, now a standing test-plan item, not a one-time

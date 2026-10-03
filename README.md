@@ -131,6 +131,9 @@ a plausible number. What backs that up:
   between them.
 - **A property suite** over randomly generated expressions, with conditioning
   gates so float noise is not mistaken for a bug, plus a soak that runs nightly.
+  Query-level AD has its own: generated loss queries whose gradients must match
+  a finite difference of the query, and a set of identities that must hold
+  between ddx's own programs.
 - **Pinned conventions** where ddx and JAX differ on purpose rather than one
   being wrong — `abs` at its kink, missing values, domain edges — asserted from
   both sides so a change to either is visible.
