@@ -304,6 +304,17 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         ),
     });
 
+    let mut backward_steps = Vec::new();
+    // The region steps the transposes so far asked for, before anything that
+    // reads their contributions.
+    let drain = |t: &mut Transposer, steps: &mut Vec<Step>| {
+        for (name, rel, names) in t.steps.drain(..) {
+            steps.push(Step {
+                name,
+                plan: plan(rel, names, &t.ext),
+            });
+        }
+    };
     let (cotangent, cotangent_check) = match seed {
         Seed::One => {
             let col = scalar_output(f)?;
@@ -317,9 +328,10 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         }
     };
 
+    drain(&mut t, &mut backward_steps);
+
     // Parents first: every saved aggregate that reads saved aggregate n comes
     // after it in `f.saved`.
-    let mut backward_steps = Vec::new();
     for n in (0..f.saved.len()).rev() {
         let Some(contribs) = t.contributions.remove(&Input::Saved(n)) else {
             continue; // no gradient reaches it
@@ -332,6 +344,7 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
             plan: plan(rel, names.clone(), &t.ext),
         });
         t.saved(n, &cols, read_step(&cotangent_name(&f.namespace, n), names))?;
+        drain(&mut t, &mut backward_steps);
     }
 
     let mut gradients = Vec::new();

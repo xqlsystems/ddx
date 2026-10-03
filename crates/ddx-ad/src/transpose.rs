@@ -66,6 +66,11 @@ pub(crate) struct Transposer<'a> {
     pub ext: Extensions,
     ew: Elementwise<'a>,
     pub contributions: BTreeMap<Input, Vec<Contribution>>,
+    /// Steps the transposes need materialized before the contributions that
+    /// read them: a region's cotangents, when several inputs read them.
+    /// `(name, relation, column names)`, in the order they must run.
+    pub steps: Vec<(String, Rel, Vec<String>)>,
+    region_steps: usize,
 }
 
 impl<'a> Transposer<'a> {
@@ -75,6 +80,8 @@ impl<'a> Transposer<'a> {
             ext: Extensions::new(&f.functions),
             ew: Elementwise::new(ddx, &f.functions),
             contributions: BTreeMap::new(),
+            steps: Vec::new(),
+            region_steps: 0,
         }
     }
 
@@ -404,10 +411,61 @@ impl<'a> Transposer<'a> {
                 pending.keys().collect::<Vec<_>>()
             )));
         }
+        // Each input's contribution sums its cotangents over the region's
+        // rows. With one input the region is read once; with several, each
+        // would rebuild it, and a region that reads one relation twice (a CTE
+        // read twice) has twice the inputs at each level, so its backward
+        // step grew as the square of the forward query. So the columns the
+        // contributions read, each input's dims and cotangents, are
+        // materialized once, and every contribution reads them.
+        if at_inputs.len() > 1 {
+            let mut needed = std::collections::BTreeSet::new();
+            for (&slot, cols) in &at_inputs {
+                let offset = region.slots[slot].offset.unwrap_or(0);
+                needed.extend(self.slot_dims(region, slot)?.iter().map(|d| offset + d));
+                needed.extend(cols.values().copied());
+            }
+            let needed: Vec<usize> = needed.into_iter().collect();
+            let name = format!("{}region_{}", self.f.namespace, self.steps_made());
+            let names: Vec<String> = (0..needed.len()).map(|i| format!("c{i}")).collect();
+            self.steps.push((
+                name.clone(),
+                crate::emit::select(rel, needed.clone()),
+                names.clone(),
+            ));
+            let read = crate::emit::read_step(&name, names);
+            let at = |c: usize| {
+                needed
+                    .binary_search(&c)
+                    .expect("a column materialized above")
+            };
+            for (slot, cols) in at_inputs {
+                self.broadcast(region, &read, slot, cols, &at)?;
+            }
+            return Ok(());
+        }
         for (slot, cols) in at_inputs {
-            self.broadcast(region, &rel, slot, cols)?;
+            self.broadcast(region, &rel, slot, cols, &|c| c)?;
         }
         Ok(())
+    }
+
+    /// How many region steps this program has made so far, counting those
+    /// already handed to the program.
+    fn steps_made(&mut self) -> usize {
+        self.region_steps += 1;
+        self.region_steps - 1
+    }
+
+    /// The dims of input `slot` of `region`, as columns of the input.
+    fn slot_dims(&self, region: &Region, slot: usize) -> Result<Vec<usize>> {
+        match region.slots[slot].input {
+            Input::Table(t) => Ok(self.f.tables[t].dims.clone()),
+            Input::Saved(n) => Ok(self.f.saved[n].dims()),
+            Input::Const => Err(AdError::Internal(
+                "gradient reached a constant input".into(),
+            )),
+        }
     }
 
     /// A window function in a region is recomputed in the backward pass, and
@@ -525,29 +583,25 @@ impl<'a> Transposer<'a> {
     /// The broadcast rule, at an input: a join copied each input row to every
     /// row it matched, so the input's cotangent is the sum over those rows,
     /// grouped by the input's dims.
+    /// `at` maps a column of the region (with its cotangents) to its column
+    /// in `rel`, which is the region itself or the columns of it a region
+    /// step materialized.
     fn broadcast(
         &mut self,
         region: &Region,
         rel: &Rel,
         slot: usize,
         cols: BTreeMap<usize, usize>,
+        at: &dyn Fn(usize) -> usize,
     ) -> Result<()> {
         let s = &region.slots[slot];
         let offset = s.offset.ok_or_else(|| {
             AdError::Internal("gradient reached an input that is not part of the output".into())
         })?;
-        let dims = match s.input {
-            Input::Table(t) => self.f.tables[t].dims.clone(),
-            Input::Saved(n) => self.f.saved[n].dims(),
-            Input::Const => {
-                return Err(AdError::Internal(
-                    "gradient reached a constant input".into(),
-                ))
-            }
-        };
+        let dims = self.slot_dims(region, slot)?;
         let sum = self.ext.anchor("sum");
-        let groupings = dims.iter().map(|d| field(offset + d)).collect();
-        let measures = cols.values().map(|&at| (sum, vec![field(at)])).collect();
+        let groupings = dims.iter().map(|d| field(at(offset + d))).collect();
+        let measures = cols.values().map(|&c| (sum, vec![field(at(c))])).collect();
         self.contributions
             .entry(s.input)
             .or_default()
