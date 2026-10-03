@@ -94,7 +94,7 @@ pub use program::{
 };
 pub use relation::ColumnRef;
 pub use run::{run, Action, Backend, RunError, Runner};
-pub use sql::{GradCall, GradCalls, Job, Loss, Statements};
+pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use {

@@ -4,31 +4,43 @@
 
 //! `grad` in SQL: a query's gradient as a relation in another query.
 //!
+//! `grad(f, table.column, …)` in a `FROM` clause is the gradient of the
+//! number the CTE `f` computes (its **objective**: one row, one column), with
+//! respect to the named columns of one table. It is a relation shaped like
+//! that table: the table's dims and, under the columns' own names, their
+//! gradients. The objective is any query that returns one number: an ML
+//! loss, a log-likelihood, a portfolio's risk, or a physical system's energy,
+//! whose gradient is the force on each body with its sign flipped:
+//!
 //! ```sql
-//! WITH loss AS (SELECT SUM(power(x.v * w.val - y.v, 2)) AS l
-//!               FROM x JOIN w ON x.i = w.i JOIN y ON x.s = y.s)
-//! SELECT w.i, w.val - 0.1 * g.val AS val
-//! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+//! -- Masses at heights mass(i, y), joined by springs spring(lo, hi, k, rest),
+//! -- under their weights weight(i, w).
+//! WITH springs AS (
+//!        SELECT SUM(0.5 * s.k * power(b.y - a.y - s.rest, 2)) AS e
+//!        FROM spring s JOIN mass a ON s.lo = a.i JOIN mass b ON s.hi = b.i),
+//!      gravity AS (SELECT SUM(w.w * m.y) AS e FROM mass m JOIN weight w ON m.i = w.i),
+//!      energy AS (SELECT springs.e + gravity.e AS e FROM springs CROSS JOIN gravity)
+//! SELECT m.i, m.y - 0.01 * g.y AS y            -- one step towards equilibrium
+//! FROM mass m JOIN grad(energy, mass.y) g ON m.i = g.i
 //! ```
 //!
-//! `grad(loss, table.column, …)` in a `FROM` clause is the gradient of the
-//! loss the CTE `loss` computes, with respect to the named columns of one
-//! table. It is a relation shaped like that table: the table's dims and, under
-//! the columns' own names, their gradients. That is `params - lr *
-//! grad(loss)(params)`, JAX's shape of an update, written as a join.
+//! An SGD step is the same join: `params - lr * grad(loss)(params)`, JAX's
+//! shape of an update. The objective must be one number because `grad` is
+//! the gradient of a scalar function; for a query with any output, the
+//! vector-Jacobian product is [`crate::vjp`].
 //!
 //! No engine could run that call: a table function receives values, and
-//! `loss` is a query. So, like v1's `grad` (design.md §3.3, Path A), it is
+//! `f` is a query. So, like v1's `grad` (design.md §3.3, Path A), it is
 //! rewritten before the engine sees the statement. [`GradCalls::find`] finds
-//! the calls and the loss queries they need; the engine adapter runs each
-//! loss's [`crate::grad`] program; [`GradCalls::rewrite`] splices a relation
+//! the calls and the objectives they need; the engine adapter runs each
+//! objective's [`crate::grad`] program; [`GradCalls::rewrite`] splices a relation
 //! holding each gradient in place of each call, by source span, leaving the
 //! rest of the statement byte-identical.
 //!
 //! An adapter runs several statements at once with [`Statements`]: it plans
-//! one job per distinct loss query, differentiated with respect to every
+//! one job per distinct objective, differentiated with respect to every
 //! column any statement asks about, so statements that update different
-//! tables from one loss pay for one backward pass. The adapter runs each
+//! tables from one objective pay for one backward pass. The adapter runs each
 //! job's program and hands the programs back to [`Statements::rewrite`]. Only
 //! those two calls need the engine.
 //!
@@ -55,24 +67,25 @@ use crate::error::{AdError, Result};
 use crate::program::BackwardProgram;
 use crate::relation::{table_matches, ColumnRef};
 
-/// A loss CTE some `grad` call differentiates.
+/// The CTE some `grad` call differentiates: a query computing one number
+/// (a loss, a likelihood, an energy, …).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Loss {
+pub struct Objective {
     /// The CTE's name.
     pub name: String,
-    /// A query computing just the loss: the statement's CTEs up to and
+    /// A query computing just the objective: the statement's CTEs up to and
     /// including this one, then `SELECT * FROM` it.
     pub query: String,
-    /// Every column any call takes this loss's gradient with respect to, each
-    /// once, compared case-insensitively.
+    /// Every column any call takes this objective's gradient with respect
+    /// to, each once, compared case-insensitively.
     pub wrt: Vec<ColumnRef>,
 }
 
-/// One `grad(loss, table.column, …)` call.
+/// One `grad(f, table.column, …)` call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradCall {
-    /// Index into [`GradCalls::losses`].
-    pub loss: usize,
+    /// Index into [`GradCalls::objectives`].
+    pub objective: usize,
     /// The table, as written.
     pub table: String,
     /// The columns, as written.
@@ -85,18 +98,18 @@ pub struct GradCall {
 /// The `grad` calls in a statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradCalls {
-    /// The losses the calls differentiate, each once.
-    pub losses: Vec<Loss>,
+    /// The objectives the calls differentiate, each once.
+    pub objectives: Vec<Objective>,
     /// The calls, in source order.
     pub calls: Vec<GradCall>,
     sql: String,
 }
 
-/// One loss to differentiate for [`Statements`]: a query, and every column
-/// any statement takes its gradient with respect to.
+/// One objective to differentiate for [`Statements`]: a query, and every
+/// column any statement takes its gradient with respect to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
-    /// The loss query.
+    /// The objective's query.
     pub query: String,
     /// The columns, each once, compared case-insensitively.
     pub wrt: Vec<ColumnRef>,
@@ -108,13 +121,13 @@ pub struct Statements {
     statements: Vec<String>,
     found: Vec<Option<GradCalls>>,
     jobs: Vec<Job>,
-    /// (statement, loss within it) → job.
+    /// (statement, objective within it) → job.
     job_of: BTreeMap<(usize, usize), usize>,
 }
 
 impl Statements {
     /// Find every statement's calls, and the jobs they need: one per
-    /// distinct loss query.
+    /// distinct objective.
     pub fn plan(statements: &[&str], dialect: &dyn Dialect) -> Result<Statements> {
         let mut found = Vec::with_capacity(statements.len());
         for sql in statements {
@@ -124,18 +137,18 @@ impl Statements {
         let mut job_of = BTreeMap::new();
         for (s, calls) in found.iter().enumerate() {
             let Some(calls) = calls else { continue };
-            for (l, loss) in calls.losses.iter().enumerate() {
-                let j = match jobs.iter().position(|j| j.query == loss.query) {
+            for (l, objective) in calls.objectives.iter().enumerate() {
+                let j = match jobs.iter().position(|j| j.query == objective.query) {
                     Some(j) => j,
                     None => {
                         jobs.push(Job {
-                            query: loss.query.clone(),
+                            query: objective.query.clone(),
                             wrt: Vec::new(),
                         });
                         jobs.len() - 1
                     }
                 };
-                for w in &loss.wrt {
+                for w in &objective.wrt {
                     let same = |x: &ColumnRef| {
                         x.table.eq_ignore_ascii_case(&w.table)
                             && x.column.eq_ignore_ascii_case(&w.column)
@@ -155,7 +168,7 @@ impl Statements {
         })
     }
 
-    /// The losses to differentiate, in the order [`Statements::rewrite`]
+    /// The objectives to differentiate, in the order [`Statements::rewrite`]
     /// expects their programs.
     pub fn jobs(&self) -> &[Job] {
         &self.jobs
@@ -185,7 +198,7 @@ impl Statements {
             };
             let mut failure = None;
             let rewritten = calls.rewrite(&mut |call| {
-                let j = self.job_of[&(s, call.loss)];
+                let j = self.job_of[&(s, call.objective)];
                 let found = programs[j]
                     .gradients
                     .iter()
@@ -236,7 +249,7 @@ impl GradCalls {
     ///
     /// A statement without the text `grad(` is not parsed at all, and one
     /// `sqlparser` cannot parse is passed over: it may be engine syntax
-    /// `sqlparser` lacks, and if it does hold a `grad(loss, …)`, the engine
+    /// `sqlparser` lacks, and if it does hold a `grad(f, …)`, the engine
     /// refuses it loudly as an unknown table function.
     pub fn find(sql: &str, dialect: &dyn Dialect) -> Result<Option<GradCalls>> {
         // Tokens, not text: a comment or a string can hold `(`, `)` or
@@ -258,27 +271,27 @@ impl GradCalls {
             return Ok(None);
         }
 
-        let mut losses: Vec<Loss> = Vec::new();
+        let mut objectives: Vec<Objective> = Vec::new();
         let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
         let mut calls = Vec::new();
         for (factor, args) in finder.found {
-            let (loss_name, wrt) = parse_args(&args)?;
-            let loss = match by_name.get(&loss_name.to_ascii_lowercase()) {
+            let (name, wrt) = parse_args(&args)?;
+            let objective = match by_name.get(&name.to_ascii_lowercase()) {
                 Some(&i) => i,
                 None => {
-                    losses.push(Loss {
-                        query: loss_query(query, &loss_name)?,
-                        name: loss_name.clone(),
+                    objectives.push(Objective {
+                        query: objective_query(query, &name)?,
+                        name: name.clone(),
                         wrt: Vec::new(),
                     });
-                    by_name.insert(loss_name.to_ascii_lowercase(), losses.len() - 1);
-                    losses.len() - 1
+                    by_name.insert(name.to_ascii_lowercase(), objectives.len() - 1);
+                    objectives.len() - 1
                 }
             };
             let table = wrt[0].table.clone();
             if wrt.iter().any(|w| w.table != table) {
                 return Err(AdError::NotImplemented(format!(
-                    "grad({loss_name}, …) takes columns of one table, so it can return a \
+                    "grad({name}, …) takes columns of one table, so it can return a \
                      relation shaped like that table; call it once per table"
                 )));
             }
@@ -289,12 +302,12 @@ impl GradCalls {
                     x.table.eq_ignore_ascii_case(&w.table)
                         && x.column.eq_ignore_ascii_case(&w.column)
                 };
-                if !losses[loss].wrt.iter().any(same) {
-                    losses[loss].wrt.push(w.clone());
+                if !objectives[objective].wrt.iter().any(same) {
+                    objectives[objective].wrt.push(w.clone());
                 }
             }
             calls.push(GradCall {
-                loss,
+                objective,
                 table,
                 columns: wrt.into_iter().map(|w| w.column).collect(),
                 span: call_span(sql, tokens.as_deref(), factor)?,
@@ -307,7 +320,7 @@ impl GradCalls {
             ));
         }
         Ok(Some(GradCalls {
-            losses,
+            objectives,
             calls,
             sql: sql.to_string(),
         }))
@@ -361,7 +374,7 @@ fn find_none(statements: &[Statement]) -> Result<Option<GradCalls>> {
         Ok(None)
     } else {
         Err(AdError::NotImplemented(
-            "grad(loss, …) in a statement that is not a single query".into(),
+            "grad(f, …) in a statement that is not a single query".into(),
         ))
     }
 }
@@ -392,10 +405,11 @@ impl Visitor for Finder {
     }
 }
 
-/// `grad(loss, t.c, …)`'s loss name and columns.
+/// `grad(f, t.c, …)`'s objective name and columns.
 fn parse_args(args: &[FunctionArg]) -> Result<(String, Vec<ColumnRef>)> {
-    let usage = "write grad(loss, table.column, …): the name of a CTE computing the loss, \
-                 then the columns to differentiate with respect to";
+    let usage = "write grad(f, table.column, …): the name of a CTE computing one number \
+                 (a loss, a likelihood, an energy), then the columns to differentiate with \
+                 respect to";
     let exprs: Vec<&Expr> = args
         .iter()
         .map(|a| match a {
@@ -403,10 +417,10 @@ fn parse_args(args: &[FunctionArg]) -> Result<(String, Vec<ColumnRef>)> {
             _ => Err(AdError::InvalidPlan(usage.into())),
         })
         .collect::<Result<_>>()?;
-    let [loss, wrt @ ..] = exprs.as_slice() else {
+    let [objective, wrt @ ..] = exprs.as_slice() else {
         return Err(AdError::InvalidPlan(usage.into()));
     };
-    let Expr::Identifier(loss) = loss else {
+    let Expr::Identifier(objective) = objective else {
         return Err(AdError::InvalidPlan(usage.into()));
     };
     if wrt.is_empty() {
@@ -431,16 +445,16 @@ fn parse_args(args: &[FunctionArg]) -> Result<(String, Vec<ColumnRef>)> {
             ))),
         })
         .collect::<Result<_>>()?;
-    Ok((loss.value.clone(), wrt))
+    Ok((objective.value.clone(), wrt))
 }
 
-/// A query computing just the loss CTE `name`: the statement's CTEs up to and
-/// including it, then `SELECT * FROM` it.
-fn loss_query(query: &Query, name: &str) -> Result<String> {
+/// A query computing just the objective CTE `name`: the statement's CTEs up
+/// to and including it, then `SELECT * FROM` it.
+fn objective_query(query: &Query, name: &str) -> Result<String> {
     let with = query.with.as_ref().ok_or_else(|| no_cte(name))?;
     if with.recursive {
         return Err(AdError::NotImplemented(
-            "grad of a loss defined in a WITH RECURSIVE clause".into(),
+            "grad of an objective defined in a WITH RECURSIVE clause".into(),
         ));
     }
     let idx = with
@@ -526,19 +540,24 @@ mod tests {
                        FROM w JOIN GRAD(loss, w.val) g ON w.i = g.i";
 
     #[test]
-    fn a_call_is_found_with_its_loss_query() {
+    fn a_call_is_found_with_its_objective_query() {
         let found = GradCalls::find(SQL, &GenericDialect {}).unwrap().unwrap();
-        assert_eq!(found.losses.len(), 1);
-        let loss = &found.losses[0];
-        assert_eq!(loss.name, "loss");
-        assert_eq!(loss.wrt, vec![ColumnRef::new("w", "val")]);
+        assert_eq!(found.objectives.len(), 1);
+        let objective = &found.objectives[0];
+        assert_eq!(objective.name, "loss");
+        assert_eq!(objective.wrt, vec![ColumnRef::new("w", "val")]);
         assert!(
-            loss.query
+            objective
+                .query
                 .starts_with("WITH d AS (SELECT * FROM x), loss AS ("),
             "{}",
-            loss.query
+            objective.query
         );
-        assert!(loss.query.ends_with("SELECT * FROM loss"), "{}", loss.query);
+        assert!(
+            objective.query.ends_with("SELECT * FROM loss"),
+            "{}",
+            objective.query
+        );
         assert_eq!(found.calls[0].table, "w");
         assert_eq!(found.calls[0].columns, vec!["val"]);
     }
@@ -558,13 +577,13 @@ mod tests {
     }
 
     #[test]
-    fn two_calls_on_one_loss_share_it() {
+    fn two_calls_on_one_objective_share_it() {
         let sql = "WITH loss AS (SELECT SUM(w.val * b.val) AS l FROM w JOIN b ON w.o = b.o) \
                    SELECT * FROM grad(loss, w.val) gw, grad(loss, b.val) gb";
         let found = GradCalls::find(sql, &GenericDialect {}).unwrap().unwrap();
-        assert_eq!(found.losses.len(), 1);
+        assert_eq!(found.objectives.len(), 1);
         assert_eq!(
-            found.losses[0].wrt,
+            found.objectives[0].wrt,
             vec![ColumnRef::new("w", "val"), ColumnRef::new("b", "val")]
         );
         let out = found.rewrite(&mut |c| format!("g_{}", c.table));
@@ -576,7 +595,7 @@ mod tests {
         let sql = "WITH loss AS (SELECT SUM(val) AS l FROM w) \
                    SELECT * FROM grad(loss, w.val) a, grad(loss, W.VAL) b";
         let found = GradCalls::find(sql, &GenericDialect {}).unwrap().unwrap();
-        assert_eq!(found.losses[0].wrt, vec![ColumnRef::new("w", "val")]);
+        assert_eq!(found.objectives[0].wrt, vec![ColumnRef::new("w", "val")]);
         assert_eq!(found.calls.len(), 2);
     }
 

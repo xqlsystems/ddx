@@ -5,8 +5,9 @@
 //! Query-level reverse-mode AD (ddx v2) on DataFusion.
 //!
 //! The simplest way in is SQL itself. [`sql`] runs a statement in which
-//! `grad(loss, table.column)` is the gradient of the loss a CTE computes, as a
-//! relation shaped like the table:
+//! `grad(f, table.column)` is the gradient of the number a CTE computes (its
+//! objective: a loss, a likelihood, an energy, …), as a relation shaped like
+//! the table:
 //!
 //! ```sql
 //! WITH loss AS (SELECT SUM(val * val) AS l FROM w)
@@ -14,9 +15,9 @@
 //! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
 //! ```
 //!
-//! Underneath, [`grad`] turns a query whose result is a loss into a
+//! Underneath, [`grad`] turns a query whose result is one number into a
 //! [`BackwardProgram`], and [`run`] runs it: every step is materialized as a
-//! table on the context, the loss ends up in [`BackwardProgram::value`], and
+//! table on the context, the number ends up in [`BackwardProgram::value`], and
 //! each `wrt` table's gradient, shaped like the table, in the table
 //! [`BackwardProgram::gradients`] names. [`vjp`] does the same for a query with
 //! any output, pulling back a cotangent the caller registers as the table
@@ -92,8 +93,9 @@ fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
-/// The gradient of the loss the SQL query `sql` computes, with respect to the
-/// `wrt` columns. The query must return one row and one column.
+/// The gradient of the number the SQL query `sql` computes (a loss, a
+/// likelihood, an energy, …), with respect to the `wrt` columns. The query
+/// must return one row and one column.
 ///
 /// The query is planned and optimized by `ctx`, converted to Substrait, and
 /// handed to [`ddx_ad::grad`]. A refusal arrives as
@@ -184,17 +186,18 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
     Ok(())
 }
 
-/// Run the SQL statement `sql`, in which `grad(loss, table.column, …)` in a
-/// `FROM` clause is the gradient of the loss the CTE `loss` computes: a
-/// relation shaped like `table`, its dims and the named columns' gradients.
+/// Run the SQL statement `sql`, in which `grad(f, table.column, …)` in a
+/// `FROM` clause is the gradient of the number the CTE `f` computes (see
+/// [`ddx_ad::sql`]): a relation shaped like `table`, its dims and the named
+/// columns' gradients.
 ///
-/// Each loss's [`grad`] program runs first, once, however many calls use it,
+/// Each objective's [`grad`] program runs first, once, however many calls use it,
 /// and each call is replaced by a query over the gradient it needs before the
 /// statement is planned. A statement with no such call is planned as it is.
 /// The programs' tables are dropped once the statement is planned; the
 /// returned DataFrame keeps what it reads.
 ///
-/// A loss defined in a `WITH RECURSIVE` clause is refused, so a training loop
+/// An objective defined in a `WITH RECURSIVE` clause is refused, so a training loop
 /// cannot yet be written as one recursive statement (design.md §5). This is
 /// ddx's own limit, separate from DataFusion 54's recursive-CTE planning bug
 /// (design.md §3.6).
@@ -204,7 +207,7 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
 }
 
 /// [`sql`] for several statements at once. Statements whose `grad` calls
-/// differentiate the same loss query share one run of its program, so a
+/// differentiate the same objective share one run of its program, so a
 /// training step can update each parameter table with its own statement and
 /// pay for the backward pass once.
 pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<DataFrame>> {

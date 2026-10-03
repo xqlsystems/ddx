@@ -336,3 +336,73 @@ async fn not_in_over_a_nullable_subquery_is_refused_not_differentiated_wrongly()
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn the_gradient_of_a_spring_systems_energy_is_minus_the_force() {
+    // Not a loss: any query returning one number has a gradient. Masses at
+    // heights y on a vertical chain of springs, under their weights; the
+    // energy's gradient with respect to a height is the net force on that
+    // mass with its sign flipped, which this checks against the forces
+    // worked out by hand.
+    let ctx = SessionContext::new();
+    let (ys, weights) = ([0.0, -1.2, -1.9], [1.0, 2.0, 3.0]);
+    // (lower mass, upper mass, stiffness, rest length)
+    let springs = [(1, 0, 10.0, 1.0), (2, 1, 8.0, 1.0)];
+    let rows = |v: Vec<String>| v.join(", ");
+    for sql in [
+        format!(
+            "CREATE TABLE mass (i BIGINT, y DOUBLE) AS VALUES {}",
+            rows(
+                ys.iter()
+                    .enumerate()
+                    .map(|(i, y)| format!("({i}, {y:?})"))
+                    .collect()
+            )
+        ),
+        format!(
+            "CREATE TABLE weight (i BIGINT, w DOUBLE) AS VALUES {}",
+            rows(
+                weights
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| format!("({i}, {w:?})"))
+                    .collect()
+            )
+        ),
+        format!(
+            "CREATE TABLE spring (lo BIGINT, hi BIGINT, k DOUBLE, rest DOUBLE) AS VALUES {}",
+            rows(
+                springs
+                    .iter()
+                    .map(|(lo, hi, k, r)| format!("({lo}, {hi}, {k:?}, {r:?})"))
+                    .collect()
+            )
+        ),
+    ] {
+        ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    }
+    let got = pairs(
+        &ctx,
+        "WITH springs AS (
+           SELECT SUM(0.5 * s.k * power(b.y - a.y - s.rest, 2)) AS e
+           FROM spring s JOIN mass a ON s.lo = a.i JOIN mass b ON s.hi = b.i),
+         gravity AS (SELECT SUM(w.w * m.y) AS e FROM mass m JOIN weight w ON m.i = w.i),
+         energy AS (SELECT springs.e + gravity.e AS e FROM springs CROSS JOIN gravity)
+         SELECT i, y FROM grad(energy, mass.y)",
+    )
+    .await;
+    // dE/dy_i = w_i + Σ k·stretch over springs above i − Σ k·stretch below.
+    let mut want: Vec<f64> = weights.to_vec();
+    for &(lo, hi, k, rest) in &springs {
+        let stretch = ys[hi] - ys[lo] - rest;
+        want[hi] += k * stretch;
+        want[lo] -= k * stretch;
+    }
+    assert_eq!(got.len(), 3);
+    for ((i, g), w) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() < 1e-12,
+            "mass {i}: dE/dy = {g}, minus the force is {w}"
+        );
+    }
+}
