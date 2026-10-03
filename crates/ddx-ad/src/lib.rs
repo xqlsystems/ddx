@@ -16,7 +16,8 @@
 //! `ddx_stop_gradient`, JAX's `lax.stop_gradient`.
 //!
 //! This crate is being built across milestones M3 and M4. So far it pins the
-//! plan type and reads a plan's function table ([`Functions`]).
+//! plan type, reads a plan's function table ([`Functions`]), and has the map
+//! primitive's local derivatives ([`Elementwise`]).
 //!
 //! # `substrait` version policy
 //!
@@ -27,11 +28,14 @@
 
 #![forbid(unsafe_code)]
 
+mod elementwise;
 mod error;
+mod expr;
 mod functions;
 
+pub use elementwise::Elementwise;
 pub use error::{AdError, Result};
-pub use functions::{normalize, Functions, STOP_GRADIENT};
+pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.
