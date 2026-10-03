@@ -509,6 +509,8 @@ struct Node {
     /// ratio is shift-invariant, so a gradient through them is, by
     /// stop-gradient's definition, not the loss's derivative.
     shared: bool,
+    /// A ranking that does not break ties, made here.
+    nontotal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -656,6 +658,7 @@ impl Gen<'_> {
         unique: bool,
     ) -> usize {
         self.nodes.push(Node {
+            nontotal: false,
             body,
             unique,
             dims,
@@ -1006,9 +1009,12 @@ impl Gen<'_> {
             return c;
         }
         // The ranking breaks ties by every dim it does not partition by, so
-        // it is total, which ddx requires of a recomputed ranking.
+        // it is total, which ddx requires of a recomputed ranking. Sometimes,
+        // over a relation that carries gradient, it does not, and then ddx
+        // must refuse: its ties could be ranked differently on the way back.
+        let total = self.nodes[c].reads.is_empty() || self.rng.below(100) >= 12;
         let over = format!(
-            "{}ORDER BY v {}, {}",
+            "{}ORDER BY v {}{}",
             if part.is_empty() {
                 String::new()
             } else {
@@ -1019,7 +1025,11 @@ impl Gen<'_> {
             } else {
                 "DESC"
             },
-            list(&rest, "")
+            if total {
+                format!(", {}", list(&rest, ""))
+            } else {
+                String::new()
+            }
         );
         let keep = if self.rng.below(4) == 0 {
             "rk <= 2"
@@ -1031,7 +1041,12 @@ impl Gen<'_> {
             lead(&dims, ""),
             lead(&dims, ""),
         );
-        self.derive(c, body, "rank")
+        let n = self.derive(c, body, "rank");
+        if !total {
+            self.nodes[n].kinds.insert("nontotal-rank");
+            self.nodes[n].nontotal = true;
+        }
+        n
     }
 
     /// nn.py's softmax over one dim, as four relations: the max, the shifted
@@ -1241,6 +1256,26 @@ impl Case {
     /// or `-0.0` values.
     fn exact_ties(&self) -> bool {
         self.modes.ties || self.modes.extreme == Some(Extreme::NegZero)
+    }
+
+    /// The relations the loss reads, directly or through others.
+    fn reachable(&self) -> BTreeSet<usize> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![self.root];
+        while let Some(k) = stack.pop() {
+            if !seen.insert(k) {
+                continue;
+            }
+            // A node reads another as `§n§` in its body.
+            for (i, part) in self.nodes[k].body.split('§').enumerate() {
+                if i % 2 == 1 {
+                    if let Ok(n) = part.parse::<usize>() {
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+        seen
     }
 
     /// `WITH r…, loss AS (SELECT head AS loss FROM root) SELECT outer AS loss
@@ -2007,6 +2042,20 @@ async fn check_case_inner(
         }
     };
     out.accepted = true;
+    // A ranking over what a wrt table feeds, which the loss reads, must be
+    // refused. One in a relation the loss does not read is pruned before
+    // ddx sees it (seed 1100069). One over constant data ddx refuses too
+    // when it is joined into a recomputed region, but that is not asserted
+    // here.
+    let reachable = case.reachable();
+    if case.nodes.iter().enumerate().any(|(k, n)| {
+        n.nontotal && reachable.contains(&k) && n.reads.iter().any(|r| case.wrt.contains(r))
+    }) {
+        out.fail(
+            "[contract] grad accepted a ranking over a varied relation that does not break \
+             ties (its ORDER BY lacks a dim); recomputed, it can keep different rows",
+        );
+    }
 
     // The value step is the loss.
     match query(&ctx, &format!("SELECT * FROM \"{}\"", program.value)).await {
@@ -2316,7 +2365,15 @@ async fn name_checks(
         "later-cte",
         "two-losses",
         "lookalikes",
+        "twins",
+        "two-values",
     ]);
+    if kind == "twins" {
+        return twin_checks(&ctx, case, &t, grads, out).await;
+    }
+    if kind == "two-values" {
+        return two_value_checks(&ctx, case, &t, &want, out).await;
+    }
     let (sql, value) = match kind {
         "schema" | "quoted" => {
             let (reference, register) = if kind == "schema" {
@@ -2483,12 +2540,6 @@ async fn name_checks(
             }
         }
         _ => {
-            let key = if kind == "quoted" {
-                format!("T {t}")
-            } else {
-                t.clone()
-            };
-            let _ = key;
             let wrap = |g: Grad| BTreeMap::from([(t.clone(), g)]);
             if let Some(f) = compare("names", &want, &wrap(got), 1.0, names_rtol) {
                 out.fail(format!("{f}\n  {kind}: {sql}"));
@@ -2519,6 +2570,224 @@ async fn name_checks(
         out.fail(format!(
             "[catalog] ad::sql left {left:?} on the context ({kind})"
         ));
+    }
+    Ok(())
+}
+
+/// A statement's result set, through ad::sql.
+async fn query_sql(ctx: &SessionContext, sql: &str) -> Result<Rows, String> {
+    let df = ad::sql(ctx, sql).await.map_err(|e| e.to_string())?;
+    let schema = df.schema().inner().clone();
+    let batches = df.collect().await.map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for b in &batches {
+        for r in 0..b.num_rows() {
+            rows.push((0..b.num_columns()).map(|c| cell(b.column(c), r)).collect());
+        }
+    }
+    Ok(Rows {
+        names: schema.fields().iter().map(|f| f.name().clone()).collect(),
+        types: schema
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect(),
+        rows,
+    })
+}
+
+/// A table with two value columns, both differentiated in SQL, the second
+/// named in upper case and read back with `SELECT *`: the columns come as the
+/// dims, then the values in the order the call names them, so a value
+/// mistaken for a dim moves.
+async fn two_value_checks(
+    ctx: &SessionContext,
+    case: &Case,
+    t: &str,
+    want: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let tb = case.table(t).clone();
+    let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
+    let mut fields: Vec<Field> = dims
+        .iter()
+        .map(|d| Field::new(*d, tb.key_type.data_type(), true))
+        .collect();
+    fields.push(Field::new("val", DataType::Float64, true));
+    fields.push(Field::new("val2", DataType::Float64, true));
+    let mut cols: Vec<ArrayRef> = (0..dims.len())
+        .map(|k| tb.key_type.array(tb.keys.iter().map(|r| r[k]).collect()))
+        .collect();
+    cols.push(Arc::new(Float64Array::from(tb.vals.clone())));
+    let val2: Vec<Option<f64>> = tb
+        .vals
+        .iter()
+        .map(|v| v.map(|v| round6(0.5 * v + 0.1)))
+        .collect();
+    cols.push(Arc::new(Float64Array::from(val2.clone())));
+    let batch =
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| e.to_string())?;
+    register_batch(ctx, "t2", batch)?;
+    let moved = case.reading(t, "t2");
+    let sql = format!(
+        "WITH {}, base AS (SELECT {} AS loss FROM r{} c), \
+         loss AS (SELECT b.loss + x.s AS loss FROM base b \
+                  CROSS JOIN (SELECT SUM(val2 * val2) AS s FROM t2) x) \
+         SELECT * FROM grad(loss, t2.val, t2.VAL2)",
+        moved.ctes(),
+        case.head,
+        case.root
+    );
+    let r = match query_sql(ctx, &sql).await {
+        Ok(r) => r,
+        Err(e) => {
+            if e.contains("internal error")
+                || e.contains("invalid Substrait plan")
+                || e.contains("not found")
+            {
+                out.fail(format!("[names] two-values: {e}\n  {sql}"));
+            }
+            return Ok(());
+        }
+    };
+    out.meta_compared += 1;
+    let k = dims.len();
+    let want_names: Vec<String> = dims
+        .iter()
+        .map(|d| d.to_string())
+        .chain(["val".into(), "val2".into()])
+        .collect();
+    let names: Vec<String> = r.names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    if names != want_names {
+        out.fail(format!(
+            "[names] two-values: grad(loss, t2.val, t2.VAL2) has columns {:?}, expected the \
+             dims then the values {want_names:?}\n  {sql}",
+            r.names
+        ));
+        return Ok(());
+    }
+    let mut got = Grad::new();
+    let mut got2 = Grad::new();
+    for row in &r.rows {
+        let key: Vec<i64> = row[..k]
+            .iter()
+            .map(|v| v.map_or(NULL_KEY, |v| v as i64))
+            .collect();
+        got.insert(key.clone(), row[k]);
+        got2.insert(key, row[k + 1]);
+    }
+    let want2: Grad = tb
+        .keys
+        .iter()
+        .cloned()
+        .zip(val2.iter().map(|v| v.map(|v| 2.0 * v)))
+        .collect();
+    let wrap = |g: Grad| BTreeMap::from([(t.to_string(), g)]);
+    if let Some(f) = compare("names", want, &wrap(got), 1.0, META_RTOL) {
+        out.fail(format!("{f}\n  two-values, val: {sql}"));
+    }
+    if let Some(f) = compare("names", &wrap(want2), &wrap(got2), 1.0, META_RTOL) {
+        out.fail(format!("{f}\n  two-values, val2: {sql}"));
+    }
+    Ok(())
+}
+
+/// Two wrt tables with one name, `t` and `s1.t`: each gradient must be its
+/// own table's, however the steps are named.
+async fn twin_checks(
+    ctx: &SessionContext,
+    case: &Case,
+    t: &str,
+    grads: &BTreeMap<String, Grad>,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let tb = case.table(t).clone();
+    ctx.sql("CREATE SCHEMA IF NOT EXISTS s1")
+        .await
+        .map_err(|e| e.to_string())?
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut twin = tb.clone();
+    for v in twin.vals.iter_mut().flatten() {
+        *v = round6(*v * 0.5 + 0.37);
+    }
+    let batch = twin.batch();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
+    ctx.register_table(
+        datafusion::sql::TableReference::parse_str(&format!("s1.{t}")),
+        Arc::new(table),
+    )
+    .map_err(|e| e.to_string())?;
+    let sql = format!(
+        "WITH {}, base AS (SELECT {} AS loss FROM r{} c) \
+         SELECT b.loss + x.s AS loss FROM base b \
+         CROSS JOIN (SELECT SUM(val * val) AS s FROM s1.{t}) x",
+        case.ctes(),
+        case.head,
+        case.root
+    );
+    let wrt: Vec<ColumnRef> = case
+        .wrt_refs()
+        .into_iter()
+        .chain([ColumnRef::new(format!("s1.{t}"), "val")])
+        .collect();
+    let program = match ad::grad(ctx, &sql, &wrt).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Refusal::Bug(b) = classify(e) {
+                out.fail(format!("[names] twins: {b}"));
+            }
+            return Ok(());
+        }
+    };
+    if let Err(e) = ad::run(ctx, &program).await {
+        out.fail(format!("[names] twins: {e}"));
+        return Ok(());
+    }
+    let steps: BTreeSet<&str> = program.gradients.iter().map(|g| g.step.as_str()).collect();
+    if steps.len() != program.gradients.len() {
+        out.fail(format!(
+            "[names] twins: {} wrt tables share gradient steps {steps:?}",
+            program.gradients.len()
+        ));
+        return Ok(());
+    }
+    for g in &program.gradients {
+        let r = query(ctx, &format!("SELECT * FROM \"{}\"", g.step)).await?;
+        let n = r.names.len();
+        let got: Grad = r
+            .rows
+            .iter()
+            .map(|row| {
+                let key = row[..n - 1]
+                    .iter()
+                    .map(|v| v.map_or(NULL_KEY, |v| v as i64))
+                    .collect();
+                (key, row[n - 1])
+            })
+            .collect();
+        let name = g.table.last().cloned().unwrap_or_default();
+        let want: Option<Grad> = if g.table.iter().any(|p| p == "s1") {
+            Some(
+                twin.keys
+                    .iter()
+                    .cloned()
+                    .zip(twin.vals.iter().map(|v| v.map(|v| 2.0 * v)))
+                    .collect(),
+            )
+        } else {
+            grads.get(&name).cloned()
+        };
+        let Some(want) = want else { continue };
+        out.meta_compared += 1;
+        let wrap = |x: Grad| BTreeMap::from([(name.clone(), x)]);
+        if let Some(f) = compare("names", &wrap(want), &wrap(got), 1.0, META_RTOL) {
+            out.fail(format!(
+                "{f}\n  twins: {:?} and s1.{t} under one name",
+                g.table
+            ));
+        }
     }
     Ok(())
 }
@@ -3909,6 +4178,7 @@ fn soak_v2_query_ad() {
     };
 
     SOAKING.store(true, Ordering::Relaxed);
+    let stop_on_fail = std::env::var("DDX_SOAK_STOP_ON_FAIL").is_ok();
     let props = soak_props();
     let rt = runtime();
     let start = Instant::now();
@@ -3922,14 +4192,30 @@ fn soak_v2_query_ad() {
         "REPRO DDX_SOAK_SECS=15 DDX_SOAK_BASE={seed} cargo test -p ddx-datafusion \
          --test ad_simulation --release -- --ignored --nocapture soak_v2_query_ad",
     );
+    // Seeds known to fail without any change (`DDX_V2_SKIP_SEEDS`, a file
+    // of one seed per line): mutation testing's baseline, so a failure it
+    // counts is the mutant's.
+    let skip: BTreeSet<u64> = std::env::var("DDX_V2_SKIP_SEEDS")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default();
     while start.elapsed().as_secs() < budget {
         let seed = base.wrapping_add(iters);
+        if skip.contains(&seed) {
+            iters += 1;
+            continue;
+        }
         let o = run_one(&rt, seed, props);
         tally.add(&o);
         for f in &o.failures {
             logline(&format!("\nFAILURE (seed={seed}, base={base}):\n{f}"));
         }
         iters += 1;
+        // For mutation testing: the time to the first failure is the measure.
+        if stop_on_fail && tally.failures > 0 {
+            break;
+        }
         let elapsed = start.elapsed().as_secs();
         if elapsed >= last_beat + 10 {
             last_beat = elapsed;

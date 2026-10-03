@@ -31,6 +31,11 @@
 //!   near-tie. *Fixed in #76:* the extreme and the rows attaining it are
 //!   windows over the recomputed rows themselves, never compared with the
 //!   saved value.
+//!   The root is broader than MAX: constant subtrees are recomputed
+//!   in each backward step unread and unchecked, so a ranking over constant
+//!   data that does not break ties (ddx refuses one only over what a wrt
+//!   table feeds) could keep a different row on the way back, and a CASE on
+//!   it take a different branch.
 //! - **A table with capitals has no gradient in SQL.** `ad::sql` reads a
 //!   gradient step back under a quoted name DataFusion lowercased when it
 //!   was registered. *Fixed in #74:* a step's name is lower case.

@@ -249,6 +249,12 @@ extreme,big` forces those data modes on every case, and `DDX_V2_DEBUG=1` with
 `replay_one_seed` prints each step's table and flags any relation that is not
 bit-reproducible from run to run.
 
+To see how much a clean v2 soak proves, `.github/scripts/mutation_test.py`
+seeds one deliberate bug at a time into `ddx-ad` and the DataFusion adapter
+and measures how long the soak takes to catch it (it also runs weekly, in
+`.github/workflows/mutation.yml`). A mutant that survives is a blind spot;
+when you change a rule, add a mutant for it.
+
 ### 4. Open a pull request
 
 - Keep PRs focused; one logical change per PR is easiest to review.

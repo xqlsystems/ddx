@@ -1,0 +1,50 @@
+name: Mutation test (v2 soak)
+
+# How much does a clean v2 soak prove? This seeds one deliberate bug at a time
+# into ddx-ad and the DataFusion adapter (.github/scripts/mutation_test.py),
+# runs the v2 simulation soak until its first failure or a time budget, and
+# reports how long each took to kill. A mutant that survives marks a blind
+# spot in the soak's generator or properties.
+#
+# Weekly rather than nightly: it rebuilds once per mutant and spends a budget
+# on each. The table goes to the job summary; a surviving mutant fails the
+# job but files no issue, since it is a gap in the tests, not a bug in ddx.
+on:
+  schedule:
+    - cron: '0 17 * * 0'
+  workflow_dispatch:
+    inputs:
+      budget_secs:
+        description: 'Soak budget per mutant (seconds)'
+        required: false
+        default: '180'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # ddx-ad's `substrait` dependency generates its types from .proto files
+      # at build time.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build the soak once, unmutated
+        run: cargo test -p ddx-datafusion --test ad_simulation --release --no-run
+
+      - name: Run the mutants
+        run: |
+          set -o pipefail
+          BUDGET='${{ github.event.inputs.budget_secs || '180' }}'
+          python3 .github/scripts/mutation_test.py --budget "$BUDGET" \
+            --base $(( GITHUB_RUN_NUMBER * 100000 )) | tee mutation.md
+          cat mutation.md >> "$GITHUB_STEP_SUMMARY"
