@@ -18,10 +18,36 @@
 //! [`grad`] and [`vjp`] take a plan and the `wrt` columns and return a
 //! [`BackwardProgram`]: plain Substrait plans for an engine to run in order,
 //! the last of which hold the gradients, shaped like the tables they are
-//! gradients of. The pieces are public for adapters: [`relation`] states what
-//! dims and values are, [`forward`] reads the plan, [`Elementwise`] gives the
-//! map primitive's local derivatives, and [`emit`] writes plans and binds their
-//! reads.
+//! gradients of. An adapter runs the steps in order, late-binding each step's
+//! reads of earlier steps with [`unbound_reads`] and [`bind_reads`], and runs
+//! the program's [`checks`](BackwardProgram::checks) first. The table names
+//! a program writes all start with a prefix unique to the program,
+//! `__ddx_{id}_`; the `__ddx_` prefix is reserved.
+//!
+//! The modules that read and write plans (`forward`, `emit`, `expr`,
+//! `relation`) are public only with the `internals` feature, for this
+//! workspace's tests: they are not part of the API, and a field renamed in
+//! them is not a breaking change. They may become a supported plan builder
+//! once a second adapter shows what it needs.
+//!
+//! # What you can extend, and what you cannot yet
+//!
+//! - **A scalar function's derivative.** Register a rule on a `ddx-core`
+//!   engine ([`ddx_core::Ddx::register`]) and pass it with [`Options::ddx`],
+//!   much as `jax.custom_jvp` does for one function. A unary function with a
+//!   rule is differentiated wherever it appears in a projected expression.
+//! - **What not to differentiate.** `ddx_stop_gradient(x)`, an identity the
+//!   engine registers under that name, is a constant to ddx, like JAX's
+//!   `lax.stop_gradient`.
+//! - **The engine.** A program is plain Substrait plans plus the run protocol
+//!   ([`Runner`], or [`Backend`] and [`run`] for a synchronous engine), so a
+//!   new engine writes four primitives and nothing about AD.
+//!
+//! A relational operator of the host's own has no extension point: a
+//! user-defined aggregate, or a Substrait `ExtensionSingleRel`,
+//! `ExtensionMultiRel` or `ExtensionLeafRel`, on a path the gradient flows
+//! along, is refused as [`AdError::NotImplemented`]. Off that path (constant
+//! data, or a subtree no gradient reaches) it is copied as it is.
 //!
 //! # `substrait` version policy
 //!
@@ -32,24 +58,46 @@
 
 #![forbid(unsafe_code)]
 
+/// Modules public only with the `internals` feature (see the crate docs).
+macro_rules! internal {
+    ($(mod $m:ident;)*) => {$(
+        #[cfg(feature = "internals")]
+        #[doc(hidden)]
+        pub mod $m;
+        #[cfg(not(feature = "internals"))]
+        mod $m;
+    )*};
+}
+
 mod elementwise;
-pub mod emit;
 mod error;
-pub mod expr;
-pub mod forward;
 mod functions;
 mod program;
-pub mod relation;
+mod run;
 mod transpose;
+internal! {
+    mod emit;
+    mod expr;
+    mod forward;
+    mod relation;
+}
 
-pub use elementwise::Elementwise;
+pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
-pub use forward::Forward;
-pub use functions::{normalize, Extensions, Functions, STOP_GRADIENT};
+pub use functions::STOP_GRADIENT;
 pub use program::{
     decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, Gradient, Options, Step,
 };
-pub use relation::{ColumnRef, Table};
+pub use relation::ColumnRef;
+pub use run::{run, Action, Backend, RunError, Runner};
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use {
+    elementwise::Elementwise,
+    forward::Forward,
+    functions::{normalize, Extensions, Functions},
+    relation::Table,
+};
 
 /// The exact `substrait` this crate was built against, re-exported so an
 /// adapter links the same version.

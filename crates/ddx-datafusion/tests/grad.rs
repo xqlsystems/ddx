@@ -610,21 +610,14 @@ async fn a_value_many_columns_read_has_a_small_backward_step() {
     );
     let plan = substrait_of(&ctx, &loss, true).await;
     let program = grad(&plan, &[ColumnRef::new("fn_", "val")]).unwrap();
-    run(&ctx, &program).await;
+    // Each step as the plan ad::run builds for it, run one at a time.
     let mut bytes = 0;
-    for step in &program.backward_steps {
-        let mut p = step.plan.clone();
-        let mut schemas = std::collections::HashMap::new();
-        for name in ddx_ad::emit::unbound_reads(&p) {
-            let s = common::ad::schema_of(&ctx, &name).await;
-            schemas.insert(name, s);
-        }
-        ddx_ad::emit::bind_reads(&mut p, &mut |n| schemas.get(n).cloned()).unwrap();
-        let lp =
-            datafusion_substrait::logical_plan::consumer::from_substrait_plan(&ctx.state(), &p)
-                .await
-                .unwrap();
+    for step in program.steps() {
+        let lp = ddx_datafusion::ad::logical_plan(&ctx, &step.plan)
+            .await
+            .unwrap();
         bytes += lp.display_indent().to_string().len();
+        ddx_datafusion::ad::run_step(&ctx, step).await.unwrap();
     }
     assert!(bytes < 200_000, "{bytes} bytes of plan for {n} readers");
     // And the gradient is right: Σ k·cos(k·val).
@@ -810,4 +803,46 @@ fn for_each_named_table(
             walk(root.input.as_mut().unwrap(), f);
         }
     }
+}
+
+#[tokio::test]
+async fn the_public_api_differentiates_sql_and_reports_refusals() {
+    use ddx_datafusion::ad;
+    let ctx = ctx();
+    w().create(&ctx).await;
+    let program = ad::grad(
+        &ctx,
+        "SELECT SUM(val * val) AS loss FROM w",
+        &[wrt("w", "val")],
+    )
+    .await
+    .unwrap();
+    ad::run(&ctx, &program).await.unwrap();
+    let got = common::ad::rows(
+        &ctx,
+        &format!(
+            "SELECT i, o, val FROM {} ORDER BY i, o",
+            program.gradients[0].step
+        ),
+    )
+    .await;
+    for (g, row) in got.iter().zip(&w().rows) {
+        assert_eq!(g[2], 2.0 * row[2]);
+    }
+
+    // A refusal is a DataFusionError::External boxing the AdError.
+    let err = ad::grad(
+        &ctx,
+        "SELECT i, SUM(val) AS s FROM w GROUP BY i",
+        &[wrt("w", "val")],
+    )
+    .await
+    .unwrap_err();
+    let datafusion::error::DataFusionError::External(boxed) = err else {
+        panic!("expected External")
+    };
+    assert!(matches!(
+        boxed.downcast_ref::<AdError>(),
+        Some(AdError::NotScalar(_))
+    ));
 }

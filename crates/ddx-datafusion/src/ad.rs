@@ -1,0 +1,317 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Query-level reverse-mode AD (ddx v2) on DataFusion.
+//!
+//! Write the forward pass as one SQL query whose result is a loss. [`grad`]
+//! turns it into a [`BackwardProgram`], and [`run`] runs it: every step is
+//! materialized as a table on the context, the loss ends up in
+//! [`BackwardProgram::value`], and each `wrt` table's gradient, shaped like the
+//! table, in the table [`BackwardProgram::gradients`] names. [`vjp`] does the
+//! same for a query with any output, pulling back a cotangent the caller
+//! registers as the table [`BackwardProgram::cotangent_table`] names.
+//!
+//! Every table a program writes is named with a prefix unique to that program,
+//! `__ddx_{id}_`, so two programs on one context never read each other's
+//! tables, and a user's table is never replaced unless its name starts with
+//! `__ddx_`, which is reserved. After [`run`], only the value and the
+//! gradients remain on the context; [`release`] drops those too.
+//!
+//! ```
+//! # use datafusion::prelude::SessionContext;
+//! # #[tokio::main]
+//! # async fn main() -> datafusion::error::Result<()> {
+//! use ddx_datafusion::ad::{self, ColumnRef};
+//!
+//! let ctx = SessionContext::new();
+//! ctx.sql("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
+//!     .await?
+//!     .collect()
+//!     .await?;
+//!
+//! let loss = "SELECT SUM(val * val) AS loss FROM w";
+//! let program = ad::grad(&ctx, loss, &[ColumnRef::new("w", "val")]).await?;
+//! ad::run(&ctx, &program).await?;
+//!
+//! // d/dval of Σ val² is 2·val.
+//! let grad = &program.gradients[0].step;
+//! let df = ctx.sql(&format!("SELECT i, val FROM {grad} ORDER BY i")).await?;
+//! # let _ = df.collect().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::catalog::TableProvider;
+use datafusion::common::{DFSchema, TableReference};
+use datafusion::datasource::MemTable;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::{FunctionRegistry, SessionState};
+use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
+use datafusion::prelude::SessionContext;
+use datafusion_substrait::extensions::Extensions;
+use datafusion_substrait::logical_plan::consumer::{
+    from_project_rel, from_substrait_plan_with_consumer, DefaultSubstraitConsumer,
+    SubstraitConsumer,
+};
+use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+use ddx_ad::substrait::proto::rel::RelType;
+use ddx_ad::substrait::proto::{NamedStruct, Rel};
+use ddx_ad::substrait::proto::{Plan, ProjectRel};
+use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
+
+pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
+
+fn to_df_err(e: AdError) -> DataFusionError {
+    DataFusionError::External(Box::new(e))
+}
+
+/// The gradient of the loss the SQL query `sql` computes, with respect to the
+/// `wrt` columns. The query must return one row and one column.
+///
+/// The query is planned and optimized by `ctx`, converted to Substrait, and
+/// handed to [`ddx_ad::grad`]. A refusal arrives as
+/// [`DataFusionError::External`] boxing an [`AdError`].
+pub async fn grad(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
+    grad_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
+}
+
+/// [`grad`] for a plan already built, for instance with the DataFrame API.
+pub fn grad_plan(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    wrt: &[ColumnRef],
+) -> Result<BackwardProgram> {
+    ddx_ad::grad(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// The vector-Jacobian product of the SQL query `sql` with respect to the
+/// `wrt` columns. Before the program's backward steps run, register the
+/// cotangent as the table [`BackwardProgram::cotangent_table`] names, with the
+/// columns [`BackwardProgram::cotangent`] lists.
+pub async fn vjp(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
+    vjp_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
+}
+
+/// [`vjp`] for a plan already built.
+pub fn vjp_plan(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    wrt: &[ColumnRef],
+) -> Result<BackwardProgram> {
+    ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// Run `program`: its [`checks`](BackwardProgram::checks), then every step,
+/// forward then backward, registering each result on `ctx` under the step's
+/// name. Once the gradients are written, the intermediate tables (saved
+/// aggregates and cotangents) are dropped; the value and the gradients stay
+/// until [`release`] or the next run replaces them.
+///
+/// A failed check arrives as [`DataFusionError::External`] boxing
+/// [`AdError::InvalidWrt`]: a `wrt` table's rows are not what the program
+/// assumed, for instance two rows share their dims.
+///
+/// A program depends on the tables' names and schemas, not their values, so
+/// build it once and run it on every training step. One program's runs must
+/// not overlap: they write the same tables. Build a program per concurrent
+/// caller instead.
+pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+    // The order, and what is dropped when, are ddx_ad::Runner's.
+    let mut runner = ddx_ad::Runner::new(program);
+    while let Some(action) = runner.next() {
+        match &action {
+            Action::Check(i) => runner.checked(returns_rows(ctx, &program.checks[*i].plan).await),
+            Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
+            Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
+        }
+    }
+    runner.finish().map_err(|e| match e {
+        RunError::Refused(e) => to_df_err(e),
+        RunError::Engine(e) => e,
+        other => DataFusionError::Internal(other.to_string()),
+    })
+}
+
+/// Run `program`'s checks, failing on the first that returns a row.
+pub async fn run_checks(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+    for check in &program.checks {
+        if returns_rows(ctx, &check.plan).await? {
+            return Err(to_df_err(AdError::InvalidWrt(check.message.clone())));
+        }
+    }
+    Ok(())
+}
+
+/// Does `plan` (a check) return any row? The returns-rows primitive of
+/// [`ddx_ad::Backend`].
+pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
+    let lp = logical_plan(ctx, plan).await?;
+    let rows: usize = ctx
+        .execute_logical_plan(lp)
+        .await?
+        .limit(0, Some(1))?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    Ok(rows > 0)
+}
+
+/// Drop every table `program` registered on `ctx`, the value and the
+/// gradients included.
+pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+    for step in program.steps() {
+        ctx.deregister_table(step.name.as_str())?;
+    }
+    Ok(())
+}
+
+/// Run one step and register its result, replacing a table of that name.
+/// Every step it reads must already be registered. Unlike [`run`], this
+/// neither runs the checks nor drops anything.
+pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
+    materialize(ctx, &step.name, &step.plan).await
+}
+
+/// Run `plan` and register its rows as the table `name`, replacing one: the
+/// materialize primitive of [`ddx_ad::Backend`].
+pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Result<()> {
+    let lp = logical_plan(ctx, plan).await?;
+    let df = ctx.execute_logical_plan(lp).await?;
+    // The schema of the plan that runs, not the logical one: a step read
+    // from an unanalyzed plan can be typed before type coercion (a CASE
+    // between BIGINT and DOUBLE branches), and the table must declare the
+    // types its batches hold.
+    let task = df.task_ctx();
+    let physical = df.create_physical_plan().await?;
+    let schema = physical.schema();
+    let batches = datafusion::physical_plan::collect(physical, Arc::new(task)).await?;
+    // A MemTable, not a view: DataFusion's Substrait consumer can pick
+    // columns out of a table scan, and a later step reads only some.
+    let table = MemTable::try_new(schema, vec![batches])?;
+    ctx.deregister_table(name)?;
+    ctx.register_table(name, Arc::new(table))?;
+    Ok(())
+}
+
+/// The DataFusion plan [`run`] executes for one of a program's plans (a step
+/// or a check): its reads of earlier steps bound to the tables registered on
+/// `ctx`, and consumed with each computed column given a short name.
+///
+/// DataFusion's own Substrait consumer names a computed column by its whole
+/// expression, and ddx's plans compute each column from earlier ones, so a
+/// layer that reads its input twice (`sin(v) + 0.1 * v`) doubles every name
+/// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
+/// names mean nothing to ddx, whose plans refer to columns by position.
+pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
+    let mut plan = plan.clone();
+    let mut schemas = HashMap::new();
+    for name in unbound_reads(&plan) {
+        let schema = table_schema(ctx, &name).await?;
+        schemas.insert(name, schema);
+    }
+    bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(to_df_err)?;
+    let state = ctx.state();
+    let extensions = Extensions::try_from(&plan.extensions)?;
+    let consumer = ShortNames {
+        inner: DefaultSubstraitConsumer::new(&extensions, &state),
+        state: &state,
+        next: AtomicUsize::new(0),
+    };
+    from_substrait_plan_with_consumer(&consumer, &plan).await
+}
+
+/// DataFusion's Substrait consumer, but a projection's computed columns are
+/// named `__ddx_c{n}` rather than by their expressions (see [`logical_plan`]).
+struct ShortNames<'a> {
+    inner: DefaultSubstraitConsumer<'a>,
+    state: &'a SessionState,
+    next: AtomicUsize,
+}
+
+#[async_trait]
+impl SubstraitConsumer for ShortNames<'_> {
+    async fn resolve_table_ref(
+        &self,
+        table: &TableReference,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.resolve_table_ref(table).await
+    }
+
+    fn get_extensions(&self) -> &Extensions {
+        self.inner.get_extensions()
+    }
+
+    fn get_function_registry(&self) -> &impl FunctionRegistry {
+        self.state
+    }
+
+    fn push_outer_schema(&self, schema: Arc<DFSchema>) {
+        self.inner.push_outer_schema(schema)
+    }
+
+    fn pop_outer_schema(&self) {
+        self.inner.pop_outer_schema()
+    }
+
+    fn get_outer_schema(&self, steps_out: usize) -> Option<Arc<DFSchema>> {
+        self.inner.get_outer_schema(steps_out)
+    }
+
+    async fn consume_project(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
+        let LogicalPlan::Projection(p) = from_project_rel(self, rel).await? else {
+            return Err(DataFusionError::Internal(
+                "a Substrait projection consumed as something else".into(),
+            ));
+        };
+        let exprs = p
+            .expr
+            .into_iter()
+            .map(|e| match e {
+                Expr::Column(_) => e,
+                computed => {
+                    let n = self.next.fetch_add(1, Ordering::Relaxed);
+                    computed.unalias().alias(format!("__ddx_c{n}"))
+                }
+            })
+            .collect();
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs, p.input,
+        )?))
+    }
+}
+
+/// The Substrait schema of the registered table `name`, as DataFusion's
+/// producer states it: the base schema of the read in `SELECT * FROM name`.
+pub async fn table_schema(ctx: &SessionContext, name: &str) -> Result<NamedStruct> {
+    let lp = ctx.table(name).await?.into_unoptimized_plan();
+    let plan = to_substrait_plan(&lp, &ctx.state())?;
+    let root = plan.relations.iter().find_map(|r| match &r.rel_type {
+        Some(PlanRelType::Root(root)) => root.input.as_ref(),
+        _ => None,
+    });
+    let mut rel: Option<&Rel> = root;
+    while let Some(r) = rel {
+        match &r.rel_type {
+            Some(RelType::Read(read)) => {
+                return read.base_schema.clone().ok_or_else(|| {
+                    DataFusionError::Internal(format!("the read of `{name}` has no schema"))
+                })
+            }
+            Some(RelType::Project(p)) => rel = p.input.as_deref(),
+            Some(RelType::Filter(f)) => rel = f.input.as_deref(),
+            _ => break,
+        }
+    }
+    Err(DataFusionError::Internal(format!(
+        "no table read found in the Substrait plan of `{name}`"
+    )))
+}

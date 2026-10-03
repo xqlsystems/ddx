@@ -117,6 +117,12 @@ impl BackwardProgram {
         self.forward_steps.iter().chain(&self.backward_steps)
     }
 
+    /// Step `i` of [`BackwardProgram::steps`], as [`crate::Action`] numbers
+    /// them.
+    pub fn step(&self, i: usize) -> &Step {
+        self.steps().nth(i).expect("a step index from this program")
+    }
+
     /// The steps whose tables only other steps read: the saved aggregates
     /// and the cotangents. An adapter may drop them once the program has run;
     /// the value and the gradients are what a caller reads.
