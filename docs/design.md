@@ -1092,8 +1092,12 @@ layered:
   Substrait plan is rewritten into equivalent shapes another producer might
   emit (identity and permuting projections, `WHERE true`, swapped join sides,
   an added sort, a computed-then-dropped column); DataFusion confirms each
-  rewrite computes the same loss before ddx sees it. It runs nightly beside
-  v1's soak.
+  rewrite computes the same loss before ddx sees it. The data varies as well:
+  exact ties, where only directions that keep the ties are checked (at a tie
+  the loss need not be differentiable, and any subgradient is a convention);
+  dense NULLs and NULL keys; huge, tiny, `-0.0`, NaN and infinite values; and
+  thousand-row tables in several partitions. Near a kink, ⟨∇L, d⟩ must lie
+  between the one-sided derivatives. It runs nightly beside v1's soak.
 - **v2-specific: spike each rule's forward idiom against both engines'
   actual Substrait implementations before trusting it** — the coverage
   discipline §4.2 commits to, now a standing test-plan item, not a one-time
