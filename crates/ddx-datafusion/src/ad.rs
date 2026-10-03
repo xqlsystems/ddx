@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::common::{DFSchema, TableReference};
+use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{FunctionRegistry, SessionState};
@@ -398,7 +398,43 @@ impl SubstraitConsumer for ShortNames<'_> {
         self.inner.get_outer_schema(steps_out)
     }
 
+    /// The input's columns, then the projection's expressions under short
+    /// names. Built directly, not with DataFusion's `project` builder: that
+    /// normalizes each expression's columns by walking the whole input plan,
+    /// once per expression, and ddx's projections carry every earlier column,
+    /// so a chain of n of them cost about n³ (1.2 s to consume an 80-map
+    /// chain whose plan is 18 KB). These columns come from the input's schema
+    /// already qualified, so there is nothing to normalize.
     async fn consume_project(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
+        let Some(input) = rel.input.as_deref() else {
+            return self.consume_project_by_builder(rel).await;
+        };
+        let input = self.consume_rel(input).await?;
+        let schema = Arc::clone(input.schema());
+        let mut exprs: Vec<Expr> = (0..schema.fields().len())
+            .map(|i| Expr::Column(Column::from(schema.qualified_field(i))))
+            .collect();
+        for e in &rel.expressions {
+            let e = self.consume_expression(e, &schema).await?;
+            // A window function needs a Window relation beneath the
+            // projection, which DataFusion's own consumer builds.
+            if matches!(e, Expr::WindowFunction(_)) {
+                return self.consume_project_by_builder(rel).await;
+            }
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            exprs.push(e.alias(format!("__ddx_c{n}")));
+        }
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(input),
+        )?))
+    }
+}
+
+impl ShortNames<'_> {
+    /// DataFusion's own projection consumer, then the computed columns
+    /// renamed: for a projection with a window function.
+    async fn consume_project_by_builder(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
         let LogicalPlan::Projection(p) = from_project_rel(self, rel).await? else {
             return Err(DataFusionError::Internal(
                 "a Substrait projection consumed as something else".into(),
