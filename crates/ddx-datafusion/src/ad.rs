@@ -75,8 +75,8 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    from_project_rel, from_substrait_plan_with_consumer, DefaultSubstraitConsumer,
-    SubstraitConsumer,
+    from_project_rel, from_substrait_plan_with_consumer, from_substrait_rel,
+    DefaultSubstraitConsumer, SubstraitConsumer,
 };
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
@@ -398,6 +398,64 @@ impl SubstraitConsumer for ShortNames<'_> {
         self.inner.get_outer_schema(steps_out)
     }
 
+    /// A relation with an emit (an output mapping): the relation without it,
+    /// then the mapped columns picked out. DataFusion's own consumer applies
+    /// an emit through its `project` builder, which re-normalizes every
+    /// column by walking the whole plan (see `consume_project`), and ddx's
+    /// pruned plans put an emit on most projections.
+    async fn consume_rel(&self, rel: &Rel) -> Result<LogicalPlan> {
+        let Some(mapping) = emit_of(rel) else {
+            return from_substrait_rel(self, rel).await;
+        };
+        let mut seen = std::collections::HashSet::new();
+        if !mapping.iter().all(|i| seen.insert(*i)) {
+            // A column emitted twice needs DataFusion's unique naming.
+            return from_substrait_rel(self, rel).await;
+        }
+        // The relation without its emit: the typed consumer, which does not
+        // read the emit (cloning the relation to strip it would copy the
+        // whole subtree beneath, at every emit).
+        let plan = match rel.rel_type.as_ref() {
+            Some(RelType::Project(p)) => self.consume_project(p).await?,
+            Some(RelType::Filter(f)) => self.consume_filter(f).await?,
+            Some(RelType::Fetch(f)) => self.consume_fetch(f).await?,
+            Some(RelType::Sort(s)) => self.consume_sort(s).await?,
+            Some(RelType::Join(j)) => self.consume_join(j).await?,
+            Some(RelType::Cross(c)) => self.consume_cross(c).await?,
+            Some(RelType::Aggregate(a)) => self.consume_aggregate(a).await?,
+            Some(RelType::Set(s)) => self.consume_set(s).await?,
+            Some(RelType::Read(r)) => self.consume_read(r).await?,
+            _ => return from_substrait_rel(self, rel).await,
+        };
+        let pick = |i: i32| usize::try_from(i).ok();
+        let plan = match plan {
+            LogicalPlan::Projection(p) => {
+                let exprs = mapping
+                    .iter()
+                    .map(|&i| pick(i).and_then(|i| p.expr.get(i).cloned()))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("an emit past the projection".into())
+                    })?;
+                LogicalPlan::Projection(Projection::try_new(exprs, p.input)?)
+            }
+            other => {
+                let schema = Arc::clone(other.schema());
+                let exprs = mapping
+                    .iter()
+                    .map(|&i| {
+                        pick(i)
+                            .filter(|&i| i < schema.fields().len())
+                            .map(|i| Expr::Column(Column::from(schema.qualified_field(i))))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| DataFusionError::Internal("an emit past the relation".into()))?;
+                LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(other))?)
+            }
+        };
+        Ok(plan)
+    }
+
     /// The input's columns, then the projection's expressions under short
     /// names. Built directly, not with DataFusion's `project` builder: that
     /// normalizes each expression's columns by walking the whole input plan,
@@ -454,6 +512,27 @@ impl ShortNames<'_> {
         Ok(LogicalPlan::Projection(Projection::try_new(
             exprs, p.input,
         )?))
+    }
+}
+
+/// `rel`'s emit, if it has one.
+fn emit_of(rel: &Rel) -> Option<Vec<i32>> {
+    use ddx_ad::substrait::proto::rel_common::EmitKind;
+    let common = match rel.rel_type.as_ref()? {
+        RelType::Project(p) => p.common.as_ref(),
+        RelType::Filter(f) => f.common.as_ref(),
+        RelType::Fetch(f) => f.common.as_ref(),
+        RelType::Sort(s) => s.common.as_ref(),
+        RelType::Join(j) => j.common.as_ref(),
+        RelType::Cross(c) => c.common.as_ref(),
+        RelType::Aggregate(a) => a.common.as_ref(),
+        RelType::Set(s) => s.common.as_ref(),
+        RelType::Read(r) => r.common.as_ref(),
+        _ => None,
+    }?;
+    match &common.emit_kind {
+        Some(EmitKind::Emit(e)) => Some(e.output_mapping.clone()),
+        _ => None,
     }
 }
 

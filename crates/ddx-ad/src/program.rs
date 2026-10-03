@@ -374,7 +374,7 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
             t.contributions.keys().collect::<Vec<_>>()
         )));
     }
-    Ok(BackwardProgram {
+    let mut program = BackwardProgram {
         forward_steps,
         value: format!("{}value", f.namespace),
         cotangent_table: format!("{}cotangent", f.namespace),
@@ -387,7 +387,51 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         cotangent,
         backward_steps,
         gradients,
-    })
+    };
+    prune_program(&mut program);
+    Ok(program)
+}
+
+/// Drop the columns nothing reads (see [`crate::prune`]): within each plan,
+/// then across steps, from the last back, so each step keeps only the columns
+/// some later step reads. The value and the gradients keep all theirs.
+fn prune_program(program: &mut BackwardProgram) {
+    use std::collections::{BTreeSet, HashMap};
+    for c in program.checks.iter_mut() {
+        crate::prune::prune_plan(&mut c.plan);
+    }
+    let keep: BTreeSet<String> = std::iter::once(program.value.clone())
+        .chain(program.gradients.iter().map(|g| g.step.clone()))
+        .collect();
+    // Every step's columns that plans after it read, by name.
+    let mut read: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let note_reads = |plan: &Plan, read: &mut HashMap<String, BTreeSet<String>>| {
+        crate::emit::for_each_unbound_read(plan, &mut |name, cols| {
+            read.entry(name.to_string())
+                .or_default()
+                .extend(cols.iter().cloned());
+        });
+    };
+    for c in &program.checks {
+        note_reads(&c.plan, &mut read);
+    }
+    let n_forward = program.forward_steps.len();
+    let total = n_forward + program.backward_steps.len();
+    for i in (0..total).rev() {
+        let step = if i < n_forward {
+            &mut program.forward_steps[i]
+        } else {
+            &mut program.backward_steps[i - n_forward]
+        };
+        let narrowed = !keep.contains(&step.name) && {
+            let used = read.get(&step.name).cloned().unwrap_or_default();
+            crate::prune::prune_plan_to_names(&mut step.plan, &used)
+        };
+        if !narrowed {
+            crate::prune::prune_plan(&mut step.plan);
+        }
+        note_reads(&step.plan, &mut read);
+    }
 }
 
 /// The loss column for [`grad`]: the query must return one column, on one
