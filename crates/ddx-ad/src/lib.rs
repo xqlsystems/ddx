@@ -17,7 +17,8 @@
 //!
 //! This crate is being built across milestones M3 and M4. So far it pins the
 //! plan type, reads a plan's function table ([`Functions`]), and has the map
-//! primitive's local derivatives ([`Elementwise`]).
+//! primitive's local derivatives ([`Elementwise`]). [`emit`] writes the plans
+//! of a backward program, and [`expr`] builds the expressions inside them.
 //!
 //! # `substrait` version policy
 //!
@@ -29,8 +30,9 @@
 #![forbid(unsafe_code)]
 
 mod elementwise;
+pub mod emit;
 mod error;
-mod expr;
+pub mod expr;
 mod functions;
 
 pub use elementwise::Elementwise;
