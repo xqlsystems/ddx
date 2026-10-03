@@ -290,3 +290,49 @@ async fn grad_in_sql_reads_comments_as_comments() {
     .await;
     assert_eq!(got, vec![(0, 4.0), (1, 6.0)]);
 }
+
+#[tokio::test]
+async fn not_in_over_a_nullable_subquery_is_refused_not_differentiated_wrongly() {
+    // From the adversarial tester's review of #79: DataFusion's Substrait
+    // producer writes `NOT IN`'s null-aware anti-join as a plain one (#104),
+    // so ddx would differentiate a query that keeps rows a NULL excludes,
+    // and say nothing. The adapter sees the null-aware join and refuses.
+    use datafusion::prelude::SessionContext;
+    use ddx_datafusion::ad::{self, AdError, ColumnRef};
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE ny (s BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0), (2, 4.0)",
+        "CREATE TABLE nx (s BIGINT, val DOUBLE) AS VALUES (0, 0.5), (NULL, 0.9), (1, -0.2)",
+        "CREATE TABLE nn (s BIGINT NOT NULL, val DOUBLE) AS VALUES (0, 0.5), (1, -0.2)",
+        "CREATE TABLE ky (s BIGINT NOT NULL, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0), (2, 4.0)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    let loss =
+        "SELECT SUM(val * val) AS l FROM ny WHERE s NOT IN (SELECT s FROM nx WHERE val > 0.05)";
+    let refused = |e: datafusion::error::DataFusionError| match e {
+        datafusion::error::DataFusionError::External(b) => {
+            matches!(b.downcast_ref::<AdError>(), Some(AdError::NotImplemented(m)) if m.contains("NOT IN"))
+        }
+        _ => false,
+    };
+    let wrt = [ColumnRef::new("ny", "val")];
+    let err = ad::grad(&ctx, loss, &wrt).await.unwrap_err();
+    assert!(refused(err));
+    // Unoptimized, NOT IN is still a subquery expression: refused too.
+    let lp = ctx.sql(loss).await.unwrap().into_unoptimized_plan();
+    assert!(refused(ad::grad_plan(&ctx, &lp, &wrt).unwrap_err()));
+    // In SQL, the same.
+    let stmt = format!("WITH loss AS ({loss}) SELECT * FROM grad(loss, ny.val)");
+    assert!(refused(ad::sql(&ctx, &stmt).await.unwrap_err()));
+    // NOT EXISTS is a plain anti-join, and the round trip keeps it.
+    let exists = "SELECT SUM(val * val) AS l FROM ny WHERE NOT EXISTS \
+                  (SELECT 1 FROM nx WHERE nx.s = ny.s AND nx.val > 0.05)";
+    ad::grad(&ctx, exists, &wrt).await.unwrap();
+    // Neither side can be NULL: no null-aware join, nothing lost.
+    let keyed =
+        "SELECT SUM(val * val) AS l FROM ky WHERE s NOT IN (SELECT s FROM nn WHERE val > 0.05)";
+    ad::grad(&ctx, keyed, &[ColumnRef::new("ky", "val")])
+        .await
+        .unwrap();
+}

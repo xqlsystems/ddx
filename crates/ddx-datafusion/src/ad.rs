@@ -108,6 +108,7 @@ pub fn grad_plan(
     plan: &LogicalPlan,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
+    refuse_what_substrait_loses(plan)?;
     ddx_ad::grad(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
 }
 
@@ -125,7 +126,62 @@ pub fn vjp_plan(
     plan: &LogicalPlan,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
+    refuse_what_substrait_loses(plan)?;
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// Refuse a plan whose meaning DataFusion's Substrait producer does not
+/// keep, so ddx would differentiate a different query, silently.
+///
+/// One case, upstream bug #104: `x NOT IN (subquery)` keeps no row when the
+/// subquery returns a NULL. DataFusion plans it as a null-aware anti-join
+/// (as an `IN` subquery expression before optimization), and its producer
+/// writes a plain anti-join, which keeps those rows. ddx-ad cannot tell from
+/// the Substrait plan, which reads as `NOT EXISTS`; only this plan can. As
+/// DataFusion does, a `NOT IN` whose two sides cannot be NULL is let through.
+fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::ExprSchemable;
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Join(j) = node {
+            found |= j.null_aware;
+        }
+        let schema = node.inputs().first().map_or(node.schema(), |i| i.schema());
+        node.apply_expressions(|e| {
+            e.apply(|x| {
+                if let Expr::InSubquery(sq) = x {
+                    if sq.negated {
+                        let needle = sq.expr.nullable(schema).unwrap_or(true);
+                        let haystack = sq
+                            .subquery
+                            .subquery
+                            .schema()
+                            .fields()
+                            .first()
+                            .is_none_or(|f| f.is_nullable());
+                        found |= needle || haystack;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    if found {
+        return Err(to_df_err(AdError::NotImplemented(
+            "`NOT IN` over a subquery whose values may be NULL: DataFusion's Substrait \
+             producer writes it as a plain anti-join, which keeps the rows a NULL in the \
+             subquery should exclude (ddx issue #104). Write `NOT EXISTS`, or filter the \
+             NULLs out of the subquery"
+                .into(),
+        )));
+    }
+    Ok(())
 }
 
 /// Run the SQL statement `sql`, in which `grad(loss, table.column, …)` in a
