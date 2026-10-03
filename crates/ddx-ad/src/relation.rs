@@ -22,8 +22,10 @@
 //! For a table the query reads, the values are the columns named in `wrt`, and
 //! the dims are all the others. A table whose every column is named in `wrt`
 //! has no dims and is refused. That the dims identify the rows (no two rows
-//! share a dim tuple) is the XQL model's promise; ddx cannot see it in a plan,
-//! and a table that breaks it gets each shared tuple's rows' gradients summed. For a relation the query computes, the plan
+//! share a dim tuple) is the XQL model's promise. A plan cannot show it, so
+//! each program carries a check that runs before its steps
+//! ([`crate::BackwardProgram::checks`]) and refuses a table that breaks it,
+//! rather than give rows that share dims their summed gradient. For a relation the query computes, the plan
 //! says which is which: a `GROUP BY` key is a dim, an aggregate is a value, and
 //! a join's dims are both sides' dims.
 
@@ -33,9 +35,16 @@ use substrait::proto::NamedStruct;
 /// to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
-    /// The table, as the plan names it: `weights`, or `schema.weights`. A bare
-    /// name also matches a qualified one with that last part, and case is
-    /// ignored.
+    /// The table, as the plan names it: `weights`, or `schema.weights`.
+    ///
+    /// It is matched against the names of the tables the plan reads, ignoring
+    /// case (a producer folds unquoted identifiers). A qualified name must
+    /// match all of a table's name; a bare name matches a table whose last
+    /// part it is, so `weights` matches `schema.weights`. A bare name that
+    /// matches tables in two schemas is refused, listing them: which rows get
+    /// a gradient is not guessed. Some producers drop the schema before ddx
+    /// sees the plan (Ibis writes `schema.weights` as `weights`), and then
+    /// only the bare name matches; the error says so.
     pub table: String,
     /// The column.
     pub column: String,

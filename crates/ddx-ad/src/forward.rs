@@ -223,11 +223,30 @@ pub struct Forward {
     pub output: Region,
     /// The output column names.
     pub output_names: Vec<String>,
+    /// The prefix of every table name the program materializes.
+    pub namespace: String,
 }
 
-/// The name of saved aggregate `n`'s table.
-pub fn saved_name(n: usize) -> String {
-    format!("__ddx_saved_{n}")
+/// The name of saved aggregate `n`'s table, in a program's `namespace`.
+pub fn saved_name(namespace: &str, n: usize) -> String {
+    format!("{namespace}saved_{n}")
+}
+
+/// A fresh prefix for one program's table names: `__ddx_{id}_`.
+///
+/// Every table a program materializes lives under it, so two programs on one
+/// engine never read or replace each other's tables, and none takes a name a
+/// user is likely to have. The id is unique within the process (a counter)
+/// and unlikely to repeat across processes (the clock).
+pub fn new_namespace() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("__ddx_{:x}{n:x}_", clock & 0xffff_ffff)
 }
 
 /// The column names of a saved relation or its cotangent, `width` wide.
@@ -238,6 +257,12 @@ pub fn step_columns(width: usize) -> Vec<String> {
 impl Forward {
     /// Read `plan`, with `wrt` naming the table columns that are values.
     pub fn new(plan: &Plan, wrt: &[ColumnRef]) -> Result<Forward> {
+        Forward::in_namespace(plan, wrt, new_namespace())
+    }
+
+    /// [`Forward::new`], naming every table the program writes under
+    /// `namespace` rather than a fresh one.
+    pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = root_of(plan)?;
         let root = &inline_references(root, &plan.relations)?;
@@ -248,6 +273,7 @@ impl Forward {
         }
         let mut b = Builder {
             functions: &functions,
+            namespace: namespace.clone(),
             wrt,
             tables: Vec::new(),
             saved: Vec::new(),
@@ -262,6 +288,7 @@ impl Forward {
             saved,
             output,
             output_names,
+            namespace,
         })
     }
 }
@@ -370,6 +397,7 @@ fn mentions_reference(rel: &Rel) -> bool {
 
 struct Builder<'a> {
     functions: &'a Functions,
+    namespace: String,
     wrt: &'a [ColumnRef],
     tables: Vec<Table>,
     saved: Vec<Saved>,
@@ -469,7 +497,10 @@ impl Builder<'_> {
             RelType::Aggregate(a) => {
                 let n = self.read_saved(a)?;
                 let width = self.saved[n].outputs.len();
-                let mut s = empty(emit::read_step(&saved_name(n), step_columns(width)));
+                let mut s = empty(emit::read_step(
+                    &saved_name(&self.namespace, n),
+                    step_columns(width),
+                ));
                 s.slots.push(Slot {
                     input: Input::Saved(n),
                     offset: Some(0),
@@ -899,14 +930,41 @@ impl Builder<'_> {
 
     fn check_every_wrt_was_read(&self) -> Result<()> {
         for w in self.wrt {
+            // A bare name that matches tables in two schemas would take both
+            // as wrt tables; which rows get a gradient must not be a guess.
+            let matching: Vec<&String> = self
+                .seen
+                .iter()
+                .filter(|t| {
+                    table_matches(
+                        &w.table,
+                        &t.split('.').map(str::to_string).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            if matching.len() > 1 {
+                return Err(AdError::UnknownWrt(format!(
+                    "`{}` names more than one table the query reads: {matching:?}; \
+                     qualify it",
+                    w.table
+                )));
+            }
             let read = self
                 .tables
                 .iter()
                 .any(|t| table_matches(&w.table, &t.names));
             if !read {
+                // A producer may drop a schema qualifier (Ibis writes `s.t`
+                // as `t`), and then only the bare name can match.
+                let hint = match w.table.rsplit_once('.') {
+                    Some((_, last)) if self.seen.iter().any(|t| t.eq_ignore_ascii_case(last)) => {
+                        format!("; the plan names its tables without a schema, so name it `{last}`")
+                    }
+                    _ => String::new(),
+                };
                 return Err(AdError::UnknownWrt(format!(
                     "the query does not read a table `{}` (or reads it only where no gradient \
-                     can reach); it reads {:?}",
+                     can reach); it reads {:?}{hint}",
                     w.table, self.seen
                 )));
             }

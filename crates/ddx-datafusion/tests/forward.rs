@@ -389,8 +389,8 @@ async fn a_subtree_shared_through_reference_rel_reads_as_the_tree() {
         // The analysis, less the function table (a HashMap, so its Debug
         // order varies).
         let analysis = |f: Forward| format!("{:?}", (f.tables, f.saved, f.output, f.output_names));
-        let want = analysis(Forward::new(&tree, &wrt).unwrap());
-        let got = analysis(Forward::new(&shared, &wrt).unwrap());
+        let read = |p| Forward::in_namespace(p, &wrt, "__ddx_t_".into()).unwrap();
+        let (want, got) = (analysis(read(&tree)), analysis(read(&shared)));
         assert_eq!(got, want);
     }
 }

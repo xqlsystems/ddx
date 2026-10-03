@@ -19,12 +19,17 @@ pub enum AdError {
     /// The plan uses something `ddx-ad` has no transpose rule for yet, on a
     /// path the gradient flows along.
     NotImplemented(String),
+    /// `grad` was asked for the gradient of something that is not a loss: one
+    /// row and one column that depends on `wrt`.
+    NotScalar(String),
     /// A `wrt` column names a table or column the plan does not read.
     UnknownWrt(String),
     /// A `wrt` column cannot be differentiated with respect to: it is not a
     /// floating-point column, or its table has no other column to identify
     /// its rows.
     InvalidWrt(String),
+    /// The options a program was asked to be built with are not usable.
+    InvalidOptions(String),
     /// The plan is not one ddx can read: malformed, or missing a field every
     /// producer fills in.
     InvalidPlan(String),
@@ -38,8 +43,10 @@ impl fmt::Display for AdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AdError::NotImplemented(m) => write!(f, "not supported by ddx-ad yet: {m}"),
+            AdError::NotScalar(m) => write!(f, "not a scalar loss: {m}"),
             AdError::UnknownWrt(m) => write!(f, "unknown wrt column: {m}"),
             AdError::InvalidWrt(m) => write!(f, "invalid wrt column: {m}"),
+            AdError::InvalidOptions(m) => write!(f, "invalid options: {m}"),
             AdError::InvalidPlan(m) => write!(f, "invalid Substrait plan: {m}"),
             AdError::Diff(e) => write!(f, "{e}"),
             AdError::Internal(m) => write!(f, "internal error in ddx-ad (a bug): {m}"),

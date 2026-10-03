@@ -1349,6 +1349,7 @@ name = "ddx-ad"
 version = "0.0.0"
 dependencies = [
  "ddx-core",
+ "prost",
  "substrait",
 ]
 
@@ -1368,6 +1369,7 @@ dependencies = [
  "datafusion-substrait",
  "ddx-ad",
  "ddx-core",
+ "prost",
  "tokio",
 ]
 
