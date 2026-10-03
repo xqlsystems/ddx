@@ -31,6 +31,9 @@
 //!   near-tie. *Fixed in #76:* the extreme and the rows attaining it are
 //!   windows over the recomputed rows themselves, never compared with the
 //!   saved value.
+//! - **A table with capitals has no gradient in SQL.** `ad::sql` reads a
+//!   gradient step back under a quoted name DataFusion lowercased when it
+//!   was registered. *Fixed in #74:* a step's name is lower case.
 //! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
@@ -239,6 +242,46 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
             "run {run}: the MAX's gradient is 0 at every row"
         );
     }
+}
+
+#[tokio::test]
+async fn grad_in_sql_of_a_table_with_capitals() {
+    // A gradient step is named after its table (`…_grad_0_W`). DataFusion
+    // folds the unquoted name it is registered under to lower case, and
+    // ad::sql then reads it back quoted, case and all, and finds nothing.
+    // Every table with a capital in its name, "Weights" from a Parquet file
+    // for one, has no gradient in SQL.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let df = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") SELECT i, val FROM grad(loss, \"W\".val) ORDER BY i",
+    )
+    .await
+    .unwrap();
+    df.collect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_power_under_one_at_zero_has_an_infinite_derivative_not_a_failed_query() {
+    // Found by the soak after the fixes above (seed 811): the map rule's
+    // partial of power(v, 0.5) was 0.5 * power(v, -0.5), and DataFusion
+    // refuses power(0, c) for c < 0 ("zero raised to a negative power is
+    // undefined"), so a program ddx accepted failed to run where v = 0.
+    // *Fixed in ddx-core:* a negative power is written as a division, so the
+    // partial there is 0.5 / 0 = inf, as it is.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 0.0), (1, 4.0)",
+    )
+    .await;
+    let got = grad(&ctx, "SELECT SUM(power(val, 0.5)) AS loss FROM p", "p").await;
+    assert_eq!(got, vec![(0, Some(f64::INFINITY)), (1, Some(0.25))]);
 }
 
 // ---------------------------------------------------------------------------
