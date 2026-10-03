@@ -122,27 +122,58 @@ fn unsupported_function_errors() {
 
 #[test]
 fn power_negative_constant_exponent() {
-    // d/dx power(x, -2) = -2 * power(x, -3); a negative constant exponent is
-    // inside the stated v1 surface and must not be rejected (review #46).
-    assert_eq!(d("power(x, -2)", "x"), "-2.0 * power(x, -3.0)");
+    // d/dx power(x, -2) = -2 * power(x, -3), written -2 / power(x, 3); a
+    // negative constant exponent is inside the stated v1 surface and must not
+    // be rejected (review #46).
+    assert_eq!(
+        d("power(x, -2)", "x"),
+        "CAST(-2.0 AS DOUBLE) / power(x, 3.0)"
+    );
 }
 
 #[test]
 fn power_negative_fractional_exponent() {
-    // d/dx power(x, -0.5) = -0.5 * power(x, -1.5); the negative *fractional*
-    // case, complementing the -2 integer case above (review #46).
-    assert_eq!(d("power(x, -0.5)", "x"), "-0.5 * power(x, -1.5)");
+    // d/dx power(x, -0.5) = -0.5 * power(x, -1.5), written as a division; the
+    // negative *fractional* case, complementing the -2 integer case above
+    // (review #46).
+    assert_eq!(
+        d("power(x, -0.5)", "x"),
+        "CAST(-0.5 AS DOUBLE) / power(x, 1.5)"
+    );
 }
 
 #[test]
 fn power_fractional_exponent_output_is_reconsumable() {
-    // d/dx power(x, 0.5) emits a negative exponent; differentiating that TEXT
-    // again must work (the engine must be able to re-consume its own output).
+    // d/dx power(x, 0.5) = 0.5 * power(x, -0.5), written as a division;
+    // differentiating that TEXT again must work (the engine must be able to
+    // re-consume its own output).
     let once = d("power(x, 0.5)", "x");
-    assert!(once.contains("power(x, -0.5)"), "unexpected: {once}");
+    assert!(once.contains("/ power(x, 0.5)"), "unexpected: {once}");
     // Re-parse and differentiate the emitted text again — no error.
     let twice = Ddx::new().differentiate_sql(&once, "x", &GenericDialect {});
     assert!(twice.is_ok(), "engine rejected its own output: {twice:?}");
+}
+
+#[test]
+fn a_negative_power_is_a_division_so_a_zero_base_gives_infinity() {
+    // DataFusion refuses power(0, c) for c < 0 ("zero raised to a negative
+    // power is undefined"), failing the query; written as c / power(u, 1 - c)
+    // the derivative at 0 is c / 0, an infinity, as it is (v2 soak).
+    use ddx_core::test_utils::{eval, parse_expr};
+    for (sql, want) in [
+        ("power(x, 0.5)", f64::INFINITY),
+        ("power(x, -1)", f64::NEG_INFINITY),
+    ] {
+        let out = d(sql, "x");
+        assert!(!out.contains(", -"), "{sql}: a negative exponent in {out}");
+        assert_eq!(
+            eval(&parse_expr(&out), 0.0, 1.0),
+            Some(want),
+            "{sql}: {out}"
+        );
+    }
+    // A zero exponent is a constant.
+    assert_eq!(d("power(x, 0)", "x"), "0.0");
 }
 
 #[test]
