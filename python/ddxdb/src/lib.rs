@@ -490,6 +490,33 @@ fn _vjp<'py>(
     Ok((to_py_program(py, program.clone()), Program(program)))
 }
 
+/// Does `sql` hold `x NOT IN (subquery)`? DataFusion's Substrait producer
+/// writes its null-aware anti-join as a plain one (ddx issue #104), so a
+/// gradient of such a query would be of a different query. The Rust adapter
+/// sees DataFusion's plan and refuses only when a NULL is possible; from
+/// Python only the SQL is at hand, so any `NOT IN` over a subquery is
+/// refused. A statement that does not parse is let through.
+#[pyfunction]
+fn _not_in_subquery(sql: &str) -> bool {
+    use ddx_core::sqlparser::ast::{Expr, Visit, Visitor};
+    use ddx_core::sqlparser::dialect::GenericDialect;
+    use ddx_core::sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                Expr::InSubquery { negated: true, .. } => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    Parser::parse_sql(&GenericDialect {}, sql)
+        .map(|stmts| stmts.visit(&mut Finder).is_break())
+        .unwrap_or(false)
+}
+
 /// The tables a step's plan reads without their types: the earlier steps it
 /// depends on.
 #[pyfunction]
@@ -542,6 +569,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
     m.add_function(wrap_pyfunction!(_grad, m)?)?;
     m.add_function(wrap_pyfunction!(_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(_not_in_subquery, m)?)?;
     m.add_class::<Program>()?;
     m.add_class::<Runner>()?;
     m.add_class::<Statements>()?;

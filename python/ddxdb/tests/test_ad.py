@@ -277,9 +277,16 @@ def test_a_failed_run_leaves_none_of_the_programs_tables(ad, ctx):
 
 
 def test_a_fixed_namespace_gives_the_same_program(ad, ctx):
+    # The same plan, not the same query: DataFusion's producer can number a
+    # query's functions differently from one call to the next.
+    from datafusion.substrait import Serde
+
+    from ddxdb import program as p
+
     q = "SELECT SUM(val * val) AS l FROM w"
-    a = ad.grad(ctx, q, [("w", "val")], namespace="__ddx_py_")
-    b = ad.grad(ctx, q, [("w", "val")], namespace="__ddx_py_")
+    plan = Serde.serialize_bytes(q, ctx)
+    a = p.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
+    b = p.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
     assert a == b and a.value == "__ddx_py_value"
     with pytest.raises(ddxdb.DdxError, match="namespace"):
         ad.grad(ctx, q, [("w", "val")], namespace="__ddx_Py_")
@@ -292,3 +299,19 @@ def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in():
     assert len(_Statements([stmt], "duckdb").jobs()) == 1
     with pytest.raises(ValueError, match="dialect"):
         _Statements([stmt], "klingon")
+
+
+def test_not_in_over_a_subquery_is_refused(ad, ctx):
+    # DataFusion's Substrait producer drops NOT IN's NULL semantics (#104):
+    # refused, rather than differentiated as a different query.
+    loss = "SELECT SUM(val * val) AS l FROM w WHERE i NOT IN (SELECT i FROM b WHERE val > 1.0)"
+    with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
+        ad.grad(ctx, loss, [("w", "val")])
+    with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
+        ad.sql(ctx, f"WITH loss AS ({loss}) SELECT * FROM grad(loss, w.val)")
+    exists = (
+        "SELECT SUM(val * val) AS l FROM w WHERE NOT EXISTS "
+        "(SELECT 1 FROM b WHERE b.i = w.i AND b.val > 1.0)"
+    )
+    ad.grad(ctx, exists, [("w", "val")])
+

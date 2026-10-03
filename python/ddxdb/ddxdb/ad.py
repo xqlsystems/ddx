@@ -54,7 +54,14 @@ try:
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.ad needs DataFusion: pip install 'ddxdb[datafusion]'") from e
 
-from ._ddxdb import InvalidColumn, _bind_reads, _Statements, _unbound_reads
+from ._ddxdb import (
+    InvalidColumn,
+    UnsupportedExpression,
+    _bind_reads,
+    _not_in_subquery,
+    _Statements,
+    _unbound_reads,
+)
 from .program import (
     Backend,
     BackwardProgram,
@@ -117,9 +124,12 @@ def grad(
     Raises a :class:`ddxdb.DdxError` subclass when ddx cannot differentiate
     the query: :class:`ddxdb.NotScalar` for a query that is not a loss,
     :class:`ddxdb.UnknownColumn` for a ``wrt`` it does not read, and so on.
-    ``namespace`` fixes the prefix of the tables the program writes, so the
-    same query gives the same program (see :func:`ddxdb.program.grad_plan`).
+    ``namespace`` fixes the prefix of the tables the program writes (see
+    :func:`ddxdb.program.grad_plan`). The same plan then gives the same
+    program; the same query need not, since DataFusion's producer can number
+    its functions differently from one call to the next.
     """
+    _refuse_not_in(sql)
     return grad_plan(Serde.serialize_bytes(sql, ctx), wrt, namespace=namespace)
 
 
@@ -134,7 +144,21 @@ def vjp(
     backward steps, register the cotangent as the table
     ``program.cotangent_table`` names, with the columns ``program.cotangent``
     lists."""
+    _refuse_not_in(sql)
     return vjp_plan(Serde.serialize_bytes(sql, ctx), wrt, namespace=namespace)
+
+
+def _refuse_not_in(sql: str) -> None:
+    """Refuse ``x NOT IN (subquery)``: DataFusion's Substrait producer drops
+    its NULL semantics (ddx issue #104), so ddx would differentiate a query
+    that keeps rows a NULL in the subquery excludes."""
+    if _not_in_subquery(sql):
+        raise UnsupportedExpression(
+            "not supported by ddx-ad yet: `NOT IN` over a subquery: DataFusion's Substrait "
+            "producer writes it as a plain anti-join, which keeps the rows a NULL in the "
+            "subquery should exclude (ddx issue #104). Write `NOT EXISTS`, or filter the NULLs "
+            "out of the subquery"
+        )
 
 
 class DataFusionBackend:
