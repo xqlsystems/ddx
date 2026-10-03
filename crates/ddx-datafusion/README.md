@@ -39,8 +39,9 @@ statements that take `grad` of one loss for one backward pass, and
 tables are named under a prefix of its own (`__ddx_{id}_`, a reserved
 prefix), so programs never touch each other's tables or yours; `ad::sql`
 leaves none behind, and `ad::release` drops what `ad::run` keeps.
-[`examples/nn`](examples/nn) trains nn.py's MLP (xarray-sql#196) with one SQL
-statement per parameter table: `cargo run -p ddx-datafusion --example nn`.
+[`examples/nn`](examples/nn) trains a small MLP written entirely in SQL
+(adapted from [a neural network written entirely in SQL](https://github.com/xqlsystems/xarray-sql/pull/196) in xarray-sql) with one SQL statement per
+parameter table: `cargo run -p ddx-datafusion --example nn`.
 
 ## Two routes to the same rewrite
 

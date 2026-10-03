@@ -86,10 +86,12 @@ it the way `jax.grad` differentiates a function, reverse mode, one transpose
 rule per relational operator (joins, sums, averages, max and min, window
 rankings), and nothing in it is labelled. The backward pass is a sequence of
 plain Substrait plans the engine runs.
-[`examples/nn`](crates/ddx-datafusion/examples/nn) trains nn.py's MLP this way,
-with nn.py's own loss query; its gradients equal nn.py's hand-written backward
-queries to 1e-12, and the spikes' MLP, attention and max-pool gradients equal
-`jax.grad` to 1e-12.
+[`examples/nn`](crates/ddx-datafusion/examples/nn) trains a small classifier
+this way: a two-layer MLP over 6×6 images, adapted from [a neural network written entirely in SQL](https://github.com/xqlsystems/xarray-sql/pull/196)
+in xarray-sql, which computed its gradients with hand-written backward queries.
+Here its loss query is used unchanged, and ddx's gradients equal those
+hand-written ones to 1e-12. The spikes' MLP, attention and max-pool gradients
+equal `jax.grad` to 1e-12.
 
 ## Status
 
