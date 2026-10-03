@@ -149,6 +149,7 @@ python/ddxdb/       # PyO3/maturin wheel: rewrite_sql + a DataFusion Context + a
 tests/              # cross-engine numeric-agreement suites (vs JAX)
 docs/spikes/        # runnable evidence for every design claim
 docs/design.md      # the design
+docs/fast-linalg-notes.md  # notes seeding a future fast linear-algebra project
 ```
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
