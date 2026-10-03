@@ -48,8 +48,36 @@ fn product_rule() {
 
 #[test]
 fn quotient_rule() {
-    // d/dx (x / y) = (1*y - x*0) / (y*y) = y / (y*y), numerator cast to DOUBLE.
-    assert_eq!(d("x / y", "x"), "CAST(y AS DOUBLE) / (y * y)");
+    // d/dx (x / y) = 1 / y: a denominator constant in x divides the tangent,
+    // the numerator cast to DOUBLE (design.md §3.8).
+    assert_eq!(d("x / y", "x"), "CAST(1.0 AS DOUBLE) / y");
+    // d/dy (x / y) = (0 - (x/y)*1)/y: the full rule, divided by y once
+    // through the quotient.
+    assert_eq!(
+        d("x / y", "y"),
+        "CAST(-(CAST(x AS DOUBLE) / y) AS DOUBLE) / y"
+    );
+}
+
+#[test]
+fn a_quotients_derivative_holds_when_its_denominator_is_infinite_or_tiny() {
+    // (du·v - u·dv)/v² is ∞/∞ = NaN at v = ∞, where the limit is 0: a value in
+    // the data can be infinite (found by the v2 soak). (du - (u/v)·dv)/v is
+    // finite there, whether or not v depends on the variable, and never
+    // squares v, which underflows at 1e-163.
+    use ddx_core::test_utils::{eval, parse_expr};
+    let constant = parse_expr(&d("x * x / y", "x"));
+    assert_eq!(eval(&constant, 1.5, f64::INFINITY), Some(0.0));
+    assert_eq!(eval(&constant, 1.5, 2.0), Some(1.5));
+    let varied = parse_expr(&d("x / (x + y)", "x"));
+    assert_eq!(eval(&varied, 1.5, f64::INFINITY), Some(0.0));
+    assert_eq!(eval(&varied, 1.0, 1.0), Some(0.25));
+    // x / sinh(x) is 1 - x²/6 + …, so its derivative at a tiny x is about
+    // -x/3, not the ±1e159 two cancelling 1/x terms leave (v2 soak, tiny
+    // values).
+    let tiny = parse_expr(&d("x / sinh(x)", "x"));
+    let at = eval(&tiny, 1e-163, 1.0).unwrap();
+    assert!(at.abs() < 1e-150, "{at:e}");
 }
 
 #[test]
