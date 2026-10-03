@@ -14,6 +14,8 @@
 //! | **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
 //! | **broadcast** | a join, which pairs each row with every row it matches | sum the cotangent back over the rows each input row was copied to |
 //! | **reduce** | a grouped `SUM` | broadcast the group's cotangent to every row that was summed |
+//! | | `AVG` | the same, divided by the group's count |
+//! | | `MAX`, `MIN` | the group's cotangent to the rows that attain it, shared evenly at a tie (`jax.grad`'s convention for `jnp.max`) |
 //!
 //! A matrix product, `SUM(a.v * b.v) … GROUP BY` over a join, is not a
 //! primitive: it is broadcast, map and reduce, and its transpose is theirs
@@ -47,8 +49,8 @@ use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64};
-use crate::forward::{width, Def, Forward, Input, Output, Region};
+use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
+use crate::forward::{subquery_rounds, width, Def, Forward, Input, Output, Region};
 use crate::functions::Extensions;
 
 /// An input's cotangent from one place that reads it: the input's dims, then
@@ -91,7 +93,8 @@ impl<'a> Transposer<'a> {
         // Each measure's argument becomes a column of the region, so the
         // chain rule can start from it.
         let mut args = Vec::new();
-        let mut seeds = Vec::new();
+        // (argument column, rule, index into `cols`, output column)
+        let mut rules = Vec::new();
         for (i, &col) in cols.iter().enumerate() {
             let Output::Value(m) = saved.outputs[col] else {
                 return Err(AdError::NotImplemented(
@@ -100,25 +103,22 @@ impl<'a> Transposer<'a> {
                         .into(),
                 ));
             };
-            match reduce_rule(&self.f.functions, &saved.measures[m])? {
-                Reduce::Sum(arg) => {
-                    seeds.push((width + args.len(), dims.len() + i));
-                    args.push(*arg);
-                }
-                Reduce::Constant => {}
-            }
+            let (rule, arg) = match reduce_rule(&self.f.functions, &saved.measures[m])? {
+                Reduce::Constant => continue,
+                Reduce::Of(rule, arg) => (rule, arg),
+            };
+            rules.push((width + args.len(), rule, i, col));
+            args.push(*arg);
         }
         for e in &args {
             let varied = depends(&self.f.functions, e, &|c| region.varied[c])?;
             region.defs.push(Def::Expr(e.clone()));
+            region.rounds.push(subquery_rounds(&self.f.functions, e)?);
             region.varied.push(varied);
             region.refusals.push(None);
         }
         let rows = project(region.rel.clone(), args);
-
-        // The reduce rule's broadcast: every row joined to the cotangent of
-        // the group it was summed into.
-        let region_width = region.defs.len();
+        let rows_width = region.defs.len();
         let keys: Vec<Expression> = dims
             .iter()
             .map(|&d| match saved.outputs[d] {
@@ -126,22 +126,110 @@ impl<'a> Transposer<'a> {
                 Output::Value(_) => unreachable!("dims() returns grouping columns"),
             })
             .collect();
-        let base = self.join_on(rows, cotangent, keys, region_width)?;
-        // An aggregate skips a row whose argument is NULL, so nothing in that
-        // row moves the loss: its cotangent is NULL, not the group's, or the
-        // row's other inputs (the `p` of `SUM(p + q)` where `q` is NULL) would
-        // get gradient through it.
-        let is_null = self.ext.anchor("is_null");
-        let seeds = seeds
-            .into_iter()
-            .map(|(arg, cot)| {
-                let seed = if_then(
-                    vec![(call(is_null, vec![field(arg)]), null_f64())],
-                    field(region_width + cot),
+
+        // AVG divides by its group's count, and MAX and MIN find the rows
+        // that attain the group's extreme and how many do. Each is a window
+        // over the recomputed rows themselves, partitioned by the group's
+        // keys, never a comparison with the saved aggregate: a recomputation
+        // need not be bit-identical to the forward pass (a grouped SUM over
+        // several partitions adds in arrival order), and a saved maximum no
+        // recomputed row equals would silently send no gradient at all.
+        let count = self.ext.anchor("count");
+        let sum = self.ext.anchor("sum");
+        let isnan = self.ext.anchor("isnan");
+        let mut rel = rows;
+        let mut next = rows_width;
+        let mut stat_at = BTreeMap::new();
+        let mut extreme_at = BTreeMap::new();
+        let mut windows = Vec::new();
+        for &(arg_col, rule, _, _) in &rules {
+            let at = next + windows.len();
+            match rule {
+                Rule::Sum => continue,
+                Rule::Mean => {
+                    windows.push(window(count, vec![field(arg_col)], keys.clone()));
+                    stat_at.insert(arg_col, at);
+                }
+                Rule::Extreme(name) => {
+                    // NaN arguments are left out. DataFusion's grouped MAX
+                    // skips a NaN where its ungrouped and window MAX return
+                    // it; a MAX that gave a finite value skipped them, so
+                    // leaving them out agrees with it, and a NaN row gets no
+                    // gradient, as a NULL one gets none.
+                    let f = self.ext.anchor(name);
+                    let arg = if_then(
+                        vec![(call(isnan, vec![field(arg_col)]), null_f64())],
+                        field(arg_col),
+                    );
+                    windows.push(window(f, vec![arg], keys.clone()));
+                    extreme_at.insert(arg_col, at);
+                }
+            }
+        }
+        if !windows.is_empty() {
+            next += windows.len();
+            rel = project(rel, windows);
+        }
+        let attaining: Vec<Expression> = extreme_at
+            .iter()
+            .map(|(&arg_col, &at)| {
+                let attains = if_then(
+                    vec![(
+                        self.attains(arg_col, at, jitters(&region, arg_col)),
+                        lit_f64(1.0),
+                    )],
+                    lit_f64(0.0),
                 );
-                (arg, seed)
+                window(sum, vec![attains], keys.clone())
             })
             .collect();
+        for (k, &arg_col) in extreme_at.keys().enumerate() {
+            stat_at.insert(arg_col, next + k);
+        }
+        if !attaining.is_empty() {
+            next += attaining.len();
+            rel = project(rel, attaining);
+        }
+
+        // Every row joined to the cotangent of the group it went into: the
+        // broadcast every reduce rule starts from.
+        let cotangent_at = next + dims.len();
+        let key_positions: Vec<usize> = (0..dims.len()).collect();
+        let base = self.join_on(rel, cotangent, keys, &key_positions, next)?;
+
+        let divide = self.ext.anchor("divide");
+        let is_null = self.ext.anchor("is_null");
+        let mut seeds = Vec::new();
+        for (arg_col, rule, i, _) in rules {
+            let cot = field(cotangent_at + i);
+            let seed = match rule {
+                // Every summed row gets the group's cotangent.
+                Rule::Sum => cot,
+                // A mean is a sum divided by the group's count.
+                Rule::Mean => call(divide, vec![cot, field(stat_at[&arg_col])]),
+                // Only the rows equal to the extreme get it, shared evenly
+                // among them: jax.grad's convention for jnp.max at a tie. The
+                // others get none, NULL rather than 0, so it stays none
+                // through a partial that is not finite there (0 · ∞ is NaN:
+                // an infinite value in the data that does not attain a MIN).
+                Rule::Extreme(_) => if_then(
+                    vec![(
+                        self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),
+                        call(divide, vec![cot, field(stat_at[&arg_col])]),
+                    )],
+                    null_f64(),
+                ),
+            };
+            // An aggregate skips a row whose argument is NULL, so nothing in
+            // that row moves the loss: its cotangent is NULL, not the
+            // group's, or the row's other inputs (the `p` of `SUM(p + q)`
+            // where `q` is NULL) would get gradient through it.
+            let seed = if_then(
+                vec![(call(is_null, vec![field(arg_col)]), null_f64())],
+                seed,
+            );
+            seeds.push((arg_col, seed));
+        }
         self.region(&region, base, seeds)
     }
 
@@ -172,14 +260,53 @@ impl<'a> Transposer<'a> {
         if_then(vec![(none, null_f64())], total)
     }
 
+    /// Does the row's argument (column `arg`) attain the group's extreme
+    /// (column `extreme`)? Equal to it, or, where it is finite, within a few
+    /// ulps of it: the extreme and the arguments are recomputed, and two
+    /// groups that tie in exact arithmetic can differ in the last bit (a sum
+    /// over several partitions adds in arrival order), which would give the
+    /// whole cotangent to whichever rounded higher on that run. Within the
+    /// tolerance they share it, as at an exact tie, the same way every run.
+    /// Only an argument that can jitter gets the tolerance (see [`jitters`]):
+    /// one computed from table values alone is the same every run, and two
+    /// of its values a few ulps apart do not tie (MAX(1, 1 + 2 ulps) has
+    /// gradient (0, 1), as jax.grad gives).
+    fn attains(&mut self, arg: usize, extreme: usize, tolerant: bool) -> Expression {
+        let equal = self.ext.anchor("equal");
+        if !tolerant {
+            return call(equal, vec![field(arg), field(extreme)]);
+        }
+        let or = self.ext.anchor("or");
+        let and = self.ext.anchor("and");
+        let lte = self.ext.anchor("lte");
+        let abs = self.ext.anchor("abs");
+        let subtract = self.ext.anchor("subtract");
+        let multiply = self.ext.anchor("multiply");
+        let size = call(abs, vec![field(extreme)]);
+        let finite = call(lte, vec![size.clone(), lit_f64(f64::MAX)]);
+        let gap = call(abs, vec![call(subtract, vec![field(arg), field(extreme)])]);
+        let close = call(
+            lte,
+            vec![gap, call(multiply, vec![lit_f64(8.0 * f64::EPSILON), size])],
+        );
+        call(
+            or,
+            vec![
+                call(equal, vec![field(arg), field(extreme)]),
+                call(and, vec![finite, close]),
+            ],
+        )
+    }
+
     /// Join `left` (whose columns before `left_width` are a region's) to
-    /// `right` on `left_keys[i] = right column i`, null-safely; a cross join
-    /// when there are no keys.
+    /// `right` on `left_keys[k] = right column right_keys[k]`, null-safely; a
+    /// cross join when there are no keys.
     pub fn join_on(
         &mut self,
         left: Rel,
         right: Rel,
         left_keys: Vec<Expression>,
+        right_keys: &[usize],
         left_width: usize,
     ) -> Result<Rel> {
         if left_keys.is_empty() {
@@ -197,8 +324,8 @@ impl<'a> Transposer<'a> {
         let and = self.ext.anchor("and");
         let cond = left_keys
             .into_iter()
-            .enumerate()
-            .map(|(k, key)| call(same, vec![key, field(left_width + k)]))
+            .zip(right_keys)
+            .map(|(key, &r)| call(same, vec![key, field(left_width + r)]))
             .reduce(|a, b| call(and, vec![a, b]))
             .expect("at least one key");
         Ok(join(left, right, cond, JoinType::Inner))
@@ -215,6 +342,7 @@ impl<'a> Transposer<'a> {
         base: Rel,
         seeds: Vec<(usize, Expression)>,
     ) -> Result<()> {
+        self.check_rankings_are_total(region)?;
         let mut width = width(&base)?;
         let mut rel = base;
         let mut pending: BTreeMap<usize, Vec<Expression>> = BTreeMap::new();
@@ -282,6 +410,95 @@ impl<'a> Transposer<'a> {
         Ok(())
     }
 
+    /// A window function in a region is recomputed in the backward pass, and
+    /// a filter on its rank must keep the same rows it kept forward. SQL does
+    /// not order ties, so an engine may rank tied rows differently each time;
+    /// that only cannot happen when the ranking is total. So every window
+    /// must partition or order by each dim of the rows beneath it; otherwise
+    /// the program is refused rather than risk sending gradient to rows the
+    /// forward pass did not keep.
+    fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+        if region.volatile {
+            return Err(AdError::NotImplemented(
+                "a volatile function (random(), now(), …) in rows that carry gradient: ddx \
+                 recomputes them for the backward pass, and the function would not give the \
+                 same values again; materialize its result as a table first"
+                    .into(),
+            ));
+        }
+        // Constant data is recomputed too, and ddx has no dims for it, so it
+        // cannot show a ranking or LIMIT inside it is total.
+        if region
+            .slots
+            .iter()
+            .any(|s| s.input == Input::Const && s.ordered)
+        {
+            return Err(AdError::NotImplemented(
+                "a window function or LIMIT over data that reads no wrt table, joined into                  rows that carry gradient: ddx recomputes it for the backward pass and cannot                  show it keeps the same rows (its ties may be ordered differently);                  materialize it as a table first"
+                    .into(),
+            ));
+        }
+        for cut in &region.cuts {
+            for &(input, offset, one) in &cut.covers {
+                let dims = match input {
+                    Input::Table(t) => self.f.tables[t].dims.clone(),
+                    Input::Saved(n) => self.f.saved[n].dims(),
+                    Input::Const if one => continue,
+                    Input::Const => {
+                        return Err(AdError::NotImplemented(
+                            "a LIMIT, or a ranking on a semi-join's right side, over rows                              joined to data ddx has no dims for: ddx cannot show which rows                              it keeps when it recomputes them"
+                                .into(),
+                        ))
+                    }
+                };
+                if one {
+                    continue;
+                }
+                let total = match &cut.keys {
+                    Some(keys) => dims.iter().all(|d| keys.contains(&(offset + d))),
+                    None => false,
+                };
+                if !total {
+                    return Err(AdError::NotImplemented(
+                        "a LIMIT (or a ranking on a semi-join's right side) whose ORDER BY                          does not include every dim of the rows it cuts. The rows it keeps                          may differ when ddx recomputes it for the backward pass; add the                          remaining dims to its ORDER BY to break ties"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        for (c, def) in region.defs.iter().enumerate() {
+            let Def::Window { keys } = def else { continue };
+            for s in &region.slots {
+                let Some(offset) = s.offset.filter(|&o| o < c) else {
+                    continue;
+                };
+                let dims = match s.input {
+                    Input::Table(t) => self.f.tables[t].dims.clone(),
+                    Input::Saved(n) => self.f.saved[n].dims(),
+                    Input::Const if s.at_most_one_row => continue,
+                    Input::Const => {
+                        return Err(AdError::NotImplemented(
+                            "a window function over rows joined to data ddx has no dims \
+                             for: ddx cannot show its ranking is total, and recomputing it \
+                             could keep different rows than the forward pass"
+                                .into(),
+                        ))
+                    }
+                };
+                if dims.iter().any(|d| !keys.contains(&(offset + d))) {
+                    return Err(AdError::NotImplemented(
+                        "a window function whose PARTITION BY and ORDER BY do not include \
+                         every dim of the rows it ranks. Its ties may be ranked differently \
+                         when ddx recomputes it for the backward pass; add the remaining dims \
+                         to its ORDER BY to break ties"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The map rule: `y = f(x₁, …)` with cotangent in column `cotangent`
     /// gives each varied `xᵢ` the term `ȳ · ∂f/∂xᵢ`.
     fn map(
@@ -342,10 +559,66 @@ impl<'a> Transposer<'a> {
     }
 }
 
-/// What the reduce rule does with one measure.
+/// Can column `col` of `region` differ in its last bits from one
+/// recomputation to the next? Only if it reads the output of an aggregate
+/// that rounds: a saved aggregate, constant data a sum or average computes,
+/// or a scalar subquery that does, since a grouped sum over several
+/// partitions adds in arrival order. A table's values, whether or not the
+/// table is differentiated, a maximum or count of them, and elementwise
+/// functions of those, are the same every run (#102: otherwise a table's
+/// gradient depended on which other tables were differentiated).
+fn jitters(region: &Region, col: usize) -> bool {
+    let mut stack = vec![col];
+    let mut seen = vec![false; region.defs.len()];
+    while let Some(c) = stack.pop() {
+        if std::mem::replace(&mut seen[c], true) {
+            continue;
+        }
+        match &region.defs[c] {
+            Def::Input { slot, .. } => {
+                if !matches!(region.slots[*slot].input, Input::Table(_)) {
+                    return true;
+                }
+            }
+            Def::Expr(e) => {
+                if region.rounds[c] {
+                    return true;
+                }
+                match fields_of(e) {
+                    Ok(fields) => stack.extend(fields),
+                    Err(_) => return true,
+                }
+            }
+            Def::Const => {
+                let slot = region.slots.iter().find(|s| {
+                    s.input == Input::Const && s.offset.is_some_and(|o| o <= c && c < o + s.width)
+                });
+                if slot.is_none_or(|s| s.rounds) {
+                    return true;
+                }
+            }
+            Def::Window { .. } => return true,
+        }
+    }
+    false
+}
+
+/// Which reduce rule a measure has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// `SUM`: every row gets the group's cotangent.
+    Sum,
+    /// `AVG`: every row gets the group's cotangent over the group's count.
+    Mean,
+    /// `MAX` or `MIN` (the name): the rows attaining it share the group's
+    /// cotangent.
+    Extreme(&'static str),
+}
+
+/// What the reduce rules do with one measure.
 enum Reduce {
-    /// A sum: the cotangent is broadcast onto this argument.
-    Sum(Box<Expression>),
+    /// The cotangent flows into this argument by this rule.
+    Of(Rule, Box<Expression>),
     /// Unchanged when its argument changes: no cotangent flows.
     Constant,
 }
@@ -362,25 +635,33 @@ fn reduce_rule(functions: &crate::Functions, f: &AggregateFunction) -> Result<Re
             _ => None,
         })
         .collect();
-    match name {
-        "count" => Ok(Reduce::Constant),
-        "sum" => {
-            if f.invocation == AggregationInvocation::Distinct as i32 {
-                return Err(AdError::NotImplemented(
-                    "SUM(DISTINCT …) over a value that carries gradient".into(),
-                ));
-            }
-            match args.as_slice() {
-                [arg] => Ok(Reduce::Sum(Box::new((*arg).clone()))),
-                _ => Err(AdError::InvalidPlan(format!(
-                    "SUM with {} arguments",
-                    args.len()
-                ))),
-            }
+    let rule = match name {
+        "count" => return Ok(Reduce::Constant),
+        "sum" => Rule::Sum,
+        "avg" | "mean" => Rule::Mean,
+        "max" => Rule::Extreme("max"),
+        "min" => Rule::Extreme("min"),
+        other => {
+            return Err(AdError::NotImplemented(format!(
+                "the aggregate `{other}` over a value that carries gradient; ddx has transpose \
+                 rules for SUM, AVG, MAX, MIN and COUNT"
+            )))
         }
-        other => Err(AdError::NotImplemented(format!(
-            "the aggregate `{other}` over a value that carries gradient; ddx has transpose \
-             rules for SUM and COUNT"
+    };
+    // DISTINCT changes which rows a sum or mean counts; it makes no difference
+    // to a max or min.
+    if f.invocation == AggregationInvocation::Distinct as i32 && !matches!(rule, Rule::Extreme(_)) {
+        return Err(AdError::NotImplemented(format!(
+            "{}(DISTINCT …) over a value that carries gradient",
+            name.to_uppercase()
+        )));
+    }
+    match args.as_slice() {
+        [arg] => Ok(Reduce::Of(rule, Box::new((*arg).clone()))),
+        _ => Err(AdError::InvalidPlan(format!(
+            "{} with {} arguments",
+            name.to_uppercase(),
+            args.len()
         ))),
     }
 }

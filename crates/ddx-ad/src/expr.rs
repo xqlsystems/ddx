@@ -132,6 +132,22 @@ pub fn call(anchor: u32, args: Vec<Expression>) -> Expression {
     }
 }
 
+/// The aggregate `anchor` over `args` as a window over each whole partition
+/// of `partitions`: `f(args) OVER (PARTITION BY partitions)`.
+pub fn window(anchor: u32, args: Vec<Expression>, partitions: Vec<Expression>) -> Expression {
+    use substrait::proto::expression::WindowFunction;
+    use substrait::proto::AggregationPhase;
+    Expression {
+        rex_type: Some(RexType::WindowFunction(WindowFunction {
+            function_reference: anchor,
+            arguments: args.into_iter().map(value_arg).collect(),
+            partitions,
+            phase: AggregationPhase::InitialToResult as i32,
+            ..Default::default()
+        })),
+    }
+}
+
 /// `CAST(e AS ty)`.
 pub fn cast(e: Expression, ty: Type) -> Expression {
     Expression {

@@ -100,6 +100,48 @@ impl Functions {
         Ok(self.name(anchor)? == STOP_GRADIENT)
     }
 
+    /// Can `anchor` give a different value each time a query is run
+    /// (`random()`, `now()`)? A recomputation would not repeat it.
+    pub fn is_volatile(&self, anchor: u32) -> Result<bool> {
+        const VOLATILE: &[&str] = &[
+            "random",
+            "rand",
+            "uuid",
+            "gen_random_uuid",
+            "now",
+            "current_timestamp",
+            "current_time",
+            "localtimestamp",
+            "localtime",
+        ];
+        Ok(VOLATILE.contains(&self.name(anchor)?))
+    }
+
+    /// Can the aggregate or window function `anchor` round differently from
+    /// one run to the next? A sum adds in the order its partitions arrive, so
+    /// its last bits can change; a maximum, a count or a rank cannot. Any
+    /// function not known to be exact is assumed to round.
+    pub fn rounds(&self, anchor: u32) -> Result<bool> {
+        const EXACT: &[&str] = &[
+            "max",
+            "min",
+            "count",
+            "any_value",
+            "first_value",
+            "last_value",
+            "nth_value",
+            "bool_and",
+            "bool_or",
+            "row_number",
+            "rank",
+            "dense_rank",
+            "ntile",
+            "lag",
+            "lead",
+        ];
+        Ok(!EXACT.contains(&self.name(anchor)?))
+    }
+
     /// The declarations, as the plan gave them.
     pub fn declarations(&self) -> &[ExtensionFunction] {
         &self.declarations

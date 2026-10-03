@@ -467,10 +467,12 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<(Vec<String>, usize
         .collect();
     let width = out.defs.len();
     let keys: Vec<Expression> = dim_cols.iter().map(|&i| field(out.outputs[i])).collect();
+    let positions: Vec<usize> = (0..dim_cols.len()).collect();
     let base = t.join_on(
         out.rel.clone(),
         read_step(&format!("{}cotangent", f.namespace), names.clone()),
         keys,
+        &positions,
         width,
     )?;
     // An output row whose value is NULL does not move with anything in it,

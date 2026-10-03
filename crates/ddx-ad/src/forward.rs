@@ -88,6 +88,29 @@ pub struct Slot {
     /// with no grouping, or constant data the plan shows is one row. `grad`
     /// needs this of every input its loss reads.
     pub at_most_one_row: bool,
+    /// Whether it is constant data computed with a window function or a
+    /// `LIMIT`, which a recomputation need not repeat row for row.
+    pub ordered: bool,
+    /// Whether it is constant data computed by an aggregate or window
+    /// function that rounds (see [`Functions::rounds`]): its values can
+    /// differ in their last bits between recomputations (a sum over several
+    /// partitions adds in arrival order). A table's values cannot, nor a
+    /// maximum's.
+    pub rounds: bool,
+}
+
+/// Rows cut by an ordering: a `LIMIT` (after an `ORDER BY` on `keys`, or with
+/// none), or a window function a semi-join's right side computed. The
+/// recomputed region keeps the same rows only if the ordering is total over
+/// the inputs it covers. Self-contained: `keys` and the offsets in `covers`
+/// are in one numbering, so it outlives the columns it was recorded over.
+#[derive(Debug, Clone)]
+pub struct Cut {
+    /// The columns it orders by, or `None` for a `LIMIT` with no `ORDER BY`.
+    pub keys: Option<Vec<usize>>,
+    /// Each input it cuts: the input, its first column, and whether it has at
+    /// most one row.
+    pub covers: Vec<(Input, usize, bool)>,
 }
 
 /// How a column of a rebuilt region is computed.
@@ -128,6 +151,14 @@ pub struct Region {
     pub outputs: Vec<usize>,
     /// Its inputs.
     pub slots: Vec<Slot>,
+    /// Where its rows were cut by an ordering (see [`Cut`]).
+    pub cuts: Vec<Cut>,
+    /// Whether it calls a volatile function (`random()`, `now()`), which a
+    /// recomputation would not repeat.
+    pub volatile: bool,
+    /// For each column, whether its own expression reads a scalar subquery
+    /// computed by a function that rounds (see [`Slot::rounds`]).
+    pub rounds: Vec<bool>,
 }
 
 impl Region {
@@ -153,24 +184,72 @@ impl Region {
             });
         }
         self.varied.extend(other.varied);
+        self.rounds.extend(other.rounds);
         self.refusals.extend(other.refusals);
         self.slots.extend(other.slots.into_iter().map(|s| Slot {
             offset: s.offset.map(|o| o + shift),
             ..s
         }));
+        self.cuts
+            .extend(other.cuts.into_iter().map(|c| c.shifted(shift)));
+        self.volatile |= other.volatile;
         Ok(shift)
     }
 
     fn push(&mut self, def: Def, varied: bool) -> usize {
         self.defs.push(def);
+        self.rounds.push(false);
         self.varied.push(varied);
         self.refusals.push(None);
         self.defs.len() - 1
     }
 
+    /// A cut by `keys` over every input whose columns come before `before`.
+    fn cut(&self, keys: Option<Vec<usize>>, before: usize) -> Cut {
+        Cut {
+            keys,
+            covers: self
+                .slots
+                .iter()
+                .filter_map(|s| {
+                    s.offset
+                        .filter(|&o| o < before)
+                        .map(|o| (s.input, o, s.at_most_one_row))
+                })
+                .collect(),
+        }
+    }
+
+    /// Its windows and cuts, as cuts that need none of its columns: for a
+    /// semi-join's right side, whose columns are dropped.
+    fn detached_cuts(&self) -> Vec<Cut> {
+        let mut cuts = self.cuts.clone();
+        for (c, d) in self.defs.iter().enumerate() {
+            if let Def::Window { keys } = d {
+                cuts.push(self.cut(Some(keys.clone()), c));
+            }
+        }
+        cuts
+    }
+
     fn refuse(&mut self, col: usize, why: AdError) {
         if self.refusals[col].is_none() {
             self.refusals[col] = Some(why);
+        }
+    }
+}
+
+impl Cut {
+    fn shifted(self, shift: usize) -> Cut {
+        Cut {
+            keys: self
+                .keys
+                .map(|k| k.into_iter().map(|c| c + shift).collect()),
+            covers: self
+                .covers
+                .into_iter()
+                .map(|(i, o, one)| (i, o + shift, one))
+                .collect(),
         }
     }
 }
@@ -435,6 +514,10 @@ impl Builder<'_> {
                 }
             }
         }
+        let volatile = !matches!(kind, RelType::Aggregate(_))
+            && rel_expressions(kind)
+                .into_iter()
+                .any(|e| self.calls_volatile(e));
         let (mut s, direct, common) = match kind {
             RelType::Read(r) => {
                 let s = self.read(r)?;
@@ -475,7 +558,24 @@ impl Builder<'_> {
                 (s, direct, so.common.as_ref())
             }
             RelType::Fetch(fe) => {
-                let mut s = self.lower(input(&fe.input)?)?;
+                let below = input(&fe.input)?;
+                let mut s = self.lower(below)?;
+                // The rows a LIMIT keeps are the first in its input's order:
+                // an ORDER BY's keys, or none.
+                let keys = match &below.rel_type {
+                    Some(RelType::Sort(so)) => {
+                        let mut keys = Vec::new();
+                        for e in so.sorts.iter().filter_map(|sf| sf.expr.as_ref()) {
+                            for f in fields_of(e)? {
+                                keys.push(lookup(&s.outputs, f)?);
+                            }
+                        }
+                        Some(keys)
+                    }
+                    _ => None,
+                };
+                let cut = s.cut(keys, s.width());
+                s.cuts.push(cut);
                 s.rel = Rel {
                     rel_type: Some(RelType::Fetch(Box::new(FetchRel {
                         common: None,
@@ -506,6 +606,8 @@ impl Builder<'_> {
                     offset: Some(0),
                     width,
                     at_most_one_row: self.saved[n].groupings.is_empty(),
+                    ordered: false,
+                    rounds: false,
                 });
                 for c in 0..width {
                     let v = self.saved[n].varied[c];
@@ -521,6 +623,7 @@ impl Builder<'_> {
             }
         };
         s.outputs = apply_emit(common, direct)?;
+        s.volatile |= volatile;
         Ok(s)
     }
 
@@ -533,11 +636,14 @@ impl Builder<'_> {
             offset: Some(0),
             width,
             at_most_one_row: at_most_one_row(rel),
+            ordered: is_ordered(rel),
+            rounds: rounds_under(self.functions, rel)?,
         });
         for _ in 0..width {
             s.push(Def::Const, false);
         }
         s.outputs = (0..width).collect();
+        s.volatile = self.volatile_under(rel);
         Ok(s)
     }
 
@@ -559,6 +665,8 @@ impl Builder<'_> {
             offset: Some(0),
             width,
             at_most_one_row: false,
+            ordered: false,
+            rounds: false,
         });
         for c in 0..width {
             let v = self.tables[table].values.contains(&c);
@@ -688,7 +796,9 @@ impl Builder<'_> {
                 ));
             } else {
                 let varied = depends(self.functions, &e, &|f| s.varied[f])?;
-                s.push(Def::Expr(e.clone()), varied)
+                let col = s.push(Def::Expr(e.clone()), varied);
+                s.rounds[col] = subquery_rounds(self.functions, &e)?;
+                col
             };
             direct.push(col);
             exprs.push(e);
@@ -739,7 +849,9 @@ impl Builder<'_> {
         };
         if semi {
             // Only the left side's columns come out. The right side is still
-            // read, to decide which rows do.
+            // read, to decide which rows do, so its orderings still count.
+            s.cuts.extend(right.detached_cuts());
+            s.volatile |= right.volatile;
             s.slots.extend(
                 right
                     .slots
@@ -807,7 +919,7 @@ impl Builder<'_> {
 
     /// Read aggregate `a` as a saved relation.
     fn read_saved(&mut self, a: &AggregateRel) -> Result<usize> {
-        let input = self.lower(input(&a.input)?)?;
+        let mut input = self.lower(input(&a.input)?)?;
         let outputs = &input.outputs;
         let groupings = grouping_expressions(a)?
             .into_iter()
@@ -880,6 +992,16 @@ impl Builder<'_> {
                 advanced_extension: None,
             }))),
         };
+        // The region beneath is recomputed with the keys and the measures'
+        // arguments, so a volatile one makes it unrepeatable too.
+        let args = measures
+            .iter()
+            .flat_map(|m| &m.arguments)
+            .filter_map(|a| match &a.arg_type {
+                Some(ArgType::Value(e)) => Some(e),
+                _ => None,
+            });
+        input.volatile |= groupings.iter().chain(args).any(|e| self.calls_volatile(e));
         self.saved.push(Saved {
             input,
             groupings,
@@ -889,6 +1011,35 @@ impl Builder<'_> {
             rel,
         });
         Ok(self.saved.len() - 1)
+    }
+
+    /// Does `e` call a volatile function?
+    fn calls_volatile(&self, e: &Expression) -> bool {
+        let direct = contains(e, &|x| match &x.rex_type {
+            Some(RexType::ScalarFunction(f)) => self
+                .functions
+                .is_volatile(f.function_reference)
+                .unwrap_or(false),
+            _ => false,
+        });
+        let mut subqueries = Vec::new();
+        collect_subqueries(e, &mut subqueries);
+        direct
+            || subqueries.into_iter().any(|sq| {
+                // A subquery ddx cannot read is refused elsewhere.
+                uncorrelated_scalar(sq).is_some_and(|r| self.volatile_under(r))
+            })
+    }
+
+    /// Does anything in `rel` call a volatile function?
+    fn volatile_under(&self, rel: &Rel) -> bool {
+        let Some(kind) = rel.rel_type.as_ref() else {
+            return false;
+        };
+        rel_expressions(kind)
+            .into_iter()
+            .any(|e| self.calls_volatile(e))
+            || rel_inputs(kind).into_iter().any(|r| self.volatile_under(r))
     }
 
     /// Does anything under `rel` read a `wrt` table? Records every table name
@@ -994,6 +1145,24 @@ fn rename_in_place(rel: Rel, width: usize, cols: &[usize]) -> Rel {
     emit::project_emit(rel, exprs, Some(emit))
 }
 
+/// Whether `rel` computes a window function or cuts rows with a `LIMIT`
+/// anywhere in it: then which rows it gives can depend on how the engine
+/// orders ties, and a recomputation need not give the same ones.
+fn is_ordered(rel: &Rel) -> bool {
+    let Some(kind) = rel.rel_type.as_ref() else {
+        return false;
+    };
+    if matches!(kind, RelType::Fetch(_) | RelType::Window(_)) {
+        return true;
+    }
+    let window = |e: &Expression| {
+        contains(e, &|x| {
+            matches!(x.rex_type, Some(RexType::WindowFunction(_)))
+        })
+    };
+    rel_expressions(kind).into_iter().any(window) || rel_inputs(kind).into_iter().any(is_ordered)
+}
+
 fn empty(rel: Rel) -> Region {
     Region {
         rel,
@@ -1002,6 +1171,9 @@ fn empty(rel: Rel) -> Region {
         refusals: Vec::new(),
         outputs: Vec::new(),
         slots: Vec::new(),
+        cuts: Vec::new(),
+        volatile: false,
+        rounds: Vec::new(),
     }
 }
 
@@ -1188,6 +1360,78 @@ pub fn width(rel: &Rel) -> Result<usize> {
     }
 }
 
+/// Does anything under `rel`, a subquery's included, call an aggregate or
+/// window function that rounds (see [`Functions::rounds`])?
+pub(crate) fn rounds_under(functions: &Functions, rel: &Rel) -> Result<bool> {
+    let Some(kind) = rel.rel_type.as_ref() else {
+        return Ok(false);
+    };
+    let calls = |anchor: u32| functions.rounds(anchor);
+    match kind {
+        RelType::Aggregate(a) => {
+            for m in &a.measures {
+                if let Some(f) = &m.measure {
+                    if calls(f.function_reference)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        RelType::Window(w) => {
+            for f in &w.window_functions {
+                if calls(f.function_reference)? {
+                    return Ok(true);
+                }
+            }
+        }
+        _ => {}
+    }
+    for e in rel_expressions(kind) {
+        let mut windows = Vec::new();
+        collect_window_functions(e, &mut windows);
+        for f in windows {
+            if calls(f)? {
+                return Ok(true);
+            }
+        }
+        if subquery_rounds(functions, e)? {
+            return Ok(true);
+        }
+    }
+    for r in rel_inputs(kind) {
+        if rounds_under(functions, r)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Does `e` read a subquery computed by a function that rounds? A
+/// subquery that is not an uncorrelated scalar one is assumed to.
+pub(crate) fn subquery_rounds(functions: &Functions, e: &Expression) -> Result<bool> {
+    let mut subqueries = Vec::new();
+    collect_subqueries(e, &mut subqueries);
+    for sq in subqueries {
+        match uncorrelated_scalar(sq) {
+            Some(inner) if !rounds_under(functions, inner)? => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// The function of every window function inside `e`; not inside subqueries.
+fn collect_window_functions(e: &Expression, out: &mut Vec<u32>) {
+    match &e.rex_type {
+        Some(RexType::WindowFunction(w)) => out.push(w.function_reference),
+        Some(RexType::Subquery(_)) => return,
+        _ => {}
+    }
+    for c in children(e) {
+        collect_window_functions(c, out);
+    }
+}
+
 /// Every subquery inside `e`, outermost first; not inside the subqueries.
 fn collect_subqueries<'e>(
     e: &'e Expression,
@@ -1268,6 +1512,21 @@ pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
                         }
                     }
                 }
+            }
+            out.extend(r.measures.iter().filter_map(|m| m.filter.as_ref()));
+            out
+        }
+        // A read's filters, and a virtual table's rows (DataFusion writes a
+        // projection over one empty row, `SELECT random()`, as one).
+        RelType::Read(r) => {
+            let mut out: Vec<&Expression> = r
+                .filter
+                .as_deref()
+                .into_iter()
+                .chain(r.best_effort_filter.as_deref())
+                .collect();
+            if let Some(ReadType::VirtualTable(v)) = &r.read_type {
+                out.extend(v.expressions.iter().flat_map(|row| &row.fields));
             }
             out
         }
