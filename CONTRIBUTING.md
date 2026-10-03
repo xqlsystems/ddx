@@ -243,6 +243,8 @@ DDX_SOAK_SECS=120 cargo test -p ddx-datafusion --test ad_simulation --release \
 
 A failure prints its seed; `DDX_V2_SEED=<seed>` with the ignored
 `replay_one_seed` test prints that case's SQL and tables and reruns only it.
+`DDX_V2_PROPS=shapes,fd` spends a soak on some property groups only, and
+`DDX_V2_NULL_PCT=0` turns off generated NULLs.
 
 ### 4. Open a pull request
 

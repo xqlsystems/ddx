@@ -1086,8 +1086,14 @@ layered:
   with 1, `vjp(R, c)` = `grad(Σ R·c)`, and invariance to CTE inlining, the
   unoptimized plan, row order, partition count, dim storage type, the `wrt`
   list, reuse of a program on new values, and concurrent programs. It also
-  checks that `grad(loss, t.col)` in SQL matches the program. It runs nightly
-  beside v1's soak.
+  checks that `grad(loss, t.col)` in SQL matches the program. The plan ddx
+  reads is varied too, because §4.2's coverage risk is about plan shapes. The
+  query is re-planned with optimizer rules removed or reordered, and the
+  Substrait plan is rewritten into equivalent shapes another producer might
+  emit (identity and permuting projections, `WHERE true`, swapped join sides,
+  an added sort, a computed-then-dropped column); DataFusion confirms each
+  rewrite computes the same loss before ddx sees it. It runs nightly beside
+  v1's soak.
 - **v2-specific: spike each rule's forward idiom against both engines'
   actual Substrait implementations before trusting it** — the coverage
   discipline §4.2 commits to, now a standing test-plan item, not a one-time
