@@ -412,13 +412,15 @@ impl<'a> Transposer<'a> {
             )));
         }
         // Each input's contribution sums its cotangents over the region's
-        // rows. With one input the region is read once; with several, each
-        // would rebuild it, and a region that reads one relation twice (a CTE
-        // read twice) has twice the inputs at each level, so its backward
-        // step grew as the square of the forward query. So the columns the
-        // contributions read, each input's dims and cotangents, are
-        // materialized once, and every contribution reads them.
-        if at_inputs.len() > 1 {
+        // rows, so each rebuilds the region. A region that reads one relation
+        // twice (a CTE read twice) doubles its inputs at each level, so its
+        // backward step grew as the square of the forward query. With three
+        // or more inputs, the columns the contributions read, each input's
+        // dims and cotangents, are materialized once, and every contribution
+        // reads them. With two (a contraction of two varied operands) the
+        // region is rebuilt twice instead, which costs at most twice and
+        // never writes a contraction's join (N x D x H rows) out (S6).
+        if at_inputs.len() > 2 {
             let mut needed = std::collections::BTreeSet::new();
             for (&slot, cols) in &at_inputs {
                 let offset = region.slots[slot].offset.unwrap_or(0);
