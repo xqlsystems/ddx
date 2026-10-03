@@ -1023,6 +1023,65 @@ bug (workaround verified, no upstream-fix dependency).
   default) that the adapter sets when it builds the program, not a `Backend`
   capability.
 
+### 4.7 What a backward program costs
+
+**Against the bound.** Reverse mode's cheap-gradient principle bounds a
+gradient's work by a small multiple of the forward pass's, about 2-3x when
+contractions dominate: each forward contraction `Y = X·W` has two backward
+ones, `X̄ = Ȳ·Wᵀ` and `W̄ = Xᵀ·Ȳ`. ddx's work per primitive, for `R` rows:
+
+| primitive | forward | ddx's backward | optimal | note |
+|---|---|---|---|---|
+| map, a chain of `ℓ` expressions | `R·ℓ` | `R·ℓ` | `R·ℓ` | plan size `ℓ²`: every intermediate is a column (the tape) |
+| contraction `X(N×D)·W(D×H)` as join + `SUM` | `NDH` | `2·NDH` | `2·NDH` | the join is recomputed inside each contribution, never written out (`S6`) |
+| grouped `SUM`/`AVG` | `R` | `R` (a broadcast join) | `R` | |
+| `MAX`/`MIN` | `R` | `R` (windows over the recomputed rows) | `R` | |
+| a relation read `k` times | `k·R` | `k·R` | `k·R` | with `k ≥ 3` reads, the region's cotangents are materialized once |
+| rank-select | `R log R` | `R log R` | `R log R` | the ranking is recomputed |
+
+So the work is within a constant of the bound wherever contractions
+dominate. Measured (`tests/ad_perf.rs`, backward over forward):
+single-head attention 2.5x at L = 16 rising to 3.0x at L = 256; nn.py's MLP
+1.9-2.4x; residual blocks 4x at one block falling to 1x at six (DataFusion
+recomputes the forward pass's reused CTEs, ddx's steps read saved ones). The
+memory is the saved aggregates, one per aggregate that depends on a `wrt`
+table: a layer's outputs, as a framework's saved activations.
+
+**What is not proportional to the data: a fixed cost per step.** Each step
+is consumed, optimized and planned by the engine before it runs: about 3 ms
+on DataFusion for a typical step, independent of the rows, more for a long
+row-local chain (the plan grows as `ℓ²`). A program has about `2A + T`
+steps, for `A` saved aggregates and `T` `wrt` tables. For a transformer of
+`D` blocks with the heads as a dim column (so `H` adds rows, not steps), a
+block has about 14 aggregates (q, k and v projections, scores, the softmax's
+max and sum, the weighted values, the output projection, two layer norms'
+means and variances, two feed-forward contractions), so about `28·D` steps:
+roughly `84·D` ms of fixed cost per training step.
+
+**How the overhead scales with a model.** In the data sizes (batch `B`,
+sequence length `L`, width `d`, heads `H`) the backward-to-forward ratio is a
+constant: every backward contraction mirrors a forward one, and the
+recomputed row-local work (`O(B·L·d)` per block, `O(B·H·L²)` for the
+softmax) is a fraction of the contractions' (`O(B·L·d²)`, `O(B·H·L²·d/H)`).
+The attention benchmark shows the ratio flat as `L` grows 16-fold. In depth
+`D` the fixed cost grows linearly, with the steps. So on a CPU engine, where
+a contraction is a hash join emitting `N·D·H` rows, the data cost dominates
+and the overhead is the inherent 2-3x. With an accelerated contraction
+operator, the data cost per step falls to milliseconds and the fixed cost
+would dominate, unless the engine's plans are kept across training steps: a
+program is built once and its plans do not change between steps, so they
+need planning once, not on every run.
+
+**What would make it marginal**, in order of payoff for that setting:
+caching each step's physical plan across training steps; a fused dense
+contraction operator (`§4.1`), which ddx's backward contractions use as the
+forward ones do; a contraction path for multi-way products (Blacher et al.,
+*Efficient and Portable Einstein Summation in SQL*: engines do not push a
+`SUM` below joins, so a product of three or more factors materializes the
+full join); forward-mode tangents within a long row-local region (plans
+linear in `ℓ`); and saving a subtree read many times once rather than
+recomputing it.
+
 ---
 
 ## 5. Testing & verification
