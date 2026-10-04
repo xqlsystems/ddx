@@ -928,3 +928,62 @@ async fn upstream_not_in_over_a_null_keeps_no_rows_through_substrait() {
         "the round trip kept rows a NULL excludes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Found by review: an ordering by an expression counted as a key.
+
+async fn lp() -> SessionContext {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE lp (i BIGINT, val DOUBLE) AS VALUES (0, 0.3), (1, 0.5), (2, 0.7), (3, 0.1)",
+    )
+    .await;
+    ctx
+}
+
+#[tokio::test]
+async fn a_limit_ordered_by_an_expression_of_its_dims_is_refused() {
+    // `i % 2` ties every even i: the recomputed LIMIT 1 could keep another
+    // row than the forward pass kept, and send it the gradient. Its ORDER BY
+    // named the dim inside an expression, which counted as ordering by it.
+    let ctx = lp().await;
+    let e = ad::grad(
+        &ctx,
+        "SELECT SUM(v) AS l FROM (SELECT val AS v FROM lp ORDER BY i % 2 LIMIT 1)",
+        &[ColumnRef::new("lp", "val")],
+    )
+    .await
+    .expect_err("ties are not broken");
+    assert!(e.to_string().contains("ORDER BY"), "{e}");
+    // Ordered by the dim itself, it is total.
+    ad::grad(
+        &ctx,
+        "SELECT SUM(v) AS l FROM (SELECT val AS v FROM lp ORDER BY i LIMIT 1)",
+        &[ColumnRef::new("lp", "val")],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_ranking_ordered_by_an_expression_of_its_dims_is_refused() {
+    let ctx = lp().await;
+    let e = ad::grad(
+        &ctx,
+        "SELECT SUM(val) AS l FROM (SELECT val, ROW_NUMBER() OVER (ORDER BY i % 2) AS r FROM lp) \
+         WHERE r = 1",
+        &[ColumnRef::new("lp", "val")],
+    )
+    .await
+    .expect_err("ties are not broken");
+    assert!(e.to_string().contains("break ties"), "{e}");
+    ad::grad(
+        &ctx,
+        "SELECT SUM(val) AS l FROM (SELECT val, ROW_NUMBER() OVER (ORDER BY i % 2, i) AS r \
+         FROM lp) WHERE r = 1",
+        &[ColumnRef::new("lp", "val")],
+    )
+    .await
+    .unwrap();
+}

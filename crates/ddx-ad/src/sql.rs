@@ -344,7 +344,7 @@ impl GradCalls {
                 }
             };
             let table = wrt[0].table.clone();
-            if wrt.iter().any(|w| w.table != table) {
+            if wrt.iter().any(|w| !w.table.eq_ignore_ascii_case(&table)) {
                 return Err(AdError::NotImplemented(format!(
                     "grad({name}, …) takes columns of one table, so it can return a \
                      relation shaped like that table; call it once per table"
@@ -774,6 +774,18 @@ mod tests {
             .calls[0]
             .filter
             .clone()
+    }
+
+    #[test]
+    fn one_table_named_in_two_cases_is_one_table() {
+        let found = GradCalls::find(
+            "WITH loss AS (SELECT SUM(a * b) AS l FROM w) SELECT * FROM grad(loss, w.a, W.b)",
+            &GenericDialect {},
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.calls[0].columns, vec!["a", "b"]);
+        assert_eq!(found.objectives[0].wrt.len(), 2);
     }
 
     #[test]
