@@ -174,10 +174,13 @@ jobs:
       # Catch packaging/metadata breakage (missing files, bad metadata, a
       # path-dep without a version) on every PR — long before a release actually
       # tries to publish. Add publishable crates here as they come online.
-      - name: cargo publish --dry-run (ddx-core)
-        run: cargo publish --dry-run -p ddx-core
-      # ddx-datafusion depends on ddx-ad, which may not be on crates.io yet at
-      # the version the workspace has. Packaging the two together lets cargo
-      # resolve ddx-ad from the local package instead of the registry.
-      - name: cargo publish --dry-run (ddx-ad, ddx-datafusion)
-        run: cargo publish --dry-run -p ddx-ad -p ddx-datafusion
+      #
+      # The crates are packaged together, in one command, so cargo resolves each
+      # one's workspace dependencies from the local packages instead of the
+      # registry. That matters whenever a dependency's version is not on
+      # crates.io yet: ddx-ad has not been published, and a release bumps
+      # ddx-core's version (and the floor ddx-ad and ddx-datafusion require)
+      # before release-plz publishes it. Packaged one at a time, that release's
+      # dry-run fails with "failed to select a version for `ddx-core = ^0.2.2`".
+      - name: cargo publish --dry-run (ddx-core, ddx-ad, ddx-datafusion)
+        run: cargo publish --dry-run -p ddx-core -p ddx-ad -p ddx-datafusion

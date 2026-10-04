@@ -1,6 +1,6 @@
 [package]
 name = "ddx-datafusion"
-description = "DataFusion adapter for ddx: bare grad()/jvp() via an AnalyzerRule, plus the ddx_sql text-rewrite helper."
+description = "DataFusion adapter for ddx: grad and vjp of a whole query, and grad(loss, table.column) in SQL (v2); bare grad()/jvp() on expressions (v1)."
 # Versioned independently of ddx-core: the two publish on their own cadence, and
 # an adapter that had to move whenever the engine did would force a release for
 # changes that do not touch it.
