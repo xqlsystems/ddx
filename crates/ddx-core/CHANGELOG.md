@@ -9,6 +9,22 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.1...ddx-core-v0.2.2) - 2026-10-04
+
+### Added
+
+- *(ddx-datafusion)* grad, vjp and run, the v2 API on DataFusion (M4 1) ([#79](https://github.com/xqlsystems/ddx/pull/79))
+
+### Fixed
+
+- *(ddx-core)* write a negative power as a division ([#97](https://github.com/xqlsystems/ddx/pull/97))
+- *(ddx-core)* divide a quotient's derivative by its denominator once ([#96](https://github.com/xqlsystems/ddx/pull/96))
+- *(ddx-core)* refuse a cast to an integer or decimal type that depends on wrt (closes #87) ([#95](https://github.com/xqlsystems/ddx/pull/95))
+
+### Other
+
+- *(ddx-core)* gate the finite-difference oracle on a measured noise floor (closes #67) ([#94](https://github.com/xqlsystems/ddx/pull/94))
+
 ## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.0...ddx-core-v0.2.1) - 2026-08-09
 
 ### Fixed
