@@ -101,9 +101,9 @@ MUTANTS = [
      "pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {\n"
      "    for step in program.backward_steps.iter() {",
      "release leaves the value table on the context"),
-    ("sql-case-sensitive", f"{DF}/ad.rs",
-     ".any(|w| names_table(&w.table, table) && w.column.eq_ignore_ascii_case(c))",
-     ".any(|w| names_table(&w.table, table) && w.column == *c)",
+    ("sql-case-sensitive", f"{AD}/sql.rs",
+     "table_matches(&w.table, &g.table) && w.column.eq_ignore_ascii_case(c)",
+     "table_matches(&w.table, &g.table) && w.column == *c",
      "grad in SQL treats W.VAL and w.val as different columns"),
 ]
 
