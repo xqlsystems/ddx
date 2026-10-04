@@ -27,7 +27,10 @@ use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::{Emit, EmitKind};
 use substrait::proto::set_rel::SetOp;
-use substrait::proto::{Expression, Plan, Rel, RelCommon};
+use substrait::proto::{
+    AggregateRel, CrossRel, Expression, FetchRel, FilterRel, JoinRel, Plan, ProjectRel, ReadRel,
+    Rel, RelCommon, SetRel, SortRel,
+};
 
 use crate::emit::select;
 use crate::expr::{fields_of, map_fields};
@@ -110,30 +113,205 @@ fn select_exactly(rel: Rel, keep: &[usize]) -> Rel {
 /// `w` is `rel`'s output width, which the caller knows: computing it here
 /// would walk the whole subtree at every level.
 fn prune(rel: Rel, need: &BTreeSet<usize>, w: usize) -> crate::Result<(Rel, Map)> {
-    let Some(mut kind) = rel.rel_type else {
-        return Ok((Rel { rel_type: None }, identity(w)));
-    };
-    let emit = take_emit(&mut kind);
-    let direct_need: BTreeSet<usize> = match &emit {
-        Some(m) => need.iter().map(|&o| m[o]).collect(),
-        None => need.clone(),
-    };
-    // With no emit, the direct width is the output width.
-    let direct_w = if emit.is_none() { Some(w) } else { None };
-    let (kind, dmap, narrow) = match prune_direct(kind, &direct_need, direct_w)? {
-        Ok(pruned) => pruned,
-        Err(mut kind) => {
-            // Not a relation pruned through: as it was, emit included.
-            set_emit(&mut kind, emit);
-            return Ok((
-                Rel {
-                    rel_type: Some(kind),
-                },
-                identity(w),
-            ));
+    // A chain of single-input relations can be hundreds deep (a rebuilt
+    // region is a projection per batch of columns), deeper than a 2 MB
+    // worker stack allows for recursion. So the chain is walked with a loop:
+    // down, keeping what each level has left to do once its input is pruned,
+    // then back up.
+    let mut levels: Vec<Level> = Vec::new();
+    let (mut rel, mut need, mut w) = (rel, need.clone(), w);
+    let mut done = loop {
+        let Some(mut kind) = rel.rel_type else {
+            break (Rel { rel_type: None }, identity(w));
+        };
+        let emit = take_emit(&mut kind);
+        let direct_need: BTreeSet<usize> = match &emit {
+            Some(m) => need.iter().map(|&o| m[o]).collect(),
+            None => need.clone(),
+        };
+        // With no emit, the direct width is the output width.
+        let direct_w = if emit.is_none() { Some(w) } else { None };
+        match down(kind, &direct_need, direct_w)? {
+            Ok(Descent {
+                step,
+                input,
+                input_need,
+                input_w,
+            }) => {
+                levels.push(Level { step, emit, need });
+                (rel, need, w) = (*input, input_need, input_w);
+            }
+            Err(kind) => match prune_direct(kind, &direct_need)? {
+                Ok((kind, dmap, narrow)) => break finish(kind, emit, &need, dmap, narrow),
+                Err(mut kind) => {
+                    // Not a relation pruned through: as it was, emit included.
+                    set_emit(&mut kind, emit);
+                    break (
+                        Rel {
+                            rel_type: Some(kind),
+                        },
+                        identity(w),
+                    );
+                }
+            },
         }
     };
-    let mut kind = kind;
+    while let Some(l) = levels.pop() {
+        let (input, cmap) = done;
+        let (kind, dmap, narrow) = up(l.step, input, cmap)?;
+        done = finish(kind, l.emit, &l.need, dmap, narrow);
+    }
+    Ok(done)
+}
+
+/// A single-input relation on the way down a chain, its input taken, with
+/// what it needs to finish once that input is pruned.
+enum Step {
+    /// A projection and the expressions kept.
+    Project(Box<ProjectRel>, Vec<usize>),
+    /// A filter and its condition, taken out of it.
+    Filter(Box<FilterRel>, Option<Expression>),
+    Fetch(Box<FetchRel>),
+    Sort(Box<SortRel>),
+}
+
+/// A level of a chain: its step, its emit, and the output columns needed of
+/// it.
+struct Level {
+    step: Step,
+    emit: Option<Vec<usize>>,
+    need: BTreeSet<usize>,
+}
+
+/// A single-input relation on the way down: its input, to be pruned to
+/// `input_need`.
+struct Descent {
+    step: Step,
+    input: Box<Rel>,
+    input_need: BTreeSet<usize>,
+    input_w: usize,
+}
+
+/// Take a single-input relation's input, and work out the columns it needs
+/// of it to give `need` of its direct output; any other relation comes back
+/// as `Err`, unchanged.
+fn down(
+    kind: RelType,
+    need: &BTreeSet<usize>,
+    direct_w: Option<usize>,
+) -> crate::Result<Result<Descent, RelType>> {
+    let (step, input, input_need, w_in) = match kind {
+        RelType::Project(mut p) => {
+            let input = p.input.take().expect("a projection has an input");
+            let w_in = match direct_w {
+                Some(w) => w - p.expressions.len(),
+                None => width(&input)?,
+            };
+            let mut child_need: BTreeSet<usize> =
+                need.iter().copied().filter(|&c| c < w_in).collect();
+            let mut kept = Vec::new();
+            for (j, e) in p.expressions.iter().enumerate() {
+                if need.contains(&(w_in + j)) {
+                    child_need.extend(fields_of(e)?);
+                    kept.push(j);
+                }
+            }
+            (Step::Project(p, kept), input, child_need, w_in)
+        }
+        RelType::Filter(mut f) => {
+            let input = f.input.take().expect("a filter has an input");
+            let cond = f.condition.take().map(|c| *c);
+            let mut child_need = need.clone();
+            if let Some(c) = &cond {
+                child_need.extend(fields_of(c)?);
+            }
+            let w_in = match direct_w {
+                Some(w) => w,
+                None => width(&input)?,
+            };
+            (Step::Filter(f, cond), input, child_need, w_in)
+        }
+        RelType::Fetch(mut f) => {
+            let input = f.input.take().expect("a fetch has an input");
+            let w_in = match direct_w {
+                Some(w) => w,
+                None => width(&input)?,
+            };
+            (Step::Fetch(f), input, need.clone(), w_in)
+        }
+        RelType::Sort(mut s) => {
+            let input = s.input.take().expect("a sort has an input");
+            let mut child_need = need.clone();
+            for k in &s.sorts {
+                if let Some(e) = &k.expr {
+                    child_need.extend(fields_of(e)?);
+                }
+            }
+            let w_in = match direct_w {
+                Some(w) => w,
+                None => width(&input)?,
+            };
+            (Step::Sort(s), input, child_need, w_in)
+        }
+        other => return Ok(Err(other)),
+    };
+    Ok(Ok(Descent {
+        step,
+        input,
+        input_need,
+        input_w: w_in,
+    }))
+}
+
+/// Finish a single-input relation over its pruned input: the relation, where
+/// each direct column went, and whether to narrow it with an emit.
+fn up(step: Step, input: Rel, cmap: Map) -> crate::Result<(RelType, Map, bool)> {
+    Ok(match step {
+        Step::Project(mut p, kept) => {
+            let exprs = kept
+                .iter()
+                .map(|&j| remap(&p.expressions[j], &cmap))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let w_child = cmap.iter().flatten().count();
+            let mut dmap: Map = cmap;
+            dmap.extend(
+                (0..p.expressions.len())
+                    .map(|j| kept.iter().position(|&k| k == j).map(|i| w_child + i)),
+            );
+            p.input = Some(Box::new(input));
+            p.expressions = exprs;
+            (RelType::Project(p), dmap, true)
+        }
+        Step::Filter(mut f, cond) => {
+            f.condition = cond.map(|c| remap(&c, &cmap)).transpose()?.map(Box::new);
+            f.input = Some(Box::new(input));
+            (RelType::Filter(f), cmap, false)
+        }
+        Step::Fetch(mut f) => {
+            f.input = Some(Box::new(input));
+            (RelType::Fetch(f), cmap, false)
+        }
+        Step::Sort(mut s) => {
+            for k in s.sorts.iter_mut() {
+                if let Some(e) = k.expr.as_mut() {
+                    *e = remap(e, &cmap)?;
+                }
+            }
+            s.input = Some(Box::new(input));
+            (RelType::Sort(s), cmap, false)
+        }
+    })
+}
+
+/// A relation whose direct output was pruned (`dmap`), with its emit put
+/// back: narrowed to the needed outputs when it has one or `narrow` asks.
+fn finish(
+    mut kind: RelType,
+    emit: Option<Vec<usize>>,
+    need: &BTreeSet<usize>,
+    dmap: Map,
+    narrow: bool,
+) -> (Rel, Map) {
     let outputs: Vec<usize> = match &emit {
         Some(m) => m.clone(),
         None => (0..dmap.len()).collect(),
@@ -153,21 +331,26 @@ fn prune(rel: Rel, need: &BTreeSet<usize>, w: usize) -> crate::Result<(Rel, Map)
         let is_identity =
             mapping.len() == new_direct && mapping.iter().enumerate().all(|(i, &c)| i == c);
         set_emit(&mut kind, (!is_identity).then_some(mapping));
-        Ok((
+        (
             Rel {
                 rel_type: Some(kind),
             },
             map,
-        ))
+        )
     } else {
-        Ok((
+        (
             Rel {
                 rel_type: Some(kind),
             },
             dmap,
-        ))
+        )
     }
 }
+
+/// A relation pruned through: the relation, where each direct column went,
+/// and whether to narrow it with an emit; or, as `Err`, a relation not pruned
+/// through, unchanged.
+type Pruned = crate::Result<Result<(RelType, Map, bool), RelType>>;
 
 fn identity(w: usize) -> Map {
     (0..w).map(Some).collect()
@@ -177,262 +360,204 @@ fn identity(w: usize) -> Map {
 /// relation, where each direct column went, and whether narrowing its output
 /// with an emit is worth it (a projection or a join, whose outputs a parent
 /// would otherwise carry); `None` for a relation not pruned through.
-/// `direct_w` is the direct width when the caller knows it. A relation not
-/// pruned through comes back as `Err`, unchanged.
-#[allow(clippy::type_complexity)]
-fn prune_direct(
-    kind: RelType,
-    need: &BTreeSet<usize>,
-    direct_w: Option<usize>,
-) -> crate::Result<Result<(RelType, Map, bool), RelType>> {
-    Ok(Ok(match kind {
-        RelType::Project(mut p) => {
-            let input = *p.input.take().expect("a projection has an input");
-            let w_in = match direct_w {
-                Some(w) => w - p.expressions.len(),
-                None => width(&input)?,
-            };
-            let mut child_need: BTreeSet<usize> =
-                need.iter().copied().filter(|&c| c < w_in).collect();
-            let mut kept = Vec::new();
-            for (j, e) in p.expressions.iter().enumerate() {
-                if need.contains(&(w_in + j)) {
-                    child_need.extend(fields_of(e)?);
-                    kept.push(j);
-                }
+/// A relation not pruned through comes back as `Err`, unchanged.
+///
+/// Single-input relations are pruned by [`prune`]'s loop, not here. Each
+/// other kind is pruned in a function of its own, so a level holds only its
+/// own kind's locals on the stack: as one match, a debug build gave every
+/// level all of them, 66 KB.
+fn prune_direct(kind: RelType, need: &BTreeSet<usize>) -> Pruned {
+    match kind {
+        RelType::Join(j) => prune_join(j, need),
+        RelType::Cross(c) => prune_cross(c, need),
+        RelType::Aggregate(a) => prune_aggregate(a, need),
+        RelType::Set(s) => prune_set(s, need),
+        RelType::Read(r) => prune_read(r, need),
+        other => Ok(Err(other)),
+    }
+}
+
+fn prune_join(mut j: Box<JoinRel>, need: &BTreeSet<usize>) -> Pruned {
+    Ok(Ok({
+        let kind = JoinType::try_from(j.r#type).unwrap_or(JoinType::Unspecified);
+        let (keeps_left, keeps_right) = match kind {
+            JoinType::Inner
+            | JoinType::Outer
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::LeftSingle
+            | JoinType::RightSingle => (true, true),
+            JoinType::LeftSemi | JoinType::LeftAnti => (true, false),
+            JoinType::RightSemi | JoinType::RightAnti => (false, true),
+            _ => return Ok(Err(RelType::Join(j))),
+        };
+        let left = *j.left.take().expect("a join has a left");
+        let right = *j.right.take().expect("a join has a right");
+        let (wl, wr) = (width(&left)?, width(&right)?);
+        // The condition reads both sides, numbered left then right.
+        let mut cond_fields = BTreeSet::new();
+        for e in j.expression.iter().chain(j.post_join_filter.iter()) {
+            cond_fields.extend(fields_of(e)?);
+        }
+        let out_offset_right = if keeps_left { wl } else { 0 };
+        let mut ln: BTreeSet<usize> = cond_fields.iter().copied().filter(|&c| c < wl).collect();
+        let mut rn: BTreeSet<usize> = cond_fields
+            .iter()
+            .filter(|&&c| c >= wl)
+            .map(|&c| c - wl)
+            .collect();
+        for &c in need {
+            if keeps_left && c < wl {
+                ln.insert(c);
+            } else if keeps_right {
+                rn.insert(c - out_offset_right);
             }
-            let (input, cmap) = prune(input, &child_need, w_in)?;
-            let exprs = kept
+        }
+        let (left, lmap) = prune(left, &ln, wl)?;
+        let (right, rmap) = prune(right, &rn, wr)?;
+        let wl2 = lmap.iter().flatten().count();
+        let both: Map = lmap
+            .iter()
+            .copied()
+            .chain(rmap.iter().map(|c| c.map(|c| c + wl2)))
+            .collect();
+        j.expression = j
+            .expression
+            .map(|e| remap(&e, &both))
+            .transpose()?
+            .map(Box::new);
+        j.post_join_filter = j
+            .post_join_filter
+            .map(|e| remap(&e, &both))
+            .transpose()?
+            .map(Box::new);
+        let dmap: Map = match (keeps_left, keeps_right) {
+            (true, true) => both,
+            (true, false) => lmap,
+            _ => rmap,
+        };
+        j.left = Some(Box::new(left));
+        j.right = Some(Box::new(right));
+        (RelType::Join(j), dmap, true)
+    }))
+}
+
+fn prune_cross(mut c: Box<CrossRel>, need: &BTreeSet<usize>) -> Pruned {
+    Ok(Ok({
+        let left = *c.left.take().expect("a cross join has a left");
+        let right = *c.right.take().expect("a cross join has a right");
+        let (wl, wr) = (width(&left)?, width(&right)?);
+        let ln = need.iter().copied().filter(|&x| x < wl).collect();
+        let rn = need.iter().filter(|&&x| x >= wl).map(|&x| x - wl).collect();
+        let (left, lmap) = prune(left, &ln, wl)?;
+        let (right, rmap) = prune(right, &rn, wr)?;
+        let wl2 = lmap.iter().flatten().count();
+        let dmap: Map = lmap
+            .into_iter()
+            .chain(rmap.into_iter().map(|c| c.map(|c| c + wl2)))
+            .collect();
+        c.left = Some(Box::new(left));
+        c.right = Some(Box::new(right));
+        (RelType::Cross(c), dmap, true)
+    }))
+}
+
+fn prune_aggregate(mut a: Box<AggregateRel>, need: &BTreeSet<usize>) -> Pruned {
+    Ok(Ok({
+        #[allow(deprecated)]
+        if a.groupings.len() > 1 {
+            return Ok(Err(RelType::Aggregate(a)));
+        }
+        let input = *a.input.take().expect("an aggregate has an input");
+        // Older producers list the groupings only per grouping.
+        #[allow(deprecated)]
+        let ng = if a.grouping_expressions.is_empty() {
+            a.groupings
+                .first()
+                .map_or(0, |g| g.grouping_expressions.len())
+        } else {
+            a.grouping_expressions.len()
+        };
+        let mut child_need = BTreeSet::new();
+        #[allow(deprecated)]
+        for e in a.grouping_expressions.iter().chain(
+            a.groupings
                 .iter()
-                .map(|&j| remap(&p.expressions[j], &cmap))
-                .collect::<crate::Result<Vec<_>>>()?;
-            let w_child = cmap.iter().flatten().count();
-            let mut dmap: Map = cmap.clone();
-            dmap.extend(
-                (0..p.expressions.len())
-                    .map(|j| kept.iter().position(|&k| k == j).map(|i| w_child + i)),
-            );
-            p.input = Some(Box::new(input));
-            p.expressions = exprs;
-            (RelType::Project(p), dmap, true)
+                .flat_map(|g| g.grouping_expressions.iter()),
+        ) {
+            child_need.extend(fields_of(e)?);
         }
-        RelType::Filter(mut f) => {
-            let input = *f.input.take().expect("a filter has an input");
-            let cond = f.condition.take().map(|c| *c);
-            let mut child_need = need.clone();
-            if let Some(c) = &cond {
-                child_need.extend(fields_of(c)?);
-            }
-            let w_in = match direct_w {
-                Some(w) => w,
-                None => width(&input)?,
-            };
-            let (input, cmap) = prune(input, &child_need, w_in)?;
-            f.condition = cond.map(|c| remap(&c, &cmap)).transpose()?.map(Box::new);
-            f.input = Some(Box::new(input));
-            (RelType::Filter(f), cmap, false)
+        let kept: Vec<usize> = (0..a.measures.len())
+            .filter(|m| need.contains(&(ng + m)))
+            .collect();
+        for &m in &kept {
+            child_need.extend(measure_fields(&a.measures[m])?);
         }
-        RelType::Fetch(mut f) => {
-            let input = *f.input.take().expect("a fetch has an input");
-            let w_in = match direct_w {
-                Some(w) => w,
-                None => width(&input)?,
-            };
-            let (input, cmap) = prune(input, need, w_in)?;
-            f.input = Some(Box::new(input));
-            (RelType::Fetch(f), cmap, false)
-        }
-        RelType::Sort(mut s) => {
-            let input = *s.input.take().expect("a sort has an input");
-            let mut child_need = need.clone();
-            for k in &s.sorts {
-                if let Some(e) = &k.expr {
-                    child_need.extend(fields_of(e)?);
-                }
-            }
-            let w_in = match direct_w {
-                Some(w) => w,
-                None => width(&input)?,
-            };
-            let (input, cmap) = prune(input, &child_need, w_in)?;
-            for k in s.sorts.iter_mut() {
-                if let Some(e) = k.expr.as_mut() {
-                    *e = remap(e, &cmap)?;
-                }
-            }
-            s.input = Some(Box::new(input));
-            (RelType::Sort(s), cmap, false)
-        }
-        RelType::Join(mut j) => {
-            let kind = JoinType::try_from(j.r#type).unwrap_or(JoinType::Unspecified);
-            let (keeps_left, keeps_right) = match kind {
-                JoinType::Inner
-                | JoinType::Outer
-                | JoinType::Left
-                | JoinType::Right
-                | JoinType::LeftSingle
-                | JoinType::RightSingle => (true, true),
-                JoinType::LeftSemi | JoinType::LeftAnti => (true, false),
-                JoinType::RightSemi | JoinType::RightAnti => (false, true),
-                _ => return Ok(Err(RelType::Join(j))),
-            };
-            let left = *j.left.take().expect("a join has a left");
-            let right = *j.right.take().expect("a join has a right");
-            let (wl, wr) = (width(&left)?, width(&right)?);
-            // The condition reads both sides, numbered left then right.
-            let mut cond_fields = BTreeSet::new();
-            for e in j.expression.iter().chain(j.post_join_filter.iter()) {
-                cond_fields.extend(fields_of(e)?);
-            }
-            let out_offset_right = if keeps_left { wl } else { 0 };
-            let mut ln: BTreeSet<usize> = cond_fields.iter().copied().filter(|&c| c < wl).collect();
-            let mut rn: BTreeSet<usize> = cond_fields
-                .iter()
-                .filter(|&&c| c >= wl)
-                .map(|&c| c - wl)
-                .collect();
-            for &c in need {
-                if keeps_left && c < wl {
-                    ln.insert(c);
-                } else if keeps_right {
-                    rn.insert(c - out_offset_right);
-                }
-            }
-            let (left, lmap) = prune(left, &ln, wl)?;
-            let (right, rmap) = prune(right, &rn, wr)?;
-            let wl2 = lmap.iter().flatten().count();
-            let both: Map = lmap
-                .iter()
-                .copied()
-                .chain(rmap.iter().map(|c| c.map(|c| c + wl2)))
-                .collect();
-            j.expression = j
-                .expression
-                .map(|e| remap(&e, &both))
-                .transpose()?
-                .map(Box::new);
-            j.post_join_filter = j
-                .post_join_filter
-                .map(|e| remap(&e, &both))
-                .transpose()?
-                .map(Box::new);
-            let dmap: Map = match (keeps_left, keeps_right) {
-                (true, true) => both,
-                (true, false) => lmap,
-                _ => rmap,
-            };
-            j.left = Some(Box::new(left));
-            j.right = Some(Box::new(right));
-            (RelType::Join(j), dmap, true)
-        }
-        RelType::Cross(mut c) => {
-            let left = *c.left.take().expect("a cross join has a left");
-            let right = *c.right.take().expect("a cross join has a right");
-            let (wl, wr) = (width(&left)?, width(&right)?);
-            let ln = need.iter().copied().filter(|&x| x < wl).collect();
-            let rn = need.iter().filter(|&&x| x >= wl).map(|&x| x - wl).collect();
-            let (left, lmap) = prune(left, &ln, wl)?;
-            let (right, rmap) = prune(right, &rn, wr)?;
-            let wl2 = lmap.iter().flatten().count();
-            let dmap: Map = lmap
-                .into_iter()
-                .chain(rmap.into_iter().map(|c| c.map(|c| c + wl2)))
-                .collect();
-            c.left = Some(Box::new(left));
-            c.right = Some(Box::new(right));
-            (RelType::Cross(c), dmap, true)
-        }
-        RelType::Aggregate(mut a) => {
-            #[allow(deprecated)]
-            if a.groupings.len() > 1 {
-                return Ok(Err(RelType::Aggregate(a)));
-            }
-            let input = *a.input.take().expect("an aggregate has an input");
-            // Older producers list the groupings only per grouping.
-            #[allow(deprecated)]
-            let ng = if a.grouping_expressions.is_empty() {
-                a.groupings
-                    .first()
-                    .map_or(0, |g| g.grouping_expressions.len())
-            } else {
-                a.grouping_expressions.len()
-            };
-            let mut child_need = BTreeSet::new();
-            #[allow(deprecated)]
-            for e in a.grouping_expressions.iter().chain(
-                a.groupings
-                    .iter()
-                    .flat_map(|g| g.grouping_expressions.iter()),
-            ) {
-                child_need.extend(fields_of(e)?);
-            }
-            let kept: Vec<usize> = (0..a.measures.len())
-                .filter(|m| need.contains(&(ng + m)))
-                .collect();
-            for &m in &kept {
-                child_need.extend(measure_fields(&a.measures[m])?);
-            }
-            let w_in = width(&input)?;
-            let (input, cmap) = prune(input, &child_need, w_in)?;
-            a.grouping_expressions = a
+        let w_in = width(&input)?;
+        let (input, cmap) = prune(input, &child_need, w_in)?;
+        a.grouping_expressions = a
+            .grouping_expressions
+            .iter()
+            .map(|e| remap(e, &cmap))
+            .collect::<crate::Result<_>>()?;
+        #[allow(deprecated)]
+        for g in a.groupings.iter_mut() {
+            g.grouping_expressions = g
                 .grouping_expressions
                 .iter()
                 .map(|e| remap(e, &cmap))
                 .collect::<crate::Result<_>>()?;
-            #[allow(deprecated)]
-            for g in a.groupings.iter_mut() {
-                g.grouping_expressions = g
-                    .grouping_expressions
-                    .iter()
-                    .map(|e| remap(e, &cmap))
-                    .collect::<crate::Result<_>>()?;
-            }
-            let mut measures = Vec::with_capacity(kept.len());
-            for &m in &kept {
-                measures.push(remap_measure(&a.measures[m], &cmap)?);
-            }
-            let mut dmap: Map = (0..ng).map(Some).collect();
-            dmap.extend(
-                (0..a.measures.len()).map(|m| kept.iter().position(|&k| k == m).map(|i| ng + i)),
-            );
-            a.measures = measures;
-            a.input = Some(Box::new(input));
-            (RelType::Aggregate(a), dmap, false)
         }
-        RelType::Set(mut s) => {
-            if SetOp::try_from(s.op) != Ok(SetOp::UnionAll) || s.inputs.is_empty() {
-                return Ok(Err(RelType::Set(s)));
-            }
-            let first = &s.inputs[0];
-            let w = width(first)?;
-            // Every input keeps exactly the needed columns, so they line up.
-            let keep: Vec<usize> = need.iter().copied().collect();
-            s.inputs = s.inputs.into_iter().map(|r| prune_to(r, &keep)).collect();
-            let mut dmap = vec![None; w];
-            for (i, &c) in keep.iter().enumerate() {
-                dmap[c] = Some(i);
-            }
-            (RelType::Set(s), dmap, false)
+        let mut measures = Vec::with_capacity(kept.len());
+        for &m in &kept {
+            measures.push(remap_measure(&a.measures[m], &cmap)?);
         }
-        RelType::Read(mut r) => {
-            let unbound = matches!(&r.read_type, Some(ReadType::NamedTable(_)))
-                && r.base_schema.as_ref().is_some_and(|s| s.r#struct.is_none());
-            if !unbound || r.filter.is_some() || r.projection.is_some() {
-                return Ok(Err(RelType::Read(r)));
-            }
-            // A read of an earlier step names its columns but not their
-            // types; naming only the ones used lets that step drop the rest.
-            let schema = r.base_schema.as_mut().expect("checked above");
-            let w = schema.names.len();
-            let keep: Vec<usize> = (0..w).filter(|c| need.contains(c)).collect();
-            schema.names = keep.iter().map(|&c| schema.names[c].clone()).collect();
-            let mut dmap = vec![None; w];
-            for (i, &c) in keep.iter().enumerate() {
-                dmap[c] = Some(i);
-            }
-            (RelType::Read(r), dmap, false)
+        let mut dmap: Map = (0..ng).map(Some).collect();
+        dmap.extend(
+            (0..a.measures.len()).map(|m| kept.iter().position(|&k| k == m).map(|i| ng + i)),
+        );
+        a.measures = measures;
+        a.input = Some(Box::new(input));
+        (RelType::Aggregate(a), dmap, false)
+    }))
+}
+
+fn prune_set(mut s: SetRel, need: &BTreeSet<usize>) -> Pruned {
+    Ok(Ok({
+        if SetOp::try_from(s.op) != Ok(SetOp::UnionAll) || s.inputs.is_empty() {
+            return Ok(Err(RelType::Set(s)));
         }
-        other => return Ok(Err(other)),
+        let first = &s.inputs[0];
+        let w = width(first)?;
+        // Every input keeps exactly the needed columns, so they line up.
+        let keep: Vec<usize> = need.iter().copied().collect();
+        s.inputs = s.inputs.into_iter().map(|r| prune_to(r, &keep)).collect();
+        let mut dmap = vec![None; w];
+        for (i, &c) in keep.iter().enumerate() {
+            dmap[c] = Some(i);
+        }
+        (RelType::Set(s), dmap, false)
+    }))
+}
+
+fn prune_read(mut r: Box<ReadRel>, need: &BTreeSet<usize>) -> Pruned {
+    Ok(Ok({
+        let unbound = matches!(&r.read_type, Some(ReadType::NamedTable(_)))
+            && r.base_schema.as_ref().is_some_and(|s| s.r#struct.is_none());
+        if !unbound || r.filter.is_some() || r.projection.is_some() {
+            return Ok(Err(RelType::Read(r)));
+        }
+        // A read of an earlier step names its columns but not their
+        // types; naming only the ones used lets that step drop the rest.
+        let schema = r.base_schema.as_mut().expect("checked above");
+        let w = schema.names.len();
+        let keep: Vec<usize> = (0..w).filter(|c| need.contains(c)).collect();
+        schema.names = keep.iter().map(|&c| schema.names[c].clone()).collect();
+        let mut dmap = vec![None; w];
+        for (i, &c) in keep.iter().enumerate() {
+            dmap[c] = Some(i);
+        }
+        (RelType::Read(r), dmap, false)
     }))
 }
 
