@@ -51,8 +51,9 @@ use substrait::proto::{Expression, Plan, Rel};
 
 use crate::emit::{aggregate, join, plan, project_emit, read_step, read_table, select, union_all};
 use crate::error::{AdError, Result};
-use crate::expr::{call, cast, field, if_then, lit_f64, null_f64};
+use crate::expr::{call, cast, field, if_then, lit_f64, map_fields, null_f64};
 use crate::forward::{saved_name, step_columns, Forward, Input};
+use crate::functions::{Extensions, Functions};
 use crate::relation::ColumnRef;
 use crate::relation::Table;
 use crate::transpose::{Contribution, Transposer};
@@ -178,6 +179,7 @@ pub fn decode_plan(bytes: &[u8]) -> Result<Plan> {
 pub struct Options {
     ddx: Option<Ddx>,
     namespace: Option<String>,
+    restrict: Vec<(String, Plan)>,
 }
 
 impl Options {
@@ -203,6 +205,19 @@ impl Options {
     /// share a namespace: they would write the same tables.
     pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Compute `table`'s gradient only on the rows where a predicate holds,
+    /// because nothing reads the others (a `grad(…)` in SQL whose statement
+    /// filters it: [`crate::sql::Job::restrict`]). `select` is the engine's
+    /// own plan of `SELECT * FROM table WHERE predicate`; the predicate may
+    /// read only the table's dims, since a gradient row is a sum grouped by
+    /// them. Rows outside it are left out of the gradient step, and every
+    /// contribution to it is filtered before it is summed, which an engine
+    /// pushes down into the region beneath.
+    pub fn restrict(mut self, table: impl Into<String>, select: Plan) -> Self {
+        self.restrict.push((table.into(), select));
         self
     }
 
@@ -259,7 +274,12 @@ pub fn grad(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
 /// rules, or a fixed namespace.
 pub fn grad_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<BackwardProgram> {
     let f = options.forward(plan, wrt)?;
-    build(options.ddx.as_ref().unwrap_or(&Ddx::new()), &f, Seed::One)
+    build(
+        options.ddx.as_ref().unwrap_or(&Ddx::new()),
+        &f,
+        Seed::One,
+        &options.restrict,
+    )
 }
 
 /// The vector-Jacobian product of the query `plan` with respect to the `wrt`
@@ -277,6 +297,7 @@ pub fn vjp_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<Bac
         options.ddx.as_ref().unwrap_or(&Ddx::new()),
         &f,
         Seed::Cotangent,
+        &options.restrict,
     )
 }
 
@@ -285,8 +306,35 @@ enum Seed {
     Cotangent,
 }
 
-fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
+fn build(
+    ddx: &Ddx,
+    f: &Forward,
+    seed: Seed,
+    restrict: &[(String, Plan)],
+) -> Result<BackwardProgram> {
     let mut t = Transposer::new(f, ddx);
+    // Each wrt table's restriction, if any: a predicate over its columns.
+    let mut restrictions: Vec<Option<Expression>> = vec![None; f.tables.len()];
+    for (name, select) in restrict {
+        let i = f
+            .tables
+            .iter()
+            .position(|t| crate::relation::table_matches(name, &t.names))
+            .ok_or_else(|| {
+                AdError::InvalidOptions(format!(
+                    "restrict names `{name}`, which is not a wrt table of the query"
+                ))
+            })?;
+        let pred = restriction(select, &f.tables[i], &mut t.ext)?;
+        restrictions[i] = Some(match restrictions[i].take() {
+            // Two restrictions of one table: rows both allow.
+            Some(prev) => {
+                let and = t.ext.anchor("and");
+                call(and, vec![prev, pred])
+            }
+            None => pred,
+        });
+    }
 
     let mut forward_steps = Vec::new();
     for (n, saved) in f.saved.iter().enumerate() {
@@ -304,6 +352,17 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         ),
     });
 
+    let mut backward_steps = Vec::new();
+    // The region steps the transposes so far asked for, before anything that
+    // reads their contributions.
+    let drain = |t: &mut Transposer, steps: &mut Vec<Step>| {
+        for (name, rel, names) in t.steps.drain(..) {
+            steps.push(Step {
+                name,
+                plan: plan(rel, names, &t.ext),
+            });
+        }
+    };
     let (cotangent, cotangent_check) = match seed {
         Seed::One => {
             let col = scalar_output(f)?;
@@ -317,9 +376,10 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         }
     };
 
+    drain(&mut t, &mut backward_steps);
+
     // Parents first: every saved aggregate that reads saved aggregate n comes
     // after it in `f.saved`.
-    let mut backward_steps = Vec::new();
     for n in (0..f.saved.len()).rev() {
         let Some(contribs) = t.contributions.remove(&Input::Saved(n)) else {
             continue; // no gradient reaches it
@@ -332,13 +392,14 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
             plan: plan(rel, names.clone(), &t.ext),
         });
         t.saved(n, &cols, read_step(&cotangent_name(&f.namespace, n), names))?;
+        drain(&mut t, &mut backward_steps);
     }
 
     let mut gradients = Vec::new();
     for (i, table) in f.tables.iter().enumerate() {
         let contribs = t.contributions.remove(&Input::Table(i)).unwrap_or_default();
         let step = gradient_name(&f.namespace, i, &table.names);
-        let rel = dense_gradient(&mut t, i, contribs)?;
+        let rel = dense_gradient(&mut t, i, contribs, restrictions[i].as_ref())?;
         let columns: Vec<String> = table
             .dims
             .iter()
@@ -361,7 +422,7 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
             t.contributions.keys().collect::<Vec<_>>()
         )));
     }
-    Ok(BackwardProgram {
+    let mut program = BackwardProgram {
         forward_steps,
         value: format!("{}value", f.namespace),
         cotangent_table: format!("{}cotangent", f.namespace),
@@ -374,7 +435,51 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
         cotangent,
         backward_steps,
         gradients,
-    })
+    };
+    prune_program(&mut program);
+    Ok(program)
+}
+
+/// Drop the columns nothing reads (see [`crate::prune`]): within each plan,
+/// then across steps, from the last back, so each step keeps only the columns
+/// some later step reads. The value and the gradients keep all theirs.
+fn prune_program(program: &mut BackwardProgram) {
+    use std::collections::{BTreeSet, HashMap};
+    for c in program.checks.iter_mut() {
+        crate::prune::prune_plan(&mut c.plan);
+    }
+    let keep: BTreeSet<String> = std::iter::once(program.value.clone())
+        .chain(program.gradients.iter().map(|g| g.step.clone()))
+        .collect();
+    // Every step's columns that plans after it read, by name.
+    let mut read: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let note_reads = |plan: &Plan, read: &mut HashMap<String, BTreeSet<String>>| {
+        crate::emit::for_each_unbound_read(plan, &mut |name, cols| {
+            read.entry(name.to_string())
+                .or_default()
+                .extend(cols.iter().cloned());
+        });
+    };
+    for c in &program.checks {
+        note_reads(&c.plan, &mut read);
+    }
+    let n_forward = program.forward_steps.len();
+    let total = n_forward + program.backward_steps.len();
+    for i in (0..total).rev() {
+        let step = if i < n_forward {
+            &mut program.forward_steps[i]
+        } else {
+            &mut program.backward_steps[i - n_forward]
+        };
+        let narrowed = !keep.contains(&step.name) && {
+            let used = read.get(&step.name).cloned().unwrap_or_default();
+            crate::prune::prune_plan_to_names(&mut step.plan, &used)
+        };
+        if !narrowed {
+            crate::prune::prune_plan(&mut step.plan);
+        }
+        note_reads(&step.plan, &mut read);
+    }
 }
 
 /// The loss column for [`grad`]: the query must return one column, on one
@@ -502,6 +607,132 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<(Vec<String>, usize
 
 /// Add up an input's contributions: its dims, then one cotangent column per
 /// input column any contribution has, in column order.
+/// The predicate of `select`, an engine's plan of `SELECT * FROM table
+/// WHERE predicate` (see [`Options::restrict`]), over `table`'s columns, with
+/// its functions declared in `ext`.
+fn restriction(select: &Plan, table: &Table, ext: &mut Extensions) -> Result<Expression> {
+    use substrait::proto::plan_rel::RelType as PlanRelType;
+    use substrait::proto::read_rel::ReadType;
+    use substrait::proto::rel::RelType;
+    let refuse = |why: &str| {
+        AdError::InvalidOptions(format!(
+            "the restriction of `{}` {why}; it must be the plan of `SELECT * FROM table WHERE \
+             predicate`",
+            table.names.join(".")
+        ))
+    };
+    let mut rel = select
+        .relations
+        .iter()
+        .find_map(|r| match &r.rel_type {
+            Some(PlanRelType::Root(root)) => root.input.as_ref(),
+            _ => None,
+        })
+        .ok_or_else(|| refuse("has no root"))?;
+    // Down through projections to the filter, then its read.
+    let filter = loop {
+        match &rel.rel_type {
+            Some(RelType::Project(p)) => {
+                rel = p.input.as_deref().ok_or_else(|| refuse("is malformed"))?;
+            }
+            Some(RelType::Filter(f)) => break f,
+            _ => return Err(refuse("has no filter over the table")),
+        }
+    };
+    let Some(RelType::Read(read)) = filter.input.as_deref().and_then(|r| r.rel_type.as_ref())
+    else {
+        return Err(refuse("filters something other than the table"));
+    };
+    let read_names = match (&read.read_type, &read.base_schema) {
+        (Some(ReadType::NamedTable(t)), Some(schema)) if table_matches_names(table, &t.names) => {
+            schema.names.clone()
+        }
+        _ => return Err(refuse("reads another table")),
+    };
+    let condition = filter
+        .condition
+        .as_deref()
+        .ok_or_else(|| refuse("has an empty filter"))?;
+    let functions = Functions::from_plan(select)?;
+    let columns = table.columns();
+    let on_table = map_fields(condition, &mut |i| {
+        let name = read_names
+            .get(i)
+            .ok_or_else(|| refuse("reads past the table"))?;
+        let c = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+            .ok_or_else(|| refuse("reads a column the table does not have"))?;
+        if !table.dims.contains(&c) {
+            return Err(refuse(&format!(
+                "reads `{name}`, which is not one of the table's dims"
+            )));
+        }
+        Ok(c)
+    })?;
+    redeclare_functions(on_table, &functions, ext)
+}
+
+fn table_matches_names(table: &Table, names: &[String]) -> bool {
+    crate::relation::table_matches(&names.join("."), &table.names)
+        || crate::relation::table_matches(&table.names.join("."), names)
+}
+
+/// `e` with each function anchor of `from` replaced by its anchor in `ext`,
+/// by name. Literals, field references, casts, `CASE`, `IN` lists and scalar
+/// functions are followed; anything else is refused.
+fn redeclare_functions(
+    mut e: Expression,
+    from: &Functions,
+    ext: &mut Extensions,
+) -> Result<Expression> {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::function_argument::ArgType;
+    fn walk(e: &mut Expression, from: &Functions, ext: &mut Extensions) -> Result<()> {
+        match e.rex_type.as_mut() {
+            Some(RexType::Literal(_)) | Some(RexType::Selection(_)) => Ok(()),
+            Some(RexType::ScalarFunction(f)) => {
+                f.function_reference = ext.anchor(from.name(f.function_reference)?);
+                for a in f.arguments.iter_mut() {
+                    if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
+                        walk(x, from, ext)?;
+                    }
+                }
+                Ok(())
+            }
+            Some(RexType::Cast(c)) => match c.input.as_deref_mut() {
+                Some(x) => walk(x, from, ext),
+                None => Ok(()),
+            },
+            Some(RexType::IfThen(it)) => {
+                for c in it.ifs.iter_mut() {
+                    for x in c.r#if.iter_mut().chain(c.then.iter_mut()) {
+                        walk(x, from, ext)?;
+                    }
+                }
+                for x in it.r#else.iter_mut() {
+                    walk(x, from, ext)?;
+                }
+                Ok(())
+            }
+            Some(RexType::SingularOrList(l)) => {
+                for x in l.value.iter_mut() {
+                    walk(x, from, ext)?;
+                }
+                for x in l.options.iter_mut() {
+                    walk(x, from, ext)?;
+                }
+                Ok(())
+            }
+            _ => Err(AdError::InvalidOptions(
+                "a restriction may only compare a table's dims with literals".into(),
+            )),
+        }
+    }
+    walk(&mut e, from, ext)?;
+    Ok(e)
+}
+
 fn combine(
     t: &mut Transposer,
     contribs: Vec<Contribution>,
@@ -553,8 +784,32 @@ fn combine(
 /// - a row no gradient reached gets `0`;
 /// - a row whose value is NULL gets NULL, as v1 does (#60): a missing value
 ///   has no gradient, not a zero one.
-fn dense_gradient(t: &mut Transposer, i: usize, contribs: Vec<Contribution>) -> Result<Rel> {
+fn dense_gradient(
+    t: &mut Transposer,
+    i: usize,
+    contribs: Vec<Contribution>,
+    restriction: Option<&Expression>,
+) -> Result<Rel> {
     let table = &t.f.tables[i];
+    // Only the rows the restriction allows: in the table, and in every
+    // contribution, whose leading columns are the table's dims in order.
+    let contribs = match restriction {
+        None => contribs,
+        Some(pred) => {
+            let on_dims = map_fields(pred, &mut |c| {
+                table.dims.iter().position(|&d| d == c).ok_or_else(|| {
+                    AdError::Internal("a restriction reads a column that is not a dim".into())
+                })
+            })?;
+            contribs
+                .into_iter()
+                .map(|c| Contribution {
+                    rel: crate::emit::filter(c.rel, on_dims.clone()),
+                    cols: c.cols,
+                })
+                .collect()
+        }
+    };
     let dims = table.dims.clone();
     let values = table.values.clone();
     let types: Vec<substrait::proto::Type> = values
@@ -572,10 +827,12 @@ fn dense_gradient(t: &mut Transposer, i: usize, contribs: Vec<Contribution>) -> 
         .collect();
     // The table's dims, then its wrt values (for the NULL convention).
     let picked: Vec<usize> = dims.iter().chain(&values).copied().collect();
-    let rows = select(
-        read_table(table.names.clone(), table.schema.clone()),
-        picked,
-    );
+    let read = read_table(table.names.clone(), table.schema.clone());
+    let read = match restriction {
+        Some(pred) => crate::emit::filter(read, pred.clone()),
+        None => read,
+    };
+    let rows = select(read, picked);
     let (k, v) = (dims.len(), values.len());
     let (joined, cols, right) = if contribs.is_empty() {
         (rows, Vec::new(), k + v)

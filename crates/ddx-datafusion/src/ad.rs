@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::common::{DFSchema, TableReference};
+use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{FunctionRegistry, SessionState};
@@ -75,8 +75,8 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    from_project_rel, from_substrait_plan_with_consumer, DefaultSubstraitConsumer,
-    SubstraitConsumer,
+    from_project_rel, from_substrait_plan_with_consumer, from_substrait_rel,
+    DefaultSubstraitConsumer, SubstraitConsumer,
 };
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
@@ -130,6 +130,15 @@ pub fn vjp_plan(
 ) -> Result<BackwardProgram> {
     refuse_what_substrait_loses(plan)?;
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for
+/// [`ddx_ad::Options::restrict`]; `None` if it does not plan, and then every
+/// row of the gradient is computed, which is always right.
+async fn restriction_plan(ctx: &SessionContext, table: &str, predicate: &str) -> Option<Plan> {
+    let sql = format!("SELECT * FROM {table} WHERE {predicate}");
+    let lp = ctx.sql(&sql).await.ok()?.into_unoptimized_plan();
+    to_substrait_plan(&lp, &ctx.state()).ok().map(|p| *p)
 }
 
 /// Refuse a plan whose meaning DataFusion's Substrait producer does not
@@ -218,7 +227,18 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
     let result = async {
         for job in planned.jobs() {
-            let program = grad(ctx, &job.query, &job.wrt).await?;
+            // Only the gradient rows the statements read, where they say.
+            let mut options = ddx_ad::Options::new();
+            for (table, predicate) in &job.restrict {
+                if let Some(select) = restriction_plan(ctx, table, predicate).await {
+                    options = options.restrict(table.clone(), select);
+                }
+            }
+            let lp = ctx.sql(&job.query).await?.into_optimized_plan()?;
+            refuse_what_substrait_loses(&lp)?;
+            let program =
+                ddx_ad::grad_with(&*to_substrait_plan(&lp, &ctx.state())?, &job.wrt, &options)
+                    .map_err(to_df_err)?;
             ran.push(program);
             run(ctx, ran.last().expect("just pushed")).await?;
         }
@@ -398,7 +418,101 @@ impl SubstraitConsumer for ShortNames<'_> {
         self.inner.get_outer_schema(steps_out)
     }
 
+    /// A relation with an emit (an output mapping): the relation without it,
+    /// then the mapped columns picked out. DataFusion's own consumer applies
+    /// an emit through its `project` builder, which re-normalizes every
+    /// column by walking the whole plan (see `consume_project`), and ddx's
+    /// pruned plans put an emit on most projections.
+    async fn consume_rel(&self, rel: &Rel) -> Result<LogicalPlan> {
+        let Some(mapping) = emit_of(rel) else {
+            return from_substrait_rel(self, rel).await;
+        };
+        let mut seen = std::collections::HashSet::new();
+        if !mapping.iter().all(|i| seen.insert(*i)) {
+            // A column emitted twice needs DataFusion's unique naming.
+            return from_substrait_rel(self, rel).await;
+        }
+        // The relation without its emit: the typed consumer, which does not
+        // read the emit (cloning the relation to strip it would copy the
+        // whole subtree beneath, at every emit).
+        let plan = match rel.rel_type.as_ref() {
+            Some(RelType::Project(p)) => self.consume_project(p).await?,
+            Some(RelType::Filter(f)) => self.consume_filter(f).await?,
+            Some(RelType::Fetch(f)) => self.consume_fetch(f).await?,
+            Some(RelType::Sort(s)) => self.consume_sort(s).await?,
+            Some(RelType::Join(j)) => self.consume_join(j).await?,
+            Some(RelType::Cross(c)) => self.consume_cross(c).await?,
+            Some(RelType::Aggregate(a)) => self.consume_aggregate(a).await?,
+            Some(RelType::Set(s)) => self.consume_set(s).await?,
+            Some(RelType::Read(r)) => self.consume_read(r).await?,
+            _ => return from_substrait_rel(self, rel).await,
+        };
+        let pick = |i: i32| usize::try_from(i).ok();
+        let plan = match plan {
+            LogicalPlan::Projection(p) => {
+                let exprs = mapping
+                    .iter()
+                    .map(|&i| pick(i).and_then(|i| p.expr.get(i).cloned()))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("an emit past the projection".into())
+                    })?;
+                LogicalPlan::Projection(Projection::try_new(exprs, p.input)?)
+            }
+            other => {
+                let schema = Arc::clone(other.schema());
+                let exprs = mapping
+                    .iter()
+                    .map(|&i| {
+                        pick(i)
+                            .filter(|&i| i < schema.fields().len())
+                            .map(|i| Expr::Column(Column::from(schema.qualified_field(i))))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| DataFusionError::Internal("an emit past the relation".into()))?;
+                LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(other))?)
+            }
+        };
+        Ok(plan)
+    }
+
+    /// The input's columns, then the projection's expressions under short
+    /// names. Built directly, not with DataFusion's `project` builder: that
+    /// normalizes each expression's columns by walking the whole input plan,
+    /// once per expression, and ddx's projections carry every earlier column,
+    /// so a chain of n of them cost about n³ (1.2 s to consume an 80-map
+    /// chain whose plan is 18 KB). These columns come from the input's schema
+    /// already qualified, so there is nothing to normalize.
     async fn consume_project(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
+        let Some(input) = rel.input.as_deref() else {
+            return self.consume_project_by_builder(rel).await;
+        };
+        let input = self.consume_rel(input).await?;
+        let schema = Arc::clone(input.schema());
+        let mut exprs: Vec<Expr> = (0..schema.fields().len())
+            .map(|i| Expr::Column(Column::from(schema.qualified_field(i))))
+            .collect();
+        for e in &rel.expressions {
+            let e = self.consume_expression(e, &schema).await?;
+            // A window function needs a Window relation beneath the
+            // projection, which DataFusion's own consumer builds.
+            if matches!(e, Expr::WindowFunction(_)) {
+                return self.consume_project_by_builder(rel).await;
+            }
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            exprs.push(e.alias(format!("__ddx_c{n}")));
+        }
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(input),
+        )?))
+    }
+}
+
+impl ShortNames<'_> {
+    /// DataFusion's own projection consumer, then the computed columns
+    /// renamed: for a projection with a window function.
+    async fn consume_project_by_builder(&self, rel: &ProjectRel) -> Result<LogicalPlan> {
         let LogicalPlan::Projection(p) = from_project_rel(self, rel).await? else {
             return Err(DataFusionError::Internal(
                 "a Substrait projection consumed as something else".into(),
@@ -418,6 +532,27 @@ impl SubstraitConsumer for ShortNames<'_> {
         Ok(LogicalPlan::Projection(Projection::try_new(
             exprs, p.input,
         )?))
+    }
+}
+
+/// `rel`'s emit, if it has one.
+fn emit_of(rel: &Rel) -> Option<Vec<i32>> {
+    use ddx_ad::substrait::proto::rel_common::EmitKind;
+    let common = match rel.rel_type.as_ref()? {
+        RelType::Project(p) => p.common.as_ref(),
+        RelType::Filter(f) => f.common.as_ref(),
+        RelType::Fetch(f) => f.common.as_ref(),
+        RelType::Sort(s) => s.common.as_ref(),
+        RelType::Join(j) => j.common.as_ref(),
+        RelType::Cross(c) => c.common.as_ref(),
+        RelType::Aggregate(a) => a.common.as_ref(),
+        RelType::Set(s) => s.common.as_ref(),
+        RelType::Read(r) => r.common.as_ref(),
+        _ => None,
+    }?;
+    match &common.emit_kind {
+        Some(EmitKind::Emit(e)) => Some(e.output_mapping.clone()),
+        _ => None,
     }
 }
 

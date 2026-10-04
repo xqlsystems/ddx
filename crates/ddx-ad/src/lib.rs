@@ -76,6 +76,7 @@ mod elementwise;
 mod error;
 mod functions;
 mod program;
+mod prune;
 mod run;
 pub mod sql;
 mod transpose;

@@ -280,6 +280,88 @@ async fn resnet(blocks: usize, n: usize, d: usize) {
     print("resnet", &format!("blocks={blocks} n={n} d={d}"), &r);
 }
 
+/// nn.py's SGD statement for `weight`, all of it or only its last layer:
+/// the filter on the gradient's dims is pushed into the program, so only
+/// that layer's rows are computed.
+async fn rows(n: usize) {
+    for (label, filter) in [("all layers", ""), ("layer 2", " WHERE g.layer = 2")] {
+        let ctx = SessionContext::new();
+        ddx_datafusion::register_stop_gradient(&ctx);
+        let mut rng = model::Rng::new(7);
+        model::register_data(&ctx, n, &mut rng).unwrap();
+        model::register_model(&ctx, &mut rng).unwrap();
+        let sql = format!("{}{filter}", model::update_weight(0.5));
+        let t = best(|| async {
+            ad::sql(&ctx, &sql).await.unwrap().collect().await.unwrap();
+        })
+        .await;
+        eprintln!(
+            "PERF rows       samples={n:<8} {label:<11} ad::sql {:>9.2} ms",
+            t.as_secs_f64() * 1e3
+        );
+    }
+}
+
+/// Single-head self-attention over `l` tokens of width `d`: q, k and v
+/// projections, scaled dot-product scores, a softmax over keys, the weighted
+/// values, and the sum of their squares; with respect to the three
+/// projection matrices.
+async fn attention(l: usize, d: usize) {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE x AS SELECT CAST(r / {d} AS BIGINT) AS t, CAST(r % {d} AS BIGINT) AS k, \
+             sin(CAST(r AS DOUBLE)) AS val FROM (SELECT unnest(range(0, {})) AS r)",
+            l * d
+        ),
+    )
+    .await;
+    for (name, phase) in [("wq", 0.1), ("wk", 0.2), ("wv", 0.3)] {
+        exec(
+            &ctx,
+            &format!(
+                "CREATE TABLE {name} AS SELECT CAST(r / {d} AS BIGINT) AS k, \
+                 CAST(r % {d} AS BIGINT) AS j, 0.1 * cos(CAST(r AS DOUBLE) + {phase}) AS val \
+                 FROM (SELECT unnest(range(0, {})) AS r)",
+                d * d
+            ),
+        )
+        .await;
+    }
+    let proj = |w: &str| {
+        format!(
+            "SELECT x.t, {w}.j, SUM(x.val * {w}.val) AS v FROM x JOIN {w} ON x.k = {w}.k \
+             GROUP BY x.t, {w}.j"
+        )
+    };
+    let loss = format!(
+        "WITH q AS ({}), k AS ({}), vv AS ({}), \
+         s AS (SELECT q.t AS t, k.t AS u, SUM(q.v * k.v) / sqrt({d}.0) AS v \
+               FROM q JOIN k ON q.j = k.j GROUP BY q.t, k.t), \
+         m AS (SELECT t, MAX(v) AS m FROM s GROUP BY t), \
+         e AS (SELECT s.t, s.u, exp(s.v - m.m) AS e FROM s JOIN m ON s.t = m.t), \
+         z AS (SELECT t, SUM(e) AS z FROM e GROUP BY t), \
+         o AS (SELECT e.t, vv.j, SUM(e.e / z.z * vv.v) AS v \
+               FROM e JOIN z ON e.t = z.t JOIN vv ON e.u = vv.t GROUP BY e.t, vv.j) \
+         SELECT SUM(v * v) AS l FROM o",
+        proj("wq"),
+        proj("wk"),
+        proj("wv")
+    );
+    let r = measure(
+        &ctx,
+        &loss,
+        &[
+            ColumnRef::new("wq", "val"),
+            ColumnRef::new("wk", "val"),
+            ColumnRef::new("wv", "val"),
+        ],
+    )
+    .await;
+    print("attn", &format!("L={l} d={d}"), &r);
+}
+
 #[tokio::test]
 #[ignore = "a measurement; run one DDX_PERF family per process, under a memory cap"]
 async fn perf() {
@@ -316,6 +398,24 @@ async fn perf() {
                 resnet(n, 256, 8).await;
             }
         }
+        "rows" => {
+            for n in if sizes.is_empty() {
+                vec![256, 1024, 4096]
+            } else {
+                sizes
+            } {
+                rows(n).await;
+            }
+        }
+        "attn" => {
+            for l in if sizes.is_empty() {
+                vec![16, 32, 64, 128, 256]
+            } else {
+                sizes
+            } {
+                attention(l, 16).await;
+            }
+        }
         kind @ ("depth" | "fanin" | "layers" | "reuse") => {
             let default = match kind {
                 "depth" => vec![5, 10, 20, 40, 80],
@@ -327,6 +427,8 @@ async fn perf() {
                 chain(kind, n, 1000).await;
             }
         }
-        _ => eprintln!("set DDX_PERF to nn, matmul, depth, fanin, layers or reuse"),
+        _ => eprintln!(
+            "set DDX_PERF to nn, matmul, resnet, attn, rows, depth, fanin, layers or reuse"
+        ),
     }
 }

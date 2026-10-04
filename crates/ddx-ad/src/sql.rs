@@ -90,6 +90,12 @@ pub struct GradCall {
     pub table: String,
     /// The columns, as written.
     pub columns: Vec<String>,
+    /// The rows of the gradient the statement reads at most, when its
+    /// `WHERE` says: the conjuncts that compare one of the call's dims with
+    /// a literal, written over the table's column names (`layer = 0 AND i <
+    /// 10`). Such a comparison rejects NULL, so computing only those rows
+    /// leaves the statement's result as it was, whatever the joins.
+    pub filter: Option<String>,
     /// The byte range of `grad(…)` in the statement: the name through the
     /// closing parenthesis, not an alias after it.
     span: (usize, usize),
@@ -113,6 +119,11 @@ pub struct Job {
     pub query: String,
     /// The columns, each once, compared case-insensitively.
     pub wrt: Vec<ColumnRef>,
+    /// For a table every call of which reads only some rows of its gradient
+    /// ([`GradCall::filter`]): the table, as written, and a predicate over
+    /// its columns that holds on every row some call reads. Only those rows
+    /// need computing ([`crate::Options::restrict`]).
+    pub restrict: Vec<(String, String)>,
 }
 
 /// Several statements' `grad` calls, planned together (see the module docs).
@@ -144,6 +155,7 @@ impl Statements {
                         jobs.push(Job {
                             query: objective.query.clone(),
                             wrt: Vec::new(),
+                            restrict: Vec::new(),
                         });
                         jobs.len() - 1
                     }
@@ -158,6 +170,47 @@ impl Statements {
                     }
                 }
                 job_of.insert((s, l), j);
+            }
+        }
+        // A table's rows can be restricted only if every call reading its
+        // gradient in the job says which rows it reads.
+        for (j, job) in jobs.iter_mut().enumerate() {
+            let mut by_table: Vec<(String, Vec<Option<String>>)> = Vec::new();
+            for (s, calls) in found.iter().enumerate() {
+                let Some(calls) = calls else { continue };
+                for call in &calls.calls {
+                    if job_of.get(&(s, call.objective)) != Some(&j) {
+                        continue;
+                    }
+                    match by_table
+                        .iter_mut()
+                        .find(|(t, _)| t.eq_ignore_ascii_case(&call.table))
+                    {
+                        Some((_, filters)) => filters.push(call.filter.clone()),
+                        None => by_table.push((call.table.clone(), vec![call.filter.clone()])),
+                    }
+                }
+            }
+            for (table, filters) in by_table {
+                let Some(filters) = filters.into_iter().collect::<Option<Vec<_>>>() else {
+                    continue;
+                };
+                let mut distinct: Vec<String> = Vec::new();
+                for f in filters {
+                    if !distinct.contains(&f) {
+                        distinct.push(f);
+                    }
+                }
+                let predicate = if distinct.len() == 1 {
+                    distinct.pop().expect("one")
+                } else {
+                    distinct
+                        .iter()
+                        .map(|f| format!("({f})"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                };
+                job.restrict.push((table, predicate));
             }
         }
         Ok(Statements {
@@ -267,6 +320,8 @@ impl GradCalls {
 
         let mut finder = Finder::default();
         let _ = query.visit(&mut finder);
+        let mut filters = Filters::default();
+        let _ = query.visit(&mut filters);
         if finder.found.is_empty() {
             return Ok(None);
         }
@@ -306,10 +361,13 @@ impl GradCalls {
                     objectives[objective].wrt.push(w.clone());
                 }
             }
+            let columns: Vec<String> = wrt.into_iter().map(|w| w.column).collect();
+            let filter = filters.of(factor, &columns);
             calls.push(GradCall {
                 objective,
                 table,
-                columns: wrt.into_iter().map(|w| w.column).collect(),
+                filter,
+                columns,
                 span: call_span(sql, tokens.as_deref(), factor)?,
             });
         }
@@ -402,6 +460,176 @@ impl Visitor for Finder {
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// Each `grad` call's alias and the `WHERE` of the `SELECT` whose `FROM`
+/// holds it, by the location of the call's name.
+#[derive(Default)]
+struct Filters {
+    found: Vec<(Location, String, Option<Expr>)>,
+}
+
+impl Filters {
+    /// The conjuncts of the call at `at`'s `WHERE` that compare one of its
+    /// dims with a literal, over bare column names; `None` if there are
+    /// none. `values` are the columns the call names, which in its result
+    /// hold gradients, not the table's values, so they are never pushed.
+    fn of(&self, at: Location, values: &[String]) -> Option<String> {
+        let (_, alias, selection) = self.found.iter().find(|(l, _, _)| *l == at)?;
+        let mut kept = Vec::new();
+        for c in conjuncts(selection.as_ref()?) {
+            if let Some(text) = pushable(c, alias, values) {
+                kept.push(text);
+            }
+        }
+        (!kept.is_empty()).then(|| kept.join(" AND "))
+    }
+}
+
+impl Visitor for Filters {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        let mut stack = vec![query.body.as_ref()];
+        while let Some(body) = stack.pop() {
+            match body {
+                ddx_core::sqlparser::ast::SetExpr::Select(select) => {
+                    for twj in &select.from {
+                        let factors = std::iter::once(&twj.relation)
+                            .chain(twj.joins.iter().map(|j| &j.relation));
+                        for factor in factors {
+                            if let TableFactor::Table {
+                                name,
+                                args: Some(_),
+                                alias: Some(alias),
+                                ..
+                            } = factor
+                            {
+                                if let [ObjectNamePart::Identifier(id)] = name.0.as_slice() {
+                                    if id.value.eq_ignore_ascii_case("grad") {
+                                        self.found.push((
+                                            id.span.start,
+                                            alias.name.value.clone(),
+                                            select.selection.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ddx_core::sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+                _ => {}
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The `AND`-ed parts of `e`.
+fn conjuncts(e: &Expr) -> Vec<&Expr> {
+    use ddx_core::sqlparser::ast::BinaryOperator;
+    match e {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut out = conjuncts(left);
+            out.extend(conjuncts(right));
+            out
+        }
+        Expr::Nested(inner) => conjuncts(inner),
+        other => vec![other],
+    }
+}
+
+/// `c` over bare column names, if it compares a dim of the call aliased
+/// `alias` with a literal: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN (…)` or
+/// `BETWEEN`, none negated. Each rejects NULL.
+fn pushable(c: &Expr, alias: &str, values: &[String]) -> Option<String> {
+    use ddx_core::sqlparser::ast::BinaryOperator;
+    let dim = |e: &Expr| -> Option<Expr> {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        let [table, column] = parts.as_slice() else {
+            return None;
+        };
+        let is_value = values.iter().any(|v| v.eq_ignore_ascii_case(&column.value));
+        (table.value.eq_ignore_ascii_case(alias) && !is_value)
+            .then(|| Expr::Identifier(column.clone()))
+    };
+    let literal = |e: &Expr| match e {
+        Expr::Value(_) => true,
+        Expr::UnaryOp { expr, .. } => matches!(expr.as_ref(), Expr::Value(_)),
+        _ => false,
+    };
+    match c {
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            ) =>
+        {
+            if let (Some(d), true) = (dim(left), literal(right)) {
+                return Some(
+                    Expr::BinaryOp {
+                        left: Box::new(d),
+                        op: op.clone(),
+                        right: right.clone(),
+                    }
+                    .to_string(),
+                );
+            }
+            if let (true, Some(d)) = (literal(left), dim(right)) {
+                return Some(
+                    Expr::BinaryOp {
+                        left: left.clone(),
+                        op: op.clone(),
+                        right: Box::new(d),
+                    }
+                    .to_string(),
+                );
+            }
+            None
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if list.iter().all(literal) => dim(expr).map(|d| {
+            Expr::InList {
+                expr: Box::new(d),
+                list: list.clone(),
+                negated: false,
+            }
+            .to_string()
+        }),
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } if literal(low) && literal(high) => dim(expr).map(|d| {
+            Expr::Between {
+                expr: Box::new(d),
+                negated: false,
+                low: low.clone(),
+                high: high.clone(),
+            }
+            .to_string()
+        }),
+        _ => None,
     }
 }
 
@@ -538,6 +766,73 @@ mod tests {
                        loss AS (SELECT SUM(w.val * d.v) AS l FROM w JOIN d ON w.i = d.i) \
                        SELECT w.i, w.val - 0.1 * g.val AS val \
                        FROM w JOIN GRAD(loss, w.val) g ON w.i = g.i";
+
+    fn filter_of(sql: &str) -> Option<String> {
+        GradCalls::find(sql, &GenericDialect {})
+            .unwrap()
+            .unwrap()
+            .calls[0]
+            .filter
+            .clone()
+    }
+
+    #[test]
+    fn a_comparison_of_a_gradient_dim_with_a_literal_is_pushed_and_nothing_else() {
+        let with = |w: &str| {
+            format!(
+                "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+                 SELECT g.i FROM w JOIN grad(loss, w.val) g ON w.i = g.i WHERE {w}"
+            )
+        };
+        assert_eq!(filter_of(&with("g.layer = 0")), Some("layer = 0".into()));
+        assert_eq!(
+            filter_of(&with(
+                "g.layer IN (0, 2) AND g.i BETWEEN 1 AND 4 AND 3 > g.k"
+            )),
+            Some("layer IN (0, 2) AND i BETWEEN 1 AND 4 AND 3 > k".into())
+        );
+        // g.val is the gradient, not the table's value; w is another table;
+        // an OR, a negation, or a comparison with a column is not pushed.
+        for w in [
+            "g.val > 0",
+            "w.layer = 0",
+            "g.layer = 0 OR g.i = 1",
+            "g.layer NOT IN (0)",
+            "g.layer = w.layer",
+        ] {
+            assert_eq!(filter_of(&with(w)), None, "{w}");
+        }
+        assert_eq!(
+            filter_of(&with("g.layer = 0 AND g.val > 0")),
+            Some("layer = 0".into())
+        );
+    }
+
+    #[test]
+    fn a_job_restricts_a_table_only_when_every_call_on_it_does() {
+        let stmt = |w: &str| {
+            format!(
+                "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+                 SELECT g.i FROM grad(loss, w.val) g{w}"
+            )
+        };
+        let plan = |ws: &[&str]| {
+            let stmts: Vec<String> = ws.iter().map(|w| stmt(w)).collect();
+            let refs: Vec<&str> = stmts.iter().map(String::as_str).collect();
+            Statements::plan(&refs, &GenericDialect {}).unwrap().jobs()[0]
+                .restrict
+                .clone()
+        };
+        assert_eq!(
+            plan(&[" WHERE g.layer = 0"]),
+            vec![("w".to_string(), "layer = 0".to_string())]
+        );
+        assert_eq!(
+            plan(&[" WHERE g.layer = 0", " WHERE g.layer = 1"]),
+            vec![("w".to_string(), "(layer = 0) OR (layer = 1)".to_string())]
+        );
+        assert_eq!(plan(&[" WHERE g.layer = 0", ""]), vec![]);
+    }
 
     #[test]
     fn a_call_is_found_with_its_objective_query() {

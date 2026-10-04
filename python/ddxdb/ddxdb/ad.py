@@ -266,8 +266,16 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     planned = _Statements(list(statements), dialect)
     ran: list[BackwardProgram] = []
     try:
-        for query, wrt in planned.jobs():
-            program = grad(ctx, query, wrt)
+        for query, wrt, restrict in planned.jobs():
+            # Only the gradient rows the statements read, where they say.
+            selects = []
+            for table, predicate in restrict:
+                try:
+                    selects.append((table, Serde.serialize_bytes(f"SELECT * FROM {table} WHERE {predicate}", ctx)))
+                except Exception:  # every row is computed, which is always right
+                    pass
+            _refuse_not_in(query)
+            program = grad_plan(Serde.serialize_bytes(query, ctx), wrt, restrict=selects)
             ran.append(program)
             run(ctx, program)
         return [ctx.sql(s) for s in planned.rewrite(ran)]
