@@ -44,7 +44,14 @@ sqlparser = { version = "=0.62.0", features = ["visitor"] }
 # NOT. `crates/ddx-datafusion/tests/sqlparser_pin.rs` asserts the resolved tree
 # still has exactly one `sqlparser`, so a future bump fails loudly at the pin
 # instead of confusingly at the bridge.
-datafusion = { version = "54" }
+#
+# Pinned exactly, always, as `sqlparser` and `substrait` are: `ddx-datafusion`'s
+# public API takes and returns DataFusion's own types (`SessionContext`,
+# `LogicalPlan`, `DataFrame`), so a caller has to link the `datafusion` ddx was
+# built against. A bump is a deliberate change: update this line,
+# `datafusion-substrait` below, and the Python pins (`python/ddxdb/pyproject.toml`,
+# `tests/pyproject.toml`, and their lockfiles); see CONTRIBUTING.md.
+datafusion = { version = "=54.1.0" }
 
 # v2's plan type (M3). Pinned exactly, for the same reason as `sqlparser`:
 # `ddx-ad`'s public API takes and returns `substrait::proto` types, and an
@@ -53,9 +60,10 @@ datafusion = { version = "54" }
 # `substrait::proto::Plan` would be two unrelated Rust types and the adapter
 # would stop compiling.
 substrait = { version = "=0.63.0" }
-# DataFusion's Substrait producer and consumer, for the v2 adapter. Its
-# `substrait` requirement is what the pin above follows.
-datafusion-substrait = { version = "54.1" }
+# DataFusion's Substrait producer and consumer, for the v2 adapter. Pinned
+# exactly, to the same release as `datafusion`; its `substrait` requirement is
+# what the pin above follows.
+datafusion-substrait = { version = "=54.1.0" }
 # The protobuf runtime `substrait`'s types are generated for. ddx-ad encodes
 # plans as bytes for hosts that hold them so, and relations to compare them;
 # the version is whatever `substrait` uses.

@@ -32,10 +32,14 @@ classifiers = [
 # nothing when unused.
 dependencies = []
 
+# `datafusion` is pinned exactly, always: `ddxdb.ad` exchanges Substrait plans
+# with DataFusion's bindings, and ddx-ad pins `substrait` to the version
+# DataFusion 54 uses. This is the PyPI release (it bundles DataFusion 54.0.0);
+# the Rust crates use 54.1.0. A bump is a deliberate change (see CONTRIBUTING.md).
 [project.optional-dependencies]
-datafusion = ["datafusion>=45"]
+datafusion = ["datafusion==54.0.0"]
 duckdb = ["duckdb>=1.0"]
-test = ["pytest>=7", "datafusion>=45", "duckdb>=1.0"]
+test = ["pytest>=7", "datafusion==54.0.0", "duckdb>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/xqlsystems/ddx"

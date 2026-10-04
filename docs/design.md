@@ -1212,6 +1212,15 @@ consumers can't accidentally link a mismatch; treat a `sqlparser` bump as a
 breaking release of `ddx-core`; and if the pins ever must diverge, degrade
 the bridge to a string round-trip rather than break it `[G2]`.
 
+**`datafusion` is pinned exactly too, always** (`=54.1.0`, with
+`datafusion-substrait`; `==54.0.0` for the Python package, the PyPI release of the
+same line). `ddx-datafusion`'s public API is DataFusion's types, a user's
+`SessionContext` goes in and a `DataFrame` comes out, and v2 reads and writes
+Substrait plans of the version DataFusion's producer writes. A caller therefore
+links the DataFusion ddx was tested against; a range would promise a combination
+no test ran. A bump moves the workspace, both Python manifests and their locks
+together.
+
 ---
 
 ## 7. Naming & distribution
