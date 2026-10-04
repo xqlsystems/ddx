@@ -715,7 +715,9 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
 }
 
 // ---------------------------------------------------------------------------
-// Round 3: found on the fixed stack by the soak aimed at today's changes.
+// Round 3: found on the fixed stack by the soak. A near tie over constant
+// table values, fixed in #76, and three DataFusion bugs, pinned as upstream
+// (#101, #103, #104).
 
 #[tokio::test]
 async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
