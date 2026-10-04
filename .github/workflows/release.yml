@@ -49,6 +49,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
+      # ddx-ad's `substrait` dependency generates its types from .proto files at
+      # build time, and release-plz builds each crate (to verify the package it
+      # publishes, and for cargo-semver-checks), so it needs protoc, as CI does.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: release-plz release
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
@@ -75,6 +80,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
+      # ddx-ad's `substrait` dependency generates its types from .proto files at
+      # build time, and release-plz builds each crate (to verify the package it
+      # publishes, and for cargo-semver-checks), so it needs protoc, as CI does.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
