@@ -2444,6 +2444,52 @@ async fn check_case(seed: u64, props: Props) -> Outcome {
     out
 }
 
+/// Whether `sql` computes a single NULL.
+async fn loss_is_null(ctx: &SessionContext, sql: &str) -> bool {
+    query(ctx, sql)
+        .await
+        .is_ok_and(|r| matches!(r.rows.as_slice(), [row] if row.len() == 1 && row[0].is_none()))
+}
+
+/// A NULL loss does not move with anything in it, so every gradient is 0
+/// (NULL where the value is NULL), as `vjp` does for a NULL output row.
+async fn check_null_loss(
+    ctx: &SessionContext,
+    case: &Case,
+    sql: &str,
+    wrt: &[ColumnRef],
+    out: &mut Outcome,
+) {
+    // Two upstream bugs can make the program compute a different loss (see
+    // the value step's check): not a NULL one, so not one to check here.
+    if (case.modes.nulls && sql.contains("NOT IN"))
+        || (case.modes.extreme == Some(Extreme::NanData)
+            && (sql.contains("MAX(") || sql.contains("MIN(")))
+    {
+        out.refusal = Some("loss is NULL, over an upstream bug".into());
+        return;
+    }
+    let grads = match grad_of(ctx, sql, wrt).await {
+        Ok((_, grads)) => grads,
+        Err(Refusal::Allowed(why)) => {
+            out.refusal = Some(why);
+            return;
+        }
+        Err(Refusal::Bug(why)) => {
+            out.fail(why);
+            return;
+        }
+    };
+    out.accepted = true;
+    for (t, g) in &grads {
+        if let Some((k, v)) = g.iter().find(|(_, v)| v.is_some_and(|v| v != 0.0)) {
+            out.fail(format!(
+                "[null-loss] the loss is NULL, yet {t}{k:?} has gradient {v:?}"
+            ));
+        }
+    }
+}
+
 async fn check_case_inner(
     rng: &mut Rng,
     case: &Case,
@@ -2459,7 +2505,11 @@ async fn check_case_inner(
     let l0 = match loss(&ctx, &sql).await {
         Ok(Some(l0)) => l0,
         Ok(None) => {
-            out.refusal = Some("loss is NULL or not finite".into());
+            if loss_is_null(&ctx, &sql).await {
+                check_null_loss(&ctx, case, &sql, &wrt, out).await;
+            } else {
+                out.refusal = Some("loss is not finite".into());
+            }
             return Ok(());
         }
         Err(e) => {
