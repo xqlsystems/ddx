@@ -171,7 +171,7 @@ fn variant(rng: &mut Rng, tokens: &[&str]) -> String {
     for (k, t) in tokens.iter().enumerate() {
         if k > 0 {
             if rng.below(3) == 0 {
-                out.push_str(rng.pick(SEPARATORS));
+                out.push_str(rng.pick::<&str>(SEPARATORS));
             } else {
                 out.push(' ');
             }
@@ -179,10 +179,13 @@ fn variant(rng: &mut Rng, tokens: &[&str]) -> String {
         out.push_str(&respell(rng, t));
     }
     if rng.below(4) == 0 {
-        out.insert_str(0, rng.pick(&["/* ☕ */ ", "-- lead\n", "\r\n", "  "]));
+        out.insert_str(
+            0,
+            rng.pick::<&str>(&["/* ☕ */ ", "-- lead\n", "\r\n", "  "]),
+        );
     }
     if rng.below(4) == 0 {
-        out.push_str(rng.pick(&[" -- tail", " /* ) */", "\n", ";"]));
+        out.push_str(rng.pick::<&str>(&[" -- tail", " /* ) */", "\n", ";"]));
     }
     out
 }
