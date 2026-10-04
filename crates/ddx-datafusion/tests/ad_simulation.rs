@@ -352,6 +352,9 @@ struct Modes {
     extreme: Option<Extreme>,
     /// Domains ten times larger: thousands of rows per relation.
     big: bool,
+    /// Parameters a few ulps apart: near-ties that are not ties, where MAX
+    /// is differentiable and only exact equality is right.
+    ulps: bool,
 }
 
 impl Modes {
@@ -374,6 +377,7 @@ impl Modes {
                     nulls: on("nulls"),
                     extreme: on("extreme").then(|| extreme(&mut r)),
                     big: on("big"),
+                    ulps: on("ulps"),
                 }
             }
             Err(_) => Modes {
@@ -385,6 +389,7 @@ impl Modes {
                 // partitions need not be deterministic, which a PR gate
                 // must be.
                 big: r.below(100) < 4 && SOAKING.load(Ordering::Relaxed),
+                ulps: r.below(100) < 8,
             },
         };
         (modes, r)
@@ -409,6 +414,9 @@ impl Modes {
         }
         if self.big {
             v.push("big");
+        }
+        if self.ulps {
+            v.push("ulps");
         }
         v
     }
@@ -442,6 +450,13 @@ fn apply_modes(tables: &mut [Table], modes: &Modes, r: &mut Rng) {
                 sizes
             })
             .collect();
+        if modes.ulps && t.param {
+            for v in t.vals.iter_mut().flatten() {
+                let base = *r.pick(TIE_VALUES);
+                let off = r.below(9) as i64 - 4;
+                *v = f64::from_bits((base.to_bits() as i64 + off) as u64);
+            }
+        }
         if modes.ties && t.param {
             for v in t.vals.iter_mut().flatten() {
                 *v = *r.pick(TIE_VALUES);
@@ -511,6 +526,12 @@ struct Node {
     shared: bool,
     /// A ranking that does not break ties, made here.
     nontotal: bool,
+    /// Whether its value can differ in its last bits between two
+    /// computations: it reads an aggregate's output (a sum over partitions
+    /// adds in arrival order). Only such a value may take the 8-ulp tie
+    /// tolerance; a table's values, and elementwise functions of them, are
+    /// the same every run, whether or not the table is differentiated.
+    jitter: bool,
     /// Its forward-mode twin (see `tangent_sql`): the same relation with a
     /// tangent column `dv` beside `v`, referring to earlier twins as `§n§`.
     /// `None` where the oracle has no rule.
@@ -620,6 +641,34 @@ fn agg_tangent(agg: &str) -> Option<&'static str> {
         "SUM(v * v) * 0.1 + SUM(v)" => "SUM(2.0 * v * dv) * 0.1 + SUM(dv)",
         _ => return None,
     })
+}
+
+/// The tally for a metamorphic disagreement at the tie window's edge (see
+/// [`Case::windowed_extremes`]).
+const TIE_EDGE: &str = "ill-conditioned: a near-tie at the tie window's edge";
+
+/// An aggregate tangent whose MAX/MIN tie test must be exact: the values it
+/// compares cannot jitter, so ddx compares them exactly (`{maxx}`/`{minx}`),
+/// where one that can jitter gets the 8-ulp window (`{max}`/`{min}`).
+fn exact_ties(t: &str, exact: bool) -> String {
+    if exact {
+        t.replace("{max}", "{maxx}").replace("{min}", "{minx}")
+    } else {
+        t.to_string()
+    }
+}
+
+/// How the forward-mode twin decides that a row attains a MAX or MIN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ties {
+    /// ddx's documented rule: the 8-ulp window only for values that can
+    /// jitter (they read an aggregate's output or constant data), exact
+    /// equality for a table's values.
+    Rule,
+    /// Exact equality everywhere: jax.grad's convention.
+    Exact,
+    /// The 8-ulp window everywhere.
+    Window,
 }
 
 /// Rows of `from` with the window extremes an aggregate tangent reads.
@@ -743,6 +792,7 @@ impl Gen<'_> {
         unique: bool,
     ) -> usize {
         self.nodes.push(Node {
+            jitter: false,
             tan: None,
             nontotal: false,
             body,
@@ -762,7 +812,10 @@ impl Gen<'_> {
         let (dims, reads, mut kinds, unique) =
             (n.dims.clone(), n.reads.clone(), n.kinds.clone(), n.unique);
         kinds.insert(kind);
-        self.push_u(body, dims, reads, kinds, unique)
+        let jitter = self.nodes[c].jitter;
+        let n = self.push_u(body, dims, reads, kinds, unique);
+        self.nodes[n].jitter = jitter;
+        n
     }
 
     fn node(&mut self, depth: u32) -> usize {
@@ -834,6 +887,7 @@ impl Gen<'_> {
             )
         };
         let n = self.push_u(body, dims, reads, BTreeSet::from(["read"]), unique);
+        // A table's values are the same every read, differentiated or not.
         self.nodes[n].tan = Some(tan);
         n
     }
@@ -880,7 +934,12 @@ impl Gen<'_> {
             lead(&self.nodes[c].dims, ""),
             f.replace("{v}", "v")
         );
+        // A scalar subquery is one constant within a computation: it inherits
+        // the child's jitter, and adds its own if it sums (a sum adds in the
+        // order partitions arrive; a MAX never rounds), as ddx's rule does.
+        let rounds = f.contains("(SELECT SUM(") || f.contains("(SELECT AVG(");
         let n = self.derive(c, body, "map");
+        self.nodes[n].jitter |= rounds;
         if is_kinked(&f) {
             self.nodes[n].kinds.insert("kink");
         }
@@ -989,6 +1048,7 @@ impl Gen<'_> {
         kinds.insert(if shared.is_empty() { "cross" } else { "join" });
         let n = self.push_u(body, dims, reads, kinds, na.unique && nb.unique);
         self.nodes[n].tan = (na.tan.is_some() && nb.tan.is_some()).then_some(tan);
+        self.nodes[n].jitter = na.jitter || nb.jitter;
         n
     }
 
@@ -1038,7 +1098,9 @@ impl Gen<'_> {
             lead(&keep, ""),
             group_by(&keep)
         );
+        let exact = !n.jitter;
         let tan = agg_tangent(agg).map(|t| {
+            let t = exact_ties(t, exact);
             format!(
                 "SELECT {}{agg} AS v, {t} AS dv FROM {} c{}{having}",
                 lead(&keep, ""),
@@ -1048,6 +1110,7 @@ impl Gen<'_> {
         });
         let m = self.push_u(body, keep, n.reads.clone(), kinds, true);
         self.nodes[m].tan = tan.filter(|_| n.tan.is_some());
+        self.nodes[m].jitter = true;
         m
     }
 
@@ -1186,6 +1249,8 @@ impl Gen<'_> {
             true,
         );
         self.nodes[n].tan = tan;
+        self.nodes[u].jitter = na.jitter || nb.jitter;
+        self.nodes[n].jitter = true;
         n
     }
 
@@ -1314,9 +1379,11 @@ impl Gen<'_> {
             kinds.clone(),
         );
         let has_tan = n.tan.is_some();
+        let max_tie = if n.jitter { "{max}" } else { "{maxx}" };
+        self.nodes[mx].jitter = true;
         self.nodes[mx].tan = has_tan.then(|| {
             format!(
-                "SELECT {}MAX(v) AS v, AVG(CASE WHEN {{max}} THEN dv END) AS dv FROM {} c{}",
+                "SELECT {}MAX(v) AS v, AVG(CASE WHEN {max_tie} THEN dv END) AS dv FROM {} c{}",
                 lead(&g, ""),
                 with_extremes(&format!("§{c}§"), &g),
                 group_by(&g)
@@ -1342,6 +1409,7 @@ impl Gen<'_> {
             n.unique,
         );
         let dshift = if shift == "b.v" { "b.dv" } else { "0.0" };
+        self.nodes[e].jitter = true;
         self.nodes[e].tan = has_tan.then(|| {
             format!(
                 "SELECT {}exp(a.v - b.v) AS v, {} AS dv FROM {}",
@@ -1363,6 +1431,7 @@ impl Gen<'_> {
             n.reads.clone(),
             kinds.clone(),
         );
+        self.nodes[s].jitter = true;
         self.nodes[s].tan = has_tan.then(|| {
             format!(
                 "SELECT {}SUM(v) AS v, SUM(dv) AS dv FROM §{e}§ c{}",
@@ -1395,6 +1464,7 @@ impl Gen<'_> {
             kinds,
             n.unique,
         );
+        self.nodes[r].jitter = true;
         self.nodes[r].tan = has_tan.then(|| {
             format!(
                 "SELECT {}{ratio} AS v, {} AS dv FROM {}",
@@ -1485,6 +1555,12 @@ fn gen_case(rng: &mut Rng, modes: Modes, mrng: &mut Rng) -> Case {
             wrt.push(rng.pick(&reads).clone());
         }
         shuffle(rng, &mut wrt);
+        // `DDX_V2_WRT_ALL`: differentiate every parameter table the loss
+        // reads, so none is constant data (for a soak that must not meet the
+        // known near-tie finding over constant tables in ad_findings.rs).
+        if std::env::var("DDX_V2_WRT_ALL").is_ok() {
+            wrt = reads.clone();
+        }
         let head = rng.pick(HEADS).to_string();
         return Case {
             modes,
@@ -1532,6 +1608,20 @@ impl Case {
         }
         out.push_str(rest);
         Some(out)
+    }
+
+    /// Whether some MAX or MIN it computes shares near-ties in ddx's 8-ulp
+    /// window (its values can jitter). Where values sit a few ulps apart
+    /// (ulps mode), a rounding that differs from one plan or row order to
+    /// another can move a row across the window's edge, and the gradient with
+    /// it: ill-conditioned, not wrong (seed 4100778).
+    fn windowed_extremes(&self) -> bool {
+        let windowed = |t: &str| t.contains("{max}") || t.contains("{min}");
+        let head = self.nodes[self.root].jitter && agg_tangent(&self.head).is_some_and(windowed);
+        head || self
+            .reachable()
+            .into_iter()
+            .any(|k| self.nodes[k].tan.as_deref().is_some_and(windowed))
     }
 
     /// Whether the case holds exact ties by construction: its ties mode,
@@ -1592,9 +1682,9 @@ impl Case {
     /// agree, `⟨∇L, d⟩` is right to rounding, not to a finite difference's
     /// truncation. `window` gives MAX and MIN ddx's 8-ulp attainment window
     /// instead of exact equality. `None` if some relation has no twin.
-    fn tangent_sql(&self, window: bool) -> Option<String> {
-        let head_t = agg_tangent(&self.head)?;
-        let attains = |m: &str| {
+    fn tangent_sql(&self, ties: Ties) -> Option<String> {
+        let head_t = exact_ties(agg_tangent(&self.head)?, !self.nodes[self.root].jitter);
+        let attains = |m: &str, window: bool| {
             if window {
                 format!(
                     "(v = {m} OR (abs({m}) <= 1.7976931348623157e308 AND \
@@ -1605,8 +1695,15 @@ impl Case {
             }
         };
         let fill = |t: &str| {
-            t.replace("{max}", &attains("mx__"))
-                .replace("{min}", &attains("mn__"))
+            let (jittery, exact) = match ties {
+                Ties::Rule => (true, false),
+                Ties::Exact => (false, false),
+                Ties::Window => (true, true),
+            };
+            t.replace("{maxx}", &attains("mx__", exact))
+                .replace("{minx}", &attains("mn__", exact))
+                .replace("{max}", &attains("mx__", jittery))
+                .replace("{min}", &attains("mn__", jittery))
         };
         let mut ctes = Vec::new();
         for (k, n) in self.nodes.iter().enumerate() {
@@ -1627,7 +1724,7 @@ impl Case {
             "WITH {} SELECT {} AS loss, {} AS dloss FROM {} c",
             ctes.join(", "),
             self.head,
-            fill(head_t),
+            fill(&head_t),
             with_extremes(&format!("t{}", self.root), &[])
         ))
     }
@@ -2128,6 +2225,14 @@ async fn fd_check(
             Fd::Screened
         });
     }
+    // A tiny parameter added to an O(1) value is lost to rounding: m - (w +
+    // m) is exactly 0 for w near 1e-163 (seed 3400263), so the loss does not
+    // move at all while its derivative is -1, as jax.grad gives. No step
+    // tiny enough to follow w survives the addition; the exact oracle still
+    // compares such a gradient.
+    if case.modes.extreme == Some(Extreme::Tiny) && m2 == l0 && m1 == l0 && p1 == l0 && p2 == l0 {
+        return Ok(Fd::Screened);
+    }
     let exact_ties = case.exact_ties();
     if (kink || (d1 - d2).abs() > 1e-3 * scale) && exact_ties {
         // A tie between computed values (0.25 · 1 and -0.5 · -0.5) can still
@@ -2363,6 +2468,22 @@ async fn check_case_inner(
         }
     };
 
+    // Over NaN data, DataFusion's grouped MAX or MIN keeps or skips a NaN by
+    // the order partial aggregates merge (#101), so the loss itself can change
+    // from run to run (seed 4500386), and every program run would see a
+    // different query. Such a case is ill-conditioned before ddx is involved.
+    if case.modes.extreme == Some(Extreme::NanData)
+        && (sql.contains("MAX(") || sql.contains("MIN("))
+    {
+        for _ in 0..4 {
+            if loss(&ctx, &sql).await.ok().flatten() != Some(l0) {
+                out.engine
+                    .push("upstream #101: MAX/MIN over NaN depends on merge order".into());
+                return Ok(());
+            }
+        }
+    }
+
     let (program, grads) = match grad_of(&ctx, &sql, &wrt).await {
         Ok(ok) => ok,
         Err(Refusal::Allowed(why)) => {
@@ -2396,9 +2517,31 @@ async fn check_case_inner(
             [row]
                 if row.len() == 1
                     && row[0].is_some_and(|v| (v - l0).abs() <= 1e-9 * l0.abs().max(1.0)) => {}
-            rows => out.fail(format!(
-                "[value] the value step holds {rows:?}, the loss is {l0}"
-            )),
+            rows => {
+                // Two upstream DataFusion bugs make the program compute a
+                // different query, before ddx does anything: NOT IN over a
+                // subquery holding a NULL becomes a plain anti-join through
+                // Substrait (#104, seed 4600388), and a grouped MAX or MIN
+                // over NaN keeps or skips the NaN by merge order (#101, seed
+                // 4500386). Everything after would disagree too.
+                let loss = case.loss_sql();
+                let upstream = if case.modes.nulls && loss.contains("NOT IN") {
+                    Some("upstream #104: NOT IN over a NULL loses its NULL semantics")
+                } else if case.modes.extreme == Some(Extreme::NanData)
+                    && (loss.contains("MAX(") || loss.contains("MIN("))
+                {
+                    Some("upstream #101: MAX/MIN over NaN depends on merge order")
+                } else {
+                    None
+                };
+                if let Some(kind) = upstream {
+                    out.engine.push(kind.into());
+                    return Ok(());
+                }
+                out.fail(format!(
+                    "[value] the value step holds {rows:?}, the loss is {l0}"
+                ));
+            }
         },
         Err(e) => out.fail(format!("[value] cannot read the value step: {e}")),
     }
@@ -2436,7 +2579,9 @@ async fn check_case_inner(
         return Ok(());
     }
 
-    if props.fd {
+    // A finite difference's step crosses every near-tie in ulps mode; the
+    // forward-mode twin judges those cases instead.
+    if props.fd && !case.modes.ulps {
         for dir in directions(rng, case) {
             match fd_check(&ctx, case, &sql, l0, &grads, &dir).await? {
                 Fd::Agree => out.fd_compared += 1,
@@ -2451,6 +2596,7 @@ async fn check_case_inner(
     }
 
     // Everything below compares ddx with itself.
+    let edge = case.modes.ulps && case.windowed_extremes();
     let meta = |label: &str,
                 r: Result<(BackwardProgram, BTreeMap<String, Grad>), Refusal>,
                 factor: f64,
@@ -2461,7 +2607,11 @@ async fn check_case_inner(
             Ok((_, g)) => {
                 out.meta_compared += 1;
                 if let Some(f) = compare(label, &grads, &g, factor, rtol) {
-                    out.fail(f);
+                    if edge {
+                        out.engine.push(TIE_EDGE.into());
+                    } else {
+                        out.fail(f);
+                    }
                 }
             }
             // A physical-planning fault is DataFusion's, tallied here as
@@ -3332,7 +3482,7 @@ async fn exact_checks(
     ) {
         return Ok(());
     }
-    let Some(exact_sql) = case.tangent_sql(false) else {
+    let Some(exact_sql) = case.tangent_sql(Ties::Rule) else {
         return Ok(());
     };
     for _ in 0..3 {
@@ -3411,6 +3561,23 @@ async fn exact_checks(
             return Ok(());
         };
         if (loss_t - l0).abs() > 1e-9 * l0.abs().max(1.0) {
+            // A loss so ill-conditioned that the last bits of a parallel sum
+            // decide it (sin of 3e80) comes out differently from the twin's
+            // plan than from the query's; the twin then varies run to run.
+            let mut varies = false;
+            for _ in 0..4 {
+                if let Ok(Some((Some(again), _))) = query(ctx, &exact_sql).await.map(row) {
+                    if (again - loss_t).abs() > 1e-9 * loss_t.abs().max(1.0) {
+                        varies = true;
+                        break;
+                    }
+                }
+            }
+            if varies {
+                out.engine
+                    .push("ill-conditioned: the loss changes with the plan".into());
+                return Ok(());
+            }
             out.fail(format!(
                 "[oracle] the forward-mode twin computes the loss {loss_t}, not {l0}\n  {exact_sql}"
             ));
@@ -3423,28 +3590,40 @@ async fn exact_checks(
             continue;
         }
         out.exact_compared += 1;
-        let tol = |a: f64, b: f64| 1e-8 * ad_abs.max(a.abs()).max(b.abs()).max(1e-300) + 1e-13;
+        // The absolute floor is for a derivative that cancels to about 0 (a
+        // log-softmax summed over its group): its rounding grows with the
+        // rows summed, thousands in big mode (seeds 3901113, 4100208).
+        let floor = if case.modes.big { 1e-11 } else { 1e-13 };
+        let tol = |a: f64, b: f64| 1e-8 * ad_abs.max(a.abs()).max(b.abs()).max(1e-300) + floor;
         if (dloss - ad_dot).abs() <= tol(dloss, ad_dot) {
             continue;
         }
-        // Disagreeing with exact equality: does ddx's window explain it?
-        let windowed = match case.tangent_sql(true) {
-            Some(q) => query(ctx, &q).await.ok().and_then(row).and_then(|(_, d)| d),
-            None => None,
-        };
-        if let Some(w) = windowed.filter(|w| (w - ad_dot).abs() <= tol(*w, ad_dot)) {
-            let _ = w;
-            out.engine
-                .push("near-tie shared by the 8-ulp window (jax.grad would not)".into());
-            if std::env::var("DDX_V2_STRICT_TIES").is_ok() {
-                out.fail(format!(
-                    "[near-tie] ⟨∇L, d⟩ = {ad_dot:.15e}; jax.grad's convention gives \
-                     {dloss:.15e}: a MAX/MIN shared its cotangent between rows within 8 ulps \
-                     that do not tie"
-                ));
+        // Disagreeing with ddx's own tie rule: would another rule agree?
+        let under = |t: Ties| {
+            let q = case.tangent_sql(t);
+            async move {
+                match q {
+                    Some(q) => query(ctx, &q).await.ok().and_then(row).and_then(|(_, d)| d),
+                    None => None,
+                }
             }
+        };
+        let (exact_all, window_all) = (under(Ties::Exact).await, under(Ties::Window).await);
+        let agrees = |d: Option<f64>| d.is_some_and(|d| (d - ad_dot).abs() <= tol(d, ad_dot));
+        // Exact equality is jax.grad's convention, and right wherever the
+        // values cannot jitter; ddx taking it where they might is no error.
+        if agrees(exact_all) {
             continue;
         }
+        if agrees(window_all) {
+            out.fail(format!(
+                "[tie-rule] ddx shared a MAX/MIN near-tie between values that cannot jitter \
+                 (a table's, or elementwise functions of them): ⟨∇L, d⟩ = {ad_dot:.15e}; \
+                 exact equality, jax.grad's convention, gives {dloss:.15e}\n  twin: {exact_sql}"
+            ));
+            return Ok(());
+        }
+        let windowed = window_all;
         out.fail(format!(
             "[exact] reverse mode ⟨∇L, d⟩ = {ad_dot:.15e}, forward mode {dloss:.15e} \
              (|Δ| {:.3e}, tol {:.3e}); windowed forward mode {windowed:?}\n  twin: {exact_sql}",
@@ -3660,7 +3839,11 @@ async fn mutation_checks(
                     out.meta_compared += 1;
                     out.rewrites.extend(kinds.iter().map(|k| k.to_string()));
                     if let Some(f) = compare("plan-rewrite", grads, &g, 1.0, META_RTOL) {
-                        out.fail(format!("{f}\n  {label}"));
+                        if case.modes.ulps && case.windowed_extremes() {
+                            out.engine.push(TIE_EDGE.into());
+                        } else {
+                            out.fail(format!("{f}\n  {label}"));
+                        }
                     }
                     let _ = ad::release(ctx, &program);
                 }
@@ -4628,6 +4811,80 @@ async fn debug_steps(case: &Case) {
         Ok(p) => p,
         Err(e) => return eprintln!("grad: {e}"),
     };
+    // Each forward-mode twin must compute its relation's own values.
+    if let Some(twin) = case.tangent_sql(Ties::Rule) {
+        for (name, _) in PARAMS {
+            let tb = case.table(name);
+            let dir = Table {
+                name: format!("dir_{name}"),
+                vals: tb.vals.iter().map(|_| Some(0.0)).collect(),
+                chunks: Vec::new(),
+                ..tb.clone()
+            };
+            let batch = dir.batch();
+            let schema = Schema::new(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name() == "val" {
+                            Field::new("d", DataType::Float64, true)
+                        } else {
+                            f.as_ref().clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let _ = register_batch(
+                &ctx,
+                &dir.name,
+                RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap(),
+            );
+        }
+        let with = twin.split(" SELECT ").next().unwrap_or("").to_string();
+        for (k, n) in case.nodes.iter().enumerate() {
+            let order = n
+                .dims
+                .iter()
+                .map(|d| d.to_string())
+                .chain(["v".into()])
+                .collect::<Vec<_>>()
+                .join(", ");
+            let a = query(
+                &ctx,
+                &format!(
+                    "WITH {} SELECT {} FROM r{k} ORDER BY {order}",
+                    case.ctes(),
+                    n.dims
+                        .iter()
+                        .map(|d| d.to_string())
+                        .chain(["v".into()])
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .await
+            .map(|r| r.rows);
+            let b = query(
+                &ctx,
+                &format!(
+                    "{with} SELECT {} FROM t{k} ORDER BY {order}",
+                    n.dims
+                        .iter()
+                        .map(|d| d.to_string())
+                        .chain(["v".into()])
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .await
+            .map(|r| r.rows);
+            if a != b {
+                eprintln!("TWIN r{k} differs from its forward-mode twin t{k}:\n  {}\n  forward {a:?}\n  twin    {b:?}", n.body);
+            }
+        }
+    }
     // Recomputation assumes a relation comes out the same every time it is
     // computed; report any that does not, bit for bit.
     for (k, n) in case.nodes.iter().enumerate() {

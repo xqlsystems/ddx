@@ -312,7 +312,7 @@ fn ctx_with_only(rules: &[&str]) -> SessionContext {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a sort beneath a limit is dropped under a join"]
+#[ignore = "upstream DataFusion 54 (#99): a sort beneath a limit is dropped under a join"]
 async fn upstream_a_limit_keeps_its_sort_under_a_join() {
     // Without push_down_limit to fuse the limit into the sort, the physical
     // plan loses the sort once the projection above it drops the sort key,
@@ -340,7 +340,7 @@ async fn upstream_a_limit_keeps_its_sort_under_a_join() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a union of aggregates over windows cannot be interleaved"]
+#[ignore = "upstream DataFusion 54 (#100): a union of aggregates over windows cannot be interleaved"]
 async fn upstream_a_union_of_aggregates_over_windows_plans() {
     // With one target partition, EnforceSorting fails its own assertion
     // ("Can not create InterleaveExec: new children can not be
@@ -395,7 +395,7 @@ async fn upstream_a_union_of_aggregates_over_windows_plans() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54: a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
+#[ignore = "upstream DataFusion 54 (#101): a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
 async fn upstream_max_treats_nan_alike_grouped_or_not() {
     // The same values, the same MAX: grouped, it skips the NaN and gives
     // 0.9; as a window over the same group, and ungrouped, it gives NaN. A
@@ -711,5 +711,195 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
             .map(|b| b.num_rows())
             .sum::<usize>(),
         2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: found on the fixed stack by the soak. A near tie over constant
+// table values, fixed in #76, and three DataFusion bugs, pinned as upstream
+// (#101, #103, #104).
+
+#[tokio::test]
+async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
+    // The fix to the 8-ulp window (#76) gave the tolerance only to values
+    // that can jitter, but counted all constant data among them. A table
+    // outside wrt is constant data to ddx, yet its values are exactly as
+    // repeatable as a wrt table's: MAX(p.val * d.val) over products 2 ulps
+    // apart is differentiable, with all the gradient on the larger (jax.grad
+    // gives (0, d(1))). Now only constant data an aggregate or window
+    // computes can jitter (#76).
+    let ctx = SessionContext::new();
+    let b = f64::from_bits(1.0f64.to_bits() + 2);
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 1.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE d (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, CAST({b:e} AS DOUBLE))"
+        ),
+    )
+    .await;
+    let got = grad(
+        &ctx,
+        "SELECT MAX(p.val * d.val) AS l FROM p JOIN d ON p.i = d.i",
+        "p",
+    )
+    .await;
+    assert_eq!(got, vec![(0, Some(0.0)), (1, Some(b))]);
+}
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54 (#103, fixed in 55): a filter above an anti-join is pushed into its right side"]
+async fn upstream_a_filter_above_an_anti_join_keeps_its_rows_out() {
+    // From the round-three soak (seed 3000134, an optimizer variant). With
+    // push_down_filter off, `j <> 2` stays above the anti-join NOT IN makes,
+    // and the gradient reached b(2), a row the query excludes; the loss was
+    // unchanged, the gradient silently wrong. ddx's recomputed region is
+    // right: DataFusion 54's physical filter pushdown moves the filter into
+    // the anti-join's right input, which plain SQL shows without ddx (#103).
+    // Fixed in DataFusion 55; ddx stays on 54 with datafusion-python.
+    let mut got = Vec::new();
+    for drop in [None, Some("push_down_filter")] {
+        let ctx = SessionContext::new();
+        if let Some(rule) = drop {
+            assert!(ctx.remove_optimizer_rule(rule));
+        }
+        exec(
+            &ctx,
+            "CREATE TABLE b (j BIGINT, val DOUBLE) AS VALUES (0, -0.1), (1, 0.8), (2, 0.5), (90, 0.1)",
+        )
+        .await;
+        exec(
+            &ctx,
+            "CREATE TABLE y (j BIGINT, val DOUBLE) AS VALUES (0, 0.4), (2, 0.9), (1, -0.2)",
+        )
+        .await;
+        got.push(
+            grad(
+                &ctx,
+                "WITH r AS (SELECT j, val AS v FROM b WHERE j NOT IN (SELECT j FROM y WHERE val > 0.35)), \
+                      f AS (SELECT * FROM r WHERE j <> 2), \
+                      m AS (SELECT MAX(v) AS m FROM f), \
+                      e AS (SELECT f.j, exp(f.v - m.m) AS e FROM f CROSS JOIN m), \
+                      s AS (SELECT SUM(e) AS s FROM e) \
+                 SELECT SUM(e.e / s.s * e.e / s.s) AS loss FROM e CROSS JOIN s",
+                "b",
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        got[1], got[0],
+        "with push_down_filter off, the gradient changed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54, 55 (#101): a grouped MAX skips NaN for some groups and returns it for others"]
+async fn upstream_a_grouped_max_treats_nan_the_same_in_every_group() {
+    // Found by the round-three soak's big mode (seed 5008778), where the same
+    // loss came out finite on some runs and NaN on others. DataFusion merges
+    // a group's partial MAXes in the order the partitions deliver them, and
+    // whether a NaN survives depends on that order: in one query, group 0
+    // skips its NaN (5.0) and group 1 returns it. ddx's gradients over such
+    // data inherit the ambiguity. No ddx involved; still so in DataFusion 55
+    // (#101).
+    use datafusion::arrow::array::{AsArray, Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let parts: Vec<Vec<(i64, f64)>> = vec![
+        vec![(0, 1.0), (1, 2.0)],
+        vec![(0, f64::NAN), (1, 3.0)],
+        vec![(0, 5.0), (1, f64::NAN)],
+        vec![(0, 0.5)],
+    ];
+    let batches = parts
+        .iter()
+        .map(|p| {
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(p.iter().map(|r| r.0).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        p.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()]
+        })
+        .collect();
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(MemTable::try_new(schema, batches).unwrap()))
+        .unwrap();
+    let b = ctx
+        .sql("SELECT g, MAX(v) AS m FROM t GROUP BY g ORDER BY g")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let m = b[0].column(1).as_primitive::<Float64Type>();
+    assert_eq!(
+        m.value(0).is_nan(),
+        m.value(1).is_nan(),
+        "group 0's MAX is {} and group 1's is {}: each holds a NaN",
+        m.value(0),
+        m.value(1)
+    );
+}
+
+#[tokio::test]
+#[ignore = "upstream DataFusion 54, 55 (#104): NOT IN over a NULL becomes a plain anti-join through Substrait"]
+async fn upstream_not_in_over_a_null_keeps_no_rows_through_substrait() {
+    // From the round-four soak (seed 4600388, NULL data): the program's value
+    // step disagreed with the loss. `s NOT IN (0, NULL)` is never true, so no
+    // row is kept, as DataFusion computes directly; its own Substrait round
+    // trip writes a plain anti-join, which keeps s = 1 and s = 2. No ddx
+    // involved.
+    use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+    use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE ny (s BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0), (2, 4.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE nx (s BIGINT, val DOUBLE) AS VALUES (0, 0.5), (NULL, 0.9), (1, -0.2)",
+    )
+    .await;
+    let q = "SELECT SUM(val) AS l FROM ny WHERE s NOT IN (SELECT s FROM nx WHERE val > 0.05)";
+    let sum = |b: Vec<datafusion::arrow::record_batch::RecordBatch>| {
+        use datafusion::arrow::array::{Array, AsArray};
+        let c = b[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Float64Type>()
+            .clone();
+        (!c.is_null(0)).then(|| c.value(0))
+    };
+    let direct = sum(ctx.sql(q).await.unwrap().collect().await.unwrap());
+    let lp = ctx.sql(q).await.unwrap().into_optimized_plan().unwrap();
+    let plan = to_substrait_plan(&lp, &ctx.state()).unwrap();
+    let back = from_substrait_plan(&ctx.state(), &plan).await.unwrap();
+    let round_trip = sum(ctx
+        .execute_logical_plan(back)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap());
+    assert_eq!(direct, None);
+    assert_eq!(
+        round_trip, direct,
+        "the round trip kept rows a NULL excludes"
     );
 }
