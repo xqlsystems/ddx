@@ -9,6 +9,32 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.1.0...ddx-datafusion-v0.1.1) - 2026-10-04
+
+### Added
+
+- *(ddx-datafusion)* nn.py trained with grad in SQL (M4 3) ([#80](https://github.com/xqlsystems/ddx/pull/80))
+- grad(loss, table.column) in SQL (M4 2) ([#83](https://github.com/xqlsystems/ddx/pull/83))
+- *(ddx-datafusion)* grad, vjp and run, the v2 API on DataFusion (M4 1) ([#79](https://github.com/xqlsystems/ddx/pull/79))
+- *(ddx-ad)* save each distinct aggregate once; the attention fixture (M3 9) ([#77](https://github.com/xqlsystems/ddx/pull/77))
+- *(ddx-ad)* AVG, MAX and MIN rules; rank-select and stop-gradient (M3 8) ([#76](https://github.com/xqlsystems/ddx/pull/76))
+- *(ddx-ad)* one transpose per relational primitive; grad and vjp (M3 6) ([#74](https://github.com/xqlsystems/ddx/pull/74))
+- *(ddx-ad)* relations as dims and values; the forward pass read (M3 5) ([#73](https://github.com/xqlsystems/ddx/pull/73))
+- *(ddx-ad)* emit the plans of a backward program (M3 4) ([#72](https://github.com/xqlsystems/ddx/pull/72))
+- *(ddx-ad)* a plan's function table; ddx_stop_gradient on DataFusion (M3 2, re-land of #70) ([#105](https://github.com/xqlsystems/ddx/pull/105))
+
+### Other
+
+- aim the soak at today's changes; a cost benchmark; three findings (M4 11) ([#102](https://github.com/xqlsystems/ddx/pull/102))
+- a forward-mode oracle, a cost bound and a SQL-text fuzz; what they found (M4 10) ([#98](https://github.com/xqlsystems/ddx/pull/98))
+- mutation testing for the v2 soak, and the blind spots it found (M4 9) ([#93](https://github.com/xqlsystems/ddx/pull/93))
+- grad in SQL under awkward names, and SGD loops in SQL (M4 8) ([#92](https://github.com/xqlsystems/ddx/pull/92))
+- ties, NULLs, extreme values and big tables in the v2 soak (M4 7) ([#91](https://github.com/xqlsystems/ddx/pull/91))
+- vary the plan ddx reads — optimizer rules and Substrait rewrites (M4 6) ([#90](https://github.com/xqlsystems/ddx/pull/90))
+- a simulation soak for query-level AD, and three bugs it found (M4 5) ([#89](https://github.com/xqlsystems/ddx/pull/89))
+- M4 in the READMEs and the design (M4 4) ([#82](https://github.com/xqlsystems/ddx/pull/82))
+- *(ddx-ad)* contraction fixtures, written as plain SQL (M3 7) ([#75](https://github.com/xqlsystems/ddx/pull/75))
+
 ## [0.1.0] - 2026-08-09
 
 First release. The DataFusion adapter for `ddx-core`: `grad`/`jvp` markers in

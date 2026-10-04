@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ddx-core",
  "sqlparser",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-datafusion"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "datafusion",
