@@ -67,8 +67,8 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datafusion", marker = "extra == 'datafusion'", specifier = ">=45" },
-    { name = "datafusion", marker = "extra == 'test'", specifier = ">=45" },
+    { name = "datafusion", marker = "extra == 'datafusion'", specifier = "==54.0.0" },
+    { name = "datafusion", marker = "extra == 'test'", specifier = "==54.0.0" },
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.0" },
     { name = "duckdb", marker = "extra == 'test'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },

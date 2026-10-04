@@ -185,6 +185,14 @@ The differentiation cores are deliberately minimal so any engine can drive them:
   the version `datafusion-substrait` uses, for the same reason `sqlparser` is:
   the adapter hands `ddx-ad` the engine's own plan type, and two versions would
   be two unrelated Rust types.
+- **`datafusion` and `datafusion-substrait` are pinned exactly, always**
+  (`=54.1.0`), and so is the Python `datafusion` (`==54.0.0`, the PyPI release;
+  it bundles DataFusion 54.0.0) in `python/ddxdb/pyproject.toml` and
+  `tests/pyproject.toml`. `ddx-datafusion`'s API is DataFusion's own types, so a
+  caller must link the version ddx was built and tested against. A bump is one
+  deliberate change: the workspace `Cargo.toml`, both `pyproject.toml` files and
+  their lockfiles together (`sqlparser_pin.rs` and `substrait_pin.rs` check the
+  Rust side).
 
 ## Development workflow
 
