@@ -434,7 +434,10 @@ impl<'a> Transposer<'a> {
             .any(|s| s.input == Input::Const && s.ordered)
         {
             return Err(AdError::NotImplemented(
-                "a window function or LIMIT over data that reads no wrt table, joined into                  rows that carry gradient: ddx recomputes it for the backward pass and cannot                  show it keeps the same rows (its ties may be ordered differently);                  materialize it as a table first"
+                "a window function or LIMIT over data that reads no wrt table, joined into \
+                 rows that carry gradient: ddx recomputes it for the backward pass and cannot \
+                 show it keeps the same rows (its ties may be ordered differently); \
+                 materialize it as a table first"
                     .into(),
             ));
         }
@@ -446,7 +449,9 @@ impl<'a> Transposer<'a> {
                     Input::Const if one => continue,
                     Input::Const => {
                         return Err(AdError::NotImplemented(
-                            "a LIMIT, or a ranking on a semi-join's right side, over rows                              joined to data ddx has no dims for: ddx cannot show which rows                              it keeps when it recomputes them"
+                            "a LIMIT, or a ranking on a semi-join's right side, over rows \
+                             joined to data ddx has no dims for: ddx cannot show which rows \
+                             it keeps when it recomputes them"
                                 .into(),
                         ))
                     }
@@ -460,7 +465,10 @@ impl<'a> Transposer<'a> {
                 };
                 if !total {
                     return Err(AdError::NotImplemented(
-                        "a LIMIT (or a ranking on a semi-join's right side) whose ORDER BY                          does not include every dim of the rows it cuts. The rows it keeps                          may differ when ddx recomputes it for the backward pass; add the                          remaining dims to its ORDER BY to break ties"
+                        "a LIMIT (or a ranking on a semi-join's right side) whose ORDER BY \
+                         does not include every dim of the rows it cuts. The rows it keeps \
+                         may differ when ddx recomputes it for the backward pass; add the \
+                         remaining dims to its ORDER BY to break ties"
                             .into(),
                     ));
                 }
