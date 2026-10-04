@@ -311,3 +311,12 @@ def test_not_in_over_a_subquery_is_refused(ad, ctx):
     )
     ad.grad(ctx, exists, [("w", "val")])
 
+
+
+def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
+    # The WHERE on g's dims is pushed into the program (ddx_ad::Options::restrict);
+    # the rows read are the unrestricted gradient's.
+    loss = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w)"
+    full = pairs(ad.sql(ctx, f"{loss} SELECT g.i, g.val FROM grad(loss, w.val) g"))
+    some = pairs(ad.sql(ctx, f"{loss} SELECT g.i, g.val FROM grad(loss, w.val) g WHERE g.i >= 1"))
+    assert some == [p for p in full if p[0] >= 1]

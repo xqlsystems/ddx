@@ -406,3 +406,75 @@ async fn the_gradient_of_a_spring_systems_energy_is_minus_the_force() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_filter_on_a_gradients_dims_computes_only_those_rows() {
+    // The statement reads layer 1 of the gradient; with the filter pushed
+    // into the program, the result is the unrestricted gradient's layer 1.
+    use ddx_ad::{grad_with, ColumnRef, Options};
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE lw (layer BIGINT, i BIGINT, val DOUBLE) AS VALUES \
+         (0, 0, 0.5), (0, 1, -1.0), (1, 0, 2.0), (1, 1, 0.25), (2, 0, 1.5)",
+        "CREATE TABLE lx (i BIGINT, x DOUBLE) AS VALUES (0, 3.0), (1, -2.0)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    let loss =
+        "WITH loss AS (SELECT SUM(power(lw.val * lx.x, 2)) AS l FROM lw JOIN lx ON lw.i = lx.i)";
+    let all = pairs(
+        &ctx,
+        &format!("{loss} SELECT g.layer * 10 + g.i, g.val FROM grad(loss, lw.val) g"),
+    )
+    .await;
+    let some = pairs(
+        &ctx,
+        &format!(
+            "{loss} SELECT g.layer * 10 + g.i, g.val FROM grad(loss, lw.val) g WHERE g.layer = 1"
+        ),
+    )
+    .await;
+    let want: Vec<(i64, f64)> = all.into_iter().filter(|(k, _)| k / 10 == 1).collect();
+    assert_eq!(some, want);
+
+    // The program itself computes only the allowed rows.
+    let plan = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            let lp = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
+            *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state())
+                .unwrap()
+        }
+    };
+    let forward = {
+        let lp = ctx
+            .sql("SELECT SUM(power(lw.val * lx.x, 2)) AS l FROM lw JOIN lx ON lw.i = lx.i")
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state()).unwrap()
+    };
+    let options = Options::new().restrict("lw", plan("SELECT * FROM lw WHERE layer = 1").await);
+    let program = grad_with(&forward, &[ColumnRef::new("lw", "val")], &options).unwrap();
+    ad::run(&ctx, &program).await.unwrap();
+    let rows: usize = ctx
+        .sql(&format!("SELECT * FROM {}", program.gradients[0].step))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2);
+    // A restriction must read only dims: val is the table's value.
+    let err = grad_with(
+        &forward,
+        &[ColumnRef::new("lw", "val")],
+        &Options::new().restrict("lw", plan("SELECT * FROM lw WHERE val > 0").await),
+    )
+    .unwrap_err();
+    assert!(matches!(err, AdError::InvalidOptions(_)), "{err}");
+}

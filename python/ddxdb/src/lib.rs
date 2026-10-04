@@ -468,12 +468,20 @@ impl BackwardProgram {
     }
 }
 
-/// `ddx_ad::Options` with an optional fixed namespace.
-fn options(namespace: Option<String>) -> ddx_ad::Options {
-    match namespace {
+/// `ddx_ad::Options` with an optional fixed namespace and restrictions:
+/// `(table, serialized plan of SELECT * FROM table WHERE predicate)`.
+fn options(
+    namespace: Option<String>,
+    restrict: Option<Vec<(String, Vec<u8>)>>,
+) -> PyResult<ddx_ad::Options> {
+    let mut options = match namespace {
         Some(ns) => ddx_ad::Options::new().namespace(ns),
         None => ddx_ad::Options::new(),
+    };
+    for (table, select) in restrict.unwrap_or_default() {
+        options = options.restrict(table, decode(&select)?);
     }
+    Ok(options)
 }
 
 fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
@@ -487,14 +495,19 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
 /// under a fresh prefix, so the same plan gives the same program. It must
 /// start with `__ddx_`, end with `_`, and hold only lower-case ASCII letters,
 /// digits and `_`.
+///
+/// `restrict` is `[(table, select), …]`, each `select` the engine's serialized
+/// plan of `SELECT * FROM table WHERE predicate` over the table's dims: only
+/// those rows of the table's gradient are computed (`ddx_ad::Options::restrict`).
 #[pyfunction]
-#[pyo3(signature = (plan, wrt, *, namespace = None))]
+#[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn grad_plan(
     plan: &[u8],
     wrt: Vec<(String, String)>,
     namespace: Option<String>,
+    restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
-    ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+    ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace, restrict)?)
         .map(BackwardProgram)
         .map_err(ad_to_py_err)
 }
@@ -502,13 +515,14 @@ fn grad_plan(
 /// The vector-Jacobian product of the query the serialized Substrait `plan`
 /// computes (`ddx_ad::vjp`; see `grad_plan`).
 #[pyfunction]
-#[pyo3(signature = (plan, wrt, *, namespace = None))]
+#[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn vjp_plan(
     plan: &[u8],
     wrt: Vec<(String, String)>,
     namespace: Option<String>,
+    restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
-    ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace))
+    ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace, restrict)?)
         .map(BackwardProgram)
         .map_err(ad_to_py_err)
 }
@@ -589,8 +603,11 @@ impl Statements {
         ))
     }
 
-    /// The objectives to differentiate, as `(query, [(table, column), …])`.
-    fn jobs(&self) -> Vec<(String, Vec<(String, String)>)> {
+    /// The objectives to differentiate, as `(query, [(table, column), …],
+    /// [(table, predicate), …])`: the last, the rows of a table's gradient
+    /// every statement reads, where they say (`ddx_ad::sql::Job::restrict`).
+    #[allow(clippy::type_complexity)]
+    fn jobs(&self) -> Vec<(String, Vec<(String, String)>, Vec<(String, String)>)> {
         self.0
             .jobs()
             .iter()
@@ -600,7 +617,7 @@ impl Statements {
                     .iter()
                     .map(|w| (w.table.clone(), w.column.clone()))
                     .collect();
-                (j.query.clone(), wrt)
+                (j.query.clone(), wrt, j.restrict.clone())
             })
             .collect()
     }

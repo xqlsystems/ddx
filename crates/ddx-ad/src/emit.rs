@@ -208,6 +208,18 @@ pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
     }
 }
 
+/// Each read in `plan` that names its columns without their types (an
+/// earlier step's table), with the columns it names.
+pub(crate) fn for_each_unbound_read(plan: &Plan, f: &mut dyn FnMut(&str, &[String])) {
+    for_each_read(plan, &mut |read| {
+        if let (Some(ReadType::NamedTable(t)), Some(s)) = (&read.read_type, &read.base_schema) {
+            if s.r#struct.is_none() {
+                f(&t.names.join("."), &s.names);
+            }
+        }
+    });
+}
+
 /// The names of the tables `plan` reads without stating their types, in the
 /// order they appear. These are the steps it depends on.
 pub fn unbound_reads(plan: &Plan) -> Vec<String> {
