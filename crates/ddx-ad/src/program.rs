@@ -307,7 +307,15 @@ fn build(ddx: &Ddx, f: &Forward, seed: Seed) -> Result<BackwardProgram> {
     let (cotangent, cotangent_check) = match seed {
         Seed::One => {
             let col = scalar_output(f)?;
-            t.region(&f.output, f.output.rel.clone(), vec![(col, lit_f64(1.0))])?;
+            // A NULL loss does not move with anything in it, as with vjp's
+            // NULL output rows (seed_cotangent): its seed is NULL, so no
+            // gradient flows back through it.
+            let is_null = t.ext.anchor("is_null");
+            let seed = if_then(
+                vec![(call(is_null, vec![field(col)]), null_f64())],
+                lit_f64(1.0),
+            );
+            t.region(&f.output, f.output.rel.clone(), vec![(col, seed)])?;
             (Vec::new(), None)
         }
         Seed::Cotangent => {

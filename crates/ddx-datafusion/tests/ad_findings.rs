@@ -150,6 +150,31 @@ async fn a_null_in_constant_data_sends_no_gradient_through_its_row() {
 }
 
 #[tokio::test]
+async fn a_null_loss_sends_no_gradient() {
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE p (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE q (i BIGINT, val DOUBLE) AS VALUES (0, CAST(NULL AS DOUBLE))",
+    )
+    .await;
+    // The loss is SUM(p) + NULL = NULL, which does not move with p: grad
+    // seeded it with 1 regardless and sent 1 to each row of p, where vjp
+    // seeds a NULL output row with NULL.
+    let got = grad(
+        &ctx,
+        "SELECT s + m AS loss FROM (SELECT SUM(val) AS s FROM p) CROSS JOIN (SELECT MAX(val) AS m FROM q)",
+        "p",
+    )
+    .await;
+    assert_eq!(got, vec![(0, Some(0.0)), (1, Some(0.0))]);
+}
+
+#[tokio::test]
 async fn an_unoptimized_case_over_integer_data_runs() {
     // grad_plan takes any LogicalPlan, a DataFrame's included. In this
     // unoptimized one a CASE picks between integer data on a condition that
