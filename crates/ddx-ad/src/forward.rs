@@ -327,7 +327,7 @@ pub fn new_namespace() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("__ddx_{:x}{n:x}_", clock & 0xffff_ffff)
+    format!("__ddx_{:x}_{n:x}_", clock & 0xffff_ffff)
 }
 
 /// The column names of a saved relation or its cotangent, `width` wide.
@@ -571,7 +571,7 @@ impl Builder<'_> {
                     Some(RelType::Sort(so)) => {
                         let mut keys = Vec::new();
                         for e in so.sorts.iter().filter_map(|sf| sf.expr.as_ref()) {
-                            for f in fields_of(e)? {
+                            if let Some(f) = order_key(e) {
                                 keys.push(lookup(&s.outputs, f)?);
                             }
                         }
@@ -774,14 +774,12 @@ impl Builder<'_> {
                 continue;
             }
             let col = if let Some(RexType::WindowFunction(w)) = &e.rex_type {
-                let mut keys: Vec<usize> = Vec::new();
-                for x in w
+                let keys: Vec<usize> = w
                     .partitions
                     .iter()
                     .chain(w.sorts.iter().filter_map(|s| s.expr.as_ref()))
-                {
-                    keys.extend(fields_of(x)?);
-                }
+                    .filter_map(order_key)
+                    .collect();
                 let varied = fields_of(&e)?.into_iter().any(|f| s.varied[f]);
                 let col = s.push(Def::Window { keys }, varied);
                 s.refuse(
@@ -1145,6 +1143,16 @@ impl Builder<'_> {
         }
         Ok(())
     }
+}
+
+/// The column an ordering or partitioning expression orders by, if it is a
+/// bare column: only then does it tell the rows of each value apart. An
+/// expression over columns can tie rows that differ in all of them
+/// (`ORDER BY i % 2` ties every even `i`), so it counts as no key, and a
+/// ranking or `LIMIT` whose order is total only through one is refused as
+/// one that does not break ties.
+fn order_key(e: &Expression) -> Option<usize> {
+    as_field(e)
 }
 
 /// `rel` (`width` columns wide) with each column in `cols` replaced, in its
@@ -1581,5 +1589,28 @@ fn rel_name(kind: &RelType) -> &'static str {
         RelType::Window(_) => "window",
         RelType::Exchange(_) => "exchange",
         RelType::Expand(_) => "expand",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_namespace_separates_its_clock_from_its_counter() {
+        // Without a separator, clock 0xabc1 with counter 2 and clock 0xabc
+        // with counter 0x12 both read `__ddx_abc12_`.
+        let ns = new_namespace();
+        let parts: Vec<&str> = ns
+            .strip_prefix("__ddx_")
+            .and_then(|r| r.strip_suffix('_'))
+            .unwrap()
+            .split('_')
+            .collect();
+        assert_eq!(parts.len(), 2, "{ns}");
+        assert!(parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_hexdigit())));
+        assert_ne!(ns, new_namespace());
     }
 }
