@@ -1110,7 +1110,9 @@ impl Gen<'_> {
         });
         let m = self.push_u(body, keep, n.reads.clone(), kinds, true);
         self.nodes[m].tan = tan.filter(|_| n.tan.is_some());
-        self.nodes[m].jitter = true;
+        // A sum or average rounds by arrival order; a MAX, MIN or COUNT of
+        // exact values is exact, as ddx's rule follows a saved aggregate.
+        self.nodes[m].jitter = n.jitter || agg.contains("SUM(") || agg.contains("AVG(");
         m
     }
 
@@ -1380,7 +1382,7 @@ impl Gen<'_> {
         );
         let has_tan = n.tan.is_some();
         let max_tie = if n.jitter { "{max}" } else { "{maxx}" };
-        self.nodes[mx].jitter = true;
+        self.nodes[mx].jitter = n.jitter;
         self.nodes[mx].tan = has_tan.then(|| {
             format!(
                 "SELECT {}MAX(v) AS v, AVG(CASE WHEN {max_tie} THEN dv END) AS dv FROM {} c{}",
@@ -1409,7 +1411,8 @@ impl Gen<'_> {
             n.unique,
         );
         let dshift = if shift == "b.v" { "b.dv" } else { "0.0" };
-        self.nodes[e].jitter = true;
+        // exp of exact values and their exact MAX is exact.
+        self.nodes[e].jitter = n.jitter;
         self.nodes[e].tan = has_tan.then(|| {
             format!(
                 "SELECT {}exp(a.v - b.v) AS v, {} AS dv FROM {}",
