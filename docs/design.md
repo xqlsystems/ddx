@@ -725,6 +725,7 @@ alongside Ibis's producer) learned each of these the hard way:
 | Extension declarations | DataFusion 54 and 55: no URN (`u32::MAX`); DuckDB: a real `extension_urns` table | an emitted plan carries the input's URNs and declarations; a function ddx adds has no URN, as DataFusion writes it. A consumer that resolves only by URN (Acero) is not yet a target |
 | Table names | some producers drop the schema (`s.t` arrives as `t`) | matches a `wrt` table name as `ColumnRef::table` states, refuses a bare name two schemas share, and hints at the bare name when the schema is missing |
 | Consumer coverage | DuckDB's consumer rejects a `window_function` expression | open: the `AVG`, `MAX` and `MIN` rules emit windows (§4.6) |
+| `emit` on a relation | DataFusion honours it on any relation; DuckDB 1.5.6's consumer ignores it on a join, filter, sort, fetch, cross join or set and returns the leading columns, with no error | writes an emit only on a projection, and narrows anything else with a projection over it; the DataFusion tests check every step for it |
 
 A host that holds plans as protobuf bytes, as most of the Substrait ecosystem
 does, needs no `substrait` crate of its own: `decode_plan` takes the bytes and
