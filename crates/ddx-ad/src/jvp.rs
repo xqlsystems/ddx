@@ -7,9 +7,9 @@
 //! As in JAX, [`jvp`] pushes a tangent of the `wrt` columns forward to the
 //! query's output, `J·t`. A tangent is shaped like its primal: for each `wrt`
 //! table, a relation with the table's dims and a tangent for each of its
-//! `wrt` columns, which the caller registers under the name
-//! [`ForwardProgram::tangent_tables`] gives before the program runs. A row the
-//! tangent table lacks has tangent 0.
+//! `wrt` columns: one input table of the program per `wrt` table
+//! ([`ForwardProgram::inputs`]), which the caller registers before it runs. A row
+//! the tangent table lacks has tangent 0.
 //!
 //! Forward mode needs no transposes and no tape: tangents travel beside
 //! values through the same operators (see [`crate::tangent`]'s table), so a
@@ -18,8 +18,9 @@
 //! depends on a `wrt` column, as `jax.jvp` returns both. A tangent is NULL
 //! where its value is.
 //!
-//! [`jvp_of_program`] does the same for a program's steps: forward mode over
-//! reverse mode, which gives a Hessian-vector product.
+//! [`jvp`] of a program does the same for the program's steps: of a `grad`
+//! program, forward mode over reverse mode, which gives a Hessian-vector
+//! product.
 //!
 //! The run protocol is a [`BackwardProgram`]'s ([`crate::run`], with
 //! [`crate::Runner`]): checks first, then the steps.
@@ -34,11 +35,11 @@ use crate::expr::field;
 use crate::forward::{check_every_wrt_was_read, inline_references, root_of, wrt_table};
 use crate::functions::{Extensions, Functions};
 use crate::program::{
-    dims_check, readable, repeated_keys, BackwardProgram, Check, ForwardProgram, JvpOutput,
-    Options, Step, Tangent, TangentTable,
+    dims_check, readable, repeated_keys, BackwardProgram, Check, ForwardProgram, Options, Step,
 };
 use crate::prune::prune_plan;
 use crate::relation::{table_matches, ColumnRef, Table};
+use crate::tables::{InputTable, Of, OutputTable, Tangent};
 use crate::tangent::{Dualizer, Source, Tan};
 
 /// The tangent table of `wrt` table `i`, in a program's namespace.
@@ -51,78 +52,105 @@ fn tangent_column(c: usize) -> String {
     format!("__ddx_tangent_{c}")
 }
 
-/// The Jacobian-vector product of the query `plan` with respect to the `wrt`
-/// columns: the program computes the query's output and, beside it, the
-/// output's tangent along the tangents the caller registers as
-/// [`ForwardProgram::tangent_tables`] name.
-pub fn jvp(plan: &Plan, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
-    jvp_with(plan, wrt, &Options::new())
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for substrait::proto::Plan {}
+    impl Sealed for crate::program::BackwardProgram {}
+}
+
+/// What [`jvp`] pushes a tangent through: a query's [`Plan`], or a program
+/// (a [`BackwardProgram`]), whose steps are rewritten in order.
+///
+/// Sealed: these are the two things ddx differentiates forward.
+pub trait Differentiable: sealed::Sealed {
+    #[doc(hidden)]
+    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram>;
+}
+
+impl Differentiable for Plan {
+    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
+        jvp_of_query(self, wrt, options)
+    }
+}
+
+impl Differentiable for BackwardProgram {
+    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
+        jvp_of_steps(self, wrt, options)
+    }
+}
+
+/// The Jacobian-vector product of `of`, a query's [`Plan`] or a program,
+/// with respect to the `wrt` columns, along the tangents the caller
+/// registers as [`ForwardProgram::inputs`] name.
+///
+/// Of a query, the program computes the query's output and, beside it, the
+/// output's tangent.
+///
+/// Of a program, each step is rewritten as a query is, and reads the
+/// rewritten steps before it, so every intermediate relation of the program
+/// carries its tangent. Of a [`grad`](crate::grad) program, that is forward
+/// over reverse: the tangent of each gradient along `v` is the
+/// Hessian-vector product `H·v` ([`ForwardProgram::gradients`]), and the
+/// value's tangent is the loss's directional derivative. There is no `hvp`:
+/// `H·v` is `jvp(&grad(&plan, wrt)?, wrt)`, as in JAX it is
+/// `jax.jvp(jax.grad(f), …)`, and one `grad` program serves every direction
+/// (conjugate gradient runs it once per direction). A [`vjp`](crate::vjp)
+/// program's cotangent is constant: register it, as for the program itself,
+/// as the program's input table ([`BackwardProgram::inputs`]).
+pub fn jvp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
+    jvp_with(of, wrt, &Options::new())
 }
 
 /// [`jvp`] with [`Options`]: a caller's `ddx-core` engine, for custom scalar
 /// rules, or a fixed namespace. [`Options::restrict`] is refused: a jvp
 /// computes every row's tangent.
-pub fn jvp_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
+pub fn jvp_with<D: Differentiable + ?Sized>(
+    of: &D,
+    wrt: &[ColumnRef],
+    options: &Options,
+) -> Result<ForwardProgram> {
     options.refuse_restrict("jvp")?;
+    of.forward_program(wrt, options)
+}
+
+/// [`jvp`] of a query.
+fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
     let mut sources = Sources::new(wrt, &namespace)?;
     let mut dp = dual_plan(plan, &ddx, &mut sources)?;
     sources.check_every_wrt_was_read()?;
     let name = format!("{namespace}jvp");
-    let output = output_of(&name, &dp)?;
-    if output.tangents.is_empty() {
+    let value = output_of(&name, Of::Output, &dp)?;
+    if value.tangents.is_empty() {
         return Err(AdError::NotScalar(
             "no output column depends on a wrt column".into(),
         ));
     }
-    let (tangent_tables, checks) = sources.inputs(&mut dp.ext, Vec::new());
+    let (inputs, checks) = sources.inputs(&mut dp.ext, Vec::new());
     Ok(ForwardProgram {
-        tangent_tables,
+        inputs,
         checks,
         steps: vec![Step {
             name,
             plan: dp.plan,
         }],
-        output,
+        value,
         gradients: Vec::new(),
     })
 }
 
-/// The Jacobian-vector product of a program's steps: forward mode over the
-/// program, with respect to the `wrt` columns, along the tangents the caller
-/// registers as [`ForwardProgram::tangent_tables`] name.
-///
-/// Each step is rewritten as [`jvp`] rewrites a query, and reads the
-/// rewritten steps before it, so every intermediate relation of the program
-/// carries its tangent. For a [`grad`](crate::grad) program, forward over
-/// reverse: the tangent of each gradient along `v` is the Hessian-vector
-/// product `H·v` ([`ForwardProgram::gradients`]), and the value's tangent is the
-/// loss's directional derivative. There is no `hvp`: `H·v` is this
-/// composition, `jvp_of_program(&grad(plan, wrt)?, wrt)`, as in JAX it is
-/// `jax.jvp(jax.grad(f), …)`, and one `grad` program serves every
-/// direction (conjugate gradient runs it once per direction).
-/// A [`vjp`](crate::vjp) program's cotangent
-/// is constant: register it, as for the program itself, under
-/// [`BackwardProgram::cotangent_table`].
-pub fn jvp_of_program(program: &BackwardProgram, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
-    jvp_of_program_with(program, wrt, &Options::new())
-}
-
-/// [`jvp_of_program`] with [`Options`]; [`Options::restrict`] is refused, as
-/// for [`jvp_with`].
-pub fn jvp_of_program_with(
+/// [`jvp`] of a program's steps.
+fn jvp_of_steps(
     program: &BackwardProgram,
     wrt: &[ColumnRef],
     options: &Options,
 ) -> Result<ForwardProgram> {
-    options.refuse_restrict("jvp_of_program")?;
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
-    let old = program
-        .value
-        .strip_suffix("value")
-        .ok_or_else(|| AdError::Internal(format!("a program's value step `{}`", program.value)))?;
+    let old = program.value.step.strip_suffix("value").ok_or_else(|| {
+        AdError::Internal(format!("a program's value step `{}`", program.value.step))
+    })?;
     let rename = |name: &str| -> Result<String> {
         name.strip_prefix(old)
             .map(|rest| format!("{namespace}{rest}"))
@@ -135,16 +163,17 @@ pub fn jvp_of_program_with(
     // Only the value's and the gradients' tangents are outputs, refused if
     // one is; an intermediate step's refused tangent matters only if a
     // later step reads it, which refuses then.
-    let wanted: BTreeSet<&str> = std::iter::once(program.value.as_str())
-        .chain(program.gradients.iter().map(|g| g.step.as_str()))
+    let wanted: HashMap<&str, &Of> = std::iter::once(&program.value)
+        .chain(&program.gradients)
+        .map(|o| (o.step.as_str(), &o.of))
         .collect();
-    let mut outputs: HashMap<String, JvpOutput> = HashMap::new();
+    let mut outputs: HashMap<String, OutputTable> = HashMap::new();
     let mut ext = None;
     for step in program.steps() {
         let mut dp = dual_plan(&step.plan, &ddx, &mut sources)?;
         let name = rename(&step.name)?;
-        if wanted.contains(step.name.as_str()) {
-            outputs.insert(step.name.clone(), output_of(&name, &dp)?);
+        if let Some(&of) = wanted.get(step.name.as_str()) {
+            outputs.insert(step.name.clone(), output_of(&name, of.clone(), &dp)?);
         }
         sources.steps.insert(
             step.name.clone(),
@@ -162,19 +191,19 @@ pub fn jvp_of_program_with(
             .remove(name)
             .ok_or_else(|| AdError::Internal(format!("no step `{name}`")))
     };
-    let output = take(&program.value)?;
+    let value = take(&program.value.step)?;
     let gradients = program
         .gradients
         .iter()
         .map(|g| take(&g.step))
         .collect::<Result<Vec<_>>>()?;
     let mut ext = ext.ok_or_else(|| AdError::Internal("a program with no steps".into()))?;
-    let (tangent_tables, checks) = sources.inputs(&mut ext, program.checks.clone());
+    let (inputs, checks) = sources.inputs(&mut ext, program.checks.clone());
     Ok(ForwardProgram {
-        tangent_tables,
+        inputs,
         checks,
         steps,
-        output,
+        value,
         gradients,
     })
 }
@@ -228,7 +257,7 @@ fn dual_plan(plan: &Plan, ddx: &ddx_core::Ddx, sources: &mut Sources) -> Result<
 
 /// A dual plan materialized as `step`, as an output: refused if a column's
 /// tangent was refused.
-fn output_of(step: &str, dp: &DualPlan) -> Result<JvpOutput> {
+fn output_of(step: &str, of: Of, dp: &DualPlan) -> Result<OutputTable> {
     let mut tangents = Vec::new();
     for (c, t) in dp.tans.iter().enumerate() {
         match t {
@@ -240,8 +269,9 @@ fn output_of(step: &str, dp: &DualPlan) -> Result<JvpOutput> {
             Tan::Zero => {}
         }
     }
-    Ok(JvpOutput {
+    Ok(OutputTable {
         step: step.to_string(),
+        of,
         columns: dp.columns.clone(),
         tangents,
     })
@@ -305,7 +335,7 @@ impl<'a> Sources<'a> {
                 self.tables.len() - 1
             }
         };
-        Ok(Some(Source::Wrt {
+        Ok(Some(Source::Table {
             table: self.tables[i].clone(),
             tangent: tangent_name(self.namespace, i, names),
         }))
@@ -322,20 +352,21 @@ impl<'a> Sources<'a> {
         &self,
         ext: &mut Extensions,
         mut checks: Vec<Check>,
-    ) -> (Vec<TangentTable>, Vec<Check>) {
-        let tangent_tables: Vec<TangentTable> = self
+    ) -> (Vec<InputTable>, Vec<Check>) {
+        let tangent_tables: Vec<InputTable> = self
             .tables
             .iter()
             .enumerate()
-            .map(|(i, t)| TangentTable {
-                table: t.names.clone(),
+            .map(|(i, t)| InputTable {
                 name: tangent_name(self.namespace, i, &t.names),
+                of: Of::Table(t.names.clone()),
                 columns: t
                     .dims
                     .iter()
                     .chain(&t.values)
                     .map(|&c| t.columns()[c].clone())
                     .collect(),
+                keys: t.dims.len(),
             })
             .collect();
         for t in &self.tables {
@@ -353,7 +384,7 @@ impl<'a> Sources<'a> {
 
 /// The check that a tangent table has one row per dim tuple: a repeated one
 /// would join twice and double its rows.
-fn tangent_check(ext: &mut Extensions, table: &Table, tt: &TangentTable) -> Check {
+fn tangent_check(ext: &mut Extensions, table: &Table, tt: &InputTable) -> Check {
     let k = table.dims.len();
     let keys: Vec<usize> = (0..k).collect();
     let repeated = repeated_keys(ext, read_step(&tt.name, tt.columns.clone()), &keys);

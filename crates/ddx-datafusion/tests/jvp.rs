@@ -145,17 +145,17 @@ async fn jvp_of(
     let plan = substrait_of(ctx, sql, true).await;
     let program = ddx_ad::jvp(&plan, wrt).unwrap_or_else(|e| panic!("jvp: {e}"));
     assert_emits_on_projections(&program);
-    for tt in &program.tangent_tables {
+    for tt in &program.inputs {
         let table = tables
             .iter()
-            .find(|t| tt.table.last().map(String::as_str) == Some(t.name))
+            .find(|t| tt.of.table().and_then(|t| t.last()).map(String::as_str) == Some(t.name))
             .expect("every wrt table is given");
         tangent_of(table, &tt.name, &tt.columns).create(ctx).await;
     }
     ddx_datafusion::ad::run(ctx, &program)
         .await
         .unwrap_or_else(|e| panic!("run: {e}"));
-    let out = rows(ctx, &format!("SELECT * FROM {}", program.output.step)).await;
+    let out = rows(ctx, &format!("SELECT * FROM {}", program.value.step)).await;
     (program, out)
 }
 
@@ -194,15 +194,15 @@ async fn check_jvp(
     assert_eq!(out.len(), up.len(), "the jvp has the query's rows");
     for row in &out {
         let key: Vec<i64> = row[..keys].iter().map(|&k| k as i64).collect();
-        for tan in &program.output.tangents {
+        for tan in &program.value.tangents {
             let c = program
-                .output
+                .value
                 .columns
                 .iter()
                 .position(|n| *n == tan.column)
                 .unwrap();
             let t = program
-                .output
+                .value
                 .columns
                 .iter()
                 .position(|n| *n == tan.tangent)
@@ -351,7 +351,7 @@ async fn a_missing_tangent_row_is_zero_and_a_null_value_has_a_null_tangent() {
     .unwrap();
     let plan = substrait_of(&ctx, "SELECT i, 2.0 * val AS y FROM q", true).await;
     let program = ddx_ad::jvp(&plan, &[wrt("q", "val")]).unwrap();
-    let tt = &program.tangent_tables[0];
+    let tt = &program.inputs[0];
     assert_eq!(tt.columns, vec!["i", "val"]);
     // A tangent for rows 0 and 1 only.
     ctx.sql(&format!(
@@ -375,7 +375,7 @@ async fn a_missing_tangent_row_is_zero_and_a_null_value_has_a_null_tangent() {
     ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
     let out = rows(
         &ctx,
-        &format!("SELECT * FROM {} ORDER BY i", program.output.step),
+        &format!("SELECT * FROM {} ORDER BY i", program.value.step),
     )
     .await;
     assert_eq!(out[0][2], 1.0);
@@ -400,7 +400,7 @@ async fn forward_mode_agrees_with_grad() {
     for g in &program.gradients {
         let table = tables
             .iter()
-            .find(|t| g.table.last().map(String::as_str) == Some(t.name))
+            .find(|t| g.of.table().and_then(|t| t.last()).map(String::as_str) == Some(t.name))
             .unwrap();
         let val = table
             .columns
@@ -433,24 +433,24 @@ async fn the_dot_product_test_against_vjp() {
                FROM x JOIN w ON x.i = w.i GROUP BY x.n, w.o";
     let (program, out) = jvp_of(&ctx, sql, &[x(), w()], &[wrt("w", "val")]).await;
     let t = program
-        .output
+        .value
         .columns
         .iter()
-        .position(|c| *c == program.output.tangents[0].tangent)
+        .position(|c| *c == program.value.tangents[0].tangent)
         .unwrap();
     let cot = |n: f64, o: f64| 0.4 - 0.9 * (2.0 * n + o).cos();
     let jt_c: f64 = out.iter().map(|r| r[t] * cot(r[0], r[1])).sum();
 
     let plan = substrait_of(&ctx, sql, true).await;
     let back = ddx_ad::vjp(&plan, &[wrt("w", "val")]).unwrap();
-    assert_eq!(back.cotangent, vec!["n", "o", "y"]);
+    assert_eq!(back.inputs[0].columns, vec!["n", "o", "y"]);
     let values: Vec<String> = out
         .iter()
         .map(|r| format!("({}, {}, {:e})", r[0], r[1], cot(r[0], r[1])))
         .collect();
     ctx.sql(&format!(
         "CREATE TABLE {} (n BIGINT, o BIGINT, y DOUBLE) AS VALUES {}",
-        back.cotangent_table,
+        back.inputs[0].name,
         values.join(", ")
     ))
     .await
@@ -483,14 +483,14 @@ async fn the_value_columns_are_the_query_s_own() {
     let ctx = ctx();
     let sql = "SELECT o, SUM(val * val) AS s FROM w GROUP BY o";
     let (program, out) = jvp_of(&ctx, sql, &[w()], &[wrt("w", "val")]).await;
-    assert_eq!(program.output.columns, vec!["o", "s", "__ddx_tangent_1"]);
+    assert_eq!(program.value.columns, vec!["o", "s", "__ddx_tangent_1"]);
     let want = rows(&ctx, &format!("{sql} ORDER BY o")).await;
     let mut got: Vec<Vec<f64>> = out.iter().map(|r| r[..2].to_vec()).collect();
     got.sort_by(|a, b| a[0].total_cmp(&b[0]));
     assert_eq!(got, want);
     let total = scalar(
         &ctx,
-        &format!("SELECT SUM(__ddx_tangent_1) FROM {}", program.output.step),
+        &format!("SELECT SUM(__ddx_tangent_1) FROM {}", program.value.step),
     )
     .await;
     let want: f64 = w()
@@ -551,7 +551,7 @@ async fn a_tangent_table_whose_dims_repeat_is_refused_before_it_runs() {
     w().create(&ctx).await;
     let plan = substrait_of(&ctx, "SELECT SUM(val) AS l FROM w", true).await;
     let program = ddx_ad::jvp(&plan, &[wrt("w", "val")]).unwrap();
-    let tt = &program.tangent_tables[0];
+    let tt = &program.inputs[0];
     ctx.sql(&format!(
         "CREATE TABLE {} (i BIGINT, o BIGINT, val DOUBLE) AS VALUES (0, 0, 1.0), (0, 0, 2.0)",
         tt.name
@@ -566,7 +566,7 @@ async fn a_tangent_table_whose_dims_repeat_is_refused_before_it_runs() {
         .expect_err("refused");
     assert!(e.to_string().contains("share their dims"), "{e}");
     assert!(
-        ctx.table(program.output.step.as_str()).await.is_err(),
+        ctx.table(program.value.step.as_str()).await.is_err(),
         "a refused run leaves no output"
     );
 }
@@ -588,7 +588,7 @@ async fn gradients(
             .iter()
             .filter(|c| !wrt.iter().any(|w| w.column == **c))
             .count();
-        let table = g.table.last().unwrap().clone();
+        let table = g.of.table().and_then(|t| t.last()).unwrap().clone();
         out.insert(
             table,
             keyed(ctx, &format!("SELECT * FROM {}", g.step), dims).await,
@@ -598,7 +598,7 @@ async fn gradients(
     out
 }
 
-/// Forward over reverse: `jvp_of_program` of `grad(loss)` along the tangent
+/// Forward over reverse: `jvp` of `grad(loss)`'s program along the tangent
 /// gives `H·v` beside each gradient, checked against a central finite
 /// difference of the gradient along `v`.
 async fn check_hvp(ctx: &SessionContext, loss: &str, tables: &[Table], wrt: &[ColumnRef]) {
@@ -607,14 +607,13 @@ async fn check_hvp(ctx: &SessionContext, loss: &str, tables: &[Table], wrt: &[Co
     }
     let plan = substrait_of(ctx, loss, true).await;
     let program = ddx_ad::grad(&plan, wrt).unwrap();
-    let hvp =
-        ddx_ad::jvp_of_program(&program, wrt).unwrap_or_else(|e| panic!("jvp_of_program: {e}"));
+    let hvp = ddx_ad::jvp(&program, wrt).unwrap_or_else(|e| panic!("jvp of a program: {e}"));
     assert_emits_on_projections(&hvp);
     assert_eq!(hvp.gradients.len(), program.gradients.len());
-    for tt in &hvp.tangent_tables {
+    for tt in &hvp.inputs {
         let table = tables
             .iter()
-            .find(|t| tt.table.last().map(String::as_str) == Some(t.name))
+            .find(|t| tt.of.table().and_then(|t| t.last()).map(String::as_str) == Some(t.name))
             .unwrap();
         tangent_of(table, &tt.name, &tt.columns).create(ctx).await;
     }
@@ -635,7 +634,7 @@ async fn check_hvp(ctx: &SessionContext, loss: &str, tables: &[Table], wrt: &[Co
         t.create(ctx).await;
     }
     for (g, out) in program.gradients.iter().zip(&hvp.gradients) {
-        let table = g.table.last().unwrap();
+        let table = g.of.table().and_then(|t| t.last()).unwrap();
         let values = wrt.iter().filter(|w| w.table == *table).count();
         assert_eq!(
             out.tangents.len(),
@@ -729,7 +728,7 @@ async fn a_null_input_adds_nothing_to_a_tangent_of_two_terms() {
     .unwrap();
     let plan = substrait_of(&ctx, "SELECT i, coalesce(a, 0.0) + b AS y FROM p", true).await;
     let program = ddx_ad::jvp(&plan, &[wrt("p", "a"), wrt("p", "b")]).unwrap();
-    let tt = &program.tangent_tables[0];
+    let tt = &program.inputs[0];
     assert_eq!(tt.columns, vec!["i", "a", "b"]);
     ctx.sql(&format!(
         "CREATE TABLE {} (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES (0, 1.0, 10.0), (1, 1.0, 10.0)",
@@ -743,7 +742,7 @@ async fn a_null_input_adds_nothing_to_a_tangent_of_two_terms() {
     ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
     let out = rows(
         &ctx,
-        &format!("SELECT * FROM {} ORDER BY i", program.output.step),
+        &format!("SELECT * FROM {} ORDER BY i", program.value.step),
     )
     .await;
     assert_eq!(out[0][2], 10.0, "ḃ alone where a is NULL");
@@ -789,7 +788,7 @@ fn jvp_program_does_not_overflow_a_worker_threads_stack() {
             .spawn(move || {
                 let wrt = [wrt("p", "val")];
                 ddx_ad::jvp(&plan, &wrt)?;
-                ddx_ad::jvp_of_program(&ddx_ad::grad(&plan, &wrt)?, &wrt).map(|_| ())
+                ddx_ad::jvp(&ddx_ad::grad(&plan, &wrt)?, &wrt).map(|_| ())
             })
             .unwrap();
         t.join().unwrap().unwrap();
@@ -804,7 +803,10 @@ fn jvp_program_does_not_overflow_a_worker_threads_stack() {
         .env("DDX_JVP_CHILD", "1")
         .status()
         .unwrap();
-    assert!(status.success(), "jvp_of_program on a 2 MB stack: {status}");
+    assert!(
+        status.success(),
+        "jvp of a program on a 2 MB stack: {status}"
+    );
 }
 
 /// The jvp of the loss `sql` over `p(i, val) = (0, 0.5), (1, NULL), (2,
@@ -824,7 +826,7 @@ async fn jvp_over_a_null(sql: &str) -> f64 {
     let program = ddx_ad::jvp(&plan, &[wrt("p", "val")]).unwrap();
     ctx.sql(&format!(
         "CREATE TABLE {} (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0), (2, 3.0), (3, 4.0)",
-        program.tangent_tables[0].name
+        program.inputs[0].name
     ))
     .await
     .unwrap()
@@ -832,7 +834,7 @@ async fn jvp_over_a_null(sql: &str) -> f64 {
     .await
     .unwrap();
     ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
-    rows(&ctx, &format!("SELECT * FROM {}", program.output.step)).await[0][1]
+    rows(&ctx, &format!("SELECT * FROM {}", program.value.step)).await[0][1]
 }
 
 #[tokio::test]
@@ -863,7 +865,7 @@ async fn a_loss_that_reads_wrt_only_through_conditions_has_a_zero_tangent() {
     ] {
         let ctx = ctx();
         let (program, out) = jvp_of(&ctx, loss, &[w()], &[wrt("w", "val")]).await;
-        assert_eq!(program.output.tangents.len(), 1, "{loss}");
+        assert_eq!(program.value.tangents.len(), 1, "{loss}");
         assert_eq!(out[0][1], 0.0, "{loss}");
         let plan = substrait_of(&ctx, loss, true).await;
         let g = ddx_ad::grad(&plan, &[wrt("w", "val")]).unwrap();
@@ -886,7 +888,7 @@ async fn options_restrict_is_refused_not_ignored() {
     let e = ddx_ad::jvp_with(&plan, &[wrt("w", "val")], &options).expect_err("refused");
     assert!(matches!(e, AdError::InvalidOptions(_)), "{e}");
     let g = ddx_ad::grad(&plan, &[wrt("w", "val")]).unwrap();
-    let e = ddx_ad::jvp_of_program_with(&g, &[wrt("w", "val")], &options).expect_err("refused");
+    let e = ddx_ad::jvp_with(&g, &[wrt("w", "val")], &options).expect_err("refused");
     assert!(matches!(e, AdError::InvalidOptions(_)), "{e}");
 }
 
@@ -948,8 +950,8 @@ async fn jvp_and_hvp_run_without_the_simplifier() {
     let plan = substrait_of(&ctx, loss, true).await;
     let wrt = [wrt("ws", "val")];
     let jvp = ddx_ad::jvp(&plan, &wrt).unwrap();
-    let hvp = ddx_ad::jvp_of_program(&ddx_ad::grad(&plan, &wrt).unwrap(), &wrt).unwrap();
-    for (program, tangents) in [(&jvp, &jvp.tangent_tables), (&hvp, &hvp.tangent_tables)] {
+    let hvp = ddx_ad::jvp(&ddx_ad::grad(&plan, &wrt).unwrap(), &wrt).unwrap();
+    for (program, tangents) in [(&jvp, &jvp.inputs), (&hvp, &hvp.inputs)] {
         for tt in tangents {
             ctx.sql(&format!(
                 "CREATE OR REPLACE TABLE {} (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 1.0), (2, 1.0)",
@@ -966,6 +968,56 @@ async fn jvp_and_hvp_run_without_the_simplifier() {
             .unwrap_or_else(|e| panic!("run without the simplifier: {e}"));
     }
     // d/dv Σ (v² + v) along 1, over the rows whose value is not NULL.
-    let got = rows(&ctx, &format!("SELECT * FROM {}", jvp.output.step)).await;
+    let got = rows(&ctx, &format!("SELECT * FROM {}", jvp.value.step)).await;
     assert_eq!(got[0][1], (2.0 * 1.0 + 1.0) + (2.0 * 3.0 + 1.0));
+}
+
+#[tokio::test]
+async fn one_jvp_takes_sql_a_plan_or_a_program() {
+    // The adapter's jvp, as ddx_ad's: of SQL text, of a DataFusion plan, and
+    // of a grad program (forward over reverse, H·v), with no second name.
+    let ctx = ctx();
+    w().create(&ctx).await;
+    let wrt = [wrt("w", "val")];
+    let loss = "SELECT SUM(val * val * val) AS l FROM w";
+    let of_sql = ddx_datafusion::ad::jvp(&ctx, loss, &wrt).await.unwrap();
+    let plan = ctx.sql(loss).await.unwrap().into_optimized_plan().unwrap();
+    let of_plan = ddx_datafusion::ad::jvp(&ctx, &plan, &wrt).await.unwrap();
+    let grad = ddx_datafusion::ad::grad(&ctx, loss, &wrt).await.unwrap();
+    let of_program = ddx_datafusion::ad::jvp(&ctx, &grad, &wrt).await.unwrap();
+    assert!(of_sql.gradients.is_empty() && of_plan.gradients.is_empty());
+    assert_eq!(of_program.gradients.len(), 1);
+    // Along t = 1: d/dt Σ w³ = Σ 3 w², and H·t = 6 w.
+    for program in [&of_sql, &of_plan, &of_program] {
+        ctx.sql(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT i, o, 1.0 AS val FROM w",
+            program.inputs[0].name
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        ddx_datafusion::ad::run(&ctx, program).await.unwrap();
+        let value = rows(&ctx, &format!("SELECT * FROM {}", program.value.step)).await;
+        let want: f64 = w().rows.iter().map(|r| 3.0 * r[2] * r[2]).sum();
+        assert!(
+            (value[0][1] - want).abs() < 1e-12,
+            "{} vs {want}",
+            value[0][1]
+        );
+    }
+    let g = &of_program.gradients[0];
+    let t = g
+        .columns
+        .iter()
+        .position(|c| *c == g.tangents[0].tangent)
+        .unwrap();
+    let hv = rows(&ctx, &format!("SELECT * FROM {} ORDER BY i, o", g.step)).await;
+    let mut want: Vec<(f64, f64, f64)> =
+        w().rows.iter().map(|r| (r[0], r[1], 6.0 * r[2])).collect();
+    want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    for (row, (_, _, h)) in hv.iter().zip(want) {
+        assert!((row[t] - h).abs() < 1e-12, "{} vs {h}", row[t]);
+    }
 }

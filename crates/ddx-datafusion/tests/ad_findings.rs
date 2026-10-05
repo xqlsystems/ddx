@@ -675,7 +675,7 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
         &ctx,
         &format!(
             "CREATE TABLE \"{}\" (i BIGINT, s DOUBLE) AS VALUES (0, 1.0), (0, 1.0), (1, 1.0)",
-            program.cotangent_table
+            program.inputs[0].name
         ),
     )
     .await;

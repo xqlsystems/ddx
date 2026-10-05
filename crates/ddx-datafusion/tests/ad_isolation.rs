@@ -132,7 +132,7 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
             step.name
         );
     }
-    assert!(ctx.table_exist(program.value.as_str()).unwrap());
+    assert!(ctx.table_exist(program.value.step.as_str()).unwrap());
     assert_eq!(
         f64s(
             &ctx,
@@ -257,7 +257,7 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat_through_ad_run() {
         &ctx,
         &format!(
             "CREATE TABLE \"{}\" (i BIGINT, s DOUBLE) AS VALUES (0, 1.0), (0, 1.0), (1, 1.0)",
-            program.cotangent_table
+            program.inputs[0].name
         ),
     )
     .await;

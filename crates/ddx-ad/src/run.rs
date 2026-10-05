@@ -85,7 +85,7 @@ impl Program for BackwardProgram {
         BackwardProgram::step(self, i)
     }
     fn is_result(&self, step: &str) -> bool {
-        self.value == step || self.gradients.iter().any(|g| g.step == step)
+        self.value.step == step || self.gradients.iter().any(|g| g.step == step)
     }
 }
 
@@ -100,7 +100,7 @@ impl Program for ForwardProgram {
         &self.steps[i]
     }
     fn is_result(&self, step: &str) -> bool {
-        self.output.step == step || self.gradients.iter().any(|g| g.step == step)
+        self.value.step == step || self.gradients.iter().any(|g| g.step == step)
     }
 }
 
