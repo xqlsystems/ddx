@@ -987,3 +987,28 @@ async fn a_ranking_ordered_by_an_expression_of_its_dims_is_refused() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_max_of_a_grouped_max_is_exact_at_a_near_tie() {
+    // Found by the jvp fuzzer (seed 12301800): the 8-ulp tie window, meant
+    // for values a SUM or AVG computes, took a saved grouped MAX as one, and
+    // shared the gradient with a row 5 ulps below the maximum. A MAX of
+    // table values is exact; jax.grad gives (½, ½, 0).
+    let ctx = SessionContext::new();
+    let hi = 1.0000000000000009_f64;
+    let lo = 0.9999999999999997_f64;
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, {hi:?}), (1, {hi:?}), (2, {lo:?})"
+        ),
+    )
+    .await;
+    let got = grad(
+        &ctx,
+        "WITH r1 AS (SELECT i, MAX(val) AS v FROM w GROUP BY i) SELECT MAX(v) AS loss FROM r1",
+        "w",
+    )
+    .await;
+    assert_eq!(got, vec![(0, Some(0.5)), (1, Some(0.5)), (2, Some(0.0))]);
+}

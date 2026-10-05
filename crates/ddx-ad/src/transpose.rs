@@ -182,7 +182,7 @@ impl<'a> Transposer<'a> {
             .map(|(&arg_col, &at)| {
                 let attains = if_then(
                     vec![(
-                        self.attains(arg_col, at, jitters(&region, arg_col)),
+                        self.attains(arg_col, at, jitters(self.f, &region, arg_col)),
                         lit_f64(1.0),
                     )],
                     lit_f64(0.0),
@@ -221,7 +221,11 @@ impl<'a> Transposer<'a> {
                 // an infinite value in the data that does not attain a MIN).
                 Rule::Extreme(_) => if_then(
                     vec![(
-                        self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),
+                        self.attains(
+                            arg_col,
+                            extreme_at[&arg_col],
+                            jitters(self.f, &region, arg_col),
+                        ),
                         call(divide, vec![cot, field(stat_at[&arg_col])]),
                     )],
                     null_f64(),
@@ -625,13 +629,15 @@ impl<'a> Transposer<'a> {
 
 /// Can column `col` of `region` differ in its last bits from one
 /// recomputation to the next? Only if it reads the output of an aggregate
-/// that rounds: a saved aggregate, constant data a sum or average computes,
-/// or a scalar subquery that does, since a grouped sum over several
+/// that rounds: a saved `SUM` or `AVG`, constant data a sum or average
+/// computes, or a scalar subquery that does, since a grouped sum over several
 /// partitions adds in arrival order. A table's values, whether or not the
 /// table is differentiated, a maximum or count of them, and elementwise
 /// functions of those, are the same every run (#102: otherwise a table's
-/// gradient depended on which other tables were differentiated).
-fn jitters(region: &Region, col: usize) -> bool {
+/// gradient depended on which other tables were differentiated). A saved
+/// aggregate is followed into the region it aggregates: its `MAX` of a
+/// table's values is exact, its `MAX` of a `SUM` is not.
+fn jitters(f: &Forward, region: &Region, col: usize) -> bool {
     let mut stack = vec![col];
     let mut seen = vec![false; region.defs.len()];
     while let Some(c) = stack.pop() {
@@ -639,11 +645,15 @@ fn jitters(region: &Region, col: usize) -> bool {
             continue;
         }
         match &region.defs[c] {
-            Def::Input { slot, .. } => {
-                if !matches!(region.slots[*slot].input, Input::Table(_)) {
-                    return true;
+            Def::Input { slot, col } => match region.slots[*slot].input {
+                Input::Table(_) => {}
+                Input::Saved(n) => {
+                    if saved_jitters(f, n, *col) {
+                        return true;
+                    }
                 }
-            }
+                Input::Const => return true,
+            },
             Def::Expr(e) => {
                 if region.rounds[c] {
                     return true;
@@ -665,6 +675,41 @@ fn jitters(region: &Region, col: usize) -> bool {
         }
     }
     false
+}
+
+/// Can output column `col` of saved aggregate `n` differ in its last bits
+/// between recomputations? A measure that rounds can; so can a key or a
+/// measure computed from columns that can.
+fn saved_jitters(f: &Forward, n: usize, col: usize) -> bool {
+    let saved = &f.saved[n];
+    let over = |e: &Expression| -> bool {
+        if subquery_rounds(&f.functions, e).unwrap_or(true) {
+            return true;
+        }
+        match fields_of(e) {
+            Ok(fields) => fields.into_iter().any(|c| jitters(f, &saved.input, c)),
+            Err(_) => true,
+        }
+    };
+    match saved.outputs.get(col) {
+        Some(Output::Dim(g)) => saved.groupings.get(*g).is_none_or(over),
+        Some(Output::Value(m)) => {
+            let Some(measure) = saved.measures.get(*m) else {
+                return true;
+            };
+            if f.functions
+                .rounds(measure.function_reference)
+                .unwrap_or(true)
+            {
+                return true;
+            }
+            measure.arguments.iter().any(|a| match &a.arg_type {
+                Some(substrait::proto::function_argument::ArgType::Value(e)) => over(e),
+                _ => false,
+            })
+        }
+        None => true,
+    }
 }
 
 /// Which reduce rule a measure has.
