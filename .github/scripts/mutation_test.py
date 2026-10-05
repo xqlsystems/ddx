@@ -50,9 +50,11 @@ MUTANTS = [
      "windows.push(window(sum, vec![field(arg_col)], keys.clone()));",
      "AVG divides by the sum of its argument, not the count"),
     ("tie-unshared", f"{AD}/transpose.rs",
-     "self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),\n"
+     "jitters(self.f, &region, arg_col),\n"
+     "                        ),\n"
      "                        call(divide, vec![cot, field(stat_at[&arg_col])]),",
-     "self.attains(arg_col, extreme_at[&arg_col], jitters(&region, arg_col)),\n"
+     "jitters(self.f, &region, arg_col),\n"
+     "                        ),\n"
      "                        cot,",
      "MAX/MIN give every tied row the whole cotangent (wrong only at ties)"),
     ("extreme-everyone", f"{AD}/transpose.rs",
@@ -92,14 +94,17 @@ MUTANTS = [
      "if false && dims.iter().any(|d| !keys.contains(&(offset + d))) {",
      "a ranking that does not break ties is accepted"),
     ("gradient-names-collide", f"{AD}/program.rs",
-     'format!("{namespace}grad_{i}_{readable}")',
-     'format!("{namespace}grad_{readable}")',
+     'format!("{namespace}grad_{i}_{}", readable(table))',
+     'format!("{namespace}grad_{}", readable(table))',
      "two wrt tables with one readable name share a gradient step"),
     ("release-keeps-value", f"{DF}/ad.rs",
-     "pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {\n"
-     "    for step in program.steps() {",
-     "pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {\n"
-     "    for step in program.backward_steps.iter() {",
+     "    for i in 0..program.step_count() {\n"
+     "        let step = program.step(i);\n"
+     "        ctx.deregister_table(step.name.as_str())?;",
+     "    for i in 0..program.step_count() {\n"
+     "        let step = program.step(i);\n"
+     "        if program.is_result(&step.name) { continue; }\n"
+     "        ctx.deregister_table(step.name.as_str())?;",
      "release leaves the value table on the context"),
     ("sql-case-sensitive", f"{AD}/sql.rs",
      "table_matches(&w.table, &g.table) && w.column.eq_ignore_ascii_case(c)",
