@@ -85,7 +85,10 @@ use ddx_ad::substrait::proto::{NamedStruct, Rel};
 use ddx_ad::substrait::proto::{Plan, ProjectRel};
 use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
-pub use ddx_ad::{AdError, BackwardProgram, Check, ColumnRef, Gradient, Step};
+pub use ddx_ad::{
+    AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, Gradient, JvpOutput, Program, Step,
+    Tangent, TangentTable,
+};
 
 use ddx_ad::Statements;
 
@@ -130,6 +133,33 @@ pub fn vjp_plan(
 ) -> Result<BackwardProgram> {
     refuse_what_substrait_loses(plan)?;
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// The Jacobian-vector product of the SQL query `sql` with respect to the
+/// `wrt` columns: a program computing the query's output and, beside it, its
+/// tangent. Before running it, register each `wrt` table's tangent as the
+/// table [`ForwardProgram::tangent_tables`] names, with the columns it lists.
+pub async fn jvp(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
+    jvp_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
+}
+
+/// [`jvp`] for a plan already built.
+pub fn jvp_plan(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    wrt: &[ColumnRef],
+) -> Result<ForwardProgram> {
+    refuse_what_substrait_loses(plan)?;
+    ddx_ad::jvp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+}
+
+/// The Jacobian-vector product of a program's steps, forward mode over it
+/// (see [`ddx_ad::jvp_of_program`]). Of a [`grad`] program along `v`, each
+/// gradient's tangent is the Hessian-vector product `H·v`. There is no
+/// `hvp`: it is this over [`grad`], and one `grad` program serves every
+/// direction.
+pub fn jvp_of_program(program: &BackwardProgram, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
+    ddx_ad::jvp_of_program(program, wrt).map_err(to_df_err)
 }
 
 /// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for
@@ -274,12 +304,12 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 /// build it once and run it on every training step. One program's runs must
 /// not overlap: they write the same tables. Build a program per concurrent
 /// caller instead.
-pub async fn run(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
+pub async fn run<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
     // The order, and what is dropped when, are ddx_ad::Runner's.
     let mut runner = ddx_ad::Runner::new(program);
     while let Some(action) = runner.next() {
         match &action {
-            Action::Check(i) => runner.checked(returns_rows(ctx, &program.checks[*i].plan).await),
+            Action::Check(i) => runner.checked(returns_rows(ctx, &program.checks()[*i].plan).await),
             Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
             Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
         }
@@ -319,8 +349,9 @@ pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
 
 /// Drop every table `program` registered on `ctx`, the value and the
 /// gradients included.
-pub fn release(ctx: &SessionContext, program: &BackwardProgram) -> Result<()> {
-    for step in program.steps() {
+pub fn release<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
+    for i in 0..program.step_count() {
+        let step = program.step(i);
         ctx.deregister_table(step.name.as_str())?;
     }
     Ok(())

@@ -375,7 +375,7 @@ impl Forward {
     }
 }
 
-fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
+pub(crate) fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
     let mut roots = plan.relations.iter().filter_map(|r| match &r.rel_type {
         Some(PlanRelType::Root(root)) => Some(root),
         _ => None,
@@ -401,7 +401,7 @@ fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
 /// saves each distinct aggregate once whichever way it was written. A cycle
 /// or a missing ordinal is an invalid plan, and a reference inside a
 /// subquery expression is refused rather than read as reading nothing.
-fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel> {
+pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel> {
     fn inline(rel: &mut Rel, relations: &[PlanRel], path: &mut Vec<i32>) -> Result<()> {
         if let Some(RelType::Reference(r)) = &rel.rel_type {
             let ordinal = r.subtree_ordinal;
@@ -691,72 +691,8 @@ impl Builder<'_> {
             }
             return Ok(i);
         }
-        if schema.r#struct.as_ref().map(|s| s.types.len()) != Some(schema.names.len()) {
-            return Err(AdError::NotImplemented(format!(
-                "table `{}` has nested columns",
-                names.join(".")
-            )));
-        }
-        let mut values = Vec::new();
-        for w in self.wrt.iter().filter(|w| table_matches(&w.table, names)) {
-            let col = find_column(&schema.names, &w.column).ok_or_else(|| {
-                AdError::UnknownWrt(format!(
-                    "table `{}` has no column `{}`; its columns are {:?}",
-                    names.join("."),
-                    w.column,
-                    schema.names
-                ))
-            })?;
-            if !values.contains(&col) {
-                values.push(col);
-            }
-        }
-        values.sort_unstable();
-        // A gradient is taken only with respect to floating-point values, as
-        // jax.grad requires inexact inputs. An integer column is piecewise
-        // constant to the engine (`val / 2` truncates), while ddx would
-        // differentiate real arithmetic: a silently wrong gradient.
-        let types = schema
-            .r#struct
-            .as_ref()
-            .map(|t| t.types.as_slice())
-            .unwrap_or(&[]);
-        for &v in &values {
-            let float = matches!(
-                types.get(v).and_then(|t| t.kind.as_ref()),
-                Some(
-                    substrait::proto::r#type::Kind::Fp32(_)
-                        | substrait::proto::r#type::Kind::Fp64(_)
-                )
-            );
-            if !float {
-                return Err(AdError::InvalidWrt(format!(
-                    "column `{}` of table `{}` is not a floating-point column; a gradient is \
-                     taken only with respect to REAL or DOUBLE values. Store it as DOUBLE",
-                    schema.names[v],
-                    names.join(".")
-                )));
-            }
-        }
-        let dims: Vec<usize> = (0..schema.names.len())
-            .filter(|c| !values.contains(c))
-            .collect();
-        // A cotangent is keyed by its table's dims. With none, nothing tells
-        // one row's gradient from another's, and every row would get the sum.
-        if dims.is_empty() {
-            return Err(AdError::InvalidWrt(format!(
-                "every column of table `{}` is a wrt column, so no column identifies its \
-                 rows and their gradients cannot be told apart. Add a dim column (a row \
-                 index or coordinate) to the table",
-                names.join(".")
-            )));
-        }
-        self.tables.push(Table {
-            names: names.to_vec(),
-            schema: schema.clone(),
-            dims,
-            values,
-        });
+        let table = wrt_table(names, schema, self.wrt)?;
+        self.tables.push(table);
         Ok(self.tables.len() - 1)
     }
 
@@ -1101,47 +1037,7 @@ impl Builder<'_> {
     }
 
     fn check_every_wrt_was_read(&self) -> Result<()> {
-        for w in self.wrt {
-            // A bare name that matches tables in two schemas would take both
-            // as wrt tables; which rows get a gradient must not be a guess.
-            let matching: Vec<&String> = self
-                .seen
-                .iter()
-                .filter(|t| {
-                    table_matches(
-                        &w.table,
-                        &t.split('.').map(str::to_string).collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            if matching.len() > 1 {
-                return Err(AdError::UnknownWrt(format!(
-                    "`{}` names more than one table the query reads: {matching:?}; \
-                     qualify it",
-                    w.table
-                )));
-            }
-            let read = self
-                .tables
-                .iter()
-                .any(|t| table_matches(&w.table, &t.names));
-            if !read {
-                // A producer may drop a schema qualifier (Ibis writes `s.t`
-                // as `t`), and then only the bare name can match.
-                let hint = match w.table.rsplit_once('.') {
-                    Some((_, last)) if self.seen.iter().any(|t| t.eq_ignore_ascii_case(last)) => {
-                        format!("; the plan names its tables without a schema, so name it `{last}`")
-                    }
-                    _ => String::new(),
-                };
-                return Err(AdError::UnknownWrt(format!(
-                    "the query does not read a table `{}` (or reads it only where no gradient \
-                     can reach); it reads {:?}{hint}",
-                    w.table, self.seen
-                )));
-            }
-        }
-        Ok(())
+        check_every_wrt_was_read(self.wrt, &self.seen, &self.tables)
     }
 }
 
@@ -1153,6 +1049,127 @@ impl Builder<'_> {
 /// one that does not break ties.
 fn order_key(e: &Expression) -> Option<usize> {
     as_field(e)
+}
+
+/// Refuse a `wrt` entry that names no table the plan reads where gradient
+/// can flow (`tables`), or names more than one of the tables it reads at
+/// all (`seen`).
+pub(crate) fn check_every_wrt_was_read(
+    wrt: &[ColumnRef],
+    seen: &BTreeSet<String>,
+    tables: &[Table],
+) -> Result<()> {
+    for w in wrt {
+        // A bare name that matches tables in two schemas would take both
+        // as wrt tables; which rows get a gradient must not be a guess.
+        let matching: Vec<&String> = seen
+            .iter()
+            .filter(|t| {
+                table_matches(
+                    &w.table,
+                    &t.split('.').map(str::to_string).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        if matching.len() > 1 {
+            return Err(AdError::UnknownWrt(format!(
+                "`{}` names more than one table the query reads: {matching:?}; \
+                 qualify it",
+                w.table
+            )));
+        }
+        let read = tables
+            .iter()
+            .any(|t| table_matches(&w.table, &t.names));
+        if !read {
+            // A producer may drop a schema qualifier (Ibis writes `s.t`
+            // as `t`), and then only the bare name can match.
+            let hint = match w.table.rsplit_once('.') {
+                Some((_, last)) if seen.iter().any(|t| t.eq_ignore_ascii_case(last)) => {
+                    format!("; the plan names its tables without a schema, so name it `{last}`")
+                }
+                _ => String::new(),
+            };
+            return Err(AdError::UnknownWrt(format!(
+                "the query does not read a table `{}` (or reads it only where no gradient \
+                 can reach); it reads {:?}{hint}",
+                w.table, seen
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The `wrt` table `names` (with `schema`): its values are the columns `wrt`
+/// names, its dims the rest. Refused unless every value is floating point and
+/// some column is a dim.
+pub(crate) fn wrt_table(names: &[String], schema: &NamedStruct, wrt: &[ColumnRef]) -> Result<Table> {
+    if schema.r#struct.as_ref().map(|s| s.types.len()) != Some(schema.names.len()) {
+        return Err(AdError::NotImplemented(format!(
+            "table `{}` has nested columns",
+            names.join(".")
+        )));
+    }
+    let mut values = Vec::new();
+    for w in wrt.iter().filter(|w| table_matches(&w.table, names)) {
+        let col = find_column(&schema.names, &w.column).ok_or_else(|| {
+            AdError::UnknownWrt(format!(
+                "table `{}` has no column `{}`; its columns are {:?}",
+                names.join("."),
+                w.column,
+                schema.names
+            ))
+        })?;
+        if !values.contains(&col) {
+            values.push(col);
+        }
+    }
+    values.sort_unstable();
+    // A gradient is taken only with respect to floating-point values, as
+    // jax.grad requires inexact inputs. An integer column is piecewise
+    // constant to the engine (`val / 2` truncates), while ddx would
+    // differentiate real arithmetic: a silently wrong gradient.
+    let types = schema
+        .r#struct
+        .as_ref()
+        .map(|t| t.types.as_slice())
+        .unwrap_or(&[]);
+    for &v in &values {
+        let float = matches!(
+            types.get(v).and_then(|t| t.kind.as_ref()),
+            Some(
+                substrait::proto::r#type::Kind::Fp32(_)
+                    | substrait::proto::r#type::Kind::Fp64(_)
+            )
+        );
+        if !float {
+            return Err(AdError::InvalidWrt(format!(
+                "column `{}` of table `{}` is not a floating-point column; a gradient is \
+                 taken only with respect to REAL or DOUBLE values. Store it as DOUBLE",
+                schema.names[v],
+                names.join(".")
+            )));
+        }
+    }
+    let dims: Vec<usize> = (0..schema.names.len())
+        .filter(|c| !values.contains(c))
+        .collect();
+    // A cotangent is keyed by its table's dims. With none, nothing tells
+    // one row's gradient from another's, and every row would get the sum.
+    if dims.is_empty() {
+        return Err(AdError::InvalidWrt(format!(
+            "every column of table `{}` is a wrt column, so no column identifies its \
+             rows and their gradients cannot be told apart. Add a dim column (a row \
+             index or coordinate) to the table",
+            names.join(".")
+        )));
+    }
+    Ok(Table {
+        names: names.to_vec(),
+        schema: schema.clone(),
+        dims,
+        values,
+    })
 }
 
 /// `rel` (`width` columns wide) with each column in `cols` replaced, in its
@@ -1208,7 +1225,7 @@ fn empty(rel: Rel) -> Region {
     }
 }
 
-fn input(r: &Option<Box<Rel>>) -> Result<&Rel> {
+pub(crate) fn input(r: &Option<Box<Rel>>) -> Result<&Rel> {
     r.as_deref()
         .ok_or_else(|| AdError::InvalidPlan("a relation with no input".into()))
 }
@@ -1227,7 +1244,7 @@ fn remap(e: Option<&Expression>, outputs: &[usize]) -> Result<Option<Expression>
         .transpose()
 }
 
-fn apply_emit(common: Option<&RelCommon>, direct: Vec<usize>) -> Result<Vec<usize>> {
+pub(crate) fn apply_emit(common: Option<&RelCommon>, direct: Vec<usize>) -> Result<Vec<usize>> {
     match common.and_then(|c| c.emit_kind.as_ref()) {
         Some(EmitKind::Emit(e)) => e
             .output_mapping
@@ -1245,7 +1262,7 @@ fn apply_emit(common: Option<&RelCommon>, direct: Vec<usize>) -> Result<Vec<usiz
 
 /// A read's output columns, before any emit: its projection mask, or every
 /// column.
-fn read_outputs(r: &ReadRel) -> Result<Vec<usize>> {
+pub(crate) fn read_outputs(r: &ReadRel) -> Result<Vec<usize>> {
     let all = r.base_schema.as_ref().map_or(0, |s| s.names.len());
     match r.projection.as_ref().and_then(|m| m.select.as_ref()) {
         Some(sel) => sel
@@ -1298,7 +1315,7 @@ fn at_most_one_row(rel: &Rel) -> bool {
 }
 
 /// The grouping keys of a single-grouping-set aggregate.
-fn grouping_expressions(a: &AggregateRel) -> Result<Vec<&Expression>> {
+pub(crate) fn grouping_expressions(a: &AggregateRel) -> Result<Vec<&Expression>> {
     if a.groupings.len() > 1 {
         return Err(AdError::NotImplemented(
             "GROUPING SETS, ROLLUP or CUBE over a wrt table".into(),
@@ -1464,7 +1481,7 @@ fn collect_window_functions(e: &Expression, out: &mut Vec<u32>) {
 }
 
 /// Every subquery inside `e`, outermost first; not inside the subqueries.
-fn collect_subqueries<'e>(
+pub(crate) fn collect_subqueries<'e>(
     e: &'e Expression,
     out: &mut Vec<&'e substrait::proto::expression::Subquery>,
 ) {
@@ -1565,7 +1582,7 @@ pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
     }
 }
 
-fn rel_name(kind: &RelType) -> &'static str {
+pub(crate) fn rel_name(kind: &RelType) -> &'static str {
     match kind {
         RelType::Read(_) => "read",
         RelType::Filter(_) => "filter",

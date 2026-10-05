@@ -3236,8 +3236,10 @@ async fn two_value_checks(
     Ok(())
 }
 
-/// Two wrt tables with one name, `t` and `s1.t`: each gradient must be its
-/// own table's, however the steps are named.
+/// Two wrt tables with one name, `s1.t` and `s2.t`: each gradient must be its
+/// own table's, however the steps are named. Both are named qualified: the
+/// case's own `t` is bare, and a bare name two schemas share is refused, so a
+/// twin beside it would only ever test that refusal.
 async fn twin_checks(
     ctx: &SessionContext,
     case: &Case,
@@ -3246,35 +3248,53 @@ async fn twin_checks(
     out: &mut Outcome,
 ) -> Result<(), String> {
     let tb = case.table(t).clone();
-    ctx.sql("CREATE SCHEMA IF NOT EXISTS s1")
-        .await
-        .map_err(|e| e.to_string())?
-        .collect()
-        .await
+    // (schema, value transform, weight in the loss): the weights make the two
+    // gradients differ, so one read under the other's name cannot pass.
+    let twins = [("s1", 0.5, 0.37, 1.0), ("s2", 0.25, -0.11, 3.0)];
+    let mut tables = BTreeMap::new();
+    for &(schema, scale, shift, _) in &twins {
+        ctx.sql(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .await
+            .map_err(|e| e.to_string())?
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut twin = tb.clone();
+        for v in twin.vals.iter_mut().flatten() {
+            *v = round6(*v * scale + shift);
+        }
+        let batch = twin.batch();
+        let table =
+            MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
+        ctx.register_table(
+            datafusion::sql::TableReference::parse_str(&format!("{schema}.{t}")),
+            Arc::new(table),
+        )
         .map_err(|e| e.to_string())?;
-    let mut twin = tb.clone();
-    for v in twin.vals.iter_mut().flatten() {
-        *v = round6(*v * 0.5 + 0.37);
+        tables.insert(schema, twin);
     }
-    let batch = twin.batch();
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
-    ctx.register_table(
-        datafusion::sql::TableReference::parse_str(&format!("s1.{t}")),
-        Arc::new(table),
-    )
-    .map_err(|e| e.to_string())?;
+    let extra: Vec<String> = twins
+        .iter()
+        .map(|(schema, _, _, k)| format!("(SELECT {k} * SUM(val * val) AS s FROM {schema}.{t})"))
+        .collect();
     let sql = format!(
         "WITH {}, base AS (SELECT {} AS loss FROM r{} c) \
-         SELECT b.loss + x.s AS loss FROM base b \
-         CROSS JOIN (SELECT SUM(val * val) AS s FROM s1.{t}) x",
+         SELECT b.loss + x.s + y.s AS loss FROM base b CROSS JOIN {} x CROSS JOIN {} y",
         case.ctes(),
         case.head,
-        case.root
+        case.root,
+        extra[0],
+        extra[1]
     );
     let wrt: Vec<ColumnRef> = case
         .wrt_refs()
         .into_iter()
-        .chain([ColumnRef::new(format!("s1.{t}"), "val")])
+        .filter(|w| w.table != t)
+        .chain(
+            twins
+                .iter()
+                .map(|(schema, ..)| ColumnRef::new(format!("{schema}.{t}"), "val")),
+        )
         .collect();
     let program = match ad::grad(ctx, &sql, &wrt).await {
         Ok(p) => p,
@@ -3311,25 +3331,30 @@ async fn twin_checks(
                 (key, row[n - 1])
             })
             .collect();
-        let name = g.table.last().cloned().unwrap_or_default();
-        let want: Option<Grad> = if g.table.iter().any(|p| p == "s1") {
-            Some(
-                twin.keys
-                    .iter()
-                    .cloned()
-                    .zip(twin.vals.iter().map(|v| v.map(|v| 2.0 * v)))
-                    .collect(),
-            )
-        } else {
-            grads.get(&name).cloned()
+        let parts: &[String] = &g.table;
+        let name = parts.last().cloned().unwrap_or_default();
+        let twin = twins
+            .iter()
+            .find(|(schema, ..)| parts.first().is_some_and(|p| p == schema));
+        let want: Option<Grad> = match twin {
+            Some((schema, _, _, k)) => {
+                let tw = &tables[schema];
+                Some(
+                    tw.keys
+                        .iter()
+                        .cloned()
+                        .zip(tw.vals.iter().map(|v| v.map(|v| 2.0 * k * v)))
+                        .collect(),
+                )
+            }
+            None => grads.get(&name).cloned(),
         };
         let Some(want) = want else { continue };
         out.meta_compared += 1;
         let wrap = |x: Grad| BTreeMap::from([(name.clone(), x)]);
         if let Some(f) = compare("names", &wrap(want), &wrap(got), 1.0, META_RTOL) {
             out.fail(format!(
-                "{f}\n  twins: {:?} and s1.{t} under one name",
-                g.table
+                "{f}\n  twins: {parts:?}, of s1.{t} and s2.{t} under one name"
             ));
         }
     }

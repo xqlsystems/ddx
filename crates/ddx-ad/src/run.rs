@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Running a [`BackwardProgram`]: the protocol every engine follows.
+//! Running a [`Program`] (a [`BackwardProgram`] or a [`ForwardProgram`]): the
+//! protocol every engine follows.
 //!
 //! A program is data, and running it takes four things only an engine can
 //! do: say whether a plan returns any row (a [check](BackwardProgram::checks)),
@@ -47,7 +48,61 @@ use substrait::proto::{NamedStruct, Plan};
 
 use crate::emit::{bind_reads, unbound_reads};
 use crate::error::AdError;
-use crate::program::BackwardProgram;
+use crate::program::{BackwardProgram, Check, ForwardProgram, Step};
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::program::BackwardProgram {}
+    impl Sealed for crate::program::ForwardProgram {}
+}
+
+/// What the run protocol needs of a program: its checks, its steps in order,
+/// and which steps' tables a caller reads once it has run (the others are
+/// dropped). A [`BackwardProgram`] and a [`ForwardProgram`] are programs.
+///
+/// Sealed: an engine runs programs, and ddx makes them; a new kind of
+/// program is a change to this crate, not an extension point.
+pub trait Program: sealed::Sealed {
+    /// Plans that must return no rows, run before the steps.
+    fn checks(&self) -> &[Check];
+    /// The number of steps.
+    fn step_count(&self) -> usize;
+    /// Step `i`, in the order they run.
+    fn step(&self, i: usize) -> &Step;
+    /// Whether the table of the step named `step` stays after a successful
+    /// run, for a caller to read.
+    fn is_result(&self, step: &str) -> bool;
+}
+
+impl Program for BackwardProgram {
+    fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+    fn step_count(&self) -> usize {
+        self.forward_steps.len() + self.backward_steps.len()
+    }
+    fn step(&self, i: usize) -> &Step {
+        BackwardProgram::step(self, i)
+    }
+    fn is_result(&self, step: &str) -> bool {
+        self.value == step || self.gradients.iter().any(|g| g.step == step)
+    }
+}
+
+impl Program for ForwardProgram {
+    fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+    fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+    fn step(&self, i: usize) -> &Step {
+        &self.steps[i]
+    }
+    fn is_result(&self, step: &str) -> bool {
+        self.output.step == step || self.gradients.iter().any(|g| g.step == step)
+    }
+}
 
 /// What a [`Runner`] asks its engine to do next.
 ///
@@ -122,12 +177,14 @@ pub struct Runner<E> {
 
 impl<E> Runner<E> {
     /// A run of `program`, not yet started.
-    pub fn new(program: &BackwardProgram) -> Self {
+    pub fn new<P: Program + ?Sized>(program: &P) -> Self {
+        let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
         let mut runner = Runner {
-            messages: program.checks.iter().map(|c| c.message.clone()).collect(),
-            steps: program.steps().map(|s| s.name.clone()).collect(),
-            intermediates: program
-                .intermediate_steps()
+            messages: program.checks().iter().map(|c| c.message.clone()).collect(),
+            steps: steps.iter().map(|s| s.name.clone()).collect(),
+            intermediates: steps
+                .iter()
+                .filter(|s| !program.is_result(&s.name))
                 .map(|s| s.name.clone())
                 .collect(),
             dropping: Vec::new(),
@@ -277,15 +334,15 @@ pub trait Backend {
 
 /// Run `program` on `backend`: [`Runner`]'s protocol, binding each plan's
 /// reads with [`Backend::table_schema`].
-pub fn run<B: Backend>(
+pub fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
-    program: &BackwardProgram,
+    program: &P,
 ) -> Result<(), RunError<B::Error>> {
     let mut runner = Runner::new(program);
     let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     while let Some(action) = runner.next() {
         let plan = match &action {
-            Action::Check(i) => &program.checks[*i].plan,
+            Action::Check(i) => &program.checks()[*i].plan,
             Action::Materialize(i) => &program.step(*i).plan,
             Action::Drop(name) => {
                 schemas.remove(name);

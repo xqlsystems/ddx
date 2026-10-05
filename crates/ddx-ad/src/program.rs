@@ -136,6 +136,68 @@ impl BackwardProgram {
     }
 }
 
+/// A `wrt` table's tangent: the table the caller registers before a
+/// [`ForwardProgram`] runs.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TangentTable {
+    /// The `wrt` table, as the plan names it.
+    pub table: Vec<String>,
+    /// The name to register the tangent under.
+    pub name: String,
+    /// The columns it must have: the table's dims, then its `wrt` values,
+    /// named as in the table. Each row is a dim tuple and the tangent of each
+    /// value there; one row per dim tuple at most.
+    pub columns: Vec<String>,
+}
+
+/// Where an output column's tangent is.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Tangent {
+    /// The output column, by name.
+    pub column: String,
+    /// The column of the step holding its tangent.
+    pub tangent: String,
+}
+
+/// A relation a [`ForwardProgram`] computes, with its tangent beside it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct JvpOutput {
+    /// The step holding it.
+    pub step: String,
+    /// The step's columns: the relation's own, then the tangents.
+    pub columns: Vec<String>,
+    /// Each column that has a tangent, and where it is.
+    pub tangents: Vec<Tangent>,
+}
+
+/// The steps that compute a query's output and its tangent.
+///
+/// Like a [`BackwardProgram`], a program is data: it is read, not built,
+/// outside this crate.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ForwardProgram {
+    /// One per `wrt` table: the tangents to register before the program
+    /// runs.
+    pub tangent_tables: Vec<TangentTable>,
+    /// Plans that must return no rows, run before the steps: that each
+    /// `wrt` table's dims identify its rows, and that each tangent table has
+    /// one row per dim tuple.
+    pub checks: Vec<Check>,
+    /// The steps, in order.
+    pub steps: Vec<Step>,
+    /// The query's output, or a program's value, and its tangent.
+    pub output: JvpOutput,
+    /// For [`jvp_of_program`](crate::jvp_of_program): each of the program's gradients, and its
+    /// tangent. Of a [`grad`](crate::grad) program along `v`, that is the
+    /// Hessian-vector product `H·v`, shaped like the gradient. Empty for
+    /// [`jvp`](crate::jvp).
+    pub gradients: Vec<JvpOutput>,
+}
+
 /// A plan that must return no rows (see [`BackwardProgram::checks`]).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -222,8 +284,16 @@ impl Options {
     }
 
     fn forward(&self, plan: &Plan, wrt: &[ColumnRef]) -> Result<Forward> {
+        match &self.namespace {
+            None => Forward::new(plan, wrt),
+            Some(_) => Forward::in_namespace(plan, wrt, self.namespace_or_new()?),
+        }
+    }
+
+    /// The namespace to write under: the caller's, checked, or a fresh one.
+    pub(crate) fn namespace_or_new(&self) -> Result<String> {
         let Some(ns) = &self.namespace else {
-            return Forward::new(plan, wrt);
+            return Ok(crate::forward::new_namespace());
         };
         let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
         if !ns.starts_with("__ddx_") || !ns.ends_with('_') || !ns.chars().all(allowed) {
@@ -232,7 +302,25 @@ impl Options {
                  lower-case ASCII letters, digits and `_`"
             )));
         }
-        Forward::in_namespace(plan, wrt, ns.clone())
+        Ok(ns.clone())
+    }
+
+    /// Refuse [`Options::restrict`] for a program that cannot honour it:
+    /// set and ignored, it would compute what the caller asked not to, or
+    /// read as a restriction that was applied.
+    pub(crate) fn refuse_restrict(&self, what: &str) -> Result<()> {
+        if self.restrict.is_empty() {
+            return Ok(());
+        }
+        Err(AdError::InvalidOptions(format!(
+            "{what} computes every row's tangent; Options::restrict applies only to grad and \
+             vjp"
+        )))
+    }
+
+    /// The `ddx-core` engine to differentiate scalar expressions with.
+    pub(crate) fn ddx_or_default(&self) -> Ddx {
+        self.ddx.clone().unwrap_or_default()
     }
 }
 
@@ -241,11 +329,15 @@ fn cotangent_name(namespace: &str, n: usize) -> String {
 }
 
 /// Table `i`'s gradient step: numbered, so it is unique whatever the table is
-/// called, with the table's last name part after it, for a reader: lower
-/// case and ASCII, since an engine folds the unquoted name a step is
-/// registered under.
-fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
-    let readable: String = table
+/// called, with the table's last name part after it, for a reader.
+pub(crate) fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
+    format!("{namespace}grad_{i}_{}", readable(table))
+}
+
+/// A table's last name part, lower case and ASCII, since an engine folds the
+/// unquoted name a step is registered under.
+pub(crate) fn readable(table: &[String]) -> String {
+    table
         .last()
         .map(String::as_str)
         .unwrap_or("")
@@ -257,8 +349,7 @@ fn gradient_name(namespace: &str, i: usize, table: &[String]) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("{namespace}grad_{i}_{readable}")
+        .collect()
 }
 
 /// The gradient of the loss `plan` computes with respect to the `wrt`
@@ -437,7 +528,7 @@ fn build(
         checks: f
             .tables
             .iter()
-            .map(|table| dims_check(&mut t, table))
+            .map(|table| dims_check(&mut t.ext, table))
             .chain(cotangent_check)
             .collect(),
         cotangent,
@@ -896,9 +987,9 @@ fn set_nullable(ty: &mut substrait::proto::Type) {
 /// The check that table's dims identify its rows: the dim tuples that occur
 /// more than once. Must return no rows.
 /// The key tuples of `rel` (its columns `keys`) that more than one row has.
-fn repeated_keys(t: &mut Transposer, rel: Rel, keys: &[usize]) -> Rel {
-    let count = t.ext.anchor("count");
-    let gt = t.ext.anchor("gt");
+pub(crate) fn repeated_keys(ext: &mut Extensions, rel: Rel, keys: &[usize]) -> Rel {
+    let count = ext.anchor("count");
+    let gt = ext.anchor("gt");
     let k = keys.len();
     let grouped = aggregate(
         rel,
@@ -917,7 +1008,7 @@ fn repeated_keys(t: &mut Transposer, rel: Rel, keys: &[usize]) -> Rel {
 fn cotangent_check(t: &mut Transposer, f: &Forward, names: &[String], keys: usize) -> Check {
     let table = format!("{}cotangent", f.namespace);
     let keys: Vec<usize> = (0..keys).collect();
-    let repeated = repeated_keys(t, read_step(&table, names.to_vec()), &keys);
+    let repeated = repeated_keys(&mut t.ext, read_step(&table, names.to_vec()), &keys);
     Check {
         plan: plan(repeated, names[..keys.len()].to_vec(), &t.ext),
         message: format!(
@@ -928,9 +1019,9 @@ fn cotangent_check(t: &mut Transposer, f: &Forward, names: &[String], keys: usiz
     }
 }
 
-fn dims_check(t: &mut Transposer, table: &Table) -> Check {
+pub(crate) fn dims_check(ext: &mut Extensions, table: &Table) -> Check {
     let repeated = repeated_keys(
-        t,
+        ext,
         read_table(table.names.clone(), table.schema.clone()),
         &table.dims,
     );
@@ -940,7 +1031,7 @@ fn dims_check(t: &mut Transposer, table: &Table) -> Check {
         .map(|&d| table.columns()[d].clone())
         .collect();
     Check {
-        plan: plan(repeated, names.clone(), &t.ext),
+        plan: plan(repeated, names.clone(), ext),
         message: format!(
             "table `{}` has rows that share their dims ({}), so their gradients cannot be \
              told apart; ddx takes the columns not named in wrt as the table's dims, and \
