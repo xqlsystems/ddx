@@ -56,3 +56,64 @@ pub async fn substrait_of(
     };
     *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state()).unwrap()
 }
+
+/// The relations of `plan` that carry an emit and are not projections: none
+/// in a plan ddx writes. DuckDB's consumer ignores an emit on a join,
+/// filter, sort, fetch, cross join or set, and returns the leading columns
+/// with no error, so ddx narrows anything but a projection with a
+/// projection over it.
+pub fn emits_off_projections(plan: &ddx_ad::substrait::proto::Plan) -> Vec<&'static str> {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::Rel;
+    fn has_emit(c: &Option<ddx_ad::substrait::proto::RelCommon>) -> bool {
+        use ddx_ad::substrait::proto::rel_common::EmitKind;
+        matches!(
+            c.as_ref().and_then(|c| c.emit_kind.as_ref()),
+            Some(EmitKind::Emit(_))
+        )
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<&Rel> = plan
+        .relations
+        .iter()
+        .filter_map(|r| match &r.rel_type {
+            Some(PlanRelType::Root(root)) => root.input.as_ref(),
+            Some(PlanRelType::Rel(r)) => Some(r),
+            None => None,
+        })
+        .collect();
+    while let Some(r) = stack.pop() {
+        let (name, common, inputs): (&'static str, _, Vec<&Rel>) = match &r.rel_type {
+            Some(RelType::Project(p)) => ("project", &None, p.input.iter().map(|b| &**b).collect()),
+            Some(RelType::Filter(f)) => {
+                ("filter", &f.common, f.input.iter().map(|b| &**b).collect())
+            }
+            Some(RelType::Sort(s)) => ("sort", &s.common, s.input.iter().map(|b| &**b).collect()),
+            Some(RelType::Fetch(f)) => ("fetch", &f.common, f.input.iter().map(|b| &**b).collect()),
+            Some(RelType::Aggregate(a)) => (
+                "aggregate",
+                &a.common,
+                a.input.iter().map(|b| &**b).collect(),
+            ),
+            Some(RelType::Join(j)) => (
+                "join",
+                &j.common,
+                j.left.iter().chain(j.right.iter()).map(|b| &**b).collect(),
+            ),
+            Some(RelType::Cross(c)) => (
+                "cross",
+                &c.common,
+                c.left.iter().chain(c.right.iter()).map(|b| &**b).collect(),
+            ),
+            Some(RelType::Set(s)) => ("set", &s.common, s.inputs.iter().collect()),
+            Some(RelType::Read(rd)) => ("read", &rd.common, Vec::new()),
+            _ => ("other", &None, Vec::new()),
+        };
+        if has_emit(common) {
+            out.push(name);
+        }
+        stack.extend(inputs);
+    }
+    out
+}

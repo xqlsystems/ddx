@@ -330,13 +330,30 @@ fn finish(
         }
         let is_identity =
             mapping.len() == new_direct && mapping.iter().enumerate().all(|(i, &c)| i == c);
-        set_emit(&mut kind, (!is_identity).then_some(mapping));
-        (
+        // An emit only on a projection: DuckDB's consumer ignores one on a
+        // join, filter, sort, fetch, cross join or set and returns the leading
+        // columns, a wrong answer and no error. Anything else is narrowed by a
+        // projection over it.
+        let rel = if is_identity {
+            set_emit(&mut kind, None);
             Rel {
                 rel_type: Some(kind),
-            },
-            map,
-        )
+            }
+        } else if matches!(kind, RelType::Project(_)) {
+            set_emit(&mut kind, Some(mapping));
+            Rel {
+                rel_type: Some(kind),
+            }
+        } else {
+            set_emit(&mut kind, None);
+            select(
+                Rel {
+                    rel_type: Some(kind),
+                },
+                mapping,
+            )
+        };
+        (rel, map)
     } else {
         (
             Rel {

@@ -24,6 +24,14 @@ pub async fn run(ctx: &SessionContext, program: &BackwardProgram) {
 /// [`ddx_datafusion::ad::run`], with a refusal as its message. A check that
 /// returns a row refuses the program, with the check's message.
 pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<(), String> {
+    for step in program.steps() {
+        let off = super::emits_off_projections(&step.plan);
+        assert!(
+            off.is_empty(),
+            "step {} writes an emit on: {off:?}",
+            step.name
+        );
+    }
     ddx_datafusion::ad::run(ctx, program)
         .await
         .map_err(|e| e.to_string())
