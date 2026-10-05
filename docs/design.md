@@ -1022,7 +1022,10 @@ bug (workaround verified, no upstream-fix dependency).
   `tests/ad_perf.rs`. The choice has to reach `grad`, since a program is built
   before anything runs it: an `Options` switch (window functions on by
   default) that the adapter sets when it builds the program, not a `Backend`
-  capability.
+  capability. `jvp`'s rules use windows too (`tangent.rs`: the `MAX` and
+  `MIN` tangents, and a window `SUM` or `AVG`'s), and the switch must cover
+  them; for forward mode a join back to the group is simpler, since values
+  and tangents are computed in one pass and nothing is recomputed.
 
 ### 4.7 What a backward program costs
 
@@ -1084,6 +1087,77 @@ linear in `ℓ`); and saving a subtree read many times once rather than
 recomputing it.
 
 ---
+
+### 4.8 `jvp`: forward mode
+
+```rust
+pub fn jvp(plan: &Plan, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
+pub fn jvp_of_program(program: &BackwardProgram, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
+```
+
+As in JAX, `jvp` pushes a tangent of the `wrt` columns forward to the
+query's output, `J·t`. A tangent is shaped like its primal: for each `wrt`
+table, a relation with the table's dims and a tangent per `wrt` column,
+which the caller registers under the name the program gives
+(`tangent_tables`) before it runs. A row the tangent table lacks has tangent
+0. The program's output holds the query's own columns and, after them, the
+tangent of each column that depends on a `wrt` column, as `jax.jvp` returns
+both.
+
+Forward mode has no transposes and no tape. Tangents travel beside values
+through the same operators, so a query's `jvp` is one plan: the query
+rewritten so each relation carries, after its own columns, a tangent for
+each of them that depends on `wrt` (its **dual**). Nothing is recomputed and
+nothing saved, so the rules need none of §4.4's machinery for keeping
+recomputations repeatable.
+
+| Primitive | Tangent rule |
+|---|---|
+| map `y = f(x₁, …)` | `ẏ = Σ ∂f/∂xᵢ · ẋᵢ`, the partials from `ddx-core`, as the map transpose uses them |
+| select (filter, join condition, semi-join, `LIMIT`, sort) | the kept rows keep their tangents |
+| join, cross join | each side's tangents come along with its values; an outer join's NULL-extended side has NULL tangents |
+| `SUM`, `AVG` (aggregate or window) | the same function over the tangents |
+| `MAX`, `MIN` (aggregate, or window over a whole partition) | the mean tangent of the rows attaining it, found by a window over the group (`jax.jvp` of `jnp.max`) |
+| `COUNT` | none |
+| `UNION ALL` | each input's tangents, 0 where an input has none |
+| `ddx_stop_gradient(x)` | none |
+| a `wrt` table | its rows joined to the tangent table on its dims |
+
+A column that depends on `wrt` only through conditions (a `CASE` test, a
+comparison, a `COUNT`) has tangent 0, as `jax.jvp` gives and as `grad` gives
+it gradient 0.
+
+A `MAX`'s attaining rows are the ones equal to a window extreme computed
+over the same rows in the same query, so they are compared exactly, with no
+tolerance: values and tangents are computed together, once.
+
+**NULL.** A tangent is NULL where its value is, and a NULL tangent beside a
+value that is not NULL means zero (the value does not move with the NULL it
+was computed past, as in `coalesce(x, 0)`). Aggregates and outputs read
+tangents through that rule, so a `SUM` or `AVG` of tangents skips exactly
+the rows the value's aggregate skips.
+
+**Refusals** follow reverse mode's: a column that depends on `wrt` but has
+no tangent ddx can give (a rank, a `GROUP BY` key computed from a `wrt`
+value, an aggregate with no rule, a running `MAX` over an ordered frame)
+carries its refusal, raised only if something reads its tangent.
+
+**Forward over reverse.** `jvp_of_program` rewrites a program's steps in
+order, each as `jvp` rewrites a query, reading the duals of the steps before
+it. A step's read of an earlier step names the columns it takes, since a
+program's steps are pruned to what they read (§4.7), so a dual's columns are
+matched by name. Of a `grad` program along `v`, the tangent of each gradient
+is the Hessian-vector product `H·v`, shaped like the gradient; the value's
+tangent is the loss's directional derivative. There is no `hvp`: it is
+this composition, as in JAX it is `jax.jvp(jax.grad(f), …)`, and it also
+gives mixed second derivatives (`grad` with respect to one table, a
+tangent through another) and one `grad` program reused across directions.
+
+**Verified** (`crates/ddx-datafusion/tests/jvp.rs`): each rule, row by row,
+against a central finite difference of the same query along the same
+direction; `jvp` of a loss against `⟨∇L, t⟩` from `grad`, and of a relation
+against `vjp` by the dot-product test `⟨J t, c⟩ = ⟨t, Jᵀ c⟩`, to rounding;
+and `H·v` against a finite difference of `grad`'s gradient.
 
 ## 5. Testing & verification
 
@@ -1317,7 +1391,11 @@ breadth, not de-risking.
   table.column, tangent)` in a `FROM` clause, from Rust and Python. *Exit:*
   matches `jax.jvp` on the spikes' fixtures, passes the dot-product test
   ⟨J t, c⟩ = ⟨t, Jᵀ c⟩ against `vjp`, and gives a Hessian-vector product on
-  the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`.
+  the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
+  far:** `ddx_ad::jvp` and `jvp_of_program` (forward over reverse) and their
+  DataFusion adapter (§4.8), checked against finite differences, `grad` and
+  `vjp`. Still to come: `jvp(…)` in SQL, the Python API, and agreement with
+  `jax.jvp` on the spikes' fixtures.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,

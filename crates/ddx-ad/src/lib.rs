@@ -24,6 +24,13 @@
 //! a program writes all start with a prefix unique to the program,
 //! `__ddx_{id}_`; the `__ddx_` prefix is reserved.
 //!
+//! [`jvp`] is the forward-mode half: it rewrites the query so each relation
+//! carries the tangent of its columns beside them, along a tangent of the
+//! `wrt` columns the caller supplies, and returns a [`ForwardProgram`] that runs
+//! by the same protocol. [`jvp_of_program`] does the same for a program's
+//! steps: of a `grad` program, that is forward over reverse, a
+//! Hessian-vector product beside each gradient.
+//!
 //! The modules that read and write plans (`forward`, `emit`, `expr`,
 //! `relation`) are public only with the `internals` feature, for this
 //! workspace's tests: they are not part of the API, and a field renamed in
@@ -75,10 +82,12 @@ macro_rules! internal {
 mod elementwise;
 mod error;
 mod functions;
+mod jvp;
 mod program;
 mod prune;
 mod run;
 pub mod sql;
+mod tangent;
 mod transpose;
 internal! {
     mod emit;
@@ -90,11 +99,13 @@ internal! {
 pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
+pub use jvp::{jvp, jvp_of_program, jvp_of_program_with, jvp_with};
 pub use program::{
-    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, Gradient, Options, Step,
+    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, ForwardProgram, Gradient,
+    JvpOutput, Options, Step, Tangent, TangentTable,
 };
 pub use relation::ColumnRef;
-pub use run::{run, Action, Backend, RunError, Runner};
+pub use run::{run, Action, Backend, Program, RunError, Runner};
 pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
 #[cfg(feature = "internals")]
 #[doc(hidden)]
