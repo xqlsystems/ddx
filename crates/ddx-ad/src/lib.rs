@@ -111,7 +111,7 @@ pub use program::{
     Step,
 };
 pub use relation::ColumnRef;
-pub use run::{run, Action, Backend, Program, RunError, Runner};
+pub use run::{run, run_verified, Action, Backend, Program, RunError, Runner, Verified};
 pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]
