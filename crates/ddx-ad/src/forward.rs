@@ -363,6 +363,7 @@ impl Forward {
             saved: Vec::new(),
             by_encoding: HashMap::new(),
             seen: BTreeSet::new(),
+            reads: HashMap::new(),
         };
         let output = b.lower(root)?;
         b.check_every_wrt_was_read()?;
@@ -490,6 +491,9 @@ struct Builder<'a> {
     by_encoding: HashMap<Vec<u8>, usize>,
     /// Every table name the plan reads, for the error when a `wrt` names none.
     seen: BTreeSet<String>,
+    /// [`Builder::reads_wrt`]'s answers, by relation: the plan is borrowed for
+    /// the whole read, so its relations stay put.
+    reads: HashMap<*const Rel, bool>,
 }
 
 impl Builder<'_> {
@@ -1058,37 +1062,61 @@ impl Builder<'_> {
     /// read along the way. Conservatively true for a subquery inside an
     /// expression, which lowering then refuses rather than treats as constant.
     fn reads_wrt(&mut self, rel: &Rel) -> Result<bool> {
-        let mut found = false;
-        let mut stack = vec![rel];
-        while let Some(r) = stack.pop() {
-            let Some(kind) = &r.rel_type else { continue };
-            match kind {
-                RelType::Read(read) => {
-                    if let Some(ReadType::NamedTable(t)) = &read.read_type {
-                        self.seen.insert(t.names.join("."));
-                        found |= self.wrt.iter().any(|w| table_matches(&w.table, &t.names));
-                    }
+        // Each relation's answer is remembered, so the plan is walked once in
+        // all: `lower` asks at every level, and walking the subtree each time
+        // made reading a plan quadratic in its depth.
+        let key = rel as *const Rel;
+        if let Some(&found) = self.reads.get(&key) {
+            return Ok(found);
+        }
+        // Post-order: a relation's answer once its inputs' are known.
+        let mut stack: Vec<(&Rel, bool)> = vec![(rel, false)];
+        while let Some((r, ready)) = stack.pop() {
+            let k = r as *const Rel;
+            if self.reads.contains_key(&k) {
+                continue;
+            }
+            let Some(kind) = &r.rel_type else {
+                self.reads.insert(k, false);
+                continue;
+            };
+            if let RelType::Read(read) = kind {
+                let mut found = false;
+                if let Some(ReadType::NamedTable(t)) = &read.read_type {
+                    self.seen.insert(t.names.join("."));
+                    found = self.wrt.iter().any(|w| table_matches(&w.table, &t.names));
                 }
-                _ => {
-                    // A subquery inside an expression: an uncorrelated scalar
-                    // one is read like any other input; anything else is
-                    // conservatively assumed to read a wrt table, so lowering
-                    // refuses it rather than treating it as constant.
-                    for e in rel_expressions(kind) {
-                        let mut subqueries = Vec::new();
-                        collect_subqueries(e, &mut subqueries);
-                        for sq in subqueries {
-                            match uncorrelated_scalar(sq) {
-                                Some(inner) => stack.push(inner),
-                                None => found = true,
-                            }
-                        }
+                self.reads.insert(k, found);
+                continue;
+            }
+            // A subquery inside an expression: an uncorrelated scalar one is
+            // read like any other input; anything else is conservatively
+            // assumed to read a wrt table, so lowering refuses it rather than
+            // treating it as constant.
+            let mut below: Vec<&Rel> = rel_inputs(kind);
+            let mut correlated = false;
+            for e in rel_expressions(kind) {
+                let mut subqueries = Vec::new();
+                collect_subqueries(e, &mut subqueries);
+                for sq in subqueries {
+                    match uncorrelated_scalar(sq) {
+                        Some(inner) => below.push(inner),
+                        None => correlated = true,
                     }
-                    stack.extend(rel_inputs(kind));
                 }
             }
+            if ready {
+                let found = correlated
+                    || below
+                        .iter()
+                        .any(|b| self.reads.get(&(*b as *const Rel)) == Some(&true));
+                self.reads.insert(k, found);
+            } else {
+                stack.push((r, true));
+                stack.extend(below.into_iter().map(|b| (b, false)));
+            }
         }
-        Ok(found)
+        Ok(self.reads[&key])
     }
 
     fn check_every_wrt_was_read(&self) -> Result<()> {
