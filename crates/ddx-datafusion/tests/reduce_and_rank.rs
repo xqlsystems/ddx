@@ -521,6 +521,51 @@ async fn a_limit_must_break_ties_by_the_dims_it_cuts() {
 }
 
 #[tokio::test]
+async fn an_exact_window_over_each_whole_partition_needs_no_ties_broken() {
+    // MAX(val) OVER (PARTITION BY g) is the same however a partition's rows
+    // are ordered, so recomputing it for the backward pass gives the same
+    // value, and it needs no ORDER BY to break ties; the window jvp writes
+    // for a MAX's tangent is one, which vjp of a jvp program reads. A SUM
+    // can round differently from run to run, so it is still refused. (In a
+    // CTE: DataFusion's producer writes a window inside an aggregate's
+    // argument, which its consumer cannot plan.)
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE wp (i BIGINT, g BIGINT, val DOUBLE) AS \
+         VALUES (0, 0, 1.0), (1, 0, 3.0), (2, 1, 2.0), (3, 1, 2.5)",
+    )
+    .await;
+    let got = gradient_of(
+        &ctx,
+        "WITH m AS (SELECT val, MAX(val) OVER (PARTITION BY g) AS mx FROM wp) \
+         SELECT SUM(CASE WHEN val = mx THEN val * val ELSE val END) AS l FROM m",
+        "wp",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 6.0],
+            vec![2.0, 1.0, 1.0],
+            vec![3.0, 1.0, 5.0]
+        ]
+    );
+    let why = refusal(
+        &ctx,
+        "WITH m AS (SELECT val, SUM(val) OVER (PARTITION BY g) AS s FROM wp) \
+         SELECT SUM(CASE WHEN val > s / 2 THEN val ELSE 0 END) AS l FROM m",
+        "wp",
+    )
+    .await;
+    assert!(
+        why.as_deref().is_some_and(|m| m.contains("ties")),
+        "{why:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_ranking_over_constant_data_in_a_recomputed_region_is_refused() {
     // From #93's mutation testing: constant subtrees are recomputed in each
     // backward step, and ddx has no dims to show a ranking inside one is

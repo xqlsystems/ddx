@@ -39,7 +39,7 @@
 //! - **A table with capitals has no gradient in SQL.** `ad::sql` reads a
 //!   gradient step back under a quoted name DataFusion lowercased when it
 //!   was registered. *Fixed in #74:* a step's name is lower case.
-//! - **A CASE over integer data, in an unoptimized plan.** `grad_plan`
+//! - **A CASE over integer data, in an unoptimized plan.** `grad`
 //!   accepts any `LogicalPlan`, a DataFrame's included; a CASE choosing
 //!   between integer columns on a varied condition is accepted, and its
 //!   backward step then holds values of a type its schema does not declare.
@@ -176,7 +176,7 @@ async fn a_null_loss_sends_no_gradient() {
 
 #[tokio::test]
 async fn an_unoptimized_case_over_integer_data_runs() {
-    // grad_plan takes any LogicalPlan, a DataFrame's included. In this
+    // grad takes any LogicalPlan, a DataFrame's included. In this
     // unoptimized one a CASE picks between integer data on a condition that
     // depends on b.val: it has no derivative with respect to b (the branches
     // are constant), so the gradient is 0. ddx accepts it, then its backward
@@ -192,7 +192,9 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let sql = "SELECT SUM(CASE WHEN b.val > 0 THEN a.v ELSE 0.5 * a.v END) AS loss \
                FROM (SELECT CAST(val * 10 AS BIGINT) AS v FROM m) a CROSS JOIN b";
     let plan = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
-    let program = ad::grad_plan(&ctx, &plan, &[ColumnRef::new("b", "val")]).unwrap();
+    let program = ad::grad(&ctx, &plan, &[ColumnRef::new("b", "val")])
+        .await
+        .unwrap();
     ad::run(&ctx, &program).await.unwrap();
 }
 

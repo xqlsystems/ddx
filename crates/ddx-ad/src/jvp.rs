@@ -29,14 +29,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use substrait::proto::{NamedStruct, Plan};
 
+use crate::compose::{Differentiable, Parts, Subject};
 use crate::emit::{plan as plan_of, project_emit, read_step};
 use crate::error::{AdError, Result};
 use crate::expr::field;
 use crate::forward::{check_every_wrt_was_read, inline_references, root_of, wrt_table};
 use crate::functions::{Extensions, Functions};
-use crate::program::{
-    dims_check, readable, repeated_keys, BackwardProgram, Check, ForwardProgram, Options, Step,
-};
+use crate::program::{dims_check, readable, repeated_keys, Check, ForwardProgram, Options, Step};
 use crate::prune::prune_plan;
 use crate::relation::{table_matches, ColumnRef, Table};
 use crate::tables::{InputTable, Of, OutputTable, Tangent};
@@ -47,36 +46,19 @@ fn tangent_name(namespace: &str, i: usize, table: &[String]) -> String {
     format!("{namespace}tangent_{i}_{}", readable(table))
 }
 
-/// The column holding column `c`'s tangent.
-fn tangent_column(c: usize) -> String {
-    format!("__ddx_tangent_{c}")
-}
-
-mod sealed {
-    pub trait Sealed {}
-    impl Sealed for substrait::proto::Plan {}
-    impl Sealed for crate::program::BackwardProgram {}
-}
-
-/// What [`jvp`] pushes a tangent through: a query's [`Plan`], or a program
-/// (a [`BackwardProgram`]), whose steps are rewritten in order.
-///
-/// Sealed: these are the two things ddx differentiates forward.
-pub trait Differentiable: sealed::Sealed {
-    #[doc(hidden)]
-    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram>;
-}
-
-impl Differentiable for Plan {
-    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
-        jvp_of_query(self, wrt, options)
+/// The column holding column `c`'s tangent, `__ddx_tangent_{c}`, unless
+/// one of `taken` is called that (a column of a `jvp` program's step, whose
+/// tangent `jvp` of the program takes again): then `__ddx_tangent_{c}_{n}`
+/// for the first `n` that is free.
+fn tangent_column(c: usize, taken: &[String]) -> String {
+    let name = format!("__ddx_tangent_{c}");
+    if !taken.contains(&name) {
+        return name;
     }
-}
-
-impl Differentiable for BackwardProgram {
-    fn forward_program(&self, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
-        jvp_of_steps(self, wrt, options)
-    }
+    (2..)
+        .map(|n| format!("{name}_{n}"))
+        .find(|n| !taken.contains(n))
+        .expect("a free name")
 }
 
 /// The Jacobian-vector product of `of`, a query's [`Plan`] or a program,
@@ -86,17 +68,17 @@ impl Differentiable for BackwardProgram {
 /// Of a query, the program computes the query's output and, beside it, the
 /// output's tangent.
 ///
-/// Of a program, each step is rewritten as a query is, and reads the
-/// rewritten steps before it, so every intermediate relation of the program
-/// carries its tangent. Of a [`grad`](crate::grad) program, that is forward
-/// over reverse: the tangent of each gradient along `v` is the
+/// Of a program of either kind, each step is rewritten as a query is, and
+/// reads the rewritten steps before it, so every intermediate relation of the
+/// program carries its tangent. Of a [`grad`](crate::grad) program, that is
+/// forward over reverse: the tangent of each gradient along `v` is the
 /// Hessian-vector product `H·v` ([`ForwardProgram::gradients`]), and the
 /// value's tangent is the loss's directional derivative. There is no `hvp`:
 /// `H·v` is `jvp(&grad(&plan, wrt)?, wrt)`, as in JAX it is
 /// `jax.jvp(jax.grad(f), …)`, and one `grad` program serves every direction
-/// (conjugate gradient runs it once per direction). A [`vjp`](crate::vjp)
-/// program's cotangent is constant: register it, as for the program itself,
-/// as the program's input table ([`BackwardProgram::inputs`]).
+/// (conjugate gradient runs it once per direction). The program's own input
+/// tables (a [`vjp`](crate::vjp) program's cotangent, a `jvp` program's
+/// tangent) are constant, and come first in [`ForwardProgram::inputs`].
 pub fn jvp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
     jvp_with(of, wrt, &Options::new())
 }
@@ -110,7 +92,10 @@ pub fn jvp_with<D: Differentiable + ?Sized>(
     options: &Options,
 ) -> Result<ForwardProgram> {
     options.refuse_restrict("jvp")?;
-    of.forward_program(wrt, options)
+    match of.subject() {
+        Subject::Query(plan) => jvp_of_query(plan, wrt, options),
+        Subject::Program(parts) => jvp_of_steps(&parts, wrt, options),
+    }
 }
 
 /// [`jvp`] of a query.
@@ -118,7 +103,9 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
     let mut sources = Sources::new(wrt, &namespace)?;
-    let mut dp = dual_plan(plan, &ddx, &mut sources)?;
+    let functions = Functions::from_plan(plan)?;
+    let ext = Extensions::new(&functions);
+    let mut dp = dual_plan(plan, &ddx, &functions, ext, &mut sources)?;
     sources.check_every_wrt_was_read()?;
     let name = format!("{namespace}jvp");
     let value = output_of(&name, Of::Output, &dp)?;
@@ -140,17 +127,11 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
     })
 }
 
-/// [`jvp`] of a program's steps.
-fn jvp_of_steps(
-    program: &BackwardProgram,
-    wrt: &[ColumnRef],
-    options: &Options,
-) -> Result<ForwardProgram> {
+/// [`jvp`] of a program's steps, of either kind.
+fn jvp_of_steps(parts: &Parts, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
-    let old = program.value.step.strip_suffix("value").ok_or_else(|| {
-        AdError::Internal(format!("a program's value step `{}`", program.value.step))
-    })?;
+    let old = parts.namespace()?;
     let rename = |name: &str| -> Result<String> {
         name.strip_prefix(old)
             .map(|rest| format!("{namespace}{rest}"))
@@ -159,18 +140,22 @@ fn jvp_of_steps(
             })
     };
     let mut sources = Sources::new(wrt, &namespace)?;
+    // One set of declarations across the steps, so an anchor names one
+    // function in all of them, as in every program, and a program built
+    // from this one can read them together.
+    let functions = Functions::union(parts.plans())?;
+    let mut ext = Extensions::new(&functions);
     let mut steps = Vec::new();
     // Only the value's and the gradients' tangents are outputs, refused if
     // one is; an intermediate step's refused tangent matters only if a
     // later step reads it, which refuses then.
-    let wanted: HashMap<&str, &Of> = std::iter::once(&program.value)
-        .chain(&program.gradients)
+    let wanted: HashMap<&str, &Of> = std::iter::once(parts.value)
+        .chain(parts.gradients)
         .map(|o| (o.step.as_str(), &o.of))
         .collect();
     let mut outputs: HashMap<String, OutputTable> = HashMap::new();
-    let mut ext = None;
-    for step in program.steps() {
-        let mut dp = dual_plan(&step.plan, &ddx, &mut sources)?;
+    for step in &parts.steps {
+        let mut dp = dual_plan(&step.plan, &ddx, &functions, ext, &mut sources)?;
         let name = rename(&step.name)?;
         if let Some(&of) = wanted.get(step.name.as_str()) {
             outputs.insert(step.name.clone(), output_of(&name, of.clone(), &dp)?);
@@ -183,7 +168,7 @@ fn jvp_of_steps(
             name,
             plan: std::mem::take(&mut dp.plan),
         });
-        ext = Some(dp.ext);
+        ext = dp.ext;
     }
     sources.check_every_wrt_was_read()?;
     let mut take = |name: &str| {
@@ -191,14 +176,14 @@ fn jvp_of_steps(
             .remove(name)
             .ok_or_else(|| AdError::Internal(format!("no step `{name}`")))
     };
-    let value = take(&program.value.step)?;
-    let gradients = program
+    let value = take(&parts.value.step)?;
+    let gradients = parts
         .gradients
         .iter()
         .map(|g| take(&g.step))
         .collect::<Result<Vec<_>>>()?;
-    let mut ext = ext.ok_or_else(|| AdError::Internal("a program with no steps".into()))?;
-    let (inputs, checks) = sources.inputs(&mut ext, program.checks.clone());
+    let (mut inputs, mut checks) = sources.inputs(&mut ext, Vec::new());
+    parts.carry(&mut inputs, &mut checks);
     Ok(ForwardProgram {
         inputs,
         checks,
@@ -222,12 +207,19 @@ struct DualPlan {
 
 /// `plan`'s dual as a plan: its columns, then the tangent of each that has
 /// one, NULL where its value is NULL, named `__ddx_tangent_{c}`.
-fn dual_plan(plan: &Plan, ddx: &ddx_core::Ddx, sources: &mut Sources) -> Result<DualPlan> {
-    let functions = Functions::from_plan(plan)?;
+/// `functions` declares every function `plan` calls, and `ext` starts from
+/// them.
+fn dual_plan(
+    plan: &Plan,
+    ddx: &ddx_core::Ddx,
+    functions: &Functions,
+    ext: Extensions,
+    sources: &mut Sources,
+) -> Result<DualPlan> {
     let (root, names) = root_of(plan)?;
     let root = inline_references(root, &plan.relations)?;
     let mut source = |n: &[String], s: Option<&NamedStruct>| sources.source(n, s);
-    let mut dz = Dualizer::new(ddx, &functions, &mut source);
+    let mut dz = Dualizer::with_extensions(ddx, functions, ext, &mut source);
     let d = dz.dual(&root)?;
     let big = d.rel_width();
     let mut exprs = Vec::new();
@@ -237,7 +229,7 @@ fn dual_plan(plan: &Plan, ddx: &ddx_core::Ddx, sources: &mut Sources) -> Result<
         tans.push(match t {
             Tan::Col(j) => {
                 exprs.push(dz.masked(field(c), field(*j)));
-                columns.push(tangent_column(c));
+                columns.push(tangent_column(c, &columns));
                 Tan::Col(columns.len() - 1)
             }
             other => other.clone(),

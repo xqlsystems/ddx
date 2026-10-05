@@ -823,13 +823,14 @@ cancels exactly, so the loss differentiates correctly without it, and
 stopping it just skips work.
 
 Each backward step ddx emits is **plain** Substrait, with no ddx functions in
-it (differentiating an emitted backward program a second time is open, §4.6).
+it, so a program can be differentiated again (§4.9).
 
 ### 4.4 `grad`, `vjp` and the tape
 
 ```rust
-pub fn grad(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
-pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
+pub fn grad<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
+pub fn vjp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
+// D: a query's Plan, or a program of either kind (§4.9)
 
 pub struct ColumnRef { pub table: String, pub column: String }
 
@@ -1012,10 +1013,13 @@ bug (workaround verified, no upstream-fix dependency).
   refuses.
 - The physical fused-contraction operator for BLAS-class performance on
   dense data (§4.1) — not yet spiked.
-- Higher-order AD over an already-emitted backward query (differentiating
-  ddx's own generated plan a second time) — the backward output reads saved
-  relations by name (§4.4), so differentiating it again would need a way to
-  differentiate through such a read; undecided.
+- Reverse over reverse (`vjp` of a `grad` program, §4.9): refused. A
+  gradient step joins the table's rows to the summed contributions on the
+  table's dims (a `LEFT JOIN`, so a row no gradient reached gets 0) and keeps
+  the table's copy of them; `vjp` needs its output to keep every input's
+  dims, and cannot yet see that the two copies are equal. Behind that, the
+  gradient into the join's NULL-extended side needs a rule. The other orders
+  work.
 - The DuckDB Substrait extension is community-maintained, not core, as of
   1.5.4 — an ongoing-maintenance signal to watch, separate from the
   correctness bug already found and worked around.
@@ -1104,10 +1108,10 @@ recomputing it.
 
 ```rust
 pub fn jvp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
-// D: a query's Plan, or a BackwardProgram (forward over reverse)
+// D: a query's Plan, or a program of either kind (§4.9)
 
 pub struct ForwardProgram {
-    pub inputs: Vec<InputTable>,      // one tangent per wrt table
+    pub inputs: Vec<InputTable>,      // a program's own inputs, then one tangent per wrt table
     pub checks: Vec<Check>,
     pub steps: Vec<Step>,
     pub value: OutputTable,           // the output, with its tangents
@@ -1178,6 +1182,60 @@ against a central finite difference of the same query along the same
 direction; `jvp` of a loss against `⟨∇L, t⟩` from `grad`, and of a relation
 against `vjp` by the dot-product test `⟨J t, c⟩ = ⟨t, Jᵀ c⟩`, to rounding;
 and `H·v` against a finite difference of `grad`'s gradient.
+
+### 4.9 Composition
+
+`grad`, `vjp` and `jvp` each take a query's plan or a program of either
+kind (`Differentiable`, sealed), so they compose as JAX's do:
+
+| | is | gives |
+|---|---|---|
+| `jvp(&grad(&q, w)?, w)` | forward over reverse | `H·v` beside each gradient |
+| `vjp(&jvp(&q, w)?, w)`, cotangent `(0, 1)` | reverse over forward | `H·v` as the gradient |
+| `jvp(&jvp(&q, w)?, w)` | forward over forward | `uᵀ H v`, the tangent of the tangent |
+| `vjp(&grad(&q, w)?, w)` | reverse over reverse | refused for now (§4.6) |
+
+A program's **output** is its gradients if it has any, and otherwise its
+value: what the function it computes returns.
+
+- **`jvp` of a program** rewrites its steps in order (§4.8), so every
+  intermediate table carries its tangent, and so does every output.
+- **`grad` and `vjp` of a program** differentiate its one output table (a
+  program with several gradients is refused: build it with respect to one
+  table). Reverse mode needs the whole computation in one plan, to save what
+  the backward pass reads and to send each cotangent back the way it came, so
+  the output step's plan is written out with each read of an earlier step
+  replaced by that step's plan. That plan is pruned before it is
+  differentiated, which drops whatever of the program the output does not
+  need (another gradient's steps, a column no later step reads), and the
+  program it gives is pruned again, as every program is (§4.7). A step read
+  twice is written out twice; reverse mode saves each distinct aggregate once
+  whichever way it is written.
+
+Either way the new program reads the old one's input tables (its tangent,
+its cotangent) as constants, which the caller registers as before: they come
+first in the new program's `inputs`, and the old program's checks first in
+its `checks`. Every plan of a program declares its functions from one set of
+declarations that only grows, so a function anchor means the same function
+in every step, and steps can be read together. A `jvp` program's tangent of
+a column named `__ddx_tangent_{c}` is `__ddx_tangent_{c}_{n}` when that name
+is taken; `OutputTable::tangents` says where each tangent is.
+
+Reverse over forward runs within 0.96–1.13× of forward over reverse
+(nn.py's loss and a contraction, at two sizes each), with plans up to 1.5×
+larger. Composing needed two changes elsewhere: reverse mode no longer
+refuses an exact aggregate over each whole partition (`MAX(x) OVER
+(PARTITION BY g)`, which `jvp` writes for a `MAX`'s tangent) as a ranking
+whose ties could break differently, since no order changes its value; and
+reverse mode lowers a chain of single-input relations with a loop, since a
+`jvp` step is about twice as deep as its query.
+
+**Verified** (`crates/ddx-datafusion/tests/compose.rs`): reverse over forward
+against forward over reverse, row by row, and forward over forward against
+`uᵀ (H v)`, on an elementwise loss, a layer of three tables, and a `MAX` and
+a mean; refusals for reverse over reverse, for a program with two outputs,
+and for `grad` of a value with its tangent; and `vjp` of a `jvp` program on
+a 2 MB stack.
 
 ## 5. Testing & verification
 
@@ -1414,7 +1472,7 @@ breadth, not de-risking.
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
-  `vjp`. Still to come: `jvp(…)` in SQL, the Python API, and agreement with
+  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9). Still to come: `jvp(…)` in SQL, the Python API, and agreement with
   `jax.jvp` on the spikes' fixtures.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
@@ -1456,11 +1514,10 @@ breadth, not de-risking.
   shifts the balance toward accelerating it, since the bound path makes
   those guards unnecessary by construction. Decide if that tripwire fires,
   not preemptively.
-- **Higher-order AD over an emitted v2 backward plan** — genuinely
-  undecided (§4.6). M4 now has a working single-order emitter to reason about
-  concretely: its backward steps read saved relations by name, so
-  differentiating it again would need a way to differentiate through a read
-  of a materialized step.
+- **Higher-order AD over an emitted v2 backward plan** — decided (§4.9): a
+  read of a materialized step is differentiated through by writing the step's
+  plan in its place, and `jvp` reads each step's dual. Reverse over reverse
+  waits on reverse mode learning that join keys are equal (§4.6).
 - **Query-level `jvp`** (#86). The review that reshaped v2 asked for `grad`,
   `vjp` and `jvp` as the whole SQL surface. `grad` and `vjp` exist; forward
   mode through joins and aggregates does not yet. It is the easier half: with

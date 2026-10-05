@@ -321,7 +321,7 @@ async fn not_in_over_a_nullable_subquery_is_refused_not_differentiated_wrongly()
     assert!(refused(err));
     // Unoptimized, NOT IN is still a subquery expression: refused too.
     let lp = ctx.sql(loss).await.unwrap().into_unoptimized_plan();
-    assert!(refused(ad::grad_plan(&ctx, &lp, &wrt).unwrap_err()));
+    assert!(refused(ad::grad(&ctx, &lp, &wrt).await.unwrap_err()));
     // In SQL, the same.
     let stmt = format!("WITH loss AS ({loss}) SELECT * FROM grad(loss, ny.val)");
     assert!(refused(ad::sql(&ctx, &stmt).await.unwrap_err()));

@@ -49,6 +49,7 @@ use ddx_core::Ddx;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::{Expression, Plan, Rel};
 
+use crate::compose::{output_plan, Differentiable, Subject};
 use crate::emit::{aggregate, join, plan, project_emit, read_step, read_table, select, union_all};
 use crate::error::{AdError, Result};
 use crate::expr::{call, cast, field, if_then, lit_f64, map_fields, null_f64};
@@ -81,7 +82,8 @@ pub struct BackwardProgram {
     /// The tables the caller registers before the program runs: for
     /// [`vjp`], the output's cotangent, its keys the output's dims and its
     /// values the output's values that depend on `wrt`, named as in the
-    /// output. None for [`grad`], which seeds 1 itself.
+    /// output. None for [`grad`], which seeds 1 itself. Of a program, that
+    /// program's own inputs come first.
     pub inputs: Vec<InputTable>,
     /// Plans that must return no rows, run before the steps. Each checks a
     /// promise the plan cannot show (that a `wrt` table's dims identify its
@@ -132,7 +134,8 @@ impl BackwardProgram {
 #[non_exhaustive]
 pub struct ForwardProgram {
     /// One per `wrt` table, [`Of::Table`]: its tangent, keyed by the table's
-    /// dims, to register before the program runs.
+    /// dims, to register before the program runs. Of a program, that
+    /// program's own inputs come first.
     pub inputs: Vec<InputTable>,
     /// Plans that must return no rows, run before the steps: that each
     /// `wrt` table's dims identify its rows, and that each tangent table has
@@ -142,10 +145,10 @@ pub struct ForwardProgram {
     pub steps: Vec<Step>,
     /// The query's output, or a program's value, with its tangents.
     pub value: OutputTable,
-    /// For [`jvp`](crate::jvp) of a program: each of the program's gradients, with its
-    /// tangents. Of a [`grad`](crate::grad) program along `v`, those are the
-    /// Hessian-vector product `H·v`, shaped like the gradient. Empty for
-    /// [`jvp`](crate::jvp).
+    /// For [`jvp`](crate::jvp) of a program: each of the program's
+    /// gradients, with its tangents. Of a [`grad`](crate::grad) program along
+    /// `v`, those are the Hessian-vector product `H·v`, shaped like the
+    /// gradient. Empty for [`jvp`](crate::jvp) of a query.
     pub gradients: Vec<OutputTable>,
 }
 
@@ -303,43 +306,62 @@ pub(crate) fn readable(table: &[String]) -> String {
         .collect()
 }
 
-/// The gradient of the loss `plan` computes with respect to the `wrt`
-/// columns. The query must return one row and one column.
+/// The gradient of the loss `of` computes with respect to the `wrt`
+/// columns: of a query's [`Plan`], which must return one row and one
+/// column; of a program, of its one output table, which must too (see
+/// [`Differentiable`]).
 ///
 /// Each [`ColumnRef`] names a table as [`ColumnRef::table`] describes, and a
 /// column of it, case-insensitively.
-pub fn grad(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    grad_with(plan, wrt, &Options::new())
+pub fn grad<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
+    grad_with(of, wrt, &Options::new())
 }
 
 /// [`grad`] with [`Options`]: a caller's `ddx-core` engine, for custom scalar
 /// rules, or a fixed namespace.
-pub fn grad_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<BackwardProgram> {
-    let f = options.forward(plan, wrt)?;
-    build(
-        options.ddx.as_ref().unwrap_or(&Ddx::new()),
-        &f,
-        Seed::One,
-        &options.restrict,
-    )
+pub fn grad_with<D: Differentiable + ?Sized>(
+    of: &D,
+    wrt: &[ColumnRef],
+    options: &Options,
+) -> Result<BackwardProgram> {
+    backward(of, wrt, options, Seed::One)
 }
 
-/// The vector-Jacobian product of the query `plan` with respect to the `wrt`
+/// The vector-Jacobian product of `of`, a query's [`Plan`] or a program's
+/// one output table (see [`Differentiable`]), with respect to the `wrt`
 /// columns: the program pulls back the cotangent the caller registers as its
-/// one input table ([`BackwardProgram::inputs`]).
-pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    vjp_with(plan, wrt, &Options::new())
+/// input table ([`BackwardProgram::inputs`]).
+pub fn vjp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
+    vjp_with(of, wrt, &Options::new())
 }
 
 /// [`vjp`] with [`Options`].
-pub fn vjp_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<BackwardProgram> {
-    let f = options.forward(plan, wrt)?;
-    build(
-        options.ddx.as_ref().unwrap_or(&Ddx::new()),
-        &f,
-        Seed::Cotangent,
-        &options.restrict,
-    )
+pub fn vjp_with<D: Differentiable + ?Sized>(
+    of: &D,
+    wrt: &[ColumnRef],
+    options: &Options,
+) -> Result<BackwardProgram> {
+    backward(of, wrt, options, Seed::Cotangent)
+}
+
+/// [`grad`] or [`vjp`] of `of`: of a program, of its output's plan, written
+/// out (see [`crate::compose`]).
+fn backward<D: Differentiable + ?Sized>(
+    of: &D,
+    wrt: &[ColumnRef],
+    options: &Options,
+    seed: Seed,
+) -> Result<BackwardProgram> {
+    let ddx = options.ddx_or_default();
+    match of.subject() {
+        Subject::Query(plan) => build(&ddx, &options.forward(plan, wrt)?, seed, &options.restrict),
+        Subject::Program(parts) => {
+            let plan = output_plan(&parts)?;
+            let mut program = build(&ddx, &options.forward(&plan, wrt)?, seed, &options.restrict)?;
+            parts.carry(&mut program.inputs, &mut program.checks);
+            Ok(program)
+        }
+    }
 }
 
 enum Seed {

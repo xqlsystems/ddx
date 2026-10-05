@@ -17,6 +17,9 @@
 //! | [`jvp`](crate::jvp) | each `wrt` table's tangent | the value, with its tangents |
 //! | [`jvp`](crate::jvp) of a `grad` program | each `wrt` table's tangent | the value and each gradient, with their tangents (`H·v`) |
 //!
+//! Of a program (see [`Differentiable`](crate::Differentiable)), the
+//! program's own input tables come first.
+//!
 //! A cotangent and a tangent are shaped like what they are of, as in JAX:
 //! its keys, then a number for each of its values, under the values' names.
 

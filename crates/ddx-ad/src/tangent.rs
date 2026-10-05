@@ -131,15 +131,19 @@ pub(crate) struct Dualizer<'a> {
 }
 
 impl<'a> Dualizer<'a> {
-    pub fn new(
+    /// A dualizer of plans that call `functions`, declaring what it writes
+    /// in `ext`, which starts from `functions`' declarations: one `ext` across a program's steps keeps
+    /// an anchor naming one function in all of them.
+    pub fn with_extensions(
         ddx: &'a ddx_core::Ddx,
         functions: &'a Functions,
+        ext: Extensions,
         source: &'a mut SourceFn<'a>,
     ) -> Self {
         Dualizer {
             functions,
             ew: Elementwise::new(ddx, functions),
-            ext: Extensions::new(functions),
+            ext,
             source,
         }
     }

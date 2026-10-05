@@ -539,7 +539,9 @@ impl<'a> Transposer<'a> {
             }
         }
         for (c, def) in region.defs.iter().enumerate() {
-            let Def::Window { keys } = def else { continue };
+            let Def::Window { keys: Some(keys) } = def else {
+                continue;
+            };
             for s in &region.slots {
                 let Some(offset) = s.offset.filter(|&o| o < c) else {
                     continue;
