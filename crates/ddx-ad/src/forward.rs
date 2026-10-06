@@ -362,6 +362,7 @@ impl Forward {
             tables: Vec::new(),
             saved: Vec::new(),
             by_encoding: HashMap::new(),
+            encodings: HashMap::new(),
             seen: BTreeSet::new(),
             reads: HashMap::new(),
         };
@@ -494,15 +495,18 @@ struct Builder<'a> {
     /// [`Builder::reads_wrt`]'s answers, by relation: the plan is borrowed for
     /// the whole read, so its relations stay put.
     reads: HashMap<*const Rel, bool>,
+    /// The encodings [`Builder::lower`] computed for aggregates it walked
+    /// into, for [`Builder::read_saved`] to use rather than compute again.
+    encodings: HashMap<*const AggregateRel, Vec<u8>>,
 }
 
 impl Builder<'_> {
     /// Lower `rel`. A chain of single-input relations (projections,
-    /// filters, sorts, limits) can be hundreds deep, a `jvp` program's step
-    /// most of all, deeper than a 2 MB worker stack allows for recursion; so
-    /// the chain is walked down with a loop, and each relation lowered over
-    /// its input's region on the way back up. Only joins and aggregates
-    /// recurse.
+    /// filters, sorts, limits, aggregates) can be hundreds deep, a `jvp`
+    /// program's step most of all, deeper than a 2 MB worker stack allows
+    /// for recursion; so the chain is walked down with a loop, and each
+    /// relation lowered over its input's region on the way back up. Only
+    /// joins recurse. An aggregate already saved is not walked into again.
     fn lower(&mut self, rel: &Rel) -> Result<Region> {
         let mut chain = Vec::new();
         let mut cur = rel;
@@ -515,6 +519,14 @@ impl Builder<'_> {
                 Some(RelType::Filter(f)) => &f.input,
                 Some(RelType::Sort(so)) => &so.input,
                 Some(RelType::Fetch(fe)) => &fe.input,
+                Some(RelType::Aggregate(a)) => {
+                    let encoding = a.encode_to_vec();
+                    if self.by_encoding.contains_key(&encoding) {
+                        break self.lower_one(cur, None)?;
+                    }
+                    self.encodings.insert(std::ptr::from_ref(&**a), encoding);
+                    &a.input
+                }
                 _ => break self.lower_one(cur, None)?,
             };
             chain.push(cur);
@@ -535,10 +547,16 @@ impl Builder<'_> {
             .as_ref()
             .ok_or_else(|| AdError::InvalidPlan("an empty relation".into()))?;
         let mut below = below;
-        let mut lowered = |this: &mut Self, r: &Option<Box<Rel>>| match below.take() {
-            Some(s) => Ok(s),
-            None => this.lower(input(r)?),
-        };
+        fn lowered(
+            this: &mut Builder<'_>,
+            below: &mut Option<Region>,
+            r: &Option<Box<Rel>>,
+        ) -> Result<Region> {
+            match below.take() {
+                Some(s) => Ok(s),
+                None => this.lower(input(r)?),
+            }
+        }
         // A subquery in this relation's expressions is carried through as a
         // constant (see `uncorrelated_scalar`). That is only right if it reads
         // no wrt table; otherwise the gradient through it would be dropped.
@@ -571,12 +589,12 @@ impl Builder<'_> {
                 (s, direct, r.common.as_ref())
             }
             RelType::Project(p) => {
-                let below = lowered(self, &p.input)?;
+                let below = lowered(self, &mut below, &p.input)?;
                 let (s, direct) = self.project(below, p)?;
                 (s, direct, p.common.as_ref())
             }
             RelType::Filter(f) => {
-                let mut s = lowered(self, &f.input)?;
+                let mut s = lowered(self, &mut below, &f.input)?;
                 let cond = remap(f.condition.as_deref(), &s.outputs)?;
                 s.rel = match cond {
                     Some(c) => emit::filter(s.rel, c),
@@ -586,7 +604,7 @@ impl Builder<'_> {
                 (s, direct, f.common.as_ref())
             }
             RelType::Sort(so) => {
-                let mut s = lowered(self, &so.input)?;
+                let mut s = lowered(self, &mut below, &so.input)?;
                 let mut sorts = so.sorts.clone();
                 for sf in sorts.iter_mut() {
                     if let Some(e) = sf.expr.as_mut() {
@@ -605,7 +623,7 @@ impl Builder<'_> {
                 (s, direct, so.common.as_ref())
             }
             RelType::Fetch(fe) => {
-                let mut s = lowered(self, &fe.input)?;
+                let mut s = lowered(self, &mut below, &fe.input)?;
                 let below = input(&fe.input)?;
                 // The rows a LIMIT keeps are the first in its input's order:
                 // an ORDER BY's keys, or none.
@@ -642,7 +660,7 @@ impl Builder<'_> {
                 (s, direct, c.common.as_ref())
             }
             RelType::Aggregate(a) => {
-                let n = self.read_saved(a)?;
+                let n = self.read_saved(a, below.take())?;
                 let width = self.saved[n].outputs.len();
                 let mut s = empty(emit::read_step(
                     &saved_name(&self.namespace, n),
@@ -924,18 +942,26 @@ impl Builder<'_> {
     /// would also be correct, by linearity, but would do the work twice. This
     /// is the other half of the save-or-recompute policy the module docs
     /// describe.
-    fn read_saved(&mut self, a: &AggregateRel) -> Result<usize> {
-        let encoding = a.encode_to_vec();
+    /// Save aggregate `a`, once: lowered over `below`, its input's region,
+    /// if [`Builder::lower`] walked down to it.
+    fn read_saved(&mut self, a: &AggregateRel, below: Option<Region>) -> Result<usize> {
+        let encoding = match self.encodings.remove(&std::ptr::from_ref(a)) {
+            Some(e) => e,
+            None => a.encode_to_vec(),
+        };
         if let Some(&n) = self.by_encoding.get(&encoding) {
             return Ok(n);
         }
-        let n = self.read_aggregate(a)?;
+        let n = self.read_aggregate(a, below)?;
         self.by_encoding.insert(encoding, n);
         Ok(n)
     }
 
-    fn read_aggregate(&mut self, a: &AggregateRel) -> Result<usize> {
-        let mut input = self.lower(input(&a.input)?)?;
+    fn read_aggregate(&mut self, a: &AggregateRel, below: Option<Region>) -> Result<usize> {
+        let mut input = match below {
+            Some(s) => s,
+            None => self.lower(input(&a.input)?)?,
+        };
         let outputs = &input.outputs;
         let groupings = grouping_expressions(a)?
             .into_iter()

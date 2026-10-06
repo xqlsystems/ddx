@@ -43,7 +43,6 @@ use crate::error::{AdError, Result};
 use crate::forward::{inline_references, rel_inputs_mut, root_of};
 use crate::functions::{Extensions, Functions};
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step};
-use crate::prune::prune_plan;
 use crate::tables::{InputTable, OutputTable};
 
 pub(crate) mod sealed {
@@ -192,7 +191,7 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
                 step.name
             )));
         }
-        prune_plan(&mut plan);
+        crate::opt::plan(&mut plan);
         return Ok(plan);
     }
     Err(AdError::Internal(format!(
