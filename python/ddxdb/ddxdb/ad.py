@@ -260,13 +260,13 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     same loss query share one run of its program, so a training step can update
     each parameter table with its own statement and pay for the backward pass
     once."""
-    # Which programs to run and how each statement reads their gradients are
-    # ddx_ad::sql::Statements'; running them and planning the result are
-    # DataFusion's.
+    # Which programs to run, building them, and how each statement reads
+    # their gradients are ddx_ad::Statements'; planning queries, running the
+    # programs and planning the result are DataFusion's.
     planned = _Statements(list(statements), dialect)
     ran: list[BackwardProgram] = []
     try:
-        for query, wrt, restrict in planned.jobs():
+        for j, (query, restrict) in enumerate(planned.jobs()):
             # Only the gradient rows the statements read, where they say.
             selects = []
             for table, predicate in restrict:
@@ -275,7 +275,7 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
                 except Exception:  # every row is computed, which is always right
                     pass
             _refuse_not_in(query)
-            program = grad_plan(Serde.serialize_bytes(query, ctx), wrt, restrict=selects)
+            program = planned.build(j, Serde.serialize_bytes(query, ctx), selects)
             ran.append(program)
             run(ctx, program)
         return [ctx.sql(s) for s in planned.rewrite(ran)]

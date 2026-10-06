@@ -50,7 +50,7 @@ use crate::emit::{bind_reads, unbound_reads};
 use crate::error::AdError;
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step};
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for crate::program::BackwardProgram {}
     impl Sealed for crate::program::ForwardProgram {}

@@ -712,7 +712,7 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
     // Found by ad_sql_text.rs, 18 panics in 3000 valid spellings. The first
     // call's `/* ( */` keeps call_span counting past its real end, into the
     // second call, until a `)` in a later comment closes it; the second
-    // call starts inside the first's span, and GradCalls::rewrite slices the
+    // call starts inside the first's span, and the rewrite slices the
     // statement from a later byte to an earlier one: a panic in the
     // library, on valid SQL.
     let ctx = SessionContext::new();

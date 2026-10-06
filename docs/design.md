@@ -1194,6 +1194,44 @@ direction; `jvp` of a loss against `⟨∇L, t⟩` from `grad`, and of a relatio
 against `vjp` by the dot-product test `⟨J t, c⟩ = ⟨t, Jᵀ c⟩`, to rounding;
 and `H·v` against a finite difference of `grad`'s gradient.
 
+**In SQL.** `grad`, `vjp` and `jvp` are each a call in a `FROM` clause, of
+one shape: a CTE `f`, the columns of one table, and, for `vjp` and `jvp`,
+the relation holding the cotangent or tangent (a CTE of the statement or a
+table). Each is rewritten before the engine sees the statement, as
+`grad(f, table.column)` is (§4.4):
+
+| call | relation |
+|---|---|
+| `grad(f, t.c, …)` | shaped like `t`: its dims and each column's gradient |
+| `vjp(f, t.c, …, cotangent)` | shaped like `t`; `cotangent` is shaped like `f`'s output (its keys, then its values) |
+| `jvp(f, t.c, …, tangent)` | `f`'s columns, then each one's tangent as `{column}_tangent`; `tangent` is shaped like `t` (its dims, then each column's tangent) |
+
+Several tables are several calls, as for `grad`: a tangent, like a
+gradient, is shaped like one table, and tangents along two tables add:
+
+```sql
+WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.val)) AS y
+           FROM x JOIN w ON x.i = w.i JOIN b ON w.o = b.o GROUP BY x.n, w.o),
+     dw AS (SELECT i, o, 0.01 AS val FROM w)
+SELECT j.n, j.o, j.y, j.y_tangent + k.y_tangent AS dy       -- db: a table
+FROM jvp(h, w.val, dw) j JOIN jvp(h, b.val, db) k ON j.n = k.n AND j.o = k.o
+```
+
+`ddx_ad::Statements` finds the calls of several statements and plans
+one job per program: per objective for `grad`, per objective and cotangent
+for `vjp` (so statements updating different tables pay for one backward
+pass), per call for `jvp`. The adapter builds each job's program
+(`Job::build`), registers its cotangent or tangent as the program's input
+table (`Job::seeds`), runs it, and splices a read of what each call needs in
+its place (`Statements::rewrite`). A `jvp` relation names a tangent
+`{column}_tangent_{n}` if `f` has a column of that name. The scalar
+`jvp(expr, x, dx)` of v1 is an expression in a select list; the rewriter
+tells them apart by where they appear. *Verified* (`tests/sql_jvp.rs`,
+`tests/sql_vjp.rs`): against the closed forms, against the programs row by
+row, two `jvp` calls against one program along both tangents, `vjp` along 1
+against `grad`, a `vjp`'s `WHERE` restricting its rows, and nothing left
+behind.
+
 ### 4.9 Composition
 
 `grad`, `vjp` and `jvp` each take a query's plan or a program of either
@@ -1483,8 +1521,9 @@ breadth, not de-risking.
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
-  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9). Still to come: `jvp(…)` in SQL, the Python API, and agreement with
-  `jax.jvp` on the spikes' fixtures.
+  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); `vjp(…)`
+  and `jvp(…)` in SQL from Rust (§4.8). Still to come: the Python API (and these calls in
+  SQL from it), and agreement with `jax.jvp` on the spikes' fixtures.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
@@ -1964,7 +2003,7 @@ on DuckDB, found that what is neither calculus nor engine had been written
 once per adapter: the run protocol (checks first, steps in order, drop the
 intermediates on success and failure) and `sql_all`'s planning (one program
 per loss query, each call's dims and value columns). Both now live in
-`ddx-ad` (`Runner` and `Backend`; `sql::Statements`), and the DataFusion and
+`ddx-ad` (`Runner` and `Backend`; `Statements`), and the DataFusion and
 Python adapters drive them. The spike also found two producer gaps, now
 closed (a `ReferenceRel` was not followed; a cast of a literal was opaque, so
 `x ** 2` from an unoptimized plan was refused), and that emitted plans

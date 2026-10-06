@@ -15,6 +15,17 @@
 //! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
 //! ```
 //!
+//! `vjp(f, table.column, cotangent)` is the same for any CTE `f`, pulled back
+//! along `cotangent`, a relation shaped like `f`'s output; and `jvp(f,
+//! table.column, tangent)` is a CTE's output with, beside each column, its
+//! tangent along `tangent`, a relation shaped like the table:
+//!
+//! ```sql
+//! WITH loss AS (SELECT SUM(val * val) AS l FROM w),
+//!      v AS (SELECT i, 1.0 AS val FROM w)
+//! SELECT l, l_tangent FROM jvp(loss, w.val, v)
+//! ```
+//!
 //! Underneath, [`grad`] turns a query whose result is one number into a
 //! [`BackwardProgram`], and [`run`] runs it: every step is materialized as a
 //! table on the context, the number ends up in [`BackwardProgram::value`], and
@@ -306,16 +317,24 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
     Ok(())
 }
 
-/// Run the SQL statement `sql`, in which `grad(f, table.column, …)` in a
-/// `FROM` clause is the gradient of the number the CTE `f` computes (see
-/// [`ddx_ad::sql`]): a relation shaped like `table`, its dims and the named
-/// columns' gradients.
+/// Run the SQL statement `sql`, in which, in a `FROM` clause (see
+/// [`ddx_ad::Statements`]):
 ///
-/// Each objective's [`grad`] program runs first, once, however many calls use it,
-/// and each call is replaced by a query over the gradient it needs before the
-/// statement is planned. A statement with no such call is planned as it is.
-/// The programs' tables are dropped once the statement is planned; the
-/// returned DataFrame keeps what it reads.
+/// - `grad(f, table.column, …)` is the gradient of the number the CTE `f`
+///   computes: a relation shaped like `table`, its dims and the named
+///   columns' gradients;
+/// - `vjp(f, table.column, …, cotangent)` is the same for any `f`, pulled
+///   back along `cotangent`, a CTE or table shaped like `f`'s output;
+/// - `jvp(f, table.column, …, tangent)` is `f`'s output and, beside each
+///   column that has one, its tangent along `tangent`, a CTE or table shaped
+///   like `table`, as `{column}_tangent`.
+///
+/// Each program runs first, once, however many calls use it (one per
+/// objective for `grad`, per objective and cotangent for `vjp`, per call for
+/// `jvp`), and each call is replaced by a query over what it needs before
+/// the statement is planned. A statement with no such call is planned as it
+/// is. The programs' tables and the cotangents and tangents are dropped once
+/// the statement is planned; the returned DataFrame keeps what it reads.
 ///
 /// An objective defined in a `WITH RECURSIVE` clause is refused, so a training loop
 /// cannot yet be written as one recursive statement (design.md §5). This is
@@ -326,36 +345,41 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
     Ok(frames.pop().expect("one statement in, one frame out"))
 }
 
-/// [`sql`] for several statements at once. Statements whose `grad` calls
-/// differentiate the same objective share one run of its program, so a
-/// training step can update each parameter table with its own statement and
-/// pay for the backward pass once.
+/// [`sql`] for several statements at once. Statements whose calls need the
+/// same program share one run of it, so a training step can update each
+/// parameter table with its own statement and pay for the backward pass
+/// once.
 pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<DataFrame>> {
-    // Which programs to run, and how each statement reads their gradients,
-    // are ddx_ad::Statements'; running them and planning the result are
-    // DataFusion's.
+    // Which programs to run, and how each statement reads them, are
+    // ddx_ad::Statements'; planning queries, registering tables and running
+    // the programs are DataFusion's.
     let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
-    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
+    let mut ran: Vec<ddx_ad::JobProgram> = Vec::with_capacity(planned.jobs().len());
     let result = async {
         for job in planned.jobs() {
             // Only the gradient rows the statements read, where they say.
             let mut options = ddx_ad::Options::new();
-            for (table, predicate) in &job.restrict {
+            for (table, predicate) in job.restrict() {
                 if let Some(select) = restriction_plan(ctx, table, predicate).await {
                     options = options.restrict(table.clone(), select);
                 }
             }
-            let lp = ctx.sql(&job.query).await?.into_optimized_plan()?;
-            refuse_what_substrait_loses(&lp)?;
-            let program =
-                ddx_ad::grad_with(&*to_substrait_plan(&lp, &ctx.state())?, &job.wrt, &options)
-                    .map_err(to_df_err)?;
+            let lp = ctx.sql(job.query()).await?.into_optimized_plan()?;
+            let program = job
+                .build(&*substrait_of(ctx, &lp)?, &options)
+                .map_err(to_df_err)?;
             ran.push(program);
-            run(ctx, ran.last().expect("just pushed")).await?;
+            let program = ran.last().expect("just pushed");
+            for (name, seed) in job.seeds(program.inputs()).map_err(to_df_err)? {
+                register(ctx, &name, ctx.sql(&seed).await?).await?;
+            }
+            run(ctx, program).await?;
         }
-        let rewritten = planned
-            .rewrite(&ran.iter().collect::<Vec<_>>())
-            .map_err(to_df_err)?;
+        let programs: Vec<&dyn ddx_ad::Differentiable> = ran
+            .iter()
+            .map(|p| p as &dyn ddx_ad::Differentiable)
+            .collect();
+        let rewritten = planned.rewrite(&programs).map_err(to_df_err)?;
         let mut frames = Vec::with_capacity(rewritten.len());
         for sql in &rewritten {
             frames.push(ctx.sql(sql).await?);
@@ -363,12 +387,23 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
         Ok(frames)
     }
     .await;
-    // A planned DataFrame holds the tables it reads, so the programs' tables
-    // can leave the catalog now.
+    // A planned DataFrame holds the tables it reads, so the programs'
+    // tables, and the inputs registered here, can leave the catalog now.
     for program in &ran {
         release(ctx, program)?;
+        for input in program.inputs() {
+            ctx.deregister_table(input.name.as_str())?;
+        }
     }
     result
+}
+
+/// Register `df`'s rows as the table `name`, materialized.
+async fn register(ctx: &SessionContext, name: &str, df: DataFrame) -> Result<()> {
+    let schema = Arc::new(df.schema().as_arrow().clone());
+    let batches = df.collect().await?;
+    ctx.register_table(name, Arc::new(MemTable::try_new(schema, vec![batches])?))?;
+    Ok(())
 }
 
 /// Run `program`: its [`checks`](BackwardProgram::checks), then every step,

@@ -6,7 +6,7 @@
 //!
 //! `ad::sql` rewrites the statement's text before DataFusion sees it: it finds
 //! each `grad(…)` call and splices a relation in its place by byte span
-//! (`ddx_ad::sql::GradCalls`). Everything in that path is about text, so the
+//! (in `ddx_ad::Statements`). Everything in that path is about text, so the
 //! fuzz is about text too. It takes valid statements and puts, between their
 //! tokens, what SQL allows there: whitespace of every kind, CRLF, block and
 //! line comments (some holding parentheses, quotes or multibyte characters),

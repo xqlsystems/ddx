@@ -297,6 +297,20 @@ def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in():
         _Statements([stmt], "klingon")
 
 
+def test_vjp_and_jvp_in_sql_are_refused_from_python_for_now(ad, ctx):
+    # vjp(f, …) and jvp(f, …) in a FROM clause run from Rust (ddx-datafusion's
+    # ad::sql); the Python API to run them comes later, and until then they
+    # are refused, not passed to the engine as unknown table functions.
+    stmt = (
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w), v AS (SELECT i, 1.0 AS val FROM w) "
+        "SELECT * FROM jvp(loss, w.val, v)"
+    )
+    for call in ["jvp(", "vjp("]:
+        with pytest.raises(ddxdb.UnsupportedExpression, match="vjp.*jvp"):
+            ad.sql(ctx, stmt.replace("jvp(", call))
+    assert not ddx_tables(ctx)
+
+
 def test_not_in_over_a_subquery_is_refused(ad, ctx):
     # DataFusion's Substrait producer drops NOT IN's NULL semantics (#104):
     # refused, rather than differentiated as a different query.

@@ -587,8 +587,9 @@ fn run(backend: Bound<'_, PyAny>, program: PyRef<'_, BackwardProgram>) -> PyResu
     })
 }
 
-/// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
-/// together.
+/// `ddx_ad::Statements`: several statements' `grad` calls, planned
+/// together, their programs built by ddx-ad. A `vjp` or `jvp` call is
+/// refused for now.
 #[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Statements")]
 struct Statements(ddx_ad::Statements);
 
@@ -606,29 +607,52 @@ impl Statements {
         ))
     }
 
-    /// The objectives to differentiate, as `(query, [(table, column), …],
-    /// [(table, predicate), …])`: the last, the rows of a table's gradient
-    /// every statement reads, where they say (`ddx_ad::sql::Job::restrict`).
-    #[allow(clippy::type_complexity)]
-    fn jobs(&self) -> Vec<(String, Vec<(String, String)>, Vec<(String, String)>)> {
+    /// The programs to build and run, in order, as `(query, [(table,
+    /// predicate), …])` (`ddx_ad::Job`): the query to plan, and the rows of
+    /// a table's gradient every statement reads, where they say.
+    fn jobs(&self) -> Vec<(String, Vec<(String, String)>)> {
         self.0
             .jobs()
             .iter()
-            .map(|j| {
-                let wrt = j
-                    .wrt
-                    .iter()
-                    .map(|w| (w.table.clone(), w.column.clone()))
-                    .collect();
-                (j.query.clone(), wrt, j.restrict.clone())
-            })
+            .map(|j| (j.query().to_string(), j.restrict().to_vec()))
             .collect()
+    }
+
+    /// Job `job`'s program, from `plan`, the engine's serialized plan of its
+    /// query, with `restrict` as for `grad_plan` (`ddx_ad::Job::build`).
+    #[pyo3(signature = (job, plan, restrict = None))]
+    fn build(
+        &self,
+        job: usize,
+        plan: &[u8],
+        restrict: Option<Vec<(String, Vec<u8>)>>,
+    ) -> PyResult<BackwardProgram> {
+        let job = self
+            .0
+            .jobs()
+            .get(job)
+            .ok_or_else(|| PyValueError::new_err(format!("there is no job {job}")))?;
+        match job
+            .build(&decode(plan)?, &options(None, restrict)?)
+            .map_err(ad_to_py_err)?
+        {
+            ddx_ad::JobProgram::Backward(p) if p.inputs.is_empty() => Ok(BackwardProgram(p)),
+            _ => Err(ad_to_py_err(ddx_ad::AdError::NotImplemented(
+                "vjp(f, …) and jvp(f, …) in SQL from Python; they run from Rust, in \
+                 ddx-datafusion's ad::sql"
+                    .into(),
+            ))),
+        }
     }
 
     /// Each statement over the gradients `programs` (one per job, run)
     /// computed.
     fn rewrite(&self, programs: Vec<PyRef<'_, BackwardProgram>>) -> PyResult<Vec<String>> {
         let programs: Vec<&ddx_ad::BackwardProgram> = programs.iter().map(|p| &p.0).collect();
+        let programs: Vec<&dyn ddx_ad::Differentiable> = programs
+            .iter()
+            .map(|p| *p as &dyn ddx_ad::Differentiable)
+            .collect();
         self.0.rewrite(&programs).map_err(ad_to_py_err)
     }
 }
