@@ -2,8 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""ddx v2 against `jax.grad`: the MLP, attention and max-pool fixtures, and
-nn.py's network.
+"""ddx v2 against `jax.grad` and `jax.jvp`: the MLP, attention and max-pool
+fixtures, and nn.py's network.
 
 Each test builds the fixture of one of the design's spikes
 (`docs/spikes/relational_ad_spike.py`, `attention_ad_spike.py`,
@@ -12,7 +12,9 @@ plain SQL, takes `grad(loss, table.val)` in SQL on DataFusion, and compares
 every gradient entry with `jax.grad` of the same function written in JAX. The
 spikes showed hand-applied transpose rules match JAX to machine precision;
 these show `grad` in SQL does too. The last test does the same for the M4
-example's own network and SQL.
+example's own network and SQL. On the MLP, `jvp(…)` in SQL is checked against
+`jax.jvp`, and Hessian-vector products, forward over reverse and reverse over
+forward, against `jax.jvp(jax.grad(f))`.
 """
 
 from __future__ import annotations
@@ -64,7 +66,10 @@ def gradients(ad, ctx, with_loss: str, tables: dict[str, np.ndarray]) -> dict[st
     return out
 
 
-def test_mlp_matches_jax_grad(env):
+def mlp(env):
+    """relational_ad_spike.py's MLP: its tables registered on the context, its
+    forward pass and loss as SQL CTEs (`z2` the logits, `loss` the loss), and
+    the same functions in JAX."""
     jax, ad, ctx = env
     jnp = jax.numpy
     # relational_ad_spike.py's fixture, drawn in the same order.
@@ -84,7 +89,7 @@ def test_mlp_matches_jax_grad(env):
     ctx.register_record_batches("y", [labels.to_batches()])
     params = {"w0": W0, "b0": b0, "w1": W1, "b1": b1, "w2": W2, "b2": b2}
     for name, value in params.items():
-        register(ctx, name, value, ("inp", "out") if name.startswith("w") else ("out",))
+        register(ctx, name, value, dims_of(name))
 
     # One layer: contract with the weights, then add the bias with a join, as
     # nn.py does. The loss is nn.py's: a max-shifted softmax and -AVG(ln p).
@@ -108,13 +113,42 @@ def test_mlp_matches_jax_grad(env):
          loss AS (SELECT -AVG(ln(e.e / s.s)) AS loss
                   FROM e JOIN s ON e.sample = s.sample JOIN y ON y.sample = e.sample
                   WHERE e.out = y.label)"""
-    got = gradients(ad, ctx, with_loss, params)
 
-    def jax_loss(W0, b0, W1, b1, W2, b2):
+    def jax_logits(W0, b0, W1, b1, W2, b2):
         a0 = jnp.tanh(jnp.array(x) @ W0 + b0)
         a1 = jnp.tanh(a0 @ W1 + b1)
-        ll = jax.nn.log_softmax(a1 @ W2 + b2)
+        return a1 @ W2 + b2
+
+    def jax_loss(*p):
+        ll = jax.nn.log_softmax(jax_logits(*p))
         return -(ll[jnp.arange(N), jnp.array(y)]).mean()
+
+    return with_loss, params, jax_logits, jax_loss
+
+
+def dims_of(name: str) -> tuple[str, ...]:
+    return ("inp", "out") if name.startswith("w") else ("out",)
+
+
+def directions(params: dict[str, np.ndarray], seed: int) -> dict[str, np.ndarray]:
+    """A tangent for each parameter, shaped like it."""
+    rng = np.random.default_rng(seed)
+    return {name: rng.standard_normal(value.shape) for name, value in params.items()}
+
+
+def dense(table: pa.Table, shape: tuple[int, ...], dims: list[str], column: str) -> np.ndarray:
+    """`column` of `table`, keyed by `dims`, as an array of `shape`."""
+    got = np.full(shape, np.nan)
+    got[tuple(table.column(d).to_numpy() for d in dims)] = table.column(column).to_numpy()
+    assert not np.isnan(got).any(), "a row is missing"
+    return got
+
+
+def test_mlp_matches_jax_grad(env):
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, _, jax_loss = mlp(env)
+    got = gradients(ad, ctx, with_loss, params)
 
     values = list(params.values())
     expected = jax.grad(jax_loss, argnums=tuple(range(6)))(*map(jnp.array, values))
@@ -122,6 +156,79 @@ def test_mlp_matches_jax_grad(env):
     assert abs(loss - float(jax_loss(*map(jnp.array, values)))) < TOLERANCE
     for name, want in zip(params, expected):
         np.testing.assert_allclose(got[name], np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=name)
+
+
+def test_mlp_jvp_in_sql_matches_jax_jvp(env):
+    # The loss and the logits, each with its tangent along every parameter's
+    # tangent at once: one jvp(…) call per relation.
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, jax_logits, jax_loss = mlp(env)
+    tangents = directions(params, 1)
+    for name, value in tangents.items():
+        register(ctx, f"d{name}", value, dims_of(name))
+    args = ", ".join(f"{name}.val, d{name}" for name in params)
+    primals = tuple(map(jnp.array, params.values()))
+    dirs = tuple(map(jnp.array, tangents.values()))
+
+    t = ad.sql(ctx, f"{with_loss} SELECT loss, loss_tangent FROM jvp(loss, {args})").to_arrow_table()
+    value, tangent = jax.jvp(jax_loss, primals, dirs)
+    assert abs(t.column("loss")[0].as_py() - float(value)) < TOLERANCE
+    assert abs(t.column("loss_tangent")[0].as_py() - float(tangent)) < TOLERANCE
+
+    t = ad.sql(ctx, f"{with_loss} SELECT * FROM jvp(z2, {args})").to_arrow_table()
+    value, tangent = jax.jvp(jax_logits, primals, dirs)
+    shape = np.asarray(value).shape
+    np.testing.assert_allclose(dense(t, shape, ["sample", "out"], "z"), np.asarray(value), rtol=0, atol=TOLERANCE)
+    np.testing.assert_allclose(
+        dense(t, shape, ["sample", "out"], "z_tangent"), np.asarray(tangent), rtol=0, atol=TOLERANCE
+    )
+
+
+def register_tangents(ctx, inputs, tangents: dict[str, np.ndarray]) -> None:
+    """Register each of a program's tangent inputs from `tangents`, by the
+    table it is a tangent of."""
+    for input_table in inputs:
+        name = input_table.of[-1]
+        register(ctx, input_table.name, tangents[name], dims_of(name))
+
+
+def test_mlp_hessian_vector_products_match_jax_both_ways(env):
+    # Forward over reverse (jvp of a grad program) and reverse over forward
+    # (vjp of a jvp program, seeded 0 on the loss and 1 on its tangent) both
+    # give H·v; jax.jvp(jax.grad(f)) is the oracle.
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, _, jax_loss = mlp(env)
+    wrt = [(name, "val") for name in params]
+    tangents = directions(params, 2)
+    primals = tuple(map(jnp.array, params.values()))
+    dirs = tuple(map(jnp.array, tangents.values()))
+    grad = jax.grad(jax_loss, argnums=tuple(range(6)))
+    _, expected = jax.jvp(lambda *p: grad(*p), primals, dirs)
+    loss = f"{with_loss} SELECT loss FROM loss"
+
+    hvp = ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)
+    register_tangents(ctx, hvp.inputs, tangents)
+    ad.run(ctx, hvp)
+    for out, (name, want) in zip(hvp.gradients, zip(params, expected)):
+        assert out.of[-1] == name
+        [t] = out.tangents
+        table = ctx.table(out.step).to_arrow_table()
+        got = dense(table, params[name].shape, list(dims_of(name)), t.tangent)
+        np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"jvp(grad) {name}")
+
+    forward = ad.jvp(ctx, loss, wrt)
+    program = ad.vjp(ctx, forward, wrt)
+    *tangent_inputs, cotangent = program.inputs
+    register_tangents(ctx, tangent_inputs, tangents)
+    seed = {c: [0.0 if c == "loss" else 1.0] for c in cotangent.columns}
+    ctx.register_record_batches(cotangent.name, [pa.table(seed).to_batches()])
+    ad.run(ctx, program)
+    for out, (name, want) in zip(program.gradients, zip(params, expected)):
+        table = ctx.table(out.step).to_arrow_table()
+        got = dense(table, params[name].shape, list(dims_of(name)), "val")
+        np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"vjp(jvp) {name}")
 
 
 def test_attention_matches_jax_grad(env):
