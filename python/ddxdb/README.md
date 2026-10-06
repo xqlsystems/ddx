@@ -44,16 +44,25 @@ no engine.
 
 On a plain `SessionContext`, `ddxdb.ad.sql(ctx, statement)` does the same, and
 `ddxdb.ad.sql_all` runs several statements that take `grad` of one loss for
-the price of one backward pass. `ddxdb.ad.grad` and `ddxdb.ad.vjp` give the
-underlying program.
+the price of one backward pass.
+
+## Programs, and how they compose
+
+`ddxdb.ad.grad`, `vjp` and `jvp` give the programs underneath, and each takes
+SQL or a program, so they compose: `ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)`
+gives Hessian-vector products, checked against `jax.jvp(jax.grad(f))`. Both
+kinds of program (`BackwardProgram`, `ForwardProgram`) list the tables you
+register before they run (`inputs`, as `InputTable`s) and the tables they
+leave (`value` and `gradients`, as `OutputTable`s).
 
 ## Other engines
 
 `ddxdb.grad_plan(plan_bytes, wrt)` differentiates the serialized Substrait plan
 an engine's producer writes, and `ddxdb.run(backend, program)` runs the result
 on any object with four methods, `select_all`, `returns_rows`, `materialize`
-and `drop_table` (the `ddxdb.Backend` protocol). Both are ddx-ad's own Rust,
-the same code the Rust adapter runs. Pass `namespace="__ddx_mine_"` to get the
+and `drop_table` (the `ddxdb.Backend` protocol); `vjp_plan` and `jvp_plan`
+are the same for the other two. They are ddx-ad's own Rust, the same code the
+Rust adapter runs. Pass `namespace="__ddx_mine_"` to get the
 same program from the same plan every time.
 
 ## What you can write
