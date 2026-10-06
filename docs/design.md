@@ -933,6 +933,17 @@ repeat), and an adapter runs the checks before the steps and refuses the
 program if one returns a row. Without it, rows sharing dims got their summed
 gradient, and an SGD join then multiplied rows.
 
+A check is a grouped scan of its table on every run, and on a large `wrt`
+table the checks are most of a `jvp`'s run. Each says what it proves (a
+table, and key columns that identify its rows), and a caller running many
+programs against the same tables keeps those facts in a `Verified`:
+`run_verified` skips a check whose fact it holds and records the facts of a
+run that succeeds. Conjugate gradient checks its parameters once and each
+new direction every time; on an 8M-row table that is 712 ms a run against
+1,007. The fact holds only until the table's keys change, which ddx cannot
+watch, so keeping it is the caller's promise: `Verified::forget` a table
+whenever its keys may change. Skipping is opt-in; `run` checks everything.
+
 **Every table a program materializes is named under a prefix fresh to that
 program** (`__ddx_{id}_`), so two programs on one engine never read or
 replace each other's tables, and a user's table is never replaced. An adapter

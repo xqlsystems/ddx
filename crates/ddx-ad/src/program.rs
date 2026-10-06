@@ -160,6 +160,13 @@ pub struct Check {
     pub plan: Plan,
     /// What a returned row means, for the error.
     pub message: String,
+    /// What it proves, when it returns no row: that in the table `table`
+    /// (by its name parts), the columns `keys` identify its rows. A
+    /// [`crate::Verified`] remembers that across runs, so a run can skip a
+    /// check whose table has not changed.
+    pub table: Vec<String>,
+    /// The key columns it proves unique in `table`.
+    pub keys: Vec<String>,
 }
 
 impl Step {
@@ -993,6 +1000,8 @@ fn cotangent_check(t: &mut Transposer, f: &Forward, names: &[String], keys: usiz
     let keys: Vec<usize> = (0..keys).collect();
     let repeated = repeated_keys(&mut t.ext, read_step(&table, names.to_vec()), &keys);
     Check {
+        table: vec![table.clone()],
+        keys: names[..keys.len()].to_vec(),
         plan: plan(repeated, names[..keys.len()].to_vec(), &t.ext),
         message: format!(
             "the cotangent table `{table}` has rows that share their keys ({}); it needs one \
@@ -1014,6 +1023,8 @@ pub(crate) fn dims_check(ext: &mut Extensions, table: &Table) -> Check {
         .map(|&d| table.columns()[d].clone())
         .collect();
     Check {
+        table: table.names.clone(),
+        keys: names.clone(),
         plan: plan(repeated, names.clone(), ext),
         message: format!(
             "table `{}` has rows that share their dims ({}), so their gradients cannot be \

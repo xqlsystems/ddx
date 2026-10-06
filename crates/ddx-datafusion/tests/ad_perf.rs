@@ -604,13 +604,28 @@ async fn perf_checks() {
     })
     .await;
     let run = best(|| async { ad::run(&ctx, &program).await.unwrap() }).await;
+    // As conjugate gradient runs it: p verified once, the tangent forgotten
+    // and checked again on every run.
+    let mut verified = ad::Verified::new();
+    ad::run_verified(&ctx, &program, &mut verified)
+        .await
+        .unwrap();
+    let tangent = program.inputs[0].name.clone();
+    let verified_run = best(|| {
+        verified.forget(&tangent);
+        let mut v = verified.clone();
+        let (ctx, program) = (&ctx, &program);
+        async move { ad::run_verified(ctx, program, &mut v).await.unwrap() }
+    })
+    .await;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "PERFC rows={rows} forward {:.1} ms | checks one by one {:.1} ms | at once {:.1} ms | \
-         jvp run {:.1} ms",
+         jvp run {:.1} ms | run with p verified {:.1} ms",
         ms(forward),
         ms(one_by_one),
         ms(at_once),
-        ms(run)
+        ms(run),
+        ms(verified_run)
     );
 }

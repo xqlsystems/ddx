@@ -91,7 +91,7 @@ use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
 pub use ddx_ad::{
     AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, InputTable, Of, OutputTable,
-    Program, Step, Tangent,
+    Program, Step, Tangent, Verified,
 };
 
 use ddx_ad::Statements;
@@ -384,36 +384,84 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 /// A program depends on the tables' names and schemas, not their values, so
 /// build it once and run it on every training step. One program's runs must
 /// not overlap: they write the same tables. Build a program per concurrent
-/// caller instead.
+/// caller instead. When many runs read tables whose keys do not change, see
+/// [`run_verified`].
 pub async fn run<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
+    run_verified(ctx, program, &mut Verified::new()).await
+}
+
+/// [`run`], skipping each check whose fact `verified` holds, and recording
+/// every check's fact in it once the run has succeeded (see [`Verified`]).
+///
+/// A check is a grouped scan of its table on every run; on a large `wrt`
+/// table, the checks are most of a `jvp`'s run. Keep one [`Verified`] across
+/// the runs that read the same tables, and [`Verified::forget`] a table
+/// whenever its keys may change:
+///
+/// ```no_run
+/// # use datafusion::prelude::SessionContext;
+/// # use ddx_datafusion::ad::{self, ColumnRef, Verified};
+/// # async fn cg(ctx: &SessionContext) -> datafusion::error::Result<()> {
+/// let wrt = [ColumnRef::new("w", "val")];
+/// let grad = ad::grad(ctx, "SELECT SUM(val * val) AS l FROM w", &wrt).await?;
+/// let hvp = ad::jvp(ctx, &grad, &wrt).await?;
+/// let mut verified = Verified::new();
+/// for _ in 0..10 {
+///     // A new direction each iteration, under the same name: forget it, so
+///     // its keys are checked again; w's are checked on the first run only.
+///     let v = &hvp.inputs[0].name;
+///     ctx.sql(&format!("CREATE OR REPLACE TABLE {v} AS SELECT i, 1.0 AS val FROM w"))
+///         .await?
+///         .collect()
+///         .await?;
+///     verified.forget(v);
+///     ad::run_verified(ctx, &hvp, &mut verified).await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Keeping a fact for a table whose keys have changed is the caller's
+/// promise broken: a program its check would refuse runs, and rows that
+/// share keys get their summed gradient.
+pub async fn run_verified<P: Program + ?Sized>(
+    ctx: &SessionContext,
+    program: &P,
+    verified: &mut Verified,
+) -> Result<()> {
     // The order, and what is dropped when, are ddx_ad::Runner's. The checks
     // read no step and none reads another, so they run at once, each a task
     // of its own (polled together on one task, they ran one after another),
     // and the runner is told how each went in its own order: on a large wrt
     // table they are most of a run (the dims of a table, then of its
-    // tangent, each a grouped scan).
+    // tangent, each a grouped scan). Only those `verified` does not vouch for.
+    let mut checked: Vec<Option<Result<bool>>> = Vec::with_capacity(program.checks().len());
     let tasks: Vec<_> = program
         .checks()
         .iter()
         .map(|c| {
-            let (ctx, plan) = (ctx.clone(), c.plan.clone());
-            tokio::spawn(async move { returns_rows(&ctx, &plan).await })
+            (!verified.knows(c)).then(|| {
+                let (ctx, plan) = (ctx.clone(), c.plan.clone());
+                tokio::spawn(async move { returns_rows(&ctx, &plan).await })
+            })
         })
         .collect();
-    let mut checked: Vec<Option<Result<bool>>> = Vec::with_capacity(tasks.len());
     for task in tasks {
-        checked
-            .push(Some(task.await.unwrap_or_else(|e| {
-                Err(DataFusionError::External(Box::new(e)))
-            })));
+        checked.push(match task {
+            Some(t) => Some(
+                t.await
+                    .unwrap_or_else(|e| Err(DataFusionError::External(Box::new(e)))),
+            ),
+            None => None,
+        });
     }
-    let mut runner = ddx_ad::Runner::new(program);
+    let mut runner = ddx_ad::Runner::verified(program, verified);
     while let Some(action) = runner.next() {
         match &action {
             Action::Check(i) => runner.checked(
                 checked[*i]
                     .take()
-                    .expect("the runner asks for each check once"),
+                    .expect("the runner asks for each check it runs once"),
             ),
             Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
             Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
@@ -423,7 +471,9 @@ pub async fn run<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Resu
         RunError::Refused(e) => to_df_err(e),
         RunError::Engine(e) => e,
         other => DataFusionError::Internal(other.to_string()),
-    })
+    })?;
+    verified.record_all(program);
+    Ok(())
 }
 
 /// Run `program`'s checks, failing on the first that returns a row.

@@ -381,6 +381,8 @@ fn tangent_check(ext: &mut Extensions, table: &Table, tt: &InputTable) -> Check 
     let keys: Vec<usize> = (0..k).collect();
     let repeated = repeated_keys(ext, read_step(&tt.name, tt.columns.clone()), &keys);
     Check {
+        table: vec![tt.name.clone()],
+        keys: tt.columns[..k].to_vec(),
         plan: plan_of(repeated, tt.columns[..k].to_vec(), ext),
         message: format!(
             "the tangent table `{}` has rows that share their dims ({}); it needs one row per \
