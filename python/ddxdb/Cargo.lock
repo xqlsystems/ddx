@@ -80,14 +80,14 @@ dependencies = [
 
 [[package]]
 name = "ddx-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "sqlparser",
 ]
 
 [[package]]
 name = "ddxdb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ddx-ad",
  "ddx-core",

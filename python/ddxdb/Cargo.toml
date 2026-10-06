@@ -1,7 +1,7 @@
 [package]
 name = "ddxdb"
 description = "Python bindings for ddx: SQL-portable autograd."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/xqlsystems/ddx"
@@ -28,7 +28,10 @@ ddx-core = { path = "../../crates/ddx-core" }
 # v2. Plans cross the FFI boundary as Substrait protobuf bytes, which prost
 # decodes and encodes.
 ddx-ad = { path = "../../crates/ddx-ad" }
-prost = "0.14"
+# Without protobuf's default limit of 100 nested messages: a plan is two per
+# relation, so a query about 48 relations deep could not be differentiated
+# at all. The plans are the caller's own engine's, not untrusted input.
+prost = { version = "0.14", features = ["no-recursion-limit"] }
 
 # `abi3-py310` builds a single wheel that works on CPython 3.10+ rather than one
 # wheel per interpreter version. The cost is being limited to the stable ABI,

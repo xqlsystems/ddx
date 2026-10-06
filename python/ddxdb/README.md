@@ -172,12 +172,38 @@ the loss does not read raises `UnknownColumn`, and a column that cannot be
 differentiated (not a float, or in a table whose rows do not have unique
 dims) raises `InvalidColumn`. This needs DataFusion.
 
+## Tangents of whole queries: `jvp(f, table.column, tangent)`
+
+Forward mode is `jvp` in a `FROM` clause: a CTE's output with, beside each
+column, its tangent along a tangent you give, a relation shaped like the
+table (its dims, then a tangent under the column's name), as `jax.jvp`
+returns both:
+
+```python
+ctx.sql("""
+WITH h AS (
+  SELECT x.sample, w.out, tanh(SUM(x.val * w.val)) AS val
+  FROM x JOIN w ON x.inp = w.inp GROUP BY x.sample, w.out),
+dw AS (SELECT inp, out, 0.01 AS val FROM w)
+SELECT sample, out, val, val_tangent FROM jvp(h, w.val, dw)
+""")
+```
+
+Several tables' tangents go in one call, each after its columns:
+`jvp(f, w.val, dw, b.val, db)`. As programs, `ddxdb.ad.grad`, `vjp` and `jvp`
+each take SQL or a program, so they compose: `ad.jvp(ctx, ad.grad(ctx, loss,
+wrt), wrt)` gives Hessian-vector products, checked against
+`jax.jvp(jax.grad(f))`. Both kinds of program (`BackwardProgram`,
+`ForwardProgram`) list the tables you register before they run (`inputs`, as
+`InputTable`s) and the tables they leave (`value` and `gradients`, as
+`OutputTable`s).
+
 Another engine needs no DataFusion: `ddxdb.grad_plan(plan_bytes, wrt)`
 differentiates the serialized Substrait plan its producer writes, and
 `ddxdb.run(backend, program)` runs the result on any object with four methods,
 `select_all`, `returns_rows`, `materialize` and `drop_table` (the
-`ddxdb.Backend` protocol). Both are ddx-ad's own Rust, the same code the Rust
-adapter runs. Pass `namespace="__ddx_mine_"` to get the same program from the
+`ddxdb.Backend` protocol); `vjp_plan` and `jvp_plan` are the same for the
+other two. They are ddx-ad's own Rust, the same code the Rust adapter runs. Pass `namespace="__ddx_mine_"` to get the same program from the
 same plan every time.
 
 ## One thing to know

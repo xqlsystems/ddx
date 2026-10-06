@@ -58,12 +58,14 @@ class Context(SessionContext):
         Two kinds of `grad` are understood. In a select list, `grad(expr,
         column)` is a derivative column (v1). In a `FROM` clause, `grad(loss,
         table.column)` is the gradient of the loss a CTE computes, as a relation
-        shaped like the table (see :mod:`ddxdb.ad`).
+        shaped like the table, and `jvp(f, table.column, tangent)` is a CTE's
+        output with each column's tangent beside it (see :mod:`ddxdb.ad`).
 
         A statement with neither is passed through byte-identical and is never
         parsed by ddx, so routing every query through here is free.
         """
-        if not args and not kwargs and _Statements([query], self._ddx_dialect).jobs():
+        planned = None if args or kwargs else _Statements([query], self._ddx_dialect)
+        if planned is not None and (planned.jobs() or planned.jvp_jobs()):
             from . import ad
 
             # ad.sql runs the loss's program, then plans the rewritten

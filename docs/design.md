@@ -1526,8 +1526,11 @@ breadth, not de-risking.
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
   `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); `jvp(…)`
-  in SQL from Rust (§4.8). Still to come: the Python API (and `jvp(…)` in
-  SQL from it), and agreement with `jax.jvp` on the spikes' fixtures.
+  in SQL (§4.8); the Python API (`ddxdb` 0.3: `jvp`, `jvp_plan`,
+  `ForwardProgram`, composition, `jvp(…)` in SQL), checked against `jax.jvp`
+  and, both ways, `jax.jvp(jax.grad(f))` on the MLP fixture. Still to come:
+  a soak oracle for `jvp`, `Verified` from Python, and steps deep enough to
+  pass datafusion-python's decoding limit (§4.7), such as nn.py's `jvp`.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
