@@ -4,7 +4,7 @@ description = "DataFusion adapter for ddx: grad and vjp of a whole query, and gr
 # Versioned independently of ddx-core: the two publish on their own cadence, and
 # an adapter that had to move whenever the engine did would force a release for
 # changes that do not touch it.
-version = "0.1.1"
+version = "0.2.0"
 readme = "README.md"
 keywords = ["sql", "autograd", "differentiation", "datafusion", "dataframe"]
 categories = ["mathematics", "database"]

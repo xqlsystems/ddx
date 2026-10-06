@@ -3,7 +3,7 @@ name = "ddx-ad"
 description = "Query-level reverse-mode AD for ddx (v2): vjp over Substrait plans."
 # Versioned independently, like ddx-core. First published with M4, when
 # ddx-datafusion started depending on it.
-version = "0.1.0"
+version = "0.2.0"
 readme = "README.md"
 keywords = ["sql", "autograd", "differentiation", "substrait", "backpropagation"]
 categories = ["mathematics", "database"]
