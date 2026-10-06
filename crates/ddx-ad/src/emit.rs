@@ -77,6 +77,12 @@ pub fn read_step(name: &str, columns: Vec<String>) -> Rel {
     )
 }
 
+/// Does `emit` pick each of `width` columns once, in order, so it changes
+/// nothing?
+pub(crate) fn is_identity(emit: &[usize], width: usize) -> bool {
+    emit.len() == width && emit.iter().enumerate().all(|(i, &c)| i == c)
+}
+
 /// `input`'s columns followed by `exprs`.
 pub fn project(input: Rel, exprs: Vec<Expression>) -> Rel {
     project_emit(input, exprs, None)

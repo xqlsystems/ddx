@@ -36,7 +36,6 @@ use crate::expr::field;
 use crate::forward::{check_every_wrt_was_read, inline_references, root_of, wrt_table};
 use crate::functions::{Extensions, Functions};
 use crate::program::{dims_check, readable, repeated_keys, Check, ForwardProgram, Options, Step};
-use crate::prune::prune_plan;
 use crate::relation::{table_matches, ColumnRef, Table};
 use crate::tables::{InputTable, Of, OutputTable, Tangent};
 use crate::tangent::{Dualizer, Source, Tan};
@@ -115,13 +114,15 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
         ));
     }
     let (inputs, checks) = sources.inputs(&mut dp.ext, Vec::new());
+    let mut steps = vec![Step {
+        name,
+        plan: dp.plan,
+    }];
+    crate::opt::steps(&mut steps);
     Ok(ForwardProgram {
         inputs,
         checks,
-        steps: vec![Step {
-            name,
-            plan: dp.plan,
-        }],
+        steps,
         value,
         gradients: Vec::new(),
     })
@@ -184,6 +185,7 @@ fn jvp_of_steps(parts: &Parts, wrt: &[ColumnRef], options: &Options) -> Result<F
         .collect::<Result<Vec<_>>>()?;
     let (mut inputs, mut checks) = sources.inputs(&mut ext, Vec::new());
     parts.carry(&mut inputs, &mut checks);
+    crate::opt::steps(&mut steps);
     Ok(ForwardProgram {
         inputs,
         checks,
@@ -238,7 +240,7 @@ fn dual_plan(
     let emit: Vec<usize> = (0..d.width).chain(big..big + exprs.len()).collect();
     let rel = project_emit(d.rel, exprs, Some(emit));
     let mut plan = plan_of(rel, columns.clone(), &dz.ext);
-    prune_plan(&mut plan);
+    crate::opt::plan(&mut plan);
     Ok(DualPlan {
         plan,
         columns,

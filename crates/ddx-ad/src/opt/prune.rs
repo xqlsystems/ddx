@@ -32,7 +32,7 @@ use substrait::proto::{
     Rel, RelCommon, SetRel, SortRel,
 };
 
-use crate::emit::select;
+use crate::emit::{is_identity, select};
 use crate::expr::{fields_of, map_fields};
 use crate::forward::width;
 
@@ -89,8 +89,7 @@ pub(crate) fn prune_to(rel: Rel, keep: &[usize]) -> Rel {
         return select_exactly(rel, keep);
     };
     let out: Vec<usize> = keep.iter().map(|&c| map[c].expect("needed")).collect();
-    let w = Some(map.iter().flatten().count());
-    if Some(out.len()) == w && out.iter().enumerate().all(|(i, &c)| i == c) {
+    if is_identity(&out, map.iter().flatten().count()) {
         pruned
     } else {
         select(pruned, out)
@@ -98,11 +97,9 @@ pub(crate) fn prune_to(rel: Rel, keep: &[usize]) -> Rel {
 }
 
 fn select_exactly(rel: Rel, keep: &[usize]) -> Rel {
-    let w = width(&rel).ok();
-    if Some(keep.len()) == w && keep.iter().enumerate().all(|(i, &c)| i == c) {
-        rel
-    } else {
-        select(rel, keep.to_vec())
+    match width(&rel) {
+        Ok(w) if is_identity(keep, w) => rel,
+        _ => select(rel, keep.to_vec()),
     }
 }
 

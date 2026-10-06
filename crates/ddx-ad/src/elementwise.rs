@@ -1334,12 +1334,22 @@ mod tests {
     fn every_function_ddx_writes_is_one_both_engines_know() {
         // Names written as literals anywhere in the crate.
         let mut names = std::collections::BTreeSet::new();
-        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        for entry in std::fs::read_dir(src).unwrap() {
-            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-            for part in text.split("anchor(\"").skip(1) {
-                let name: String = part.chars().take_while(|c| *c != '"').collect();
-                names.insert(normalize(&name));
+        let mut dirs = vec![std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ))];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(path).unwrap();
+                for part in text.split("anchor(\"").skip(1) {
+                    let name: String = part.chars().take_while(|c| *c != '"').collect();
+                    names.insert(normalize(&name));
+                }
             }
         }
         // Names in derivatives: of each ddx-core rule, and of the operators.
