@@ -71,7 +71,7 @@ use crate::forward::{
     apply_emit, collect_subqueries, grouping_expressions, input, read_outputs, rel_expressions,
     rel_inputs, rel_name, width,
 };
-use crate::functions::{Extensions, Functions};
+use crate::functions::{Extensions, Function, Functions};
 use crate::relation::Table;
 
 /// A column's tangent.
@@ -212,7 +212,7 @@ impl<'a> Dualizer<'a> {
     /// `tan`, NULL where `value` is NULL and 0 where it is NULL beside a
     /// value that is not (see the module docs).
     pub fn masked(&mut self, value: Expression, tan: Expression) -> Expression {
-        let is_null = self.ext.anchor("is_null");
+        let is_null = self.ext.anchor(Function::IsNull);
         if_then(
             vec![
                 (call(is_null, vec![value]), null_f64()),
@@ -324,8 +324,8 @@ impl<'a> Dualizer<'a> {
     /// skip a NULL argument, `greatest` and `least`, are differentiated whole:
     /// see [`Dualizer::call_terms`]), so a merged sum needs no NULL guard.
     fn merged(&mut self, terms: Vec<Term>) -> Vec<Expression> {
-        let add = self.ext.anchor("add");
-        let mul = self.ext.anchor("multiply");
+        let add = self.ext.anchor(Function::Add);
+        let mul = self.ext.anchor(Function::Multiply);
         let mut order: Vec<Vec<u8>> = Vec::new();
         let mut by: std::collections::HashMap<Vec<u8>, (Vec<Option<Expression>>, Expression)> =
             std::collections::HashMap::new();
@@ -470,7 +470,7 @@ impl<'a> Dualizer<'a> {
             rex_type: Some(RexType::ScalarFunction(node)),
         };
         let partials = self.ew.partials(&node, &|x| x >= SLOT, &mut self.ext)?;
-        let mul = self.ext.anchor("multiply");
+        let mul = self.ext.anchor(Function::Multiply);
         let mut terms = Vec::new();
         for (x, d) in partials {
             let Some(inner) = arg_terms.get(x.wrapping_sub(SLOT)).and_then(Option::as_ref) else {
@@ -515,8 +515,8 @@ impl<'a> Dualizer<'a> {
     /// `coalesce(a, 0) + b` with `a` NULL would lose `ḃ`. A lone term is left
     /// as it is; a reader masks it.
     fn sum_of(&mut self, mut terms: Vec<Expression>) -> Expression {
-        let add = self.ext.anchor("add");
-        let is_null = self.ext.anchor("is_null");
+        let add = self.ext.anchor(Function::Add);
+        let is_null = self.ext.anchor(Function::IsNull);
         if terms.len() > 1 {
             terms = terms
                 .into_iter()
@@ -590,8 +590,8 @@ impl<'a> Dualizer<'a> {
                     .map(|&c| table.columns()[c].clone())
                     .collect();
                 let base = emit::read(t.names.clone(), schema, filter, None);
-                let same = self.ext.anchor("is_not_distinct_from");
-                let and = self.ext.anchor("and");
+                let same = self.ext.anchor(Function::IsNotDistinctFrom);
+                let and = self.ext.anchor(Function::And);
                 let cond = table
                     .dims
                     .iter()
@@ -798,8 +798,8 @@ impl<'a> Dualizer<'a> {
                 };
                 // The rows attaining the extreme (the window's own column),
                 // and the mean of their tangents, over the same partition.
-                let equal = self.ext.anchor("equal");
-                let avg = self.ext.anchor("avg");
+                let equal = self.ext.anchor(Function::Equal);
+                let avg = self.ext.anchor(Function::Avg);
                 let masked = self.masked(arg.clone(), t);
                 let attaining = if_then(
                     vec![(call(equal, vec![arg, field(at)]), masked)],
@@ -1066,7 +1066,7 @@ impl<'a> Dualizer<'a> {
         if name == "count" {
             // A count of varied values moves with none of them: tangent 0,
             // as grad gives it gradient 0.
-            let sum = self.ext.anchor("sum");
+            let sum = self.ext.anchor(Function::Sum);
             return Ok(Some(Measure {
                 measure: Some(AggregateFunction {
                     function_reference: sum,
@@ -1124,10 +1124,14 @@ impl<'a> Dualizer<'a> {
             // aggregate. NaN is left out of the window, as DataFusion's
             // grouped MAX leaves it out.
             "max" | "min" => {
-                let isnan = self.ext.anchor("isnan");
-                let extreme = self.ext.anchor(&name);
-                let equal = self.ext.anchor("equal");
-                let avg = self.ext.anchor("avg");
+                let isnan = self.ext.anchor(Function::IsNan);
+                let extreme = self.ext.anchor(if name == "max" {
+                    Function::Max
+                } else {
+                    Function::Min
+                });
+                let equal = self.ext.anchor(Function::Equal);
+                let avg = self.ext.anchor(Function::Avg);
                 let skip_nan = if_then(
                     vec![(call(isnan, vec![arg.clone()]), null_f64())],
                     arg.clone(),

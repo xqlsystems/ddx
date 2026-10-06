@@ -59,7 +59,7 @@ use crate::expr::{
     as_field, as_number, call, cast, field, fields_of, if_then, lit_f64, null_f64, rex_name,
     scalar_args,
 };
-use crate::functions::{Extensions, Functions};
+use crate::functions::{Extensions, Function, Functions};
 
 /// Partial derivatives of Substrait expressions.
 pub struct Elementwise<'a> {
@@ -116,8 +116,8 @@ impl<'a> Elementwise<'a> {
             through_holes.push((outer, inner));
         }
 
-        let mul = ext.anchor("multiply");
-        let add = ext.anchor("add");
+        let mul = ext.anchor(Function::Multiply);
+        let add = ext.anchor(Function::Add);
         let mut out = Vec::new();
         for i in columns {
             let mut terms = Vec::new();
@@ -166,7 +166,7 @@ impl<'a> Elementwise<'a> {
                 otherwise,
             } => {
                 // The same CASE with its conditions spelled out.
-                let equal = ext.anchor("equal");
+                let equal = ext.anchor(Function::Equal);
                 let clauses = clauses
                     .iter()
                     .map(|(value, then)| {
@@ -227,9 +227,13 @@ impl<'a> Elementwise<'a> {
                 ..
             } => {
                 // Fold left: ext(acc, b) takes acc when acc beats b or b is NULL.
-                let beats = ext.anchor(if *greatest { "gt" } else { "lt" });
-                let is_null = ext.anchor("is_null");
-                let or = ext.anchor("or");
+                let beats = ext.anchor(if *greatest {
+                    Function::Gt
+                } else {
+                    Function::Lt
+                });
+                let is_null = ext.anchor(Function::IsNull);
+                let or = ext.anchor(Function::Or);
                 let mut acc = args[0].clone();
                 let mut acc_d = partials_of(&args[0], ext)?;
                 for b in &args[1..] {
@@ -611,17 +615,17 @@ fn is_logical(name: &str) -> bool {
 }
 
 /// The Substrait name of a SQL operator ddx-core emits.
-fn function_name(op: &BinaryOperator) -> Option<&'static str> {
+fn function_name(op: &BinaryOperator) -> Option<Function> {
     Some(match op {
-        BinaryOperator::Plus => "add",
-        BinaryOperator::Minus => "subtract",
-        BinaryOperator::Multiply => "multiply",
-        BinaryOperator::Divide => "divide",
-        BinaryOperator::Gt => "gt",
-        BinaryOperator::Lt => "lt",
-        BinaryOperator::GtEq => "gte",
-        BinaryOperator::LtEq => "lte",
-        BinaryOperator::Eq => "equal",
+        BinaryOperator::Plus => Function::Add,
+        BinaryOperator::Minus => Function::Subtract,
+        BinaryOperator::Multiply => Function::Multiply,
+        BinaryOperator::Divide => Function::Divide,
+        BinaryOperator::Gt => Function::Gt,
+        BinaryOperator::Lt => Function::Lt,
+        BinaryOperator::GtEq => Function::Gte,
+        BinaryOperator::LtEq => Function::Lte,
+        BinaryOperator::Eq => Function::Equal,
         _ => return None,
     })
 }
@@ -722,7 +726,7 @@ impl FromSql<'_> {
                 // Not `negate`: DuckDB's Substrait consumer has no function
                 // of that name, and x · -1 is -x, -0.0 and NaN included.
                 Ok(call(
-                    self.ext.anchor("multiply"),
+                    self.ext.anchor(Function::Multiply),
                     vec![inner, lit_f64(-1.0)],
                 ))
             }
@@ -757,7 +761,13 @@ impl FromSql<'_> {
                         _ => Err(AdError::Internal(format!("ddx-core emitted `{f}`"))),
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(call(self.ext.anchor(&name), args))
+                let function = Function::from_name(&name).ok_or_else(|| {
+                    AdError::Internal(format!(
+                        "ddx-core wrote `{name}`, a function ddx does not write: it is not \
+                         known to work on every engine"
+                    ))
+                })?;
+                Ok(call(self.ext.anchor(function), args))
             }
             Sql::Cast {
                 expr, data_type, ..
@@ -1284,65 +1294,11 @@ mod tests {
         assert_eq!(fold(&fx.functions, &float), Some((3.5, true)));
     }
 
-    /// The functions ddx may write into a plan, each found by name on both
-    /// DataFusion's and DuckDB 1.5.6's Substrait consumers (the composability
-    /// review on #71 checked each against DuckDB with a one-function plan;
-    /// `negate` was the one it did not know). A name not here is one an
-    /// engine may refuse; add it only once it has been checked.
-    const PORTABLE: &[&str] = &[
-        // Scalar functions.
-        "multiply",
-        "add",
-        "subtract",
-        "divide",
-        "abs",
-        "lt",
-        "lte",
-        "gt",
-        "gte",
-        "equal",
-        "is_null",
-        "is_not_distinct_from",
-        "and",
-        "or",
-        "isnan",
-        "sqrt",
-        "ln",
-        "exp",
-        "sin",
-        "cos",
-        "tan",
-        "tanh",
-        "sinh",
-        "cosh",
-        "asin",
-        "acos",
-        "atan",
-        "power",
-        "log2",
-        "log10",
-        "sign",
-        // Aggregate and window functions.
-        "sum",
-        "count",
-        "max",
-        "min",
-        "avg",
-    ];
-
     #[test]
-    fn every_function_ddx_writes_is_one_both_engines_know() {
-        // Names written as literals anywhere in the crate.
-        let mut names = std::collections::BTreeSet::new();
-        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        for entry in std::fs::read_dir(src).unwrap() {
-            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-            for part in text.split("anchor(\"").skip(1) {
-                let name: String = part.chars().take_while(|c| *c != '"').collect();
-                names.insert(normalize(&name));
-            }
-        }
-        // Names in derivatives: of each ddx-core rule, and of the operators.
+    fn every_derivative_ddx_core_writes_uses_functions_ddx_may_write() {
+        // Each ddx-core rule, and each operator, differentiated: a function
+        // in a derivative that is not a `Function` is refused when the
+        // derivative is translated, so this fails if a rule writes one.
         let ddx = Ddx::new();
         let mut cases: Vec<(String, Vec<Expression>)> = ddx
             .unary_rule_names()
@@ -1360,18 +1316,7 @@ mod tests {
             Elementwise::new(&ddx, &functions)
                 .partials(&call(0, args), &|_| true, &mut ext)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            names.extend(names_of(&ext).into_values().filter(|n| *n != name));
         }
-        // The reduce rules' extremes, anchored by a variable name.
-        names.extend(["max".to_string(), "min".to_string()]);
-        let unknown: Vec<&String> = names
-            .iter()
-            .filter(|n| !PORTABLE.contains(&n.as_str()))
-            .collect();
-        assert!(
-            unknown.is_empty(),
-            "functions not checked on both engines: {unknown:?}"
-        );
     }
 
     #[test]
