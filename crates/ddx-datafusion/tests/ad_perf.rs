@@ -55,6 +55,91 @@ struct Report {
     ddx_bytes: usize,
     df_bytes: usize,
     slowest: (Duration, String),
+    /// `jvp` and `H·v` (forward over reverse), or why they were refused.
+    forward_mode: Result<ForwardMode, String>,
+}
+
+struct ForwardMode {
+    jvp_build: Duration,
+    jvp_run: Duration,
+    /// The part of `jvp_run` its checks take.
+    jvp_checks: Duration,
+    hvp_build: Duration,
+    hvp_run: Duration,
+}
+
+/// Register each of `tangent_tables` as a tangent of 0.5 at every row of its
+/// table: the table's dims, then 0.5 under each wrt column's name.
+async fn register_tangents(
+    ctx: &SessionContext,
+    tangent_tables: &[ad::InputTable],
+    wrt: &[ColumnRef],
+) {
+    for tt in tangent_tables {
+        let table = tt.of.table().unwrap_or_default().join(".");
+        let cols: Vec<String> = tt
+            .columns
+            .iter()
+            .map(|c| {
+                if wrt.iter().any(|w| w.column.eq_ignore_ascii_case(c)) {
+                    format!("CAST(0.5 AS DOUBLE) AS {c}")
+                } else {
+                    c.clone()
+                }
+            })
+            .collect();
+        exec(
+            ctx,
+            &format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT {} FROM {table}",
+                tt.name,
+                cols.join(", ")
+            ),
+        )
+        .await;
+    }
+}
+
+/// Time `jvp` and H·v (`jvp` of the `grad` program) of `loss`, each built and
+/// then run with a tangent of
+/// 0.5 everywhere.
+async fn measure_forward_mode(
+    ctx: &SessionContext,
+    loss: &str,
+    wrt: &[ColumnRef],
+) -> Result<ForwardMode, String> {
+    let program = ad::jvp(ctx, loss, wrt).await.map_err(|e| e.to_string())?;
+    let jvp_build = best(|| async {
+        ad::jvp(ctx, loss, wrt).await.unwrap();
+    })
+    .await;
+    register_tangents(ctx, &program.inputs, wrt).await;
+    let jvp_run = best(|| async { ad::run(ctx, &program).await.unwrap() }).await;
+    let jvp_checks = best(|| async {
+        for c in &program.checks {
+            ad::returns_rows(ctx, &c.plan).await.unwrap();
+        }
+    })
+    .await;
+    let _ = ad::release(ctx, &program);
+    let grad = ad::grad(ctx, loss, wrt).await.map_err(|e| e.to_string())?;
+    let hvp = ad::jvp(ctx, &grad, wrt).await.map_err(|e| e.to_string())?;
+    let hvp_build = best(|| async {
+        ad::jvp(ctx, &ad::grad(ctx, loss, wrt).await.unwrap(), wrt)
+            .await
+            .unwrap();
+    })
+    .await;
+    register_tangents(ctx, &hvp.inputs, wrt).await;
+    let hvp_run = best(|| async { ad::run(ctx, &hvp).await.unwrap() }).await;
+    let _ = ad::release(ctx, &hvp);
+    Ok(ForwardMode {
+        jvp_build,
+        jvp_run,
+        jvp_checks,
+        hvp_build,
+        hvp_run,
+    })
 }
 
 async fn measure(ctx: &SessionContext, loss: &str, wrt: &[ColumnRef]) -> Report {
@@ -84,10 +169,12 @@ async fn measure(ctx: &SessionContext, loss: &str, wrt: &[ColumnRef]) -> Report 
         }
     }
     let _ = ad::release(ctx, &program);
+    let forward_mode = measure_forward_mode(ctx, loss, wrt).await;
     Report {
         forward,
         build,
         run,
+        forward_mode,
         steps: program.steps().count(),
         ddx_bytes: program.steps().map(|s| prost_len(&s.plan)).sum(),
         df_bytes,
@@ -115,6 +202,20 @@ fn print(family: &str, size: &str, r: &Report) {
         r.slowest.1,
         ms(r.slowest.0)
     );
+    match &r.forward_mode {
+        Ok(f) => eprintln!(
+            "PERFJ {family:<10} {size:<16} jvp build {:>8.2} ms | run {:>9.2} ms (checks {:>8.2}) | \
+             jvp/forward {:>6.1}x | hvp build {:>8.2} ms | run {:>9.2} ms | hvp/grad {:>5.1}x",
+            ms(f.jvp_build),
+            ms(f.jvp_run),
+            ms(f.jvp_checks),
+            (f.jvp_build + f.jvp_run).as_secs_f64() / r.forward.as_secs_f64(),
+            ms(f.hvp_build),
+            ms(f.hvp_run),
+            (f.hvp_build + f.hvp_run).as_secs_f64() / (r.build + r.run).as_secs_f64(),
+        ),
+        Err(why) => eprintln!("PERFJ {family:<10} {size:<16} refused: {why}"),
+    }
 }
 
 async fn nn(n: usize) {
@@ -431,4 +532,85 @@ async fn perf() {
             "set DDX_PERF to nn, matmul, resnet, attn, rows, depth, fanin, layers or reuse"
         ),
     }
+}
+
+/// A jvp on a large wrt table, on a multi-threaded runtime as a DataFusion
+/// application runs one: its checks one after another, its checks at once
+/// (as `ad::run` runs them), and the whole run.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement; run alone, under a memory cap"]
+async fn perf_checks() {
+    let rows: usize = std::env::var("DDX_PERF_ROWS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(2_000_000);
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE p AS SELECT CAST(r AS BIGINT) AS i, CAST(r % 100 AS BIGINT) AS g, \
+             sin(CAST(r AS DOUBLE)) AS val FROM (SELECT unnest(range(0, {rows})) AS r)"
+        ),
+    )
+    .await;
+    let loss = "SELECT SUM(val * val) AS l FROM p";
+    let wrt = [ColumnRef::new("p", "val")];
+    let program = ad::jvp(&ctx, loss, &wrt).await.unwrap();
+    register_tangents(&ctx, &program.inputs, &wrt).await;
+    // DDX_PERF_CHECKS=one or =once runs only that way, to measure its peak
+    // memory alone (with /usr/bin/time -v, say).
+    match std::env::var("DDX_PERF_CHECKS").as_deref() {
+        Ok("one") => {
+            for c in &program.checks {
+                ad::returns_rows(&ctx, &c.plan).await.unwrap();
+            }
+            return;
+        }
+        Ok("once") => {
+            let tasks: Vec<_> = program
+                .checks
+                .iter()
+                .map(|c| {
+                    let (ctx, plan) = (ctx.clone(), c.plan.clone());
+                    tokio::spawn(async move { ad::returns_rows(&ctx, &plan).await.unwrap() })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            return;
+        }
+        _ => {}
+    }
+    let forward = best(|| async { exec(&ctx, loss).await }).await;
+    let one_by_one = best(|| async {
+        for c in &program.checks {
+            ad::returns_rows(&ctx, &c.plan).await.unwrap();
+        }
+    })
+    .await;
+    let at_once = best(|| async {
+        let tasks: Vec<_> = program
+            .checks
+            .iter()
+            .map(|c| {
+                let (ctx, plan) = (ctx.clone(), c.plan.clone());
+                tokio::spawn(async move { ad::returns_rows(&ctx, &plan).await.unwrap() })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+    })
+    .await;
+    let run = best(|| async { ad::run(&ctx, &program).await.unwrap() }).await;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    eprintln!(
+        "PERFC rows={rows} forward {:.1} ms | checks one by one {:.1} ms | at once {:.1} ms | \
+         jvp run {:.1} ms",
+        ms(forward),
+        ms(one_by_one),
+        ms(at_once),
+        ms(run)
+    );
 }

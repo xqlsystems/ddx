@@ -1021,3 +1021,42 @@ async fn one_jvp_takes_sql_a_plan_or_a_program() {
         assert!((row[t] - h).abs() < 1e-12, "{} vs {h}", row[t]);
     }
 }
+
+#[tokio::test]
+async fn a_null_coefficient_does_not_erase_a_shared_tangent() {
+    // Found by review: terms on one tangent are merged, (c₁ + c₂)·ȧ, and a
+    // NULL coefficient made the sum NULL. greatest skips a NULL argument, so
+    // on row 0, where b is NULL, y = a and its tangent is ȧ; but a·b's term
+    // there is 0 · b · ȧ, NULL, and it shares ȧ with a's.
+    let ctx = ctx();
+    ctx.sql(
+        "CREATE TABLE p (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES \
+         (0, 2.0, CAST(NULL AS DOUBLE)), (1, 1.0, 3.0)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let plan = substrait_of(&ctx, "SELECT i, greatest(a * b, a) AS y FROM p", true).await;
+    // b is wrt too (else it is a dim of p), with tangent 0.
+    let program = ddx_ad::jvp(&plan, &[wrt("p", "a"), wrt("p", "b")]).unwrap();
+    assert_eq!(program.inputs[0].columns, vec!["i", "a", "b"]);
+    ctx.sql(&format!(
+        "CREATE TABLE {} (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES (0, 1.0, 0.0), (1, 1.0, 0.0)",
+        program.inputs[0].name
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
+    let out = rows(
+        &ctx,
+        &format!("SELECT * FROM {} ORDER BY i", program.value.step),
+    )
+    .await;
+    assert_eq!(out[0][2], 1.0, "ȧ where b is NULL");
+    assert_eq!(out[1][2], 3.0, "b·ȧ where a·b is the greater");
+}

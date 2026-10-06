@@ -386,11 +386,35 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 /// not overlap: they write the same tables. Build a program per concurrent
 /// caller instead.
 pub async fn run<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
-    // The order, and what is dropped when, are ddx_ad::Runner's.
+    // The order, and what is dropped when, are ddx_ad::Runner's. The checks
+    // read no step and none reads another, so they run at once, each a task
+    // of its own (polled together on one task, they ran one after another),
+    // and the runner is told how each went in its own order: on a large wrt
+    // table they are most of a run (the dims of a table, then of its
+    // tangent, each a grouped scan).
+    let tasks: Vec<_> = program
+        .checks()
+        .iter()
+        .map(|c| {
+            let (ctx, plan) = (ctx.clone(), c.plan.clone());
+            tokio::spawn(async move { returns_rows(&ctx, &plan).await })
+        })
+        .collect();
+    let mut checked: Vec<Option<Result<bool>>> = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        checked
+            .push(Some(task.await.unwrap_or_else(|e| {
+                Err(DataFusionError::External(Box::new(e)))
+            })));
+    }
     let mut runner = ddx_ad::Runner::new(program);
     while let Some(action) = runner.next() {
         match &action {
-            Action::Check(i) => runner.checked(returns_rows(ctx, &program.checks()[*i].plan).await),
+            Action::Check(i) => runner.checked(
+                checked[*i]
+                    .take()
+                    .expect("the runner asks for each check once"),
+            ),
             Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
             Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
         }

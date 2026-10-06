@@ -64,8 +64,8 @@ use crate::elementwise::{depends, Elementwise};
 use crate::emit::{self, project_emit, read_step, select};
 use crate::error::{AdError, Result};
 use crate::expr::{
-    as_field, as_number, call, cast, field, fp64, if_then, lit_f64, map_fields, null_f64,
-    uncorrelated_scalar,
+    as_field, as_number, call, cast, field, fields_of, fp64, if_then, lit_bool, lit_f64,
+    map_fields, null_f64, scalar_args, uncorrelated_scalar,
 };
 use crate::forward::{
     apply_emit, collect_subqueries, grouping_expressions, input, read_outputs, rel_expressions,
@@ -128,6 +128,9 @@ pub(crate) struct Dualizer<'a> {
     /// The function declarations of the plan being written.
     pub ext: Extensions,
     source: &'a mut SourceFn<'a>,
+    /// [`Dualizer::reads_varied`]'s answers, by relation: the plan a dual is
+    /// built of is borrowed for the whole build, so its relations stay put.
+    varied: std::collections::HashMap<*const Rel, bool>,
 }
 
 impl<'a> Dualizer<'a> {
@@ -145,6 +148,7 @@ impl<'a> Dualizer<'a> {
             ew: Elementwise::new(ddx, functions),
             ext,
             source,
+            varied: std::collections::HashMap::new(),
         }
     }
 
@@ -220,31 +224,60 @@ impl<'a> Dualizer<'a> {
 
     /// Does anything under `rel` read a table with tangents? Conservatively
     /// true for a subquery that is not an uncorrelated scalar one.
+    ///
+    /// Each relation's answer is remembered, so a plan is walked once in all:
+    /// [`Dualizer::dual`] asks at every level, and walking the subtree each
+    /// time made the rewrite quadratic in a plan's depth.
     fn reads_varied(&mut self, rel: &Rel) -> Result<bool> {
-        let mut stack = vec![rel];
-        while let Some(r) = stack.pop() {
-            let Some(kind) = &r.rel_type else { continue };
-            if let RelType::Read(read) = kind {
-                if let Some(ReadType::NamedTable(t)) = &read.read_type {
-                    if (self.source)(&t.names, read.base_schema.as_ref())?.is_some() {
-                        return Ok(true);
-                    }
-                }
+        let key = rel as *const Rel;
+        if let Some(&v) = self.varied.get(&key) {
+            return Ok(v);
+        }
+        // Post-order: a relation's answer once its inputs' are known.
+        let mut stack: Vec<(&Rel, bool)> = vec![(rel, false)];
+        while let Some((r, ready)) = stack.pop() {
+            let k = r as *const Rel;
+            if self.varied.contains_key(&k) {
                 continue;
             }
+            let Some(kind) = &r.rel_type else {
+                self.varied.insert(k, false);
+                continue;
+            };
+            if let RelType::Read(read) = kind {
+                let v = match &read.read_type {
+                    Some(ReadType::NamedTable(t)) => {
+                        (self.source)(&t.names, read.base_schema.as_ref())?.is_some()
+                    }
+                    _ => false,
+                };
+                self.varied.insert(k, v);
+                continue;
+            }
+            let mut below: Vec<&Rel> = rel_inputs(kind);
+            let mut correlated = false;
             for e in rel_expressions(kind) {
                 let mut subqueries = Vec::new();
                 collect_subqueries(e, &mut subqueries);
                 for sq in subqueries {
                     match uncorrelated_scalar(sq) {
-                        Some(inner) => stack.push(inner),
-                        None => return Ok(true),
+                        Some(inner) => below.push(inner),
+                        None => correlated = true,
                     }
                 }
             }
-            stack.extend(rel_inputs(kind));
+            if ready {
+                let v = correlated
+                    || below
+                        .iter()
+                        .any(|b| self.varied.get(&(*b as *const Rel)) == Some(&true));
+                self.varied.insert(k, v);
+            } else {
+                stack.push((r, true));
+                stack.extend(below.into_iter().map(|b| (b, false)));
+            }
         }
-        Ok(false)
+        Ok(self.varied[&key])
     }
 
     /// A subquery in a relation on the varied path is carried through as a
@@ -272,17 +305,199 @@ impl<'a> Dualizer<'a> {
     }
 
     /// The tangent of `e`, an expression over the columns of a dual whose
-    /// tangents are `tans`: `Σ ∂e/∂x · ẋ`. `None` when `e` depends on no
-    /// varied column.
+    /// tangents are `tans`. `None` when `e` depends on no varied column; 0
+    /// when it depends on one only through conditions (a `CASE` test, a
+    /// comparison), as jax.jvp and grad give.
     fn tangent_of(&mut self, e: &Expression, tans: &[Tan]) -> Result<Option<Expression>> {
+        Ok(self.terms_of(e, tans)?.map(|terms| {
+            let terms = self.merged(terms);
+            self.sum_of(terms)
+        }))
+    }
+
+    /// Terms that share a tangent, as one: `Σ cᵢ · t` is `(Σ cᵢ) · t`.
+    /// `sin(v) + 0.1 * v` then has the one term `(cos(v) + 0.1) · v̇`, as the
+    /// partials of the whole expression give it, rather than a term per
+    /// read of `v`.
+    ///
+    /// A coefficient is NULL only where its term's value is (the calls that
+    /// skip a NULL argument, `greatest` and `least`, are differentiated whole:
+    /// see [`Dualizer::call_terms`]), so a merged sum needs no NULL guard.
+    fn merged(&mut self, terms: Vec<Term>) -> Vec<Expression> {
+        let add = self.ext.anchor("add");
+        let mul = self.ext.anchor("multiply");
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut by: std::collections::HashMap<Vec<u8>, (Vec<Option<Expression>>, Expression)> =
+            std::collections::HashMap::new();
+        for (c, t) in terms {
+            let key = prost::Message::encode_to_vec(&t);
+            match by.get_mut(&key) {
+                Some((cs, _)) => cs.push(c),
+                None => {
+                    order.push(key.clone());
+                    by.insert(key, (vec![c], t));
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|k| {
+                let (cs, t) = by.remove(&k).expect("every key was inserted");
+                let c = match <[Option<Expression>; 1]>::try_from(cs) {
+                    Ok([c]) => c,
+                    Err(cs) => cs
+                        .into_iter()
+                        .map(|c| c.unwrap_or_else(|| lit_f64(1.0)))
+                        .reduce(|x, y| call(add, vec![x, y])),
+                };
+                match c {
+                    Some(c) => call(mul, vec![c, t]),
+                    None => t,
+                }
+            })
+            .collect()
+    }
+
+    /// `e`'s tangent as terms to add, `None` when `e` depends on no varied
+    /// column.
+    ///
+    /// Forward mode over the expression's tree, as dual numbers are: a call's
+    /// terms are `∂f/∂aᵢ · t` for each term `t` of each argument's tangent,
+    /// the partials taken over the call's own arguments only, and a `CASE`'s
+    /// tangent is a `CASE` of its branches' under the same conditions.
+    /// Partials of the whole expression copied every condition into each
+    /// variable's partial (a sum of n terms inside a `CASE` over all n, a
+    /// fan-in, grew as n²). The terms stay a flat list up the tree and are
+    /// summed once, by [`Dualizer::sum_of`], where the tangent is used:
+    /// summing at every call wrote each term twice per level (its NULL
+    /// guard), 2ⁿ for n nested sums.
+    fn terms_of(&mut self, e: &Expression, tans: &[Tan]) -> Result<Option<Vec<Term>>> {
         let varied = |f: usize| tans.get(f).is_some_and(Tan::varied);
         if !depends(self.functions, e, &varied)? {
             return Ok(None);
         }
-        let partials = self.ew.partials(e, &varied, &mut self.ext)?;
+        Ok(Some(match &e.rex_type {
+            Some(RexType::Selection(_)) if as_field(e).is_some() => {
+                match as_field(e).and_then(|f| tans.get(f)) {
+                    Some(Tan::Col(j)) => vec![(None, field(*j))],
+                    Some(Tan::Refused(why)) => return Err(why.clone()),
+                    _ => Vec::new(),
+                }
+            }
+            Some(RexType::IfThen(it)) => {
+                let mut any = false;
+                let mut clauses = Vec::with_capacity(it.ifs.len());
+                for clause in &it.ifs {
+                    let t = match &clause.then {
+                        Some(r) => self.tangent_of(r, tans)?,
+                        None => None,
+                    };
+                    any |= t.is_some();
+                    let condition = clause.r#if.clone().unwrap_or_else(|| lit_bool(false));
+                    clauses.push((condition, t.unwrap_or_else(|| lit_f64(0.0))));
+                }
+                let otherwise = match it.r#else.as_deref() {
+                    Some(r) => self.tangent_of(r, tans)?,
+                    None => None,
+                };
+                any |= otherwise.is_some();
+                if any {
+                    vec![(
+                        None,
+                        if_then(clauses, otherwise.unwrap_or_else(|| lit_f64(0.0))),
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+            Some(RexType::Cast(c)) if casts_to_float(c) => match c.input.as_deref() {
+                Some(x) => self.terms_of(x, tans)?.unwrap_or_default(),
+                None => Vec::new(),
+            },
+            Some(RexType::ScalarFunction(f)) => match self.call_terms(f, tans)? {
+                Some(terms) => terms,
+                None => self.whole_terms(e, tans)?,
+            },
+            _ => self.whole_terms(e, tans)?,
+        }))
+    }
+
+    /// A call's tangent terms, `∂f/∂aᵢ · t` for each term `t` of each varied
+    /// argument's tangent, the partials taken with respect to the call's
+    /// arguments alone: each varied argument becomes a placeholder field for
+    /// `ddx-core`, and the argument itself takes its place in the partial
+    /// after. `None` if a partial still reads a placeholder (a rule `ddx-core`
+    /// writes in a form this does not follow, or a call that skips a NULL
+    /// argument): the caller differentiates the whole expression then.
+    fn call_terms(
+        &mut self,
+        f: &substrait::proto::expression::ScalarFunction,
+        tans: &[Tan],
+    ) -> Result<Option<Vec<Term>>> {
+        // `greatest` and `least` skip a NULL argument, and `ddx-core`'s rule
+        // puts each argument's partial inside the branch where it wins. Taken
+        // over placeholders here, a skipped argument's terms would be
+        // multiplied by its 0 outside that branch, and 0 · NULL is NULL:
+        // `greatest(a * b, a)` with `b` NULL would lose `ȧ`. Whole, then.
+        if matches!(
+            self.functions.name(f.function_reference)?,
+            "greatest" | "least"
+        ) {
+            return Ok(None);
+        }
+        let args = scalar_args(f)?;
+        let mut arg_terms = Vec::with_capacity(args.len());
+        for a in &args {
+            arg_terms.push(self.terms_of(a, tans)?);
+        }
+        if arg_terms.iter().all(Option::is_none) {
+            return Ok(Some(Vec::new()));
+        }
+        let mut node = f.clone();
+        node.arguments = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                value_arg(match arg_terms[i] {
+                    Some(_) => field(SLOT + i),
+                    None => (*a).clone(),
+                })
+            })
+            .collect();
+        #[allow(deprecated)]
+        node.args.clear();
+        let node = Expression {
+            rex_type: Some(RexType::ScalarFunction(node)),
+        };
+        let partials = self.ew.partials(&node, &|x| x >= SLOT, &mut self.ext)?;
         let mul = self.ext.anchor("multiply");
-        let add = self.ext.anchor("add");
-        let is_null = self.ext.anchor("is_null");
+        let mut terms = Vec::new();
+        for (x, d) in partials {
+            let Some(inner) = arg_terms.get(x.wrapping_sub(SLOT)).and_then(Option::as_ref) else {
+                continue;
+            };
+            let d = substitute(&d, &args);
+            if fields_of(&d)?.into_iter().any(|k| k >= SLOT) {
+                return Ok(None);
+            }
+            let one = as_number(&d) == Some(1.0);
+            terms.extend(inner.iter().map(|(c, t)| {
+                let c = match (one, c) {
+                    (true, c) => c.clone(),
+                    (false, None) => Some(d.clone()),
+                    (false, Some(c)) => Some(call(mul, vec![d.clone(), c.clone()])),
+                };
+                (c, t.clone())
+            }));
+        }
+        Ok(Some(terms))
+    }
+
+    /// `e`'s tangent terms from the partials of the whole expression: for an
+    /// expression [`Dualizer::terms_of`] has no structural rule for.
+    fn whole_terms(&mut self, e: &Expression, tans: &[Tan]) -> Result<Vec<Term>> {
+        let varied = |f: usize| tans.get(f).is_some_and(Tan::varied);
+        let partials = self.ew.partials(e, &varied, &mut self.ext)?;
         let mut terms = Vec::new();
         for (x, d) in partials {
             let dx = match &tans[x] {
@@ -290,27 +505,28 @@ impl<'a> Dualizer<'a> {
                 Tan::Refused(why) => return Err(why.clone()),
                 Tan::Zero => continue,
             };
-            terms.push(if as_number(&d) == Some(1.0) {
-                dx
-            } else {
-                call(mul, vec![d, dx])
-            });
+            terms.push(((as_number(&d) != Some(1.0)).then_some(d), dx));
         }
-        // A NULL term is a NULL input, which moves nothing (the module docs'
-        // NULL rule): it adds 0, or `coalesce(a, 0) + b` with `a` NULL would
-        // lose `ḃ`. A lone term is left as it is; a reader masks it.
-        // It depends on a wrt column, through conditions only (a CASE test, a
-        // comparison): its tangent is 0, as jax.jvp and grad give, not none.
-        if terms.is_empty() {
-            return Ok(Some(lit_f64(0.0)));
-        }
+        Ok(terms)
+    }
+
+    /// The sum of tangent terms, 0 if there are none. A NULL term is a NULL
+    /// input, which moves nothing (the module docs' NULL rule): it adds 0, or
+    /// `coalesce(a, 0) + b` with `a` NULL would lose `ḃ`. A lone term is left
+    /// as it is; a reader masks it.
+    fn sum_of(&mut self, mut terms: Vec<Expression>) -> Expression {
+        let add = self.ext.anchor("add");
+        let is_null = self.ext.anchor("is_null");
         if terms.len() > 1 {
             terms = terms
                 .into_iter()
                 .map(|t| if_then(vec![(call(is_null, vec![t.clone()]), lit_f64(0.0))], t))
                 .collect();
         }
-        Ok(terms.into_iter().reduce(|a, b| call(add, vec![a, b])))
+        terms
+            .into_iter()
+            .reduce(|a, b| call(add, vec![a, b]))
+            .unwrap_or_else(|| lit_f64(0.0))
     }
 
     /// The dual of a relation whose direct output (before its emit) is
@@ -1054,4 +1270,70 @@ fn value_arg(e: Expression) -> substrait::proto::FunctionArgument {
     substrait::proto::FunctionArgument {
         arg_type: Some(ArgType::Value(e)),
     }
+}
+
+/// A term of a tangent: a coefficient (none for 1) times a tangent, a
+/// column's or a `CASE` of tangents.
+type Term = (Option<Expression>, Expression);
+
+/// Placeholder fields for a call's varied arguments, past any real column
+/// (see [`Dualizer::call_tangent`]).
+const SLOT: usize = 1 << 30;
+
+/// `e` with each placeholder field `SLOT + i` replaced by `args[i]`.
+fn substitute(e: &Expression, args: &[&Expression]) -> Expression {
+    fn walk(e: &mut Expression, args: &[&Expression]) {
+        if let Some(f) = as_field(e) {
+            if let Some(a) = f.checked_sub(SLOT).and_then(|i| args.get(i)) {
+                *e = (*a).clone();
+            }
+            return;
+        }
+        match e.rex_type.as_mut() {
+            Some(RexType::ScalarFunction(f)) => {
+                for a in f.arguments.iter_mut() {
+                    if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
+                        walk(x, args);
+                    }
+                }
+            }
+            Some(RexType::IfThen(it)) => {
+                for c in it.ifs.iter_mut() {
+                    for x in c.r#if.iter_mut().chain(c.then.iter_mut()) {
+                        walk(x, args);
+                    }
+                }
+                for x in it.r#else.iter_mut() {
+                    walk(x, args);
+                }
+            }
+            Some(RexType::Cast(c)) => {
+                for x in c.input.iter_mut() {
+                    walk(x, args);
+                }
+            }
+            Some(RexType::SingularOrList(l)) => {
+                for x in l.value.iter_mut() {
+                    walk(x, args);
+                }
+                for x in l.options.iter_mut() {
+                    walk(x, args);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = e.clone();
+    walk(&mut out, args);
+    out
+}
+
+/// Whether a cast is to a floating-point type, whose derivative is 1; a cast
+/// to an integer is piecewise constant, and left to `ddx-core`.
+fn casts_to_float(c: &substrait::proto::expression::Cast) -> bool {
+    use substrait::proto::r#type::Kind;
+    matches!(
+        c.r#type.as_ref().and_then(|t| t.kind.as_ref()),
+        Some(Kind::Fp32(_) | Kind::Fp64(_))
+    )
 }
