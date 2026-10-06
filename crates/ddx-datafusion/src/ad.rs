@@ -23,7 +23,9 @@
 //! output, pulling back a cotangent the caller registers as the program's input
 //! table ([`BackwardProgram::inputs`]). [`jvp`] pushes a tangent forward instead
 //! ([`ForwardProgram`]); both kinds of program share one vocabulary of input and
-//! output tables ([`InputTable`], [`OutputTable`]).
+//! output tables ([`InputTable`], [`OutputTable`]). Each of the three takes SQL,
+//! a plan, or a program ([`Differentiable`]), so they compose: `jvp` of a
+//! `grad` program gives Hessian-vector products.
 //!
 //! Every table a program writes is named with a prefix unique to that program,
 //! `__ddx_{id}_`, so two programs on one context never read each other's
@@ -98,102 +100,33 @@ fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
-/// The gradient of the number the SQL query `sql` computes (a loss, a
-/// likelihood, an energy, …), with respect to the `wrt` columns. The query
-/// must return one row and one column.
+/// The gradient of `of` with respect to the `wrt` columns (see
+/// [`ddx_ad::grad`]): of SQL text or a plan, the number the query computes (a
+/// loss, a likelihood, an energy, …), which must be one row and one column;
+/// of a program, its one output table, which must be too.
 ///
-/// The query is planned and optimized by `ctx`, converted to Substrait, and
-/// handed to [`ddx_ad::grad`]. A refusal arrives as
+/// SQL is planned and optimized by `ctx`, and a plan converted to Substrait,
+/// before [`ddx_ad::grad`] differentiates it. A refusal arrives as
 /// [`DataFusionError::External`] boxing an [`AdError`].
-pub async fn grad(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    grad_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
-}
-
-/// [`grad`] for a plan already built, for instance with the DataFrame API.
-pub fn grad_plan(
+pub async fn grad<D: Differentiable + ?Sized>(
     ctx: &SessionContext,
-    plan: &LogicalPlan,
+    of: &D,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
-    refuse_what_substrait_loses(plan)?;
-    ddx_ad::grad(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
+    let of = of.subject(ctx).await?;
+    ddx_ad::grad(of.get(), wrt).map_err(to_df_err)
 }
 
-/// The vector-Jacobian product of the SQL query `sql` with respect to the
-/// `wrt` columns. Before the program runs, register the cotangent as its
-/// input table ([`BackwardProgram::inputs`]), with the columns it lists.
-pub async fn vjp(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
-    vjp_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
-}
-
-/// [`vjp`] for a plan already built.
-pub fn vjp_plan(
+/// The vector-Jacobian product of `of` with respect to the `wrt` columns
+/// (see [`ddx_ad::vjp`]). Before the program runs, register the cotangent as
+/// its input table ([`BackwardProgram::inputs`]), with the columns it lists.
+pub async fn vjp<D: Differentiable + ?Sized>(
     ctx: &SessionContext,
-    plan: &LogicalPlan,
+    of: &D,
     wrt: &[ColumnRef],
 ) -> Result<BackwardProgram> {
-    refuse_what_substrait_loses(plan)?;
-    ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
-}
-
-mod sealed {
-    pub trait Sealed {}
-    impl Sealed for str {}
-    impl Sealed for datafusion::logical_expr::LogicalPlan {}
-    impl Sealed for ddx_ad::BackwardProgram {}
-}
-
-/// What [`jvp`] pushes a tangent through: SQL text, a DataFusion plan (from
-/// the DataFrame API, say), or a program (a [`BackwardProgram`]: of a [`grad`]
-/// program, forward over reverse, which gives `H·v`).
-///
-/// Sealed: these are the things ddx differentiates forward here.
-pub trait Differentiable: sealed::Sealed + Sync {
-    #[doc(hidden)]
-    fn forward_program<'a>(
-        &'a self,
-        ctx: &'a SessionContext,
-        wrt: &'a [ColumnRef],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>;
-}
-
-impl Differentiable for str {
-    fn forward_program<'a>(
-        &'a self,
-        ctx: &'a SessionContext,
-        wrt: &'a [ColumnRef],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let lp = ctx.sql(self).await?.into_optimized_plan()?;
-            lp.forward_program(ctx, wrt).await
-        })
-    }
-}
-
-impl Differentiable for LogicalPlan {
-    fn forward_program<'a>(
-        &'a self,
-        ctx: &'a SessionContext,
-        wrt: &'a [ColumnRef],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            refuse_what_substrait_loses(self)?;
-            ddx_ad::jvp(&*to_substrait_plan(self, &ctx.state())?, wrt).map_err(to_df_err)
-        })
-    }
-}
-
-impl Differentiable for BackwardProgram {
-    fn forward_program<'a>(
-        &'a self,
-        _ctx: &'a SessionContext,
-        wrt: &'a [ColumnRef],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
-    {
-        Box::pin(async move { ddx_ad::jvp(self, wrt).map_err(to_df_err) })
-    }
+    let of = of.subject(ctx).await?;
+    ddx_ad::vjp(of.get(), wrt).map_err(to_df_err)
 }
 
 /// The Jacobian-vector product of `of` with respect to the `wrt` columns
@@ -210,7 +143,104 @@ pub async fn jvp<D: Differentiable + ?Sized>(
     of: &D,
     wrt: &[ColumnRef],
 ) -> Result<ForwardProgram> {
-    of.forward_program(ctx, wrt).await
+    let of = of.subject(ctx).await?;
+    ddx_ad::jvp(of.get(), wrt).map_err(to_df_err)
+}
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+mod sealed {
+    /// What a [`Differentiable`](super::Differentiable) is to ddx-ad.
+    pub trait Sealed {
+        fn subject<'a>(
+            &'a self,
+            ctx: &'a super::SessionContext,
+        ) -> super::BoxFuture<'a, super::Result<Subject<'a>>>;
+    }
+
+    /// What ddx-ad differentiates: a plan converted here, or a program as it is.
+    pub enum Subject<'a> {
+        Plan(Box<super::Plan>),
+        Program(&'a (dyn ddx_ad::Differentiable + Sync)),
+    }
+
+    impl Subject<'_> {
+        pub(super) fn get(&self) -> &dyn ddx_ad::Differentiable {
+            match self {
+                Subject::Plan(p) => &**p,
+                Subject::Program(p) => *p,
+            }
+        }
+    }
+}
+
+/// What [`grad`], [`vjp`] and [`jvp`] differentiate: SQL text (a `str` or a
+/// `String`), a DataFusion
+/// plan (from the DataFrame API, say), or a program of either kind, so they
+/// compose: [`jvp`] of a [`grad`] program is forward over reverse, `H·v`;
+/// [`vjp`] of a [`jvp`] program is reverse over forward (see
+/// [`ddx_ad::Differentiable`]).
+///
+/// Sealed: these are the things ddx differentiates here.
+pub trait Differentiable: sealed::Sealed + Sync {}
+
+impl sealed::Sealed for str {
+    fn subject<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+    ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
+        Box::pin(async move {
+            let lp = ctx.sql(self).await?.into_optimized_plan()?;
+            Ok(sealed::Subject::Plan(substrait_of(ctx, &lp)?))
+        })
+    }
+}
+impl Differentiable for str {}
+
+impl sealed::Sealed for String {
+    fn subject<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+    ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
+        self.as_str().subject(ctx)
+    }
+}
+impl Differentiable for String {}
+
+impl sealed::Sealed for LogicalPlan {
+    fn subject<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+    ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
+        Box::pin(async move { Ok(sealed::Subject::Plan(substrait_of(ctx, self)?)) })
+    }
+}
+impl Differentiable for LogicalPlan {}
+
+impl sealed::Sealed for BackwardProgram {
+    fn subject<'a>(
+        &'a self,
+        _ctx: &'a SessionContext,
+    ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
+        Box::pin(async move { Ok(sealed::Subject::Program(self)) })
+    }
+}
+impl Differentiable for BackwardProgram {}
+
+impl sealed::Sealed for ForwardProgram {
+    fn subject<'a>(
+        &'a self,
+        _ctx: &'a SessionContext,
+    ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
+        Box::pin(async move { Ok(sealed::Subject::Program(self)) })
+    }
+}
+impl Differentiable for ForwardProgram {}
+
+/// `plan` as Substrait, refused if the conversion would lose its meaning.
+fn substrait_of(ctx: &SessionContext, plan: &LogicalPlan) -> Result<Box<Plan>> {
+    refuse_what_substrait_loses(plan)?;
+    to_substrait_plan(plan, &ctx.state())
 }
 
 /// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for

@@ -2731,7 +2731,7 @@ async fn check_case_inner(
             .await
             .map_err(|e| e.to_string())?
             .into_unoptimized_plan();
-        match ad::grad_plan(&ctx, &lp, &wrt) {
+        match ad::grad(&ctx, &lp, &wrt).await {
             Ok(p) => match run_and_read(&ctx, &p).await {
                 Ok(g) => {
                     out.meta_compared += 1;

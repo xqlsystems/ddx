@@ -43,7 +43,7 @@ use std::collections::{BTreeSet, HashMap};
 use prost::Message;
 
 use substrait::proto::aggregate_rel::Grouping;
-use substrait::proto::expression::RexType;
+use substrait::proto::expression::{window_function, RexType, WindowFunction};
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
@@ -128,10 +128,13 @@ pub enum Def {
     /// A scalar expression over earlier columns: the map primitive.
     Expr(Expression),
     /// A window function: a value computed across rows (a rank), with no
-    /// derivative. `keys` are the columns it partitions and orders by.
+    /// derivative. `keys` are the columns it partitions and orders by, or
+    /// `None` if its value is the same however the rows of a partition are
+    /// ordered (an exact aggregate over each whole partition: `MAX(x) OVER
+    /// (PARTITION BY g)`), so it needs no ties broken.
     Window {
         /// The columns it partitions and orders by.
-        keys: Vec<usize>,
+        keys: Option<Vec<usize>>,
     },
     /// A column of a constant input.
     Const,
@@ -180,7 +183,7 @@ impl Region {
                 },
                 Def::Expr(e) => Def::Expr(map_fields(&e, &mut |i| Ok(i + shift))?),
                 Def::Window { keys } => Def::Window {
-                    keys: keys.into_iter().map(|k| k + shift).collect(),
+                    keys: keys.map(|keys| keys.into_iter().map(|k| k + shift).collect()),
                 },
                 Def::Const => Def::Const,
             });
@@ -227,7 +230,7 @@ impl Region {
     fn detached_cuts(&self) -> Vec<Cut> {
         let mut cuts = self.cuts.clone();
         for (c, d) in self.defs.iter().enumerate() {
-            if let Def::Window { keys } = d {
+            if let Def::Window { keys: Some(keys) } = d {
                 cuts.push(self.cut(Some(keys.clone()), c));
             }
         }
@@ -490,14 +493,48 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
+    /// Lower `rel`. A chain of single-input relations (projections,
+    /// filters, sorts, limits) can be hundreds deep, a `jvp` program's step
+    /// most of all, deeper than a 2 MB worker stack allows for recursion; so
+    /// the chain is walked down with a loop, and each relation lowered over
+    /// its input's region on the way back up. Only joins and aggregates
+    /// recurse.
     fn lower(&mut self, rel: &Rel) -> Result<Region> {
-        if !self.reads_wrt(rel)? {
-            return self.constant(rel);
+        let mut chain = Vec::new();
+        let mut cur = rel;
+        let mut s = loop {
+            if !self.reads_wrt(cur)? {
+                break self.constant(cur)?;
+            }
+            let below = match &cur.rel_type {
+                Some(RelType::Project(p)) => &p.input,
+                Some(RelType::Filter(f)) => &f.input,
+                Some(RelType::Sort(so)) => &so.input,
+                Some(RelType::Fetch(fe)) => &fe.input,
+                _ => break self.lower_one(cur, None)?,
+            };
+            chain.push(cur);
+            cur = input(below)?;
+        };
+        while let Some(r) = chain.pop() {
+            s = self.lower_one(r, Some(s))?;
         }
+        Ok(s)
+    }
+
+    /// Lower `rel`, which reads a `wrt` table, over `below`, its input's
+    /// region, if it is a single-input relation [`Builder::lower`] walked
+    /// down to.
+    fn lower_one(&mut self, rel: &Rel, below: Option<Region>) -> Result<Region> {
         let kind = rel
             .rel_type
             .as_ref()
             .ok_or_else(|| AdError::InvalidPlan("an empty relation".into()))?;
+        let mut below = below;
+        let mut lowered = |this: &mut Self, r: &Option<Box<Rel>>| match below.take() {
+            Some(s) => Ok(s),
+            None => this.lower(input(r)?),
+        };
         // A subquery in this relation's expressions is carried through as a
         // constant (see `uncorrelated_scalar`). That is only right if it reads
         // no wrt table; otherwise the gradient through it would be dropped.
@@ -530,11 +567,12 @@ impl Builder<'_> {
                 (s, direct, r.common.as_ref())
             }
             RelType::Project(p) => {
-                let (s, direct) = self.project(p)?;
+                let below = lowered(self, &p.input)?;
+                let (s, direct) = self.project(below, p)?;
                 (s, direct, p.common.as_ref())
             }
             RelType::Filter(f) => {
-                let mut s = self.lower(input(&f.input)?)?;
+                let mut s = lowered(self, &f.input)?;
                 let cond = remap(f.condition.as_deref(), &s.outputs)?;
                 s.rel = match cond {
                     Some(c) => emit::filter(s.rel, c),
@@ -544,7 +582,7 @@ impl Builder<'_> {
                 (s, direct, f.common.as_ref())
             }
             RelType::Sort(so) => {
-                let mut s = self.lower(input(&so.input)?)?;
+                let mut s = lowered(self, &so.input)?;
                 let mut sorts = so.sorts.clone();
                 for sf in sorts.iter_mut() {
                     if let Some(e) = sf.expr.as_mut() {
@@ -563,8 +601,8 @@ impl Builder<'_> {
                 (s, direct, so.common.as_ref())
             }
             RelType::Fetch(fe) => {
+                let mut s = lowered(self, &fe.input)?;
                 let below = input(&fe.input)?;
-                let mut s = self.lower(below)?;
                 // The rows a LIMIT keeps are the first in its input's order:
                 // an ORDER BY's keys, or none.
                 let keys = match &below.rel_type {
@@ -696,8 +734,8 @@ impl Builder<'_> {
         Ok(self.tables.len() - 1)
     }
 
-    fn project(&mut self, p: &ProjectRel) -> Result<(Region, Vec<usize>)> {
-        let mut s = self.lower(input(&p.input)?)?;
+    /// A projection over `s`, its input's region.
+    fn project(&mut self, mut s: Region, p: &ProjectRel) -> Result<(Region, Vec<usize>)> {
         let inputs = s.outputs.clone();
         let mut exprs = Vec::with_capacity(p.expressions.len());
         let mut direct = inputs.clone();
@@ -710,12 +748,13 @@ impl Builder<'_> {
                 continue;
             }
             let col = if let Some(RexType::WindowFunction(w)) = &e.rex_type {
-                let keys: Vec<usize> = w
-                    .partitions
-                    .iter()
-                    .chain(w.sorts.iter().filter_map(|s| s.expr.as_ref()))
-                    .filter_map(order_key)
-                    .collect();
+                let keys = (!self.whole_partition_exact(w)?).then(|| {
+                    w.partitions
+                        .iter()
+                        .chain(w.sorts.iter().filter_map(|s| s.expr.as_ref()))
+                        .filter_map(order_key)
+                        .collect()
+                });
                 let varied = fields_of(&e)?.into_iter().any(|f| s.varied[f]);
                 let col = s.push(Def::Window { keys }, varied);
                 s.refuse(
@@ -751,6 +790,22 @@ impl Builder<'_> {
             s.rel = rename_in_place(s.rel, width, &windows);
         }
         Ok((s, direct))
+    }
+
+    /// Is `w` an exact aggregate (`MAX`, `MIN`, `COUNT`) over each whole
+    /// partition, with no `ORDER BY` and no frame narrower than it? Then its
+    /// value does not depend on how a partition's rows are ordered, and a
+    /// recomputation gives the same one.
+    fn whole_partition_exact(&self, w: &WindowFunction) -> Result<bool> {
+        use substrait::proto::expression::window_function::bound::Kind;
+        let unbounded = |b: &Option<window_function::Bound>| match b {
+            None => true,
+            Some(b) => matches!(b.kind, None | Some(Kind::Unbounded(_))),
+        };
+        Ok(w.sorts.is_empty()
+            && unbounded(&w.lower_bound)
+            && unbounded(&w.upper_bound)
+            && !self.functions.rounds(w.function_reference)?)
     }
 
     fn join(&mut self, j: &JoinRel) -> Result<(Region, Vec<usize>)> {
@@ -1514,7 +1569,7 @@ pub(crate) fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
     }
 }
 
-fn rel_inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
+pub(crate) fn rel_inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
     fn one(r: &mut Option<Box<Rel>>) -> Vec<&mut Rel> {
         r.as_deref_mut().into_iter().collect()
     }

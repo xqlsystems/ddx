@@ -88,6 +88,26 @@ impl Functions {
         })
     }
 
+    /// The declarations of every plan in `plans`, which must agree: an anchor
+    /// two of them declare names one function. The plans of a program do:
+    /// each is written from one [`Extensions`], which only grows.
+    pub fn union<'p>(plans: impl IntoIterator<Item = &'p Plan>) -> Result<Self> {
+        let mut all = Plan::default();
+        for plan in plans {
+            for ext in &plan.extensions {
+                if !all.extensions.contains(ext) {
+                    all.extensions.push(ext.clone());
+                }
+            }
+            for urn in &plan.extension_urns {
+                if !all.extension_urns.contains(urn) {
+                    all.extension_urns.push(urn.clone());
+                }
+            }
+        }
+        Functions::from_plan(&all)
+    }
+
     /// The normalized name behind `anchor`.
     pub fn name(&self, anchor: u32) -> Result<&str> {
         self.names.get(&anchor).map(String::as_str).ok_or_else(|| {

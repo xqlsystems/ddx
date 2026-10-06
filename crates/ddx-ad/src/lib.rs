@@ -27,9 +27,12 @@
 //! [`jvp`] is the forward-mode half: it rewrites the query so each relation
 //! carries the tangent of its columns beside them, along a tangent of the
 //! `wrt` columns the caller supplies, and returns a [`ForwardProgram`] that runs
-//! by the same protocol. [`jvp`] of a program does the same for its
-//! steps: of a `grad` program, that is forward over reverse, a
-//! Hessian-vector product beside each gradient.
+//! by the same protocol.
+//!
+//! All three take a query's plan or a program of either kind
+//! ([`Differentiable`]), so they compose as JAX's do: [`jvp`] of a `grad`
+//! program is forward over reverse, a Hessian-vector product beside each
+//! gradient; [`vjp`] of a `jvp` program is reverse over forward.
 //!
 //! The modules that read and write plans (`forward`, `emit`, `expr`,
 //! `relation`) are public only with the `internals` feature, for this
@@ -79,6 +82,7 @@ macro_rules! internal {
     )*};
 }
 
+mod compose;
 mod elementwise;
 mod error;
 mod functions;
@@ -97,10 +101,11 @@ internal! {
     mod relation;
 }
 
+pub use compose::Differentiable;
 pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
-pub use jvp::{jvp, jvp_with, Differentiable};
+pub use jvp::{jvp, jvp_with};
 pub use program::{
     decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, ForwardProgram, Options,
     Step,
