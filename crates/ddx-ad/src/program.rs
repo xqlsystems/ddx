@@ -8,8 +8,8 @@
 //!
 //! - [`vjp`] pulls a cotangent of the query's output back to the `wrt`
 //!   columns. The cotangent is a relation with the output's dims and values,
-//!   supplied by the caller as the table [`BackwardProgram::cotangent_table`]
-//!   names, before the backward steps run.
+//!   which the caller registers as the program's one input table
+//!   ([`BackwardProgram::inputs`]) before it runs.
 //! - [`grad`] is `vjp` of a loss seeded with 1. The query's output must be one
 //!   row and one column, as `jax.grad` requires a scalar.
 //!
@@ -56,6 +56,7 @@ use crate::forward::{saved_name, step_columns, Forward, Input};
 use crate::functions::{Extensions, Functions};
 use crate::relation::ColumnRef;
 use crate::relation::Table;
+use crate::tables::{InputTable, Of, OutputTable};
 use crate::transpose::{Contribution, Transposer};
 
 /// One step of a program: a plan, and the name its result is materialized
@@ -70,19 +71,6 @@ pub struct Step {
     pub plan: Plan,
 }
 
-/// A `wrt` table's gradient.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Gradient {
-    /// The table, as the plan names it.
-    pub table: Vec<String>,
-    /// The step that computes it.
-    pub step: String,
-    /// Its columns: the table's dims, then its `wrt` values, named as in the
-    /// table.
-    pub columns: Vec<String>,
-}
-
 /// The steps that compute a query's value and its gradient.
 ///
 /// A program is data: plans, and the names to materialize their results
@@ -90,26 +78,25 @@ pub struct Gradient {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BackwardProgram {
+    /// The tables the caller registers before the program runs: for
+    /// [`vjp`], the output's cotangent, its keys the output's dims and its
+    /// values the output's values that depend on `wrt`, named as in the
+    /// output. None for [`grad`], which seeds 1 itself.
+    pub inputs: Vec<InputTable>,
+    /// Plans that must return no rows, run before the steps. Each checks a
+    /// promise the plan cannot show (that a `wrt` table's dims identify its
+    /// rows, that a cotangent's keys do); a row back means the promise is
+    /// broken, and the program must not run.
+    pub checks: Vec<Check>,
     /// The saved aggregates, then the query's value.
     pub forward_steps: Vec<Step>,
-    /// The name of the step holding the query's value.
-    pub value: String,
-    /// For [`vjp`]: the table the caller registers the output's cotangent as,
-    /// before the backward steps run.
-    pub cotangent_table: String,
-    /// For [`vjp`]: the columns that table must have, the output's dims then
-    /// its values that depend on `wrt`, named as in the output. Empty for
-    /// [`grad`], which seeds 1 itself.
-    pub cotangent: Vec<String>,
-    /// Plans that must return no rows, run before the steps. Each checks a
-    /// promise the plan cannot show, that a `wrt` table's dims identify its
-    /// rows; a row back means the promise is broken, and the program must not
-    /// run.
-    pub checks: Vec<Check>,
     /// The cotangents, then the gradients.
     pub backward_steps: Vec<Step>,
-    /// One per `wrt` table.
-    pub gradients: Vec<Gradient>,
+    /// The query's output, under its own column names.
+    pub value: OutputTable,
+    /// One per `wrt` table, [`Of::Table`]: its dims, then each `wrt`
+    /// value's gradient under the value's name.
+    pub gradients: Vec<OutputTable>,
 }
 
 impl BackwardProgram {
@@ -128,7 +115,7 @@ impl BackwardProgram {
     /// and the cotangents. An adapter may drop them once the program has run;
     /// the value and the gradients are what a caller reads.
     pub fn intermediate_steps(&self) -> impl Iterator<Item = &Step> {
-        let keep: Vec<&str> = std::iter::once(self.value.as_str())
+        let keep: Vec<&str> = std::iter::once(self.value.step.as_str())
             .chain(self.gradients.iter().map(|g| g.step.as_str()))
             .collect();
         self.steps()
@@ -136,66 +123,30 @@ impl BackwardProgram {
     }
 }
 
-/// A `wrt` table's tangent: the table the caller registers before a
-/// [`ForwardProgram`] runs.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct TangentTable {
-    /// The `wrt` table, as the plan names it.
-    pub table: Vec<String>,
-    /// The name to register the tangent under.
-    pub name: String,
-    /// The columns it must have: the table's dims, then its `wrt` values,
-    /// named as in the table. Each row is a dim tuple and the tangent of each
-    /// value there; one row per dim tuple at most.
-    pub columns: Vec<String>,
-}
-
-/// Where an output column's tangent is.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Tangent {
-    /// The output column, by name.
-    pub column: String,
-    /// The column of the step holding its tangent.
-    pub tangent: String,
-}
-
-/// A relation a [`ForwardProgram`] computes, with its tangent beside it.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct JvpOutput {
-    /// The step holding it.
-    pub step: String,
-    /// The step's columns: the relation's own, then the tangents.
-    pub columns: Vec<String>,
-    /// Each column that has a tangent, and where it is.
-    pub tangents: Vec<Tangent>,
-}
-
 /// The steps that compute a query's output and its tangent.
 ///
-/// Like a [`BackwardProgram`], a program is data: it is read, not built,
-/// outside this crate.
+/// Its anatomy is a [`BackwardProgram`]'s: input tables ([`InputTable`])
+/// the caller registers, checks, steps, and output tables ([`OutputTable`]) it leaves. Like
+/// it, a program is data: it is read, not built, outside this crate.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ForwardProgram {
-    /// One per `wrt` table: the tangents to register before the program
-    /// runs.
-    pub tangent_tables: Vec<TangentTable>,
+    /// One per `wrt` table, [`Of::Table`]: its tangent, keyed by the table's
+    /// dims, to register before the program runs.
+    pub inputs: Vec<InputTable>,
     /// Plans that must return no rows, run before the steps: that each
     /// `wrt` table's dims identify its rows, and that each tangent table has
     /// one row per dim tuple.
     pub checks: Vec<Check>,
     /// The steps, in order.
     pub steps: Vec<Step>,
-    /// The query's output, or a program's value, and its tangent.
-    pub output: JvpOutput,
-    /// For [`jvp_of_program`](crate::jvp_of_program): each of the program's gradients, and its
-    /// tangent. Of a [`grad`](crate::grad) program along `v`, that is the
+    /// The query's output, or a program's value, with its tangents.
+    pub value: OutputTable,
+    /// For [`jvp`](crate::jvp) of a program: each of the program's gradients, with its
+    /// tangents. Of a [`grad`](crate::grad) program along `v`, those are the
     /// Hessian-vector product `H·v`, shaped like the gradient. Empty for
     /// [`jvp`](crate::jvp).
-    pub gradients: Vec<JvpOutput>,
+    pub gradients: Vec<OutputTable>,
 }
 
 /// A plan that must return no rows (see [`BackwardProgram::checks`]).
@@ -374,9 +325,8 @@ pub fn grad_with(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<Ba
 }
 
 /// The vector-Jacobian product of the query `plan` with respect to the `wrt`
-/// columns: the program pulls back the cotangent the caller registers as
-/// [`BackwardProgram::cotangent_table`], with the columns
-/// [`BackwardProgram::cotangent`] lists.
+/// columns: the program pulls back the cotangent the caller registers as its
+/// one input table ([`BackwardProgram::inputs`]).
 pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
     vjp_with(plan, wrt, &Options::new())
 }
@@ -454,7 +404,7 @@ fn build(
             });
         }
     };
-    let (cotangent, cotangent_check) = match seed {
+    let (inputs, cotangent_check) = match seed {
         Seed::One => {
             let col = scalar_output(f)?;
             // A NULL loss does not move with anything in it, as with vjp's
@@ -471,7 +421,13 @@ fn build(
         Seed::Cotangent => {
             let (names, dims) = seed_cotangent(&mut t, f)?;
             let check = cotangent_check(&mut t, f, &names, dims);
-            (names, Some(check))
+            let input = InputTable {
+                name: format!("{}cotangent", f.namespace),
+                of: Of::Output,
+                columns: names,
+                keys: dims,
+            };
+            (vec![input], Some(check))
         }
     };
 
@@ -509,10 +465,11 @@ fn build(
             name: step.clone(),
             plan: plan(rel, columns.clone(), &t.ext),
         });
-        gradients.push(Gradient {
-            table: table.names.clone(),
+        gradients.push(OutputTable {
             step,
+            of: Of::Table(table.names.clone()),
             columns,
+            tangents: Vec::new(),
         });
     }
     if !t.contributions.is_empty() {
@@ -522,17 +479,21 @@ fn build(
         )));
     }
     let mut program = BackwardProgram {
-        forward_steps,
-        value: format!("{}value", f.namespace),
-        cotangent_table: format!("{}cotangent", f.namespace),
+        inputs,
         checks: f
             .tables
             .iter()
             .map(|table| dims_check(&mut t.ext, table))
             .chain(cotangent_check)
             .collect(),
-        cotangent,
+        forward_steps,
         backward_steps,
+        value: OutputTable {
+            step: format!("{}value", f.namespace),
+            of: Of::Output,
+            columns: f.output_names.clone(),
+            tangents: Vec::new(),
+        },
         gradients,
     };
     prune_program(&mut program);
@@ -547,7 +508,7 @@ fn prune_program(program: &mut BackwardProgram) {
     for c in program.checks.iter_mut() {
         crate::prune::prune_plan(&mut c.plan);
     }
-    let keep: BTreeSet<String> = std::iter::once(program.value.clone())
+    let keep: BTreeSet<String> = std::iter::once(program.value.step.clone())
         .chain(program.gradients.iter().map(|g| g.step.clone()))
         .collect();
     // Every step's columns that plans after it read, by name.

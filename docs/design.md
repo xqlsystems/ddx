@@ -834,20 +834,32 @@ pub fn vjp(plan: &Plan, wrt: &[ColumnRef]) -> Result<BackwardProgram, AdError>;
 pub struct ColumnRef { pub table: String, pub column: String }
 
 pub struct BackwardProgram {
-    pub forward_steps: Vec<Step>,   // the saved aggregates, then the value
-    pub value: String,              // the step holding the query's own result
-    pub cotangent: Vec<String>,     // vjp: the columns of the cotangent it reads
-    pub backward_steps: Vec<Step>,  // cotangents, then one gradient per table
-    pub gradients: Vec<Gradient>,   // which step holds each table's gradient
+    pub inputs: Vec<InputTable>,      // vjp: the output's cotangent; grad: none
+    pub checks: Vec<Check>,           // plans that must return no rows, run first
+    pub forward_steps: Vec<Step>,     // the saved aggregates, then the value
+    pub backward_steps: Vec<Step>,    // cotangents, then one gradient per table
+    pub value: OutputTable,           // the query's own result
+    pub gradients: Vec<OutputTable>,  // one per wrt table
 }
 pub struct Step { pub name: String, pub plan: Plan }
+
+// What a program shares with its caller, in every mode (§4.8 too):
+pub enum Of { Output, Table(Vec<String>) }   // the query's output, or a wrt table
+pub struct InputTable { pub name: String, pub of: Of, pub columns: Vec<String>, pub keys: usize }
+pub struct OutputTable { pub step: String, pub of: Of, pub columns: Vec<String>, pub tangents: Vec<Tangent> }
 ```
+
+Every program has the same anatomy: input tables the caller registers
+before it runs, checks, steps, and output tables it leaves. A cotangent and a
+tangent are both input tables, shaped like what they are of (its keys, then
+a number per value under the value's name); the value, a gradient, a `jvp`'s
+output and a Hessian-vector product are all output tables.
 
 As in JAX, `vjp` pulls a cotangent of the output back to the inputs, and
 `grad` is `vjp` of a loss seeded with 1. `grad` requires one row and one
 column, as `jax.grad` requires a scalar; anything else is an error that points
-at `vjp`. `vjp` reads the cotangent from a table the caller supplies (the
-program names it, `cotangent_table`), keyed like the output.
+at `vjp`. `vjp` reads the cotangent from a table the caller supplies, the
+program's one input table, keyed like the output.
 
 **Dims and values.** A gradient has the shape of what it is taken with
 respect to, and ddx's version of shape is the XQL model (§1). A relation's
@@ -1091,15 +1103,23 @@ recomputing it.
 ### 4.8 `jvp`: forward mode
 
 ```rust
-pub fn jvp(plan: &Plan, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
-pub fn jvp_of_program(program: &BackwardProgram, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
+pub fn jvp<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<ForwardProgram, AdError>;
+// D: a query's Plan, or a BackwardProgram (forward over reverse)
+
+pub struct ForwardProgram {
+    pub inputs: Vec<InputTable>,      // one tangent per wrt table
+    pub checks: Vec<Check>,
+    pub steps: Vec<Step>,
+    pub value: OutputTable,           // the output, with its tangents
+    pub gradients: Vec<OutputTable>,  // jvp of a grad program: each gradient with H·v
+}
 ```
 
 As in JAX, `jvp` pushes a tangent of the `wrt` columns forward to the
 query's output, `J·t`. A tangent is shaped like its primal: for each `wrt`
 table, a relation with the table's dims and a tangent per `wrt` column,
-which the caller registers under the name the program gives
-(`tangent_tables`) before it runs. A row the tangent table lacks has tangent
+one input table of the program per `wrt` table, which the caller registers
+before it runs. A row the tangent table lacks has tangent
 0. The program's output holds the query's own columns and, after them, the
 tangent of each column that depends on a `wrt` column, as `jax.jvp` returns
 both.
@@ -1142,7 +1162,7 @@ no tangent ddx can give (a rank, a `GROUP BY` key computed from a `wrt`
 value, an aggregate with no rule, a running `MAX` over an ordered frame)
 carries its refusal, raised only if something reads its tangent.
 
-**Forward over reverse.** `jvp_of_program` rewrites a program's steps in
+**Forward over reverse.** `jvp` of a program rewrites its steps in
 order, each as `jvp` rewrites a query, reading the duals of the steps before
 it. A step's read of an earlier step names the columns it takes, since a
 program's steps are pruned to what they read (§4.7), so a dual's columns are
@@ -1392,7 +1412,7 @@ breadth, not de-risking.
   matches `jax.jvp` on the spikes' fixtures, passes the dot-product test
   ⟨J t, c⟩ = ⟨t, Jᵀ c⟩ against `vjp`, and gives a Hessian-vector product on
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
-  far:** `ddx_ad::jvp` and `jvp_of_program` (forward over reverse) and their
+  far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
   `vjp`. Still to come: `jvp(…)` in SQL, the Python API, and agreement with
   `jax.jvp` on the spikes' fixtures.

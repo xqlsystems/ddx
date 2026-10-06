@@ -27,7 +27,7 @@
 //! [`jvp`] is the forward-mode half: it rewrites the query so each relation
 //! carries the tangent of its columns beside them, along a tangent of the
 //! `wrt` columns the caller supplies, and returns a [`ForwardProgram`] that runs
-//! by the same protocol. [`jvp_of_program`] does the same for a program's
+//! by the same protocol. [`jvp`] of a program does the same for its
 //! steps: of a `grad` program, that is forward over reverse, a
 //! Hessian-vector product beside each gradient.
 //!
@@ -87,6 +87,7 @@ mod program;
 mod prune;
 mod run;
 pub mod sql;
+mod tables;
 mod tangent;
 mod transpose;
 internal! {
@@ -99,14 +100,15 @@ internal! {
 pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
-pub use jvp::{jvp, jvp_of_program, jvp_of_program_with, jvp_with};
+pub use jvp::{jvp, jvp_with, Differentiable};
 pub use program::{
-    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, ForwardProgram, Gradient,
-    JvpOutput, Options, Step, Tangent, TangentTable,
+    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, ForwardProgram, Options,
+    Step,
 };
 pub use relation::ColumnRef;
 pub use run::{run, Action, Backend, Program, RunError, Runner};
 pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
+pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use {

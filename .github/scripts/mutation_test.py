@@ -107,8 +107,8 @@ MUTANTS = [
      "        ctx.deregister_table(step.name.as_str())?;",
      "release leaves the value table on the context"),
     ("sql-case-sensitive", f"{AD}/sql.rs",
-     "table_matches(&w.table, &g.table) && w.column.eq_ignore_ascii_case(c)",
-     "table_matches(&w.table, &g.table) && w.column == *c",
+     "table_matches(&w.table, table) && w.column.eq_ignore_ascii_case(c)",
+     "table_matches(&w.table, table) && w.column == *c",
      "grad in SQL treats W.VAL and w.val as different columns"),
 ]
 

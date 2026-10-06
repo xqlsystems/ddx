@@ -201,9 +201,9 @@ async fn vjp_pulls_a_cotangent_back() {
     let sql = "SELECT i, SUM(val * val) AS s FROM w GROUP BY i";
     let plan = substrait_of(&ctx, sql, true).await;
     let program = vjp(&plan, &[wrt("w", "val")]).unwrap();
-    assert_eq!(program.cotangent, vec!["i", "s"]);
+    assert_eq!(program.inputs[0].columns, vec!["i", "s"]);
 
-    let cotangent_table: &'static str = Box::leak(program.cotangent_table.clone().into_boxed_str());
+    let cotangent_table: &'static str = Box::leak(program.inputs[0].name.clone().into_boxed_str());
     Table {
         name: cotangent_table,
         columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
@@ -506,7 +506,7 @@ async fn vjp_sends_no_gradient_through_an_output_row_that_is_null() {
     .await;
     let program = vjp(&plan, &[ColumnRef::new("vp", "val")]).unwrap();
     Table {
-        name: Box::leak(program.cotangent_table.clone().into_boxed_str()),
+        name: Box::leak(program.inputs[0].name.clone().into_boxed_str()),
         columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
         rows: vec![vec![0.0, 3.0], vec![1.0, 7.0]],
     }
@@ -576,7 +576,7 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
     let plan = substrait_of(&ctx, "SELECT i, val * val AS s FROM kp", true).await;
     let program = vjp(&plan, &[ColumnRef::new("kp", "val")]).unwrap();
     Table {
-        name: Box::leak(program.cotangent_table.clone().into_boxed_str()),
+        name: Box::leak(program.inputs[0].name.clone().into_boxed_str()),
         columns: vec![("i", "BIGINT"), ("s", "DOUBLE")],
         rows: vec![vec![0.0, 1.0], vec![0.0, 1.0], vec![1.0, 1.0]],
     }
@@ -692,10 +692,10 @@ async fn a_fixed_namespace_makes_the_program_the_same_every_time() {
         grad_with(&plan, &wrt, &options).unwrap(),
     );
     assert_eq!(bytes(&a), bytes(&b));
-    assert_eq!(a.value, "__ddx_golden_value");
+    assert_eq!(a.value.step, "__ddx_golden_value");
     // Without one, two programs never share a table name.
     let (c, d) = (grad(&plan, &wrt).unwrap(), grad(&plan, &wrt).unwrap());
-    assert_ne!(c.value, d.value);
+    assert_ne!(c.value.step, d.value.step);
     // A namespace outside ddx's reserved prefix could name a user's table.
     // `__ddx_a` would run into its step names (`__ddx_asaved_0`), and an
     // engine folds `__ddx_Foo_` to lower case (composability re-review, #74).

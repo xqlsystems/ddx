@@ -18,10 +18,12 @@
 //! Underneath, [`grad`] turns a query whose result is one number into a
 //! [`BackwardProgram`], and [`run`] runs it: every step is materialized as a
 //! table on the context, the number ends up in [`BackwardProgram::value`], and
-//! each `wrt` table's gradient, shaped like the table, in the table
-//! [`BackwardProgram::gradients`] names. [`vjp`] does the same for a query with
-//! any output, pulling back a cotangent the caller registers as the table
-//! [`BackwardProgram::cotangent_table`] names.
+//! each `wrt` table's gradient, shaped like the table, in
+//! [`BackwardProgram::gradients`]. [`vjp`] does the same for a query with any
+//! output, pulling back a cotangent the caller registers as the program's input
+//! table ([`BackwardProgram::inputs`]). [`jvp`] pushes a tangent forward instead
+//! ([`ForwardProgram`]); both kinds of program share one vocabulary of input and
+//! output tables ([`InputTable`], [`OutputTable`]).
 //!
 //! Every table a program writes is named with a prefix unique to that program,
 //! `__ddx_{id}_`, so two programs on one context never read each other's
@@ -86,8 +88,8 @@ use ddx_ad::substrait::proto::{Plan, ProjectRel};
 use ddx_ad::{bind_reads, unbound_reads, Action, RunError};
 
 pub use ddx_ad::{
-    AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, Gradient, JvpOutput, Program, Step,
-    Tangent, TangentTable,
+    AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, InputTable, Of, OutputTable,
+    Program, Step, Tangent,
 };
 
 use ddx_ad::Statements;
@@ -118,9 +120,8 @@ pub fn grad_plan(
 }
 
 /// The vector-Jacobian product of the SQL query `sql` with respect to the
-/// `wrt` columns. Before the program's backward steps run, register the
-/// cotangent as the table [`BackwardProgram::cotangent_table`] names, with the
-/// columns [`BackwardProgram::cotangent`] lists.
+/// `wrt` columns. Before the program runs, register the cotangent as its
+/// input table ([`BackwardProgram::inputs`]), with the columns it lists.
 pub async fn vjp(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<BackwardProgram> {
     vjp_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
 }
@@ -135,31 +136,81 @@ pub fn vjp_plan(
     ddx_ad::vjp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
 }
 
-/// The Jacobian-vector product of the SQL query `sql` with respect to the
-/// `wrt` columns: a program computing the query's output and, beside it, its
-/// tangent. Before running it, register each `wrt` table's tangent as the
-/// table [`ForwardProgram::tangent_tables`] names, with the columns it lists.
-pub async fn jvp(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
-    jvp_plan(ctx, &ctx.sql(sql).await?.into_optimized_plan()?, wrt)
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for str {}
+    impl Sealed for datafusion::logical_expr::LogicalPlan {}
+    impl Sealed for ddx_ad::BackwardProgram {}
 }
 
-/// [`jvp`] for a plan already built.
-pub fn jvp_plan(
+/// What [`jvp`] pushes a tangent through: SQL text, a DataFusion plan (from
+/// the DataFrame API, say), or a program (a [`BackwardProgram`]: of a [`grad`]
+/// program, forward over reverse, which gives `H·v`).
+///
+/// Sealed: these are the things ddx differentiates forward here.
+pub trait Differentiable: sealed::Sealed + Sync {
+    #[doc(hidden)]
+    fn forward_program<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+        wrt: &'a [ColumnRef],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>;
+}
+
+impl Differentiable for str {
+    fn forward_program<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+        wrt: &'a [ColumnRef],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let lp = ctx.sql(self).await?.into_optimized_plan()?;
+            lp.forward_program(ctx, wrt).await
+        })
+    }
+}
+
+impl Differentiable for LogicalPlan {
+    fn forward_program<'a>(
+        &'a self,
+        ctx: &'a SessionContext,
+        wrt: &'a [ColumnRef],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            refuse_what_substrait_loses(self)?;
+            ddx_ad::jvp(&*to_substrait_plan(self, &ctx.state())?, wrt).map_err(to_df_err)
+        })
+    }
+}
+
+impl Differentiable for BackwardProgram {
+    fn forward_program<'a>(
+        &'a self,
+        _ctx: &'a SessionContext,
+        wrt: &'a [ColumnRef],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardProgram>> + Send + 'a>>
+    {
+        Box::pin(async move { ddx_ad::jvp(self, wrt).map_err(to_df_err) })
+    }
+}
+
+/// The Jacobian-vector product of `of` with respect to the `wrt` columns
+/// (see [`ddx_ad::jvp`]): of SQL text or a plan, a program computing the
+/// query's output and, beside it, its tangent; of a program, its steps
+/// rewritten, so that of a [`grad`] program each gradient's tangent is the
+/// Hessian-vector product `H·v`. There is no `hvp`: it is
+/// `jvp(ctx, &grad(ctx, sql, wrt).await?, wrt)`, and one `grad` program
+/// serves every direction. Before running the result, register each `wrt`
+/// table's tangent as the input table [`ForwardProgram::inputs`] gives for
+/// it, with the columns it lists.
+pub async fn jvp<D: Differentiable + ?Sized>(
     ctx: &SessionContext,
-    plan: &LogicalPlan,
+    of: &D,
     wrt: &[ColumnRef],
 ) -> Result<ForwardProgram> {
-    refuse_what_substrait_loses(plan)?;
-    ddx_ad::jvp(&*to_substrait_plan(plan, &ctx.state())?, wrt).map_err(to_df_err)
-}
-
-/// The Jacobian-vector product of a program's steps, forward mode over it
-/// (see [`ddx_ad::jvp_of_program`]). Of a [`grad`] program along `v`, each
-/// gradient's tangent is the Hessian-vector product `H·v`. There is no
-/// `hvp`: it is this over [`grad`], and one `grad` program serves every
-/// direction.
-pub fn jvp_of_program(program: &BackwardProgram, wrt: &[ColumnRef]) -> Result<ForwardProgram> {
-    ddx_ad::jvp_of_program(program, wrt).map_err(to_df_err)
+    of.forward_program(ctx, wrt).await
 }
 
 /// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for

@@ -151,7 +151,7 @@ pub async fn check_gradients(
 
     // The forward step reproduces the query.
     let loss = scalar(ctx, loss_sql).await;
-    let out = total(ctx, &format!("SELECT * FROM {}", program.value)).await;
+    let out = total(ctx, &format!("SELECT * FROM {}", program.value.step)).await;
     assert!(
         (loss - out).abs() <= 1e-9 * loss.abs().max(1.0),
         "loss {loss} vs value step {out}"
@@ -161,7 +161,7 @@ pub async fn check_gradients(
     for g in &program.gradients {
         let table = tables
             .iter()
-            .find(|t| g.table.last().map(String::as_str) == Some(t.name))
+            .find(|t| g.of.table().and_then(|t| t.last()).map(String::as_str) == Some(t.name))
             .expect("every wrt table is given");
         let got = rows(ctx, &format!("SELECT * FROM {}", g.step)).await;
         assert_eq!(

@@ -105,7 +105,7 @@ pub(crate) struct Dual {
 pub(crate) enum Source {
     /// A `wrt` table, joined to the table `tangent` on its dims. That table
     /// holds the dims, then one tangent per value, in the table's order.
-    Wrt { table: Table, tangent: String },
+    Table { table: Table, tangent: String },
     /// An earlier step, read from its dual: the table `dual`, whose columns
     /// are `columns`, the step's own first; the step's column `c` has the
     /// tangent `tans[c]`, a [`Tan::Col`] naming a column of the dual.
@@ -129,9 +129,6 @@ pub(crate) struct Dualizer<'a> {
     pub ext: Extensions,
     source: &'a mut SourceFn<'a>,
 }
-
-/// A tangent before its relation's emit: `Col` is a direct column.
-type DirectTan = Tan;
 
 impl<'a> Dualizer<'a> {
     pub fn new(
@@ -319,7 +316,7 @@ impl<'a> Dualizer<'a> {
         &self,
         common: Option<&RelCommon>,
         width: usize,
-        tans: Vec<DirectTan>,
+        tans: Vec<Tan>,
         build: impl FnOnce(Option<RelCommon>) -> Rel,
         direct_of: &dyn Fn(usize) -> usize,
     ) -> Result<Dual> {
@@ -362,7 +359,7 @@ impl<'a> Dualizer<'a> {
         let outputs = apply_emit(r.common.as_ref(), read_outputs(r)?)?;
         let filter = r.filter.as_deref().cloned();
         match source {
-            Source::Wrt { table, tangent } => {
+            Source::Table { table, tangent } => {
                 let schema = table.schema.clone();
                 let w = schema.names.len();
                 let (k, v) = (table.dims.len(), table.values.len());
@@ -466,7 +463,7 @@ impl<'a> Dualizer<'a> {
         // Tangents of MAX/MIN windows: they read the window's own column, so
         // they go in a second projection over this one.
         let mut deferred: Vec<(usize, Expression)> = Vec::new();
-        let mut expr_tans: Vec<DirectTan> = Vec::with_capacity(m);
+        let mut expr_tans: Vec<Tan> = Vec::with_capacity(m);
         for (i, e) in p.expressions.iter().enumerate() {
             let tan = if let Some(c) = as_field(e) {
                 // A bare reference is its column, tangent and all.
@@ -514,7 +511,7 @@ impl<'a> Dualizer<'a> {
             rel = project_emit(rel, later, None);
         }
         // Direct columns: the input's dual, the expressions, their tangents.
-        let mut tans: Vec<DirectTan> = d.tans.clone();
+        let mut tans: Vec<Tan> = d.tans.clone();
         tans.extend(expr_tans);
         let direct_of = |o: usize| if o < w_in { o } else { big + (o - w_in) };
         let common = p.common.as_ref();
@@ -748,7 +745,7 @@ impl<'a> Dualizer<'a> {
         let groupings: Vec<Expression> = grouping_expressions(a)?.into_iter().cloned().collect();
         let varied = |f: usize| d.tans.get(f).is_some_and(Tan::varied);
         let g = groupings.len();
-        let mut tans: Vec<DirectTan> = Vec::new();
+        let mut tans: Vec<Tan> = Vec::new();
         for k in &groupings {
             tans.push(if depends(self.functions, k, &varied)? {
                 Tan::Refused(AdError::NotImplemented(

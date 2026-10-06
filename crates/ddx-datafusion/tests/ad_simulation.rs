@@ -1964,7 +1964,11 @@ async fn read_grads(
         let r = query(ctx, &format!("SELECT * FROM \"{}\"", g.step))
             .await
             .map_err(|e| format!("[read] cannot read gradient step {}: {e}", g.step))?;
-        let table = g.table.last().cloned().unwrap_or_default();
+        let table =
+            g.of.table()
+                .and_then(|t| t.last())
+                .cloned()
+                .unwrap_or_default();
         let ncols = r.names.len();
         if ncols == 0 || r.names[ncols - 1] != "val" {
             return Err(format!(
@@ -2565,7 +2569,7 @@ async fn check_case_inner(
     }
 
     // The value step is the loss.
-    match query(&ctx, &format!("SELECT * FROM \"{}\"", program.value)).await {
+    match query(&ctx, &format!("SELECT * FROM \"{}\"", program.value.step)).await {
         Ok(r) => match r.rows.as_slice() {
             [row]
                 if row.len() == 1
@@ -3331,7 +3335,7 @@ async fn twin_checks(
                 (key, row[n - 1])
             })
             .collect();
-        let parts: &[String] = &g.table;
+        let parts = g.of.table().unwrap_or_default();
         let name = parts.last().cloned().unwrap_or_default();
         let twin = twins
             .iter()
@@ -3974,15 +3978,15 @@ async fn vjp_checks(
                 return Ok(());
             }
         };
-        if program.cotangent.len() != 1 {
+        if program.inputs[0].columns.len() != 1 {
             out.fail(format!(
                 "[vjp-seed] a scalar loss's cotangent should be one column, got {:?}",
-                program.cotangent
+                program.inputs[0].columns
             ));
             return Ok(());
         }
         let cot = Table {
-            name: program.cotangent_table.clone(),
+            name: program.inputs[0].name.clone(),
             dims: vec![],
             keys: vec![vec![]],
             vals: vec![Some(seed)],
@@ -3993,14 +3997,14 @@ async fn vjp_checks(
         let batch = cot.batch();
         let renamed = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
-                &program.cotangent[0],
+                &program.inputs[0].columns[0],
                 DataType::Float64,
                 true,
             )])),
             vec![batch.column(0).clone()],
         )
         .map_err(|e| e.to_string())?;
-        register_batch(ctx, &program.cotangent_table, renamed)?;
+        register_batch(ctx, &program.inputs[0].name, renamed)?;
         match run_and_read(ctx, &program).await {
             Ok(g) => {
                 out.meta_compared += 1;
@@ -4010,7 +4014,7 @@ async fn vjp_checks(
             }
             Err(e) => out.fail(format!("[vjp-seed] {e}")),
         }
-        ctx.deregister_table(program.cotangent_table.as_str())
+        ctx.deregister_table(program.inputs[0].name.as_str())
             .map_err(|e| e.to_string())?;
     }
 
@@ -4061,7 +4065,7 @@ async fn vjp_checks(
     for c in &cots {
         let mut fields = Vec::new();
         let mut cols: Vec<ArrayRef> = Vec::new();
-        for name in &program.cotangent {
+        for name in &program.inputs[0].columns {
             if let Some(k) = dims.iter().position(|d| d == name) {
                 fields.push(Field::new(name, kt.data_type(), false));
                 cols.push(
@@ -4085,7 +4089,7 @@ async fn vjp_checks(
         }
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| e.to_string())?;
-        register_batch(ctx, &program.cotangent_table, batch)?;
+        register_batch(ctx, &program.inputs[0].name, batch)?;
         match run_and_read(ctx, &program).await {
             Ok(g) => vjp_grads.push(g),
             Err(e) => {
@@ -4093,7 +4097,7 @@ async fn vjp_checks(
                 return Ok(());
             }
         }
-        ctx.deregister_table(program.cotangent_table.as_str())
+        ctx.deregister_table(program.inputs[0].name.as_str())
             .map_err(|e| e.to_string())?;
     }
 
@@ -4157,7 +4161,7 @@ async fn vjp_checks(
         .collect();
     let mut fields = Vec::new();
     let mut cols: Vec<ArrayRef> = Vec::new();
-    for name in &program.cotangent {
+    for name in &program.inputs[0].columns {
         if let Some(k) = dims.iter().position(|d| d == name) {
             fields.push(Field::new(name, kt.data_type(), false));
             cols.push(
@@ -4175,7 +4179,7 @@ async fn vjp_checks(
     }
     let batch =
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| e.to_string())?;
-    register_batch(ctx, &program.cotangent_table, batch)?;
+    register_batch(ctx, &program.inputs[0].name, batch)?;
     match run_and_read(ctx, &program).await {
         Ok(g) => {
             out.meta_compared += 1;
@@ -4199,7 +4203,7 @@ async fn vjp_checks(
         }
         Err(e) => out.fail(format!("[vjp-linear] {e}")),
     }
-    ctx.deregister_table(program.cotangent_table.as_str())
+    ctx.deregister_table(program.inputs[0].name.as_str())
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -4256,7 +4260,7 @@ async fn contract_checks(
         out.fail(format!("[accepted-but-failed] {e}"));
         return Ok(());
     }
-    let want: BTreeSet<String> = std::iter::once(p.value.clone())
+    let want: BTreeSet<String> = std::iter::once(p.value.step.clone())
         .chain(p.gradients.iter().map(|g| g.step.clone()))
         .collect();
     let have = ddx_tables(&ctx);

@@ -318,7 +318,8 @@ impl Check {
     }
 }
 
-/// Where a `wrt` table's gradient lands (`ddx_ad::Gradient`): the step's
+/// Where a `wrt` table's gradient lands (a `ddx_ad::OutputTable` of a `wrt`
+/// table): the step's
 /// table has the table's dims, then its `wrt` values, named as in the table;
 /// each value column holds the gradient, `0` where none reached and `NULL`
 /// where the value itself is `NULL`.
@@ -379,19 +380,21 @@ impl BackwardProgram {
     /// The step holding the query's own result.
     #[getter]
     fn value(&self) -> &str {
-        &self.0.value
+        &self.0.value.step
     }
 
-    /// For a vjp program: the table the caller registers the cotangent as.
+    /// For a vjp program: the table the caller registers the cotangent as,
+    /// its one input table; empty for a grad program, which has none.
     #[getter]
     fn cotangent_table(&self) -> &str {
-        &self.0.cotangent_table
+        self.0.inputs.first().map_or("", |i| i.name.as_str())
     }
 
     /// For a vjp program: that table's columns.
     #[getter]
     fn cotangent<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.0.cotangent)
+        let columns: &[String] = self.0.inputs.first().map_or(&[], |i| &i.columns);
+        PyTuple::new(py, columns)
     }
 
     /// Plans that must return no rows, run before the steps.
@@ -414,7 +417,7 @@ impl BackwardProgram {
             .gradients
             .iter()
             .map(|g| Gradient {
-                table: g.table.join("."),
+                table: g.of.table().map(|t| t.join(".")).unwrap_or_default(),
                 step: g.step.clone(),
                 columns: g.columns.clone(),
             })
@@ -446,9 +449,9 @@ impl BackwardProgram {
                 p.steps(),
                 p.checks(),
                 p.gradients(),
-                p.0.value.clone(),
-                p.0.cotangent_table.clone(),
-                p.0.cotangent.clone(),
+                p.0.value.step.clone(),
+                p.cotangent_table().to_string(),
+                p.0.inputs.first().map(|i| i.columns.clone()),
             )
         };
         key(self) == key(other)
@@ -457,7 +460,7 @@ impl BackwardProgram {
     fn __repr__(&self) -> String {
         format!(
             "BackwardProgram(value={:?}, steps={}, checks={}, gradients={:?})",
-            self.0.value,
+            self.0.value.step,
             self.0.steps().count(),
             self.0.checks.len(),
             self.gradients()

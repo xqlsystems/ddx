@@ -252,11 +252,11 @@ impl Statements {
             let mut failure = None;
             let rewritten = calls.rewrite(&mut |call| {
                 let j = self.job_of[&(s, call.objective)];
-                let found = programs[j]
-                    .gradients
-                    .iter()
-                    .find(|g| table_matches(&call.table, &g.table));
-                let Some(g) = found else {
+                let found = programs[j].gradients.iter().find_map(|g| {
+                    let table = g.of.table()?;
+                    table_matches(&call.table, table).then_some((g, table))
+                });
+                let Some((g, table)) = found else {
                     failure = Some(AdError::Internal(format!(
                         "no gradient was computed for `{}`",
                         call.table
@@ -264,9 +264,10 @@ impl Statements {
                     return String::new();
                 };
                 let is_value = |c: &String| {
-                    self.jobs[j].wrt.iter().any(|w| {
-                        table_matches(&w.table, &g.table) && w.column.eq_ignore_ascii_case(c)
-                    })
+                    self.jobs[j]
+                        .wrt
+                        .iter()
+                        .any(|w| table_matches(&w.table, table) && w.column.eq_ignore_ascii_case(c))
                 };
                 let picked: Vec<String> = g
                     .columns
