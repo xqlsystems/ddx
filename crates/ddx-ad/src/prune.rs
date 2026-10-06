@@ -40,7 +40,8 @@ use crate::forward::width;
 /// if it was kept. Every column that was needed is kept.
 type Map = Vec<Option<usize>>;
 
-/// Prune every root of `plan`, keeping all of each root's columns.
+/// Prune every root of `plan`, keeping all of each root's columns, then fuse
+/// its stacked projections ([`crate::fuse`]).
 pub(crate) fn prune_plan(plan: &mut Plan) {
     for r in plan.relations.iter_mut() {
         if let Some(substrait::proto::plan_rel::RelType::Root(root)) = r.rel_type.as_mut() {
@@ -50,6 +51,7 @@ pub(crate) fn prune_plan(plan: &mut Plan) {
             }
         }
     }
+    crate::fuse::fuse_plan(plan);
 }
 
 /// Prune `plan`'s root to the output columns named in `used`, keeping their
@@ -74,6 +76,9 @@ pub(crate) fn prune_plan_to_names(plan: &mut Plan, used: &BTreeSet<String>) -> b
                 pruned = true;
             }
         }
+    }
+    if pruned {
+        crate::fuse::fuse_plan(plan);
     }
     pruned
 }

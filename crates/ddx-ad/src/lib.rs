@@ -87,6 +87,7 @@ mod compose;
 mod elementwise;
 mod error;
 mod functions;
+mod fuse;
 mod jvp;
 mod program;
 mod prune;
