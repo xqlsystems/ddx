@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.1.0...ddx-ad-v0.2.0) - 2026-10-06
+
+### Added
+
+- skip a check whose fact a caller already holds (Verified) ([#120](https://github.com/xqlsystems/ddx/pull/120))
+- *(ddx-ad)* [**breaking**] grad, vjp and jvp compose with each other ([#121](https://github.com/xqlsystems/ddx/pull/121))
+- *(ddx-ad)* jvp of a query and of a program; Hessian-vector products (M4.5 1) ([#113](https://github.com/xqlsystems/ddx/pull/113))
+
+### Fixed
+
+- *(ddx-ad)* a MAX of a grouped MAX is exact at a near tie ([#116](https://github.com/xqlsystems/ddx/pull/116))
+- *(ddx-ad)* write an emit only on a projection ([#117](https://github.com/xqlsystems/ddx/pull/117))
+- *(ddx-ad)* an ordering by an expression breaks no ties; two smaller findings ([#114](https://github.com/xqlsystems/ddx/pull/114))
+
+### Other
+
+- tangents by forward mode over each expression; the plan walked once; checks at once ([#119](https://github.com/xqlsystems/ddx/pull/119))
+- *(ddx-ad)* [**breaking**] one vocabulary of input and output tables for every program ([#118](https://github.com/xqlsystems/ddx/pull/118))
+
 ## [0.1.0](https://github.com/xqlsystems/ddx/releases/tag/ddx-ad-v0.1.0) - 2026-10-04
 
 ### Added
