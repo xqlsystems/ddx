@@ -162,23 +162,42 @@ impl Check {
     }
 }
 
-/// Where a `wrt` table's gradient lands (a `ddx_ad::OutputTable` of a `wrt`
-/// table): the step's
-/// table has the table's dims, then its `wrt` values, named as in the table;
-/// each value column holds the gradient, `0` where none reached and `NULL`
-/// where the value itself is `NULL`.
-#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "Gradient")]
+/// What an `InputTable` or `OutputTable` is of, for Python: `None` for the
+/// query's output, or a `wrt` table's name parts.
+fn of_py(of: &ddx_ad::Of) -> Option<Vec<String>> {
+    of.table().map(<[String]>::to_vec)
+}
+
+/// `of` as Python sees it: `None`, or a tuple of name parts.
+fn of_tuple<'py>(
+    py: Python<'py>,
+    of: &Option<Vec<String>>,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    of.as_ref().map(|t| PyTuple::new(py, t)).transpose()
+}
+
+/// A table the caller registers before a program runs (`ddx_ad::InputTable`):
+/// a vjp's cotangent of the output (`of` is `None`), or a jvp's tangent of a
+/// `wrt` table (`of` is its name parts). Its `columns` are its keys, the
+/// first `keys` of them, then its values, named as in what it is of.
+#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "InputTable")]
 #[derive(Clone, PartialEq)]
-struct Gradient {
+struct InputTable {
     #[pyo3(get)]
-    table: String,
-    #[pyo3(get)]
-    step: String,
+    name: String,
+    of: Option<Vec<String>>,
     columns: Vec<String>,
+    #[pyo3(get)]
+    keys: usize,
 }
 
 #[pymethods]
-impl Gradient {
+impl InputTable {
+    #[getter]
+    fn of<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        of_tuple(py, &self.of)
+    }
+
     #[getter]
     fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.columns)
@@ -186,10 +205,116 @@ impl Gradient {
 
     fn __repr__(&self) -> String {
         format!(
-            "Gradient(table={:?}, step={:?}, columns={:?})",
-            self.table, self.step, self.columns
+            "InputTable(name={:?}, of={:?}, columns={:?}, keys={})",
+            self.name, self.of, self.columns, self.keys
         )
     }
+}
+
+impl From<&ddx_ad::InputTable> for InputTable {
+    fn from(t: &ddx_ad::InputTable) -> Self {
+        InputTable {
+            name: t.name.clone(),
+            of: of_py(&t.of),
+            columns: t.columns.clone(),
+            keys: t.keys,
+        }
+    }
+}
+
+/// Where a column's tangent is, in an `OutputTable` (`ddx_ad::Tangent`).
+#[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "Tangent")]
+#[derive(Clone, PartialEq)]
+struct Tangent {
+    #[pyo3(get)]
+    column: String,
+    #[pyo3(get)]
+    tangent: String,
+}
+
+#[pymethods]
+impl Tangent {
+    fn __repr__(&self) -> String {
+        format!(
+            "Tangent(column={:?}, tangent={:?})",
+            self.column, self.tangent
+        )
+    }
+}
+
+/// A table a program leaves once it has run (`ddx_ad::OutputTable`): the
+/// value (`of` is `None`), or a `wrt` table's gradient (`of` is its name
+/// parts), written by `step`. A gradient's `columns` are the table's dims,
+/// then its `wrt` values, named as in the table, each holding the gradient:
+/// `0` where none reached, `NULL` where the value itself is `NULL`. For a jvp
+/// program, `tangents` says which column holds each column's tangent.
+#[pyclass(
+    frozen,
+    eq,
+    skip_from_py_object,
+    module = "ddxdb",
+    name = "OutputTable"
+)]
+#[derive(Clone, PartialEq)]
+struct OutputTable {
+    #[pyo3(get)]
+    step: String,
+    of: Option<Vec<String>>,
+    columns: Vec<String>,
+    tangents: Vec<Tangent>,
+}
+
+#[pymethods]
+impl OutputTable {
+    #[getter]
+    fn of<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        of_tuple(py, &self.of)
+    }
+
+    #[getter]
+    fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.columns)
+    }
+
+    #[getter]
+    fn tangents(&self) -> Vec<Tangent> {
+        self.tangents.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OutputTable(step={:?}, of={:?}, columns={:?})",
+            self.step, self.of, self.columns
+        )
+    }
+}
+
+impl From<&ddx_ad::OutputTable> for OutputTable {
+    fn from(t: &ddx_ad::OutputTable) -> Self {
+        OutputTable {
+            step: t.step.clone(),
+            of: of_py(&t.of),
+            columns: t.columns.clone(),
+            tangents: t
+                .tangents
+                .iter()
+                .map(|x| Tangent {
+                    column: x.column.clone(),
+                    tangent: x.tangent.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn to_checks(checks: &[ddx_ad::Check]) -> Vec<Check> {
+    checks
+        .iter()
+        .map(|c| Check {
+            plan: c.plan_bytes(),
+            message: c.message.clone(),
+        })
+        .collect()
 }
 
 /// The steps that compute a query's value and its gradient: the Rust
@@ -221,51 +346,30 @@ impl BackwardProgram {
         to_steps(&self.0.backward_steps)
     }
 
-    /// The step holding the query's own result.
+    /// The tables to register before it runs: for a vjp program, the
+    /// output's cotangent; none for a grad program. Of a program, that
+    /// program's own inputs come first.
     #[getter]
-    fn value(&self) -> &str {
-        &self.0.value.step
-    }
-
-    /// For a vjp program: the table the caller registers the cotangent as,
-    /// its one input table; empty for a grad program, which has none.
-    #[getter]
-    fn cotangent_table(&self) -> &str {
-        self.0.inputs.first().map_or("", |i| i.name.as_str())
-    }
-
-    /// For a vjp program: that table's columns.
-    #[getter]
-    fn cotangent<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let columns: &[String] = self.0.inputs.first().map_or(&[], |i| &i.columns);
-        PyTuple::new(py, columns)
+    fn inputs(&self) -> Vec<InputTable> {
+        self.0.inputs.iter().map(InputTable::from).collect()
     }
 
     /// Plans that must return no rows, run before the steps.
     #[getter]
     fn checks(&self) -> Vec<Check> {
-        self.0
-            .checks
-            .iter()
-            .map(|c| Check {
-                plan: c.plan_bytes(),
-                message: c.message.clone(),
-            })
-            .collect()
+        to_checks(&self.0.checks)
+    }
+
+    /// The query's own result.
+    #[getter]
+    fn value(&self) -> OutputTable {
+        (&self.0.value).into()
     }
 
     /// One per `wrt` table.
     #[getter]
-    fn gradients(&self) -> Vec<Gradient> {
-        self.0
-            .gradients
-            .iter()
-            .map(|g| Gradient {
-                table: g.of.table().map(|t| t.join(".")).unwrap_or_default(),
-                step: g.step.clone(),
-                columns: g.columns.clone(),
-            })
-            .collect()
+    fn gradients(&self) -> Vec<OutputTable> {
+        self.0.gradients.iter().map(OutputTable::from).collect()
     }
 
     /// Every step, in the order they must run.
@@ -288,16 +392,7 @@ impl BackwardProgram {
     }
 
     fn __eq__(&self, other: &Self) -> bool {
-        let key = |p: &Self| {
-            (
-                p.steps(),
-                p.checks(),
-                p.gradients(),
-                p.0.value.step.clone(),
-                p.cotangent_table().to_string(),
-                p.0.inputs.first().map(|i| i.columns.clone()),
-            )
-        };
+        let key = |p: &Self| (p.inputs(), p.checks(), p.steps(), p.value(), p.gradients());
         key(self) == key(other)
     }
 
@@ -307,9 +402,71 @@ impl BackwardProgram {
             self.0.value.step,
             self.0.steps().count(),
             self.0.checks.len(),
-            self.gradients()
+            self.0
+                .gradients
                 .iter()
-                .map(|g| g.table.clone())
+                .filter_map(|g| g.of.table().map(|t| t.join(".")))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+/// The steps that compute a query's output and its tangent: the Rust
+/// `ddx_ad::ForwardProgram` itself, read from Python. Its anatomy is a
+/// `BackwardProgram`'s: inputs (each `wrt` table's tangent), checks, steps,
+/// the value with its tangents, and, of a program, each of its gradients
+/// with theirs (`H·v`, of a grad program).
+#[pyclass(frozen, module = "ddxdb", name = "ForwardProgram")]
+struct ForwardProgram(ddx_ad::ForwardProgram);
+
+#[pymethods]
+impl ForwardProgram {
+    /// The tables to register before it runs: of a program, that program's
+    /// own inputs first, then each `wrt` table's tangent.
+    #[getter]
+    fn inputs(&self) -> Vec<InputTable> {
+        self.0.inputs.iter().map(InputTable::from).collect()
+    }
+
+    /// Plans that must return no rows, run before the steps.
+    #[getter]
+    fn checks(&self) -> Vec<Check> {
+        to_checks(&self.0.checks)
+    }
+
+    /// The output, or a program's value, with its tangents.
+    #[getter]
+    fn value(&self) -> OutputTable {
+        (&self.0.value).into()
+    }
+
+    /// Of a program: each of its gradients, with their tangents. Empty for
+    /// jvp of a query.
+    #[getter]
+    fn gradients(&self) -> Vec<OutputTable> {
+        self.0.gradients.iter().map(OutputTable::from).collect()
+    }
+
+    /// Every step, in the order they must run.
+    fn steps(&self) -> Vec<Step> {
+        to_steps(&self.0.steps)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        let key = |p: &Self| (p.inputs(), p.checks(), p.steps(), p.value(), p.gradients());
+        key(self) == key(other)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ForwardProgram(value={:?}, steps={}, checks={}, inputs={:?})",
+            self.0.value.step,
+            self.0.steps.len(),
+            self.0.checks.len(),
+            self.0
+                .inputs
+                .iter()
+                .map(|i| i.name.clone())
                 .collect::<Vec<_>>()
         )
     }
@@ -335,8 +492,58 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
     wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
 }
 
-/// The gradient of the number the serialized Substrait `plan` computes, with
-/// respect to the `(table, column)` pairs in `wrt` (`ddx_ad::grad`).
+/// `grad_plan`, `vjp_plan` and `jvp_plan` are one path, `derivative`, over
+/// ddx-ad's own: `ddx_ad::grad` is `vjp` with the cotangent 1, built by the
+/// same code with the 1 inlined (no input table to register, none to check).
+fn derivative<T>(
+    plan: &Bound<'_, PyAny>,
+    wrt: Vec<(String, String)>,
+    options: ddx_ad::Options,
+    of: impl FnOnce(&dyn ddx_ad::Differentiable, &[ColumnRef], &ddx_ad::Options) -> ddx_ad::Result<T>,
+) -> PyResult<T> {
+    of(Subject::of(plan)?.get(), &wrt_of(wrt), &options).map_err(ad_to_py_err)
+}
+
+/// What `grad_plan`, `vjp_plan` and `jvp_plan` differentiate: a serialized
+/// Substrait plan, or a program of either kind (`ddx_ad::Differentiable`).
+enum Subject<'py> {
+    Plan(Box<Plan>),
+    Backward(PyRef<'py, BackwardProgram>),
+    Forward(PyRef<'py, ForwardProgram>),
+}
+
+impl<'py> Subject<'py> {
+    fn of(of: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(p) = of.extract::<PyRef<'py, BackwardProgram>>() {
+            return Ok(Subject::Backward(p));
+        }
+        if let Ok(p) = of.extract::<PyRef<'py, ForwardProgram>>() {
+            return Ok(Subject::Forward(p));
+        }
+        match of.extract::<Vec<u8>>() {
+            Ok(bytes) if of.is_instance_of::<PyBytes>() => {
+                Ok(Subject::Plan(Box::new(decode(&bytes)?)))
+            }
+            _ => Err(pyo3::exceptions::PyTypeError::new_err(
+                "expected a serialized Substrait plan (bytes), a BackwardProgram or a \
+                 ForwardProgram",
+            )),
+        }
+    }
+
+    fn get(&self) -> &dyn ddx_ad::Differentiable {
+        match self {
+            Subject::Plan(p) => &**p,
+            Subject::Backward(p) => &p.0,
+            Subject::Forward(p) => &p.0,
+        }
+    }
+}
+
+/// The gradient of the number `plan` computes, with respect to the `(table,
+/// column)` pairs in `wrt` (`ddx_ad::grad`). `plan` is a serialized Substrait
+/// plan, or a program of either kind, whose one output table is
+/// differentiated: `grad`, `vjp` and `jvp` compose.
 ///
 /// `namespace` names every table the program writes `{namespace}…` instead of
 /// under a fresh prefix, so the same plan gives the same program. It must
@@ -349,29 +556,50 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
 #[pyfunction]
 #[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn grad_plan(
-    plan: &[u8],
+    plan: &Bound<'_, PyAny>,
     wrt: Vec<(String, String)>,
     namespace: Option<String>,
     restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
-    ddx_ad::grad_with(&decode(plan)?, &wrt_of(wrt), &options(namespace, restrict)?)
-        .map(BackwardProgram)
-        .map_err(ad_to_py_err)
+    derivative(plan, wrt, options(namespace, restrict)?, |p, w, o| {
+        ddx_ad::grad_with(p, w, o)
+    })
+    .map(BackwardProgram)
 }
 
-/// The vector-Jacobian product of the query the serialized Substrait `plan`
-/// computes (`ddx_ad::vjp`; see `grad_plan`).
+/// The vector-Jacobian product of what `plan` computes, a serialized
+/// Substrait plan or a program (`ddx_ad::vjp`; see `grad_plan`).
 #[pyfunction]
 #[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn vjp_plan(
-    plan: &[u8],
+    plan: &Bound<'_, PyAny>,
     wrt: Vec<(String, String)>,
     namespace: Option<String>,
     restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
-    ddx_ad::vjp_with(&decode(plan)?, &wrt_of(wrt), &options(namespace, restrict)?)
-        .map(BackwardProgram)
-        .map_err(ad_to_py_err)
+    derivative(plan, wrt, options(namespace, restrict)?, |p, w, o| {
+        ddx_ad::vjp_with(p, w, o)
+    })
+    .map(BackwardProgram)
+}
+
+/// The Jacobian-vector product of what `plan` computes, a serialized
+/// Substrait plan or a program, with respect to the `(table, column)` pairs
+/// in `wrt` (`ddx_ad::jvp`): its output with, beside it, its tangent along
+/// the tangents the caller registers as the program's `inputs`. Of a grad
+/// program, each gradient's tangent is the Hessian-vector product `H·v`.
+/// `namespace` is as for `grad_plan`.
+#[pyfunction]
+#[pyo3(signature = (plan, wrt, *, namespace = None))]
+fn jvp_plan(
+    plan: &Bound<'_, PyAny>,
+    wrt: Vec<(String, String)>,
+    namespace: Option<String>,
+) -> PyResult<ForwardProgram> {
+    derivative(plan, wrt, options(namespace, None)?, |p, w, o| {
+        ddx_ad::jvp_with(p, w, o)
+    })
+    .map(ForwardProgram)
 }
 
 /// A Python engine object as a `ddx_ad::Backend`: the four primitives, with
@@ -413,7 +641,9 @@ impl ddx_ad::Backend for PyBackend<'_> {
 /// Run `program` on `backend`: `ddx_ad::run`, the same protocol the Rust
 /// adapters follow. Its checks run first, then every step. A run that
 /// succeeds drops the intermediate tables and leaves the value and the
-/// gradients; one that fails leaves none of the program's tables.
+/// gradients (or the value with its tangents); one that fails leaves none of
+/// the program's tables. `program` is a `BackwardProgram` or a
+/// `ForwardProgram`, whose input tables must be registered first.
 ///
 /// `backend` is any object with four methods (see `ddxdb.Backend`):
 /// `select_all(name) -> bytes` (the engine's serialized Substrait plan of
@@ -423,8 +653,18 @@ impl ddx_ad::Backend for PyBackend<'_> {
 /// serialized Substrait with their reads of earlier steps bound. Raises
 /// `InvalidColumn` when a check returns a row, or what the backend raised.
 #[pyfunction]
-fn run(backend: Bound<'_, PyAny>, program: PyRef<'_, BackwardProgram>) -> PyResult<()> {
-    ddx_ad::run(&mut PyBackend(backend), &program.0).map_err(|e| match e {
+fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
+    let mut backend = PyBackend(backend);
+    let result = if let Ok(p) = program.extract::<PyRef<'_, BackwardProgram>>() {
+        ddx_ad::run(&mut backend, &p.0)
+    } else if let Ok(p) = program.extract::<PyRef<'_, ForwardProgram>>() {
+        ddx_ad::run(&mut backend, &p.0)
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "run takes a BackwardProgram or a ForwardProgram",
+        ));
+    };
+    result.map_err(|e| match e {
         ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
         ddx_ad::RunError::Engine(e) => e,
         other => DdxError::new_err(other.to_string()),
@@ -554,12 +794,16 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
     m.add_function(wrap_pyfunction!(grad_plan, m)?)?;
     m.add_function(wrap_pyfunction!(vjp_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(jvp_plan, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(_not_in_subquery, m)?)?;
     m.add_class::<BackwardProgram>()?;
+    m.add_class::<ForwardProgram>()?;
     m.add_class::<Step>()?;
     m.add_class::<Check>()?;
-    m.add_class::<Gradient>()?;
+    m.add_class::<InputTable>()?;
+    m.add_class::<OutputTable>()?;
+    m.add_class::<Tangent>()?;
     m.add_class::<Statements>()?;
     m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
     m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;
