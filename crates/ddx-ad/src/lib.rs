@@ -59,8 +59,9 @@
 //! along, is refused as [`AdError::NotImplemented`]. Off that path (constant
 //! data, or a subtree no gradient reaches) it is copied as it is.
 //!
-//! [`sql`] finds `grad(loss, table.column)` in a SQL statement, for
-//! adapters that let users write `grad` in SQL.
+//! [`sql`] finds `grad(loss, table.column)` and `jvp(f, table.column,
+//! tangent)` in a SQL statement, for adapters that let users write them in
+//! SQL.
 //!
 //! # `substrait` version policy
 //!
@@ -112,7 +113,7 @@ pub use program::{
 };
 pub use relation::ColumnRef;
 pub use run::{run, run_verified, Action, Backend, Program, RunError, Runner, Verified};
-pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
+pub use sql::{Calls, GradCall, Job, JvpCall, JvpJob, JvpTangent, Objective, Statements};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]
 #[doc(hidden)]

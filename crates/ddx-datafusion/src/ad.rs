@@ -15,6 +15,15 @@
 //! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
 //! ```
 //!
+//! and `jvp(f, table.column, tangent)` is a CTE's output with, beside each
+//! column, its tangent along `tangent`, a relation shaped like the table:
+//!
+//! ```sql
+//! WITH loss AS (SELECT SUM(val * val) AS l FROM w),
+//!      v AS (SELECT i, 1.0 AS val FROM w)
+//! SELECT l, l_tangent FROM jvp(loss, w.val, v)
+//! ```
+//!
 //! Underneath, [`grad`] turns a query whose result is one number into a
 //! [`BackwardProgram`], and [`run`] runs it: every step is materialized as a
 //! table on the context, the number ends up in [`BackwardProgram::value`], and
@@ -306,16 +315,21 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
     Ok(())
 }
 
-/// Run the SQL statement `sql`, in which `grad(f, table.column, …)` in a
-/// `FROM` clause is the gradient of the number the CTE `f` computes (see
-/// [`ddx_ad::sql`]): a relation shaped like `table`, its dims and the named
-/// columns' gradients.
+/// Run the SQL statement `sql`, in which, in a `FROM` clause (see
+/// [`ddx_ad::sql`]):
+///
+/// - `grad(f, table.column, …)` is the gradient of the number the CTE `f`
+///   computes: a relation shaped like `table`, its dims and the named
+///   columns' gradients;
+/// - `jvp(f, table.column, …, tangent, …)` is the CTE `f`'s output and,
+///   beside each column that has one, its tangent along the tangents named
+///   (a CTE or a table per `wrt` table), as `{column}_tangent`.
 ///
 /// Each objective's [`grad`] program runs first, once, however many calls use it,
-/// and each call is replaced by a query over the gradient it needs before the
-/// statement is planned. A statement with no such call is planned as it is.
-/// The programs' tables are dropped once the statement is planned; the
-/// returned DataFrame keeps what it reads.
+/// and each distinct `jvp` call's program, and each call is replaced by a
+/// query over what it needs before the statement is planned. A statement
+/// with no such call is planned as it is. The programs' tables are dropped
+/// once the statement is planned; the returned DataFrame keeps what it reads.
 ///
 /// An objective defined in a `WITH RECURSIVE` clause is refused, so a training loop
 /// cannot yet be written as one recursive statement (design.md §5). This is
@@ -336,6 +350,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // DataFusion's.
     let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
     let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
+    let mut ran_jvps: Vec<ForwardProgram> = Vec::with_capacity(planned.jvp_jobs().len());
     let result = async {
         for job in planned.jobs() {
             // Only the gradient rows the statements read, where they say.
@@ -353,8 +368,17 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
             ran.push(program);
             run(ctx, ran.last().expect("just pushed")).await?;
         }
+        for job in planned.jvp_jobs() {
+            ran_jvps.push(jvp(ctx, job.query.as_str(), &job.wrt).await?);
+            let program = ran_jvps.last().expect("just pushed");
+            register_tangents(ctx, program, job).await?;
+            run(ctx, program).await?;
+        }
         let rewritten = planned
-            .rewrite(&ran.iter().collect::<Vec<_>>())
+            .rewrite(
+                &ran.iter().collect::<Vec<_>>(),
+                &ran_jvps.iter().collect::<Vec<_>>(),
+            )
             .map_err(to_df_err)?;
         let mut frames = Vec::with_capacity(rewritten.len());
         for sql in &rewritten {
@@ -368,7 +392,48 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     for program in &ran {
         release(ctx, program)?;
     }
+    for program in &ran_jvps {
+        release(ctx, program)?;
+        for input in &program.inputs {
+            ctx.deregister_table(input.name.as_str())?;
+        }
+    }
     result
+}
+
+/// Register each of `program`'s tangent tables from the tangent `job` names
+/// for its table: the columns the program asks for, by name, materialized.
+async fn register_tangents(
+    ctx: &SessionContext,
+    program: &ForwardProgram,
+    job: &ddx_ad::JvpJob,
+) -> Result<()> {
+    for input in &program.inputs {
+        let names = input.of.table().unwrap_or_default();
+        let tangent = job.tangent_of(names).ok_or_else(|| {
+            to_df_err(AdError::Internal(format!(
+                "no tangent was given for `{}`",
+                names.join(".")
+            )))
+        })?;
+        let columns: Vec<String> = input
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect();
+        let df = ctx
+            .sql(&format!(
+                "SELECT {} FROM ({}) AS __ddx_tangent",
+                columns.join(", "),
+                tangent.query
+            ))
+            .await?;
+        let schema = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        let table = MemTable::try_new(schema, vec![batches])?;
+        ctx.register_table(input.name.as_str(), Arc::new(table))?;
+    }
+    Ok(())
 }
 
 /// Run `program`: its [`checks`](BackwardProgram::checks), then every step,

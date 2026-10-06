@@ -1194,6 +1194,33 @@ direction; `jvp` of a loss against `⟨∇L, t⟩` from `grad`, and of a relatio
 against `vjp` by the dot-product test `⟨J t, c⟩ = ⟨t, Jᵀ c⟩`, to rounding;
 and `H·v` against a finite difference of `grad`'s gradient.
 
+**In SQL.** As `grad(f, table.column)` is (§4.4), `jvp(f, table.column, …,
+tangent, …)` in a `FROM` clause is rewritten before the engine sees the
+statement. `f` is any CTE; each `wrt` table's columns are followed by the
+relation holding its tangent, a CTE of the statement or a table, shaped like
+the table (its dims, then a tangent under each column's name). One call
+takes every table's tangent, since forward mode pushes them all through one
+pass:
+
+```sql
+WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.val)) AS y
+           FROM x JOIN w ON x.i = w.i JOIN b ON w.o = b.o GROUP BY x.n, w.o),
+     dw AS (SELECT i, o, 0.01 AS val FROM w)
+SELECT n, o, y, y_tangent FROM jvp(h, w.val, dw, b.val, db)   -- db: a table
+```
+
+The relation is `f`'s columns and, after them, the tangent of each that has
+one as `{column}_tangent` (`{column}_tangent_{n}` if `f` has that name), as
+`jax.jvp` returns the primal and the tangent together. The adapter runs one
+`jvp` program per distinct call, registers each tangent as the program's
+input table for its table, and splices a read of the program's value in
+place of the call (`ddx_ad::sql::Statements`). The scalar `jvp(expr, x, dx)`
+of v1 is an expression in a select list; the rewriter tells them apart by
+where they appear. *Verified* (`tests/sql_jvp.rs`): against the closed form
+and against `ad::jvp`'s program row by row, through two tables, with a
+tangent from a table missing a row, with `grad` in the same statement, and
+leaving no table behind.
+
 ### 4.9 Composition
 
 `grad`, `vjp` and `jvp` each take a query's plan or a program of either
@@ -1483,8 +1510,9 @@ breadth, not de-risking.
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
-  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9). Still to come: `jvp(…)` in SQL, the Python API, and agreement with
-  `jax.jvp` on the spikes' fixtures.
+  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); `jvp(…)`
+  in SQL from Rust (§4.8). Still to come: the Python API (and `jvp(…)` in
+  SQL from it), and agreement with `jax.jvp` on the spikes' fixtures.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,

@@ -588,7 +588,7 @@ fn run(backend: Bound<'_, PyAny>, program: PyRef<'_, BackwardProgram>) -> PyResu
 }
 
 /// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
-/// together.
+/// together. A `jvp` call is refused for now.
 #[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Statements")]
 struct Statements(ddx_ad::Statements);
 
@@ -601,9 +601,14 @@ impl Statements {
     fn new(statements: Vec<String>, dialect: &str) -> PyResult<Self> {
         let (_, parser) = engine_for(dialect)?;
         let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-        Ok(Statements(
-            ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?,
-        ))
+        let planned = ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?;
+        if !planned.jvp_jobs().is_empty() {
+            return Err(ad_to_py_err(ddx_ad::AdError::NotImplemented(
+                "jvp(f, …) in SQL from Python; it runs from Rust, in ddx-datafusion's ad::sql"
+                    .into(),
+            )));
+        }
+        Ok(Statements(planned))
     }
 
     /// The objectives to differentiate, as `(query, [(table, column), …],
@@ -629,7 +634,7 @@ impl Statements {
     /// computed.
     fn rewrite(&self, programs: Vec<PyRef<'_, BackwardProgram>>) -> PyResult<Vec<String>> {
         let programs: Vec<&ddx_ad::BackwardProgram> = programs.iter().map(|p| &p.0).collect();
-        self.0.rewrite(&programs).map_err(ad_to_py_err)
+        self.0.rewrite(&programs, &[]).map_err(ad_to_py_err)
     }
 }
 
