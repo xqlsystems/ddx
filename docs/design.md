@@ -1995,12 +1995,16 @@ groupings columns of a side), `X`'s contribution is `∂e_X/∂x ·
 join keys and `X`'s grouping keys, then joined to `X`. The NULL test moves
 from every joined row to one per row of `X` (a NULL `e_Y` already makes its
 term NULL, which `SUM` skips). Anything else (a filter across the sides, a
-sum that is not a product, `AVG`, `MAX`) keeps the composed rules. Keys
+sum that is not a product, `AVG`, `MAX`, a side differentiated while the
+other holds no grouping key, as in a matrix-vector product) keeps the
+composed rules. Keys
 joined with `=` drop their NULLs before the last join so that all its keys
 are null-safe, which DataFusion hashes; a mixed join fell back to a nested
 loop and took 40× longer. `contraction_transpose.rs` checks it against the
-composed rules on random tables with NULLs, NaNs, infinities, missing rows
-and repeated keys in constant data. `matmul`'s gradient at n = 50,000 went
+composed rules on random tables with NULLs, NaNs, infinities, missing rows,
+NULL join keys under `=` and `IS NOT DISTINCT FROM`, two-key joins, and
+repeated keys in constant data. The soak does not yet write this shape
+(#127). `matmul`'s gradient at n = 50,000 went
 from 1.77 s to 0.83 s; `attn` at L = 256 from 0.74 s to 0.52 s. → §4.3.
 
 ## References

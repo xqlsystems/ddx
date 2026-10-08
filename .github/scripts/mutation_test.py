@@ -65,6 +65,8 @@ MUTANTS = [
      "vec![(call(is_null, vec![field(arg_col)]), null_f64())],",
      "vec![(call(is_null, vec![lit_f64(0.0)]), null_f64())],",
      "a row an aggregate skips as NULL still sends gradient to its other inputs"),
+    # The two contraction mutants survive the soak until its generator writes
+    # the rule's shape (#127); contraction_transpose.rs kills both.
     ("contraction-wrong-cotangent", f"{AD}/contraction.rs",
      "vec![field(ywidth + ndims + cot_col), shape.factors[y].clone()],",
      "vec![field(ywidth + cot_col), shape.factors[y].clone()],",

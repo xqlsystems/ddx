@@ -93,8 +93,7 @@ impl<'a> Transposer<'a> {
     /// per entry of `cols`.
     pub fn saved(&mut self, n: usize, cols: &[usize], cotangent: Rel) -> Result<()> {
         let saved = &self.f.saved[n];
-        let mut region = saved.input.clone();
-        let width = region.defs.len();
+        let width = saved.input.defs.len();
         let dims = saved.dims();
 
         // Each measure's argument becomes a column of the region, so the
@@ -119,13 +118,12 @@ impl<'a> Transposer<'a> {
         }
         // A contraction's transpose needs no rebuilt join (see
         // `crate::contraction`).
-        if let [(_, Rule::Sum, i, col)] = rules[..] {
-            if let Output::Value(m) = saved.outputs[col] {
-                if self.contraction(n, m, &cotangent, i)? {
-                    return Ok(());
-                }
+        if let ([(_, Rule::Sum, i, _)], [arg]) = (&rules[..], &args[..]) {
+            if self.contraction(n, arg, &cotangent, *i)? {
+                return Ok(());
             }
         }
+        let mut region = saved.input.clone();
         for e in &args {
             let varied = depends(&self.f.functions, e, &|c| region.varied[c])?;
             region.defs.push(Def::Expr(e.clone()));
