@@ -64,7 +64,7 @@ pub(crate) struct Contribution {
 pub(crate) struct Transposer<'a> {
     pub f: &'a Forward,
     pub ext: Extensions,
-    ew: Elementwise<'a>,
+    pub(crate) ew: Elementwise<'a>,
     pub contributions: BTreeMap<Input, Vec<Contribution>>,
     /// Steps the transposes need materialized before the contributions that
     /// read them: a region's cotangents, when several inputs read them.
@@ -116,6 +116,15 @@ impl<'a> Transposer<'a> {
             };
             rules.push((width + args.len(), rule, i, col));
             args.push(*arg);
+        }
+        // A contraction's transpose needs no rebuilt join (see
+        // `crate::contraction`).
+        if let [(_, Rule::Sum, i, col)] = rules[..] {
+            if let Output::Value(m) = saved.outputs[col] {
+                if self.contraction(n, m, &cotangent, i)? {
+                    return Ok(());
+                }
+            }
         }
         for e in &args {
             let varied = depends(&self.f.functions, e, &|c| region.varied[c])?;
@@ -481,7 +490,7 @@ impl<'a> Transposer<'a> {
     /// must partition or order by each dim of the rows beneath it; otherwise
     /// the program is refused rather than risk sending gradient to rows the
     /// forward pass did not keep.
-    fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+    pub(crate) fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
         if region.volatile {
             return Err(AdError::NotImplemented(
                 "a volatile function (random(), now(), …) in rows that carry gradient: ddx \

@@ -766,6 +766,11 @@ familiar rule, `Ā = Σ_out C̄·B` and `B̄ = Σ_batch A·C̄`, both contractio
 themselves. Verified against `nn.py`'s `g2`/`g1`/`g0` and
 `relational_ad_spike.py`. The physical fused-contraction operator (§4.1) is
 where a contraction becomes a unit again, for speed, not for the math.
+Composed, the rules rebuild the join for every backward step and join it to
+the cotangent; when a saved `SUM`'s region is one inner join of two inputs
+and its argument a product of a factor from each, ddx emits each input's
+contribution as the contraction itself instead, the cotangent joined with the
+*other* input, and the join is never rebuilt (`S15`).
 
 **Mean is a reduce rule, not a separate division.** `AVG(x)` is `SUM(x)` over
 the group's count, and its transpose is too; nn.py's `-AVG(ln p)` loss
@@ -1543,7 +1548,8 @@ breadth, not de-risking.
   (S6). For nn.py's first layer that is one extra join per backward step, the
   same size as the forward one. Whether some regions should be saved instead
   is a performance question for the fused-contraction work, not a
-  correctness one.
+  correctness one. A contraction's region is no longer rebuilt at all
+  (`S15`); other regions still are.
 
 ---
 
@@ -1867,7 +1873,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S14`)
+### Building v2 (`S6`–`S15`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -1977,6 +1983,25 @@ stated, with an ambiguous one refused. Two suggestions wait for a second
 in-repo adapter: emitting the portable form of the windows in the reduce
 rules (§4.6), and putting the simulation harness behind an engine trait so
 it doubles as a conformance suite. → §4.2.
+
+**S15 — A contraction's transpose does not rebuild its join.** einfold's
+spikes S22 and S25 (#125) found each gradient step of `matmul` rebuilding
+the forward join (6.4 M rows at n = 50,000) only to test whether the
+forward product was NULL, then hash-joining those rows to the cotangent:
+1.1 s of a 1.4 s run. For `SUM(e_X · e_Y)` over one inner join of `X` and
+`Y` (each side one input, the condition equalities between them, the
+groupings columns of a side), `X`'s contribution is `∂e_X/∂x ·
+Σ_y C̄·e_Y`, so it is emitted as the cotangent joined with `Y`, summed by the
+join keys and `X`'s grouping keys, then joined to `X`. The NULL test moves
+from every joined row to one per row of `X` (a NULL `e_Y` already makes its
+term NULL, which `SUM` skips). Anything else (a filter across the sides, a
+sum that is not a product, `AVG`, `MAX`) keeps the composed rules. Keys
+joined with `=` drop their NULLs before the last join so that all its keys
+are null-safe, which DataFusion hashes; a mixed join fell back to a nested
+loop and took 40× longer. `contraction_transpose.rs` checks it against the
+composed rules on random tables with NULLs, NaNs, infinities, missing rows
+and repeated keys in constant data. `matmul`'s gradient at n = 50,000 went
+from 1.77 s to 0.83 s; `attn` at L = 256 from 0.74 s to 0.52 s. → §4.3.
 
 ## References
 
