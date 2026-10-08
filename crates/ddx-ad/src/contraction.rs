@@ -45,12 +45,17 @@
 //! **When it applies.** Exactly one measure has a cotangent, and it is a
 //! `SUM`; the region is projections over one inner join, with no filter
 //! above it, no post-join filter, no `LIMIT`, no volatile function (a
-//! ranking inside a side is checked as the general rule checks it); each side of the join reads one input; the join condition is a
-//! conjunction of `=` or `IS NOT DISTINCT FROM` between a column of each
-//! side; every grouping key is a column of one side; and the argument,
-//! through the projections above the join, is a product of an expression of
-//! one side's columns and one of the other's. Otherwise the general rule
-//! applies.
+//! ranking inside a side is checked as the general rule checks it); each
+//! side of the join reads one input; the join condition is a conjunction of
+//! `=` or `IS NOT DISTINCT FROM` between a column of each side; every
+//! grouping key is a column of one side; the argument, through the
+//! projections above the join, is a product of an expression of one side's
+//! columns and one of the other's; and, for each side that is
+//! differentiated, the *other* side holds at least one grouping key (so the
+//! cotangent joins it on a key, not as a cross join: a matrix-vector product
+//! `SUM(a.val * v.val) GROUP BY a.i`, differentiated in `a`, does not
+//! qualify), and the inlined factors stay below a size bound. Otherwise the
+//! general rule applies.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +64,7 @@ use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Rel};
 
-use crate::emit::{aggregate, filter, join};
+use crate::emit::{aggregate, filter, join, project};
 use crate::error::Result;
 use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, null_f64, scalar_args};
 use crate::forward::{Def, Input, Output, Region, Saved};
@@ -67,16 +72,16 @@ use crate::transpose::{Contribution, Transposer};
 
 /// One side of the join: the subtree that computes region columns
 /// `start..start + width`, holding one input.
-struct Side {
-    rel: Rel,
+struct Side<'r> {
+    rel: &'r Rel,
     start: usize,
     width: usize,
     slot: usize,
 }
 
 /// A contraction's shape, in each side's own column numbers.
-struct Shape {
-    sides: [Side; 2],
+struct Shape<'r> {
+    sides: [Side<'r>; 2],
     /// The join condition: `(left column, right column, is_not_distinct_from)`.
     keys: Vec<(usize, usize, bool)>,
     /// Each grouping key: its side and column.
@@ -87,20 +92,21 @@ struct Shape {
 
 impl Transposer<'_> {
     /// The transpose of saved aggregate `n` by the contraction rule, if its
-    /// shape allows (see the module docs). `measure` is the one measure with
-    /// a cotangent, which is column `cot_col` of `cotangent`.
+    /// shape allows (see the module docs). `arg` is the argument of its one
+    /// measure with a cotangent, a `SUM`, whose cotangent is column `cot_col`
+    /// of `cotangent`.
     ///
     /// Returns `false`, having changed nothing, if the shape doesn't allow.
     pub(crate) fn contraction(
         &mut self,
         n: usize,
-        measure: usize,
+        arg: &Expression,
         cotangent: &Rel,
         cot_col: usize,
     ) -> Result<bool> {
         let f = self.f;
         let saved = &f.saved[n];
-        let Some(shape) = self.shape(saved, measure)? else {
+        let Some(shape) = self.shape(saved, arg)? else {
             return Ok(false);
         };
         // Each side is recomputed, as the general rule recomputes the whole
@@ -129,14 +135,11 @@ impl Transposer<'_> {
     }
 
     /// The contraction's shape, or `None` if the region is not one.
-    fn shape(&mut self, saved: &Saved, measure: usize) -> Result<Option<Shape>> {
+    fn shape<'r>(&mut self, saved: &'r Saved, arg: &Expression) -> Result<Option<Shape<'r>>> {
         let region = &saved.input;
         if region.volatile || !region.cuts.is_empty() || region.slots.len() != 2 {
             return Ok(None);
         }
-        let Some(arg) = sum_argument(&self.f.functions, &saved.measures[measure])? else {
-            return Ok(None);
-        };
         // Walk down the projections to the join.
         let mut rel = &region.rel;
         loop {
@@ -236,9 +239,12 @@ impl Transposer<'_> {
             groups.push(sc);
         }
         // The argument: a product of one factor from each side.
-        let Some(arg) = inline_above(region, &arg, lw + rw) else {
+        let Some(arg) = inline_above(region, arg, lw + rw) else {
             return Ok(None);
         };
+        if too_big(&arg) {
+            return Ok(None);
+        }
         let Some(RexType::ScalarFunction(f)) = &arg.rex_type else {
             return Ok(None);
         };
@@ -275,13 +281,13 @@ impl Transposer<'_> {
         Ok(Some(Shape {
             sides: [
                 Side {
-                    rel: left.clone(),
+                    rel: left,
                     start: 0,
                     width: lw,
                     slot: ls,
                 },
                 Side {
-                    rel: right.clone(),
+                    rel: right,
                     start: lw,
                     width: rw,
                     slot: rs,
@@ -314,8 +320,8 @@ impl Transposer<'_> {
 
         // The factor of side x, over x's input columns, and its partials.
         let (inputs_x, e_x) = match inline_side(region, xs, &shape.factors[x])? {
-            Some(v) => v,
-            None => return Ok(None),
+            Some(v) if !too_big(&v.1) => v,
+            _ => return Ok(None),
         };
         let varied = |c: usize| inputs_x.get(&c).is_some_and(|&rc| region.varied[rc]);
         let partials = self.ew.partials(&e_x, &varied, &mut self.ext)?;
@@ -411,15 +417,23 @@ impl Transposer<'_> {
             Input::Const => return Ok(None),
         };
         let groupings: Vec<Expression> = dims.iter().map(|d| field(offset + d)).collect();
+        // Each term is a column of its own before it is summed, as the general
+        // rule's cotangents are: two columns with the same partial (both 1 in
+        // `SUM((a.val + a.bias) * w.val)`) would otherwise be two measures of
+        // the same name, which DataFusion's consumer refuses.
+        let xt_width = xwidth + t_value + 1;
         let mut cols = Vec::new();
-        let mut measures = Vec::new();
+        let mut terms = Vec::new();
         for (c, d) in partials {
             // `c` is a column of side x holding input column `c - offset`.
             cols.push(c - offset);
-            measures.push((sum, vec![call(mul, vec![guarded.clone(), d])]));
+            terms.push(call(mul, vec![guarded.clone(), d]));
         }
+        let measures = (0..terms.len())
+            .map(|i| (sum, vec![field(xt_width + i)]))
+            .collect();
         Ok(Some(Contribution {
-            rel: aggregate(xt, groupings, measures),
+            rel: aggregate(project(xt, terms), groupings, measures),
             cols,
         }))
     }
@@ -495,22 +509,13 @@ fn inline_side(
     Ok(Some((inputs, out)))
 }
 
-/// The argument of `SUM(argument)`, or `None` for any other aggregate.
-fn sum_argument(
-    functions: &crate::functions::Functions,
-    m: &substrait::proto::AggregateFunction,
-) -> Result<Option<Expression>> {
-    use substrait::proto::aggregate_function::AggregationInvocation;
-    if functions.name(m.function_reference)? != "sum"
-        || m.invocation == AggregationInvocation::Distinct as i32
-    {
-        return Ok(None);
-    }
-    let args = crate::expr::value_args(&m.arguments)?;
-    Ok(match args[..] {
-        [a] => Some(a.clone()),
-        _ => None,
-    })
+/// Is `e` too large to inline? Inlining copies an expression once per use, so
+/// a chain of projections that each read the last twice doubles at every
+/// level; past this size the general rule, which computes each column once,
+/// handles the region instead.
+fn too_big(e: &Expression) -> bool {
+    use prost::Message;
+    e.encoded_len() > 1 << 16
 }
 
 /// `e` with every column at or above `above` (an expression defined above
