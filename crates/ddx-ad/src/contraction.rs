@@ -61,7 +61,7 @@ use substrait::proto::{Expression, Rel};
 
 use crate::emit::{aggregate, filter, join};
 use crate::error::Result;
-use crate::expr::{as_field, call, field, fields_of, if_then, null_f64, scalar_args};
+use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, null_f64, scalar_args};
 use crate::forward::{Def, Input, Output, Region, Saved};
 use crate::transpose::{Contribution, Transposer};
 
@@ -306,7 +306,6 @@ impl Transposer<'_> {
         let y = 1 - x;
         let (xs, ys) = (&shape.sides[x], &shape.sides[y]);
         let same = self.ext.anchor("is_not_distinct_from");
-        let is_not_null = self.ext.anchor("is_not_null");
         let and = self.ext.anchor("and");
         let mul = self.ext.anchor("multiply");
         let sum = self.ext.anchor("sum");
@@ -355,7 +354,13 @@ impl Transposer<'_> {
             .iter()
             .zip(&y_keys)
             .filter(|((_, _, not_distinct), _)| !not_distinct)
-            .map(|(_, &c)| call(is_not_null, vec![field(c)]))
+            // `IS NOT NULL`, from names every engine ddx targets knows.
+            .map(|(_, &c)| {
+                if_then(
+                    vec![(call(is_null, vec![field(c)]), lit_bool(false))],
+                    lit_bool(true),
+                )
+            })
             .collect();
         let y_rel = match all(not_null) {
             Some(cond) => filter(ys.rel.clone(), cond),
