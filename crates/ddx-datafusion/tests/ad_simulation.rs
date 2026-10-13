@@ -83,7 +83,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
 };
 use datafusion::arrow::datatypes::{
     DataType, Field, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt64Type,
@@ -100,6 +101,9 @@ use ddx_datafusion::ad::{self, AdError, BackwardProgram, ColumnRef};
 
 #[path = "ad_simulation/mutate.rs"]
 mod mutate;
+
+#[path = "ad_simulation/jvp.rs"]
+mod jvp;
 
 // ---------------------------------------------------------------------------
 // Tables.
@@ -2416,6 +2420,7 @@ struct Props {
     train: bool,
     exact: bool,
     cost: bool,
+    jvp: bool,
 }
 
 const ALL: Props = Props {
@@ -2430,6 +2435,7 @@ const ALL: Props = Props {
     train: true,
     exact: true,
     cost: true,
+    jvp: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -2545,6 +2551,9 @@ async fn check_case_inner(
         Ok(ok) => ok,
         Err(Refusal::Allowed(why)) => {
             out.refusal = Some(why);
+            if props.jvp {
+                jvp::jvp_only_checks(rng, &ctx, case, &sql, &wrt, l0, out).await?;
+            }
             return Ok(());
         }
         Err(Refusal::Bug(why)) => {
@@ -2850,6 +2859,10 @@ async fn check_case_inner(
 
     if props.cost {
         cost_checks(case, &sql, out).await?;
+    }
+
+    if props.jvp {
+        jvp::jvp_checks(rng, &ctx, case, &sql, &wrt, l0, &grads, &program, out).await?;
     }
     Ok(())
 }
@@ -4759,6 +4772,7 @@ const NONE: Props = Props {
     train: false,
     exact: false,
     cost: false,
+    jvp: false,
 };
 
 #[test]
@@ -4782,6 +4796,17 @@ fn gradients_obey_the_calculus() {
             calculus: true,
             ..NONE
         },
+        seeds() / 3,
+    );
+}
+
+#[test]
+fn jvp_is_grads_dual() {
+    bounded(
+        "jvp",
+        12_000,
+        seeds(),
+        Props { jvp: true, ..NONE },
         seeds() / 3,
     );
 }
@@ -5050,7 +5075,7 @@ fn replay_one_seed() {
 
 /// The property groups a soak runs: all of them, or the comma-separated
 /// names in `DDX_V2_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
-/// shapes,names,train,exact,cost`), to spend a soak's budget on one surface.
+/// shapes,names,train,exact,cost,jvp`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
     let Ok(names) = std::env::var("DDX_V2_PROPS") else {
         return ALL;
@@ -5068,6 +5093,7 @@ fn soak_props() -> Props {
         train: on("train"),
         exact: on("exact"),
         cost: on("cost"),
+        jvp: on("jvp"),
     }
 }
 
