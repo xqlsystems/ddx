@@ -91,6 +91,7 @@ from ._ddxdb import (
     OutputTable,
     Step,
     Tangent,
+    Verified,
     grad_plan,
     jvp_plan,
     vjp_plan,
@@ -112,6 +113,7 @@ __all__ = [
     "Program",
     "Step",
     "Tangent",
+    "Verified",
     "grad",
     "jvp",
     "register_stop_gradient",
@@ -257,7 +259,7 @@ class Outputs(NamedTuple):
     gradients: list
 
 
-def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs:
+def run(ctx: SessionContext, program: Program, inputs: Sequence = (), *, verified: Optional[Verified] = None) -> Outputs:
     """Run ``program``, of either kind, on ``inputs``, one per
     ``program.inputs`` in order (a ``vjp``'s cotangent, a ``jvp``'s tangents;
     none for ``grad``), each a DataFrame or a ``pyarrow.Table`` with at least
@@ -272,6 +274,12 @@ def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs
     build it once and run it on every training step. One program's runs must
     not overlap, since they write the same tables while they run. To run a
     program on another engine, see :func:`ddxdb.run`.
+
+    With ``verified`` (a :class:`ddxdb.Verified` kept across runs), each
+    check of a ``wrt`` table whose fact it holds is skipped, and every
+    check's fact is recorded once the run succeeds. The inputs are new on
+    every run, so their checks always run. ``verified.forget(table)`` a
+    ``wrt`` table whenever its keys may change.
     """
     if not isinstance(ctx, SessionContext):
         raise TypeError(
@@ -288,7 +296,7 @@ def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs
         for table, given in zip(tables, inputs):
             arrow = given if isinstance(given, pa.Table) else given.to_arrow_table()
             _register(ctx, table.name, arrow.select(list(table.columns)))
-        _run(DataFusionBackend(ctx), program)
+        _run(DataFusionBackend(ctx), program, verified)
         return Outputs(ctx.sql(program.value.query()), [ctx.sql(g.query()) for g in program.gradients])
     finally:
         # A planned DataFrame holds the tables it reads, so they can leave

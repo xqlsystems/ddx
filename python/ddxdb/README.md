@@ -68,6 +68,12 @@ out = ad.run(ctx, hvp, [ctx.sql("SELECT i, 1.0 AS val FROM w")])
 out.gradients[0]   # i, val (the gradient), val_tangent (H·v)
 ```
 
+Each run checks that the `wrt` tables' keys identify their rows, a grouped
+scan of each. When many runs read the same tables (conjugate gradient, a
+training loop), keep a `ddxdb.Verified()` and pass it as `verified=`: a check
+whose fact it holds is skipped, and `verified.forget("w")` brings it back
+when `w`'s keys may have changed. Inputs are checked on every run.
+
 ## Other engines
 
 `ddxdb.grad_plan(plan_bytes, wrt)` differentiates the serialized Substrait plan

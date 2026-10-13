@@ -419,3 +419,73 @@ def test_a_query_deeper_than_datafusion_python_decodes_is_split_and_runs(ad, ctx
     assert got == pytest.approx(sum(v * d for (_, v), d in zip(g, [1.0, 2.0, 3.0])))
 
 
+def test_verified_skips_the_checks_it_holds_and_forgetting_a_table_brings_them_back(ad, ctx):
+    # An H·v program run once per direction, as conjugate gradient runs it.
+    grad = ad.grad(ctx, LOSS, [("w", "val")])
+    hvp = ad.jvp(ctx, grad, [("w", "val")])
+    assert any(c.table == ("w",) and c.keys == ("i",) for c in hvp.checks)
+    verified = ddxdb.Verified()
+    for k in (1.0, 2.0):
+        out = ad.run(ctx, hvp, [tangent_of_w(hvp.inputs[0], [k, k, k])], verified=verified)
+        assert pairs(out.gradients[0].select("i", "val_tangent")) == pytest.approx(
+            [(0, 6.0 * k), (1, -12.0 * k), (2, 3.0 * k)]
+        )
+
+    # The caller's promise broken: w's keys repeat, and its fact is kept, so
+    # its check is skipped and the run goes ahead. That is the contract.
+    ctx.deregister_table("w")
+    ctx.register_record_batches("w", [table([0, 0, 1], [1.0, -2.0, 0.5]).to_batches()])
+    v = pa.table({"i": pa.array([0, 1], pa.int64()), "val": [1.0, 1.0]})
+    ad.run(ctx, hvp, [v], verified=verified)
+    # Forgotten, w is checked again, and refused; and a run without a
+    # Verified checks everything.
+    verified.forget("W")
+    with pytest.raises(ddxdb.InvalidColumn, match="share their dims"):
+        ad.run(ctx, hvp, [v], verified=verified)
+    with pytest.raises(ddxdb.InvalidColumn, match="share their dims"):
+        ad.run(ctx, hvp, [v])
+    assert not ddx_tables(ctx)
+
+
+def test_verified_never_vouches_for_an_input(ad, ctx):
+    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
+    verified = ddxdb.Verified()
+    ad.run(ctx, program, [pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0]})], verified=verified)
+    repeated = pa.table({"i": pa.array([0, 0, 1], pa.int64()), "s": [1.0, 1.0, 1.0]})
+    with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
+        ad.run(ctx, program, [repeated], verified=verified)
+
+
+def test_a_backend_run_never_vouches_for_an_input(ad, ctx):
+    # A new cotangent under the same name, run with the same Verified: its
+    # keys are checked again.
+    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
+    name = program.inputs[0].name
+    verified = ddxdb.Verified()
+
+    def run(i):
+        cotangent = pa.table({"i": pa.array(i, pa.int64()), "s": [1.0, 1.0, 1.0]})
+        ctx.register_record_batches(name, [cotangent.to_batches()])
+        try:
+            ddxdb.run(LoggingBackend(ad, ctx), program, verified=verified)
+        finally:
+            ad._release(ctx, program)
+            ctx.deregister_table(name)
+
+    run([0, 1, 2])
+    with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
+        run([0, 0, 1])
+
+
+def test_a_backend_run_skips_what_verified_holds(ad, ctx):
+    prog = ad.grad(ctx, "SELECT SUM(val * val) AS l FROM w", [("w", "val")])
+    verified = ddxdb.Verified()
+    first = LoggingBackend(ad, ctx)
+    ddxdb.run(first, prog, verified)
+    second = LoggingBackend(ad, ctx)
+    ddxdb.run(second, prog, verified=verified)
+    assert ("check",) in first.log and ("check",) not in second.log
+    verified.clear()
+    third = LoggingBackend(ad, ctx)
+    ddxdb.run(third, prog, verified=verified)
+    assert ("check",) in third.log

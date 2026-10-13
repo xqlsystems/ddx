@@ -147,10 +147,24 @@ struct Check {
     plan: Vec<u8>,
     #[pyo3(get)]
     message: String,
+    table: Vec<String>,
+    keys: Vec<String>,
 }
 
 #[pymethods]
 impl Check {
+    /// The table whose rows it checks, by its name parts.
+    #[getter]
+    fn table<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.table)
+    }
+
+    /// The columns it proves identify the table's rows.
+    #[getter]
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.keys)
+    }
+
     /// The plan, as serialized Substrait.
     #[getter]
     fn plan<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -322,6 +336,8 @@ fn to_checks(checks: &[ddx_ad::Check]) -> Vec<Check> {
         .map(|c| Check {
             plan: c.plan_bytes(),
             message: c.message.clone(),
+            table: c.table.clone(),
+            keys: c.keys.clone(),
         })
         .collect()
 }
@@ -662,12 +678,23 @@ impl ddx_ad::Backend for PyBackend<'_> {
 /// serialized Substrait with their reads of earlier steps bound. Raises
 /// `InvalidColumn` when a check returns a row, or what the backend raised.
 #[pyfunction]
-fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
+#[pyo3(signature = (backend, program, verified = None))]
+fn run(
+    backend: Bound<'_, PyAny>,
+    program: Bound<'_, PyAny>,
+    verified: Option<PyRefMut<'_, Verified>>,
+) -> PyResult<()> {
     let mut backend = PyBackend(backend);
+    let mut fresh = ddx_ad::Verified::new();
+    let mut held = verified;
+    let verified = match held.as_mut() {
+        Some(v) => &mut v.0,
+        None => &mut fresh,
+    };
     let result = if let Ok(p) = program.extract::<PyRef<'_, BackwardProgram>>() {
-        ddx_ad::run(&mut backend, &p.0)
+        ddx_ad::run_verified(&mut backend, &p.0, verified)
     } else if let Ok(p) = program.extract::<PyRef<'_, ForwardProgram>>() {
-        ddx_ad::run(&mut backend, &p.0)
+        ddx_ad::run_verified(&mut backend, &p.0, verified)
     } else {
         return Err(pyo3::exceptions::PyTypeError::new_err(
             "run takes a BackwardProgram or a ForwardProgram",
@@ -678,6 +705,38 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
         ddx_ad::RunError::Engine(e) => e,
         other => DdxError::new_err(other.to_string()),
     })
+}
+
+/// What earlier runs' checks proved, so later runs can skip them
+/// (`ddx_ad::Verified`): that a table's keys identify its rows. Pass one to
+/// `run` (and `ddxdb.ad.run`) as `verified=` across the runs that read the
+/// same tables; a run skips each check whose fact it holds, and records
+/// every check's fact once it succeeds. A program's inputs (its cotangent
+/// or tangents) are new on every run, so their checks always run.
+/// `forget(table)` a table whenever its keys may change: keeping a fact for
+/// a table whose keys have changed lets a program its check would refuse
+/// run.
+#[pyclass(module = "ddxdb", name = "Verified")]
+#[derive(Default)]
+struct Verified(ddx_ad::Verified);
+
+#[pymethods]
+impl Verified {
+    #[new]
+    fn new() -> Self {
+        Verified::default()
+    }
+
+    /// Drop every fact about `table` (a bare name matches a table whose
+    /// last name part it is, case-insensitively).
+    fn forget(&mut self, table: &str) {
+        self.0.forget(table);
+    }
+
+    /// Drop every fact.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
@@ -814,6 +873,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OutputTable>()?;
     m.add_class::<Tangent>()?;
     m.add_class::<Statements>()?;
+    m.add_class::<Verified>()?;
     m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
     m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;
 

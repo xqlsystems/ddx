@@ -1533,8 +1533,8 @@ breadth, not de-risking.
   ⟨∇L, t⟩, linearity, a missing tangent row as 0, the dot-product test
   against `vjp`, `H·t`'s symmetry and its value, a repeated tangent key
   refused); 332 cases and 3,350 comparisons in a five-minute run, none
-  failing. Still to come: `jvp(…)` in SQL, and
-  `Verified` from Python.
+  failing; and `Verified` from Python (`ddxdb.Verified`, `verified=` on
+  `ad.run` and `ddxdb.run`). Still to come: `jvp(…)` in SQL.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
