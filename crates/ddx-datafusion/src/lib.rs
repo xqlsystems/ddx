@@ -23,6 +23,11 @@
 #![forbid(unsafe_code)]
 
 pub mod ad;
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod engine;
+#[cfg(not(feature = "internals"))]
+mod engine;
 mod stop_gradient;
 
 pub use stop_gradient::{register_stop_gradient, stop_gradient_udf, STOP_GRADIENT};

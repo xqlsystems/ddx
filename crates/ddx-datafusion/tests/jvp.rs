@@ -152,7 +152,7 @@ async fn jvp_of(
             .expect("every wrt table is given");
         tangent_of(table, &tt.name, &tt.columns).create(ctx).await;
     }
-    ddx_datafusion::ad::run(ctx, &program)
+    ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
         .await
         .unwrap_or_else(|e| panic!("run: {e}"));
     let out = rows(ctx, &format!("SELECT * FROM {}", program.value.step)).await;
@@ -372,7 +372,9 @@ async fn a_missing_tangent_row_is_zero_and_a_null_value_has_a_null_tangent() {
     .collect()
     .await
     .unwrap();
-    ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let out = rows(
         &ctx,
         &format!("SELECT * FROM {} ORDER BY i", program.value.step),
@@ -561,9 +563,10 @@ async fn a_tangent_table_whose_dims_repeat_is_refused_before_it_runs() {
     .collect()
     .await
     .unwrap();
-    let e = ddx_datafusion::ad::run(&ctx, &program)
-        .await
-        .expect_err("refused");
+    let e =
+        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .expect_err("refused");
     assert!(e.to_string().contains("share their dims"), "{e}");
     assert!(
         ctx.table(program.value.step.as_str()).await.is_err(),
@@ -594,7 +597,7 @@ async fn gradients(
             keyed(ctx, &format!("SELECT * FROM {}", g.step), dims).await,
         );
     }
-    ddx_datafusion::ad::release(ctx, &program).unwrap();
+    ddx_datafusion::engine::release(ctx, &program).unwrap();
     out
 }
 
@@ -617,7 +620,7 @@ async fn check_hvp(ctx: &SessionContext, loss: &str, tables: &[Table], wrt: &[Co
             .unwrap();
         tangent_of(table, &tt.name, &tt.columns).create(ctx).await;
     }
-    ddx_datafusion::ad::run(ctx, &hvp)
+    ddx_datafusion::engine::execute(ctx, &hvp, &mut ddx_datafusion::ad::Verified::new())
         .await
         .unwrap_or_else(|e| panic!("run: {e}"));
 
@@ -739,7 +742,9 @@ async fn a_null_input_adds_nothing_to_a_tangent_of_two_terms() {
     .collect()
     .await
     .unwrap();
-    ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let out = rows(
         &ctx,
         &format!("SELECT * FROM {} ORDER BY i", program.value.step),
@@ -833,7 +838,9 @@ async fn jvp_over_a_null(sql: &str) -> f64 {
     .collect()
     .await
     .unwrap();
-    ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     rows(&ctx, &format!("SELECT * FROM {}", program.value.step)).await[0][1]
 }
 
@@ -906,7 +913,7 @@ async fn stacked_aggregates_plan_size(n: usize) -> usize {
     }
     let sql = format!("WITH {} SELECT SUM(v) AS l FROM h{n}", ctes.join(", "));
     let (program, _) = jvp_of(&ctx, &sql, &[w()], &[wrt("w", "val")]).await;
-    let lp = ddx_datafusion::ad::logical_plan(&ctx, &program.steps[0].plan)
+    let lp = ddx_datafusion::engine::logical_plan(&ctx, &program.steps[0].plan)
         .await
         .unwrap();
     format!("{}", lp.display_indent()).len()
@@ -963,7 +970,7 @@ async fn jvp_and_hvp_run_without_the_simplifier() {
             .await
             .unwrap();
         }
-        ddx_datafusion::ad::run(&ctx, program)
+        ddx_datafusion::engine::execute(&ctx, program, &mut ddx_datafusion::ad::Verified::new())
             .await
             .unwrap_or_else(|e| panic!("run without the simplifier: {e}"));
     }
@@ -998,7 +1005,9 @@ async fn one_jvp_takes_sql_a_plan_or_a_program() {
         .collect()
         .await
         .unwrap();
-        ddx_datafusion::ad::run(&ctx, program).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap();
         let value = rows(&ctx, &format!("SELECT * FROM {}", program.value.step)).await;
         let want: f64 = w().rows.iter().map(|r| 3.0 * r[2] * r[2]).sum();
         assert!(
@@ -1051,7 +1060,9 @@ async fn a_null_coefficient_does_not_erase_a_shared_tangent() {
     .collect()
     .await
     .unwrap();
-    ddx_datafusion::ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let out = rows(
         &ctx,
         &format!("SELECT * FROM {} ORDER BY i", program.value.step),

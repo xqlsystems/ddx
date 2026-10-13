@@ -613,11 +613,11 @@ async fn a_value_many_columns_read_has_a_small_backward_step() {
     // Each step as the plan ad::run builds for it, run one at a time.
     let mut bytes = 0;
     for step in program.steps() {
-        let lp = ddx_datafusion::ad::logical_plan(&ctx, &step.plan)
+        let lp = ddx_datafusion::engine::logical_plan(&ctx, &step.plan)
             .await
             .unwrap();
         bytes += lp.display_indent().to_string().len();
-        ddx_datafusion::ad::run_step(&ctx, step).await.unwrap();
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
     }
     assert!(bytes < 200_000, "{bytes} bytes of plan for {n} readers");
     // And the gradient is right: Σ k·cos(k·val).
@@ -817,7 +817,9 @@ async fn the_public_api_differentiates_sql_and_reports_refusals() {
     )
     .await
     .unwrap();
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let got = common::ad::rows(
         &ctx,
         &format!(

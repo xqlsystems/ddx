@@ -53,7 +53,17 @@ SQL or a program, so they compose: `ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)`
 gives Hessian-vector products, checked against `jax.jvp(jax.grad(f))`. Both
 kinds of program (`BackwardProgram`, `ForwardProgram`) list the tables you
 register before they run (`inputs`, as `InputTable`s) and the tables they
-leave (`value` and `gradients`, as `OutputTable`s).
+leave (`value` and `gradients`, as `OutputTable`s). `ad.run(ctx, program,
+inputs)` runs one on its inputs (a cotangent or tangents, as DataFrames or
+Arrow tables, in the order of `program.inputs`) and returns what it computed,
+`value` and `gradients`, as DataFrames, tangents named `{column}_tangent`;
+nothing stays on the context:
+
+```python
+hvp = ad.jvp(ctx, ad.grad(ctx, "SELECT SUM(val * val * val) AS l FROM w", [("w", "val")]), [("w", "val")])
+out = ad.run(ctx, hvp, [ctx.sql("SELECT i, 1.0 AS val FROM w")])
+out.gradients[0]   # i, val (the gradient), val_tangent (H·v)
+```
 
 ## Other engines
 

@@ -35,9 +35,10 @@ and tangents along two tables add. :class:`ddxdb.Context` understands the
 same syntax in its ``.sql()``.
 
 Underneath, :func:`grad` turns a loss query into a :class:`BackwardProgram` of
-Substrait plans, and :func:`run` runs them on the context in order, registering
-each result as a table. :func:`vjp` pulls back a cotangent of any query's
-output, and :func:`jvp` pushes a tangent forward (a :class:`ForwardProgram`).
+Substrait plans, and :func:`run` runs them on the context and returns what
+they computed as DataFrames (:class:`Outputs`). :func:`vjp` pulls back a
+cotangent of any query's output, and :func:`jvp` pushes a tangent forward (a
+:class:`ForwardProgram`); :func:`run` takes the cotangent or tangents.
 Each takes SQL or a program, so they compose: ``jvp(ctx, grad(ctx, loss,
 wrt), wrt)`` gives Hessian-vector products. Both kinds of program share one
 vocabulary: the tables the caller registers (:class:`InputTable`) and the
@@ -46,11 +47,11 @@ labelled for any of this; the one function ddx gives a meaning to is
 ``ddx_stop_gradient(x)``, JAX's ``lax.stop_gradient``
 (:func:`register_stop_gradient`).
 
-Every table a program writes is named with a prefix unique to that program,
-``__ddx_{id}_``, so two programs on one context never read each other's tables,
-and a user's table is never replaced unless its name starts with ``__ddx_``,
-which is reserved. After :func:`run`, only the value and the gradients remain on
-the context; :func:`release` drops those too.
+While a program runs, every table it writes is named with a prefix unique to
+that program, ``__ddx_{id}_``, so two programs on one context never read each
+other's tables, and a user's table is never replaced unless its name starts
+with ``__ddx_``, which is reserved. None of them stays once :func:`run`
+returns.
 
 One limit Rust's ``ddx_datafusion::ad`` does not share: datafusion-python's
 Substrait consumer names a computed column by its whole expression, so a deep
@@ -65,7 +66,7 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union
+from typing import NamedTuple, Optional, Sequence, Union
 
 try:
     import pyarrow as pa
@@ -75,7 +76,6 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.ad needs DataFusion: pip install 'ddxdb[datafusion]'") from e
 
 from ._ddxdb import (
-    InvalidColumn,
     UnsupportedExpression,
     _bind_reads,
     _not_in_subquery,
@@ -115,10 +115,8 @@ __all__ = [
     "grad",
     "jvp",
     "register_stop_gradient",
-    "release",
+    "Outputs",
     "run",
-    "run_checks",
-    "run_step",
     "sql",
     "sql_all",
     "vjp",
@@ -247,49 +245,63 @@ class DataFusionBackend:
         self.ctx.deregister_table(name)
 
 
-def run(target: Union[SessionContext, Backend], program: Program) -> None:
-    """Run ``program``, of either kind, on a DataFusion context, or on any
-    :class:`ddxdb.Backend`: its checks, then every step, registering
-    each result. Its input tables must be registered first. Once the outputs
-    are written, the intermediate tables are dropped; the value and the
-    gradients stay until :func:`release` or the next run replaces them. A run
-    that fails leaves none of the program's tables.
+class Outputs(NamedTuple):
+    """What a program computed, as DataFrames that hold their rows."""
 
-    Raises :class:`ddxdb.InvalidColumn` when a check fails: a ``wrt`` table's
-    rows are not what the program assumed, for instance two share their dims.
+    #: The query's output: its columns, then for a ``jvp`` program each
+    #: column's tangent as ``{column}_tangent``.
+    value: object
+    #: One per ``wrt`` table, in the program's order: the table's dims, then
+    #: each value's gradient under the value's name (and, for ``jvp`` of a
+    #: program with gradients, each one's tangent, named as in ``value``).
+    gradients: list
+
+
+def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs:
+    """Run ``program``, of either kind, on ``inputs``, one per
+    ``program.inputs`` in order (a ``vjp``'s cotangent, a ``jvp``'s tangents;
+    none for ``grad``), each a DataFrame or a ``pyarrow.Table`` with at least
+    the columns its table names, and return what it computed.
+
+    First its checks, then every step. Nothing it writes stays on ``ctx``,
+    whether it succeeds or fails. Raises :class:`ddxdb.InvalidColumn` when a
+    check fails: a ``wrt`` table's or an input's rows are not what the
+    program assumed, for instance two share their dims.
 
     A program depends on the tables' names and schemas, not their values, so
     build it once and run it on every training step. One program's runs must
-    not overlap, since they write the same tables.
+    not overlap, since they write the same tables while they run. To run a
+    program on another engine, see :func:`ddxdb.run`.
     """
-    _run(DataFusionBackend(target) if isinstance(target, SessionContext) else target, program)
+    if not isinstance(ctx, SessionContext):
+        raise TypeError(
+            "ad.run runs a program on a DataFusion SessionContext; ddxdb.run(backend, program) "
+            "runs one on any ddxdb.Backend"
+        )
+    tables = program.inputs
+    if len(inputs) != len(tables):
+        raise ValueError(
+            f"the program takes {len(tables)} input tables "
+            f"({', '.join(t.name for t in tables)}), and was given {len(inputs)}"
+        )
+    try:
+        for table, given in zip(tables, inputs):
+            arrow = given if isinstance(given, pa.Table) else given.to_arrow_table()
+            _register(ctx, table.name, arrow.select(list(table.columns)))
+        _run(DataFusionBackend(ctx), program)
+        return Outputs(ctx.sql(program.value.query()), [ctx.sql(g.query()) for g in program.gradients])
+    finally:
+        # A planned DataFrame holds the tables it reads, so they can leave
+        # the catalog now.
+        _release(ctx, program)
+        for table in tables:
+            ctx.deregister_table(table.name)
 
 
-def run_checks(ctx: SessionContext, program: Program) -> None:
-    """Run ``program``'s checks, raising :class:`ddxdb.InvalidColumn` on the
-    first that returns a row."""
-    for check in program.checks:
-        if _returns_rows(ctx, check.plan):
-            raise InvalidColumn(f"invalid wrt column: {check.message}")
-
-
-def _returns_rows(ctx: SessionContext, plan: bytes) -> bool:
-    return ctx.create_dataframe_from_logical_plan(_consume(ctx, plan)).limit(1).count() > 0
-
-
-def release(ctx: SessionContext, program: Program) -> None:
-    """Drop every table ``program`` registered on ``ctx``, the value and the
-    gradients included. Its input tables are the caller's, and stay."""
+def _release(ctx: SessionContext, program: Program) -> None:
+    """Drop every table ``program`` registered on ``ctx``."""
     for step in program.steps():
         ctx.deregister_table(step.name)
-
-
-def run_step(ctx: SessionContext, step: Step) -> None:
-    """Run one step and register its result as a table, replacing any table of
-    that name. Every step it reads must already be registered. Unlike
-    :func:`run`, this neither runs the checks nor drops anything."""
-    table = ctx.create_dataframe_from_logical_plan(_consume(ctx, step.plan)).to_arrow_table()
-    _register(ctx, step.name, table)
 
 
 def _consume(ctx: SessionContext, plan: bytes):
@@ -370,10 +382,10 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
             _refuse_not_in(query)
             program = grad_plan(Serde.serialize_bytes(query, ctx), wrt, restrict=selects)
             ran.append(program)
-            run(ctx, program)
+            _run(DataFusionBackend(ctx), program)
         return [ctx.sql(s) for s in planned.rewrite(ran)]
     finally:
         # A planned DataFrame holds the tables it reads, so the programs'
         # tables can leave the catalog now.
         for program in ran:
-            release(ctx, program)
+            _release(ctx, program)

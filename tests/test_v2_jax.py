@@ -43,12 +43,17 @@ def env():
     return jax, ad, datafusion.SessionContext()
 
 
-def register(ctx, name: str, array: np.ndarray, dims: tuple[str, ...]) -> None:
-    """Register `array` as the tidy table `name(dims..., val)`."""
+def table_of(array: np.ndarray, dims: tuple[str, ...]) -> pa.Table:
+    """`array` as the tidy table `(dims..., val)`."""
     index = np.indices(array.shape).reshape(array.ndim, -1)
     columns = {d: pa.array(index[i], pa.int64()) for i, d in enumerate(dims)}
     columns["val"] = pa.array(array.reshape(-1).astype(np.float64))
-    ctx.register_record_batches(name, [pa.table(columns).to_batches()])
+    return pa.table(columns)
+
+
+def register(ctx, name: str, array: np.ndarray, dims: tuple[str, ...]) -> None:
+    """Register `array` as the tidy table `name(dims..., val)`."""
+    ctx.register_record_batches(name, [table_of(array, dims).to_batches()])
 
 
 def gradients(ad, ctx, with_loss: str, tables: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -159,12 +164,10 @@ def test_mlp_matches_jax_grad(env):
         np.testing.assert_allclose(got[name], np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=name)
 
 
-def register_tangents(ctx, inputs, tangents: dict[str, np.ndarray]) -> None:
-    """Register each of a program's tangent inputs from `tangents`, by the
-    table it is a tangent of."""
-    for input_table in inputs:
-        name = input_table.of[-1]
-        register(ctx, input_table.name, tangents[name], dims_of(name))
+def tangent_tables(inputs, tangents: dict[str, np.ndarray]) -> list:
+    """Each of a program's tangent inputs from `tangents`, by the table it is
+    a tangent of, as a table to pass to `ad.run`."""
+    return [table_of(tangents[t.of[-1]], dims_of(t.of[-1])) for t in inputs]
 
 
 def test_mlp_hessian_vector_products_match_jax_both_ways(env):
@@ -183,25 +186,19 @@ def test_mlp_hessian_vector_products_match_jax_both_ways(env):
     loss = f"{with_loss} SELECT loss FROM loss"
 
     hvp = ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)
-    register_tangents(ctx, hvp.inputs, tangents)
-    ad.run(ctx, hvp)
-    for out, (name, want) in zip(hvp.gradients, zip(params, expected)):
-        assert out.of[-1] == name
-        [t] = out.tangents
-        table = ctx.table(out.step).to_arrow_table()
-        got = dense(table, params[name].shape, list(dims_of(name)), t.tangent)
+    outs = ad.run(ctx, hvp, tangent_tables(hvp.inputs, tangents))
+    for g, out, (name, want) in zip(hvp.gradients, outs.gradients, zip(params, expected)):
+        assert g.of[-1] == name
+        got = dense(out.to_arrow_table(), params[name].shape, list(dims_of(name)), "val_tangent")
         np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"jvp(grad) {name}")
 
     forward = ad.jvp(ctx, loss, wrt)
     program = ad.vjp(ctx, forward, wrt)
     *tangent_inputs, cotangent = program.inputs
-    register_tangents(ctx, tangent_inputs, tangents)
-    seed = {c: [0.0 if c == "loss" else 1.0] for c in cotangent.columns}
-    ctx.register_record_batches(cotangent.name, [pa.table(seed).to_batches()])
-    ad.run(ctx, program)
-    for out, (name, want) in zip(program.gradients, zip(params, expected)):
-        table = ctx.table(out.step).to_arrow_table()
-        got = dense(table, params[name].shape, list(dims_of(name)), "val")
+    seed = pa.table({c: [0.0 if c == "loss" else 1.0] for c in cotangent.columns})
+    outs = ad.run(ctx, program, [*tangent_tables(tangent_inputs, tangents), seed])
+    for out, (name, want) in zip(outs.gradients, zip(params, expected)):
+        got = dense(out.to_arrow_table(), params[name].shape, list(dims_of(name)), "val")
         np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"vjp(jvp) {name}")
 
 

@@ -956,13 +956,20 @@ run that succeeds. Conjugate gradient checks its parameters once and each
 new direction every time; on an 8M-row table that is 712 ms a run against
 1,007. The fact holds only until the table's keys change, which ddx cannot
 watch, so keeping it is the caller's promise: `Verified::forget` a table
-whenever its keys may change. Skipping is opt-in; `run` checks everything.
+whenever its keys may change. Skipping is opt-in; `run` checks everything,
+and a program's inputs (a cotangent, a tangent) are new on every run, so
+their checks always run.
 
 **Every table a program materializes is named under a prefix fresh to that
 program** (`__ddx_{id}_`), so two programs on one engine never read or
-replace each other's tables, and a user's table is never replaced. An adapter
-drops a program's intermediate tables (the saved aggregates and cotangents)
-once it has run, and hands back the value and the gradients (`S11`).
+replace each other's tables, and a user's table is never replaced. A run
+returns what the program computed as values, as a JAX function does: the
+adapter's `run(ctx, &program, &inputs)` takes the inputs as relations, one
+per `InputTable` in order, and returns the value and the gradients as
+relations that hold their rows, tangents named `{column}_tangent` as in SQL
+(`OutputTable::query`); none of the program's tables stays on the engine
+(`S11`). The step-by-step run underneath (`Runner`, and the adapter's own
+engine module) is what `run` and SQL are built on, not the API.
 
 **Each step is a plain Substrait `Plan`,** handed to the engine's own consumer
 (`from_substrait`, `datafusion-substrait`) rather than converted to SQL text by

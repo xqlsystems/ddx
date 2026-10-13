@@ -49,6 +49,7 @@ use substrait::proto::{NamedStruct, Plan};
 use crate::emit::{bind_reads, unbound_reads};
 use crate::error::AdError;
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step};
+use crate::tables::{InputTable, OutputTable};
 
 mod sealed {
     pub trait Sealed {}
@@ -56,25 +57,38 @@ mod sealed {
     impl Sealed for crate::program::ForwardProgram {}
 }
 
-/// What the run protocol needs of a program: its checks, its steps in order,
-/// and which steps' tables a caller reads once it has run (the others are
-/// dropped). A [`BackwardProgram`] and a [`ForwardProgram`] are programs.
+/// What the run protocol needs of a program: the tables a caller registers
+/// before it runs, its checks, its steps in order, and the tables it leaves.
+/// A [`BackwardProgram`] and a [`ForwardProgram`] are programs.
 ///
 /// Sealed: an engine runs programs, and ddx makes them; a new kind of
 /// program is a change to this crate, not an extension point.
 pub trait Program: sealed::Sealed {
+    /// The tables to register before it runs: a `vjp`'s cotangent, a
+    /// `jvp`'s tangents.
+    fn inputs(&self) -> &[InputTable];
     /// Plans that must return no rows, run before the steps.
     fn checks(&self) -> &[Check];
     /// The number of steps.
     fn step_count(&self) -> usize;
     /// Step `i`, in the order they run.
     fn step(&self, i: usize) -> &Step;
+    /// The query's output, with its tangents for a `jvp` program.
+    fn value(&self) -> &OutputTable;
+    /// One per `wrt` table: its gradient, with its tangents for `jvp` of a
+    /// program that has gradients.
+    fn gradients(&self) -> &[OutputTable];
     /// Whether the table of the step named `step` stays after a successful
-    /// run, for a caller to read.
-    fn is_result(&self, step: &str) -> bool;
+    /// run, for a caller to read: the value's or a gradient's.
+    fn is_result(&self, step: &str) -> bool {
+        self.value().step == step || self.gradients().iter().any(|g| g.step == step)
+    }
 }
 
 impl Program for BackwardProgram {
+    fn inputs(&self) -> &[InputTable] {
+        &self.inputs
+    }
     fn checks(&self) -> &[Check] {
         &self.checks
     }
@@ -84,12 +98,18 @@ impl Program for BackwardProgram {
     fn step(&self, i: usize) -> &Step {
         BackwardProgram::step(self, i)
     }
-    fn is_result(&self, step: &str) -> bool {
-        self.value.step == step || self.gradients.iter().any(|g| g.step == step)
+    fn value(&self) -> &OutputTable {
+        &self.value
+    }
+    fn gradients(&self) -> &[OutputTable] {
+        &self.gradients
     }
 }
 
 impl Program for ForwardProgram {
+    fn inputs(&self) -> &[InputTable] {
+        &self.inputs
+    }
     fn checks(&self) -> &[Check] {
         &self.checks
     }
@@ -99,8 +119,11 @@ impl Program for ForwardProgram {
     fn step(&self, i: usize) -> &Step {
         &self.steps[i]
     }
-    fn is_result(&self, step: &str) -> bool {
-        self.value.step == step || self.gradients.iter().any(|g| g.step == step)
+    fn value(&self) -> &OutputTable {
+        &self.value
+    }
+    fn gradients(&self) -> &[OutputTable] {
+        &self.gradients
     }
 }
 
@@ -183,16 +206,23 @@ impl<E> Runner<E> {
     }
 
     /// A run of `program` that skips each check whose fact `verified` already
-    /// holds (see [`Verified`]). [`Action::Check`] still numbers checks as
-    /// the program does.
+    /// holds (see [`Verified`]), except a check of one of the program's
+    /// [`Program::inputs`]: a cotangent or a tangent is new on every run.
+    /// [`Action::Check`] still numbers checks as the program does.
     pub fn verified<P: Program + ?Sized>(program: &P, verified: &Verified) -> Self {
         let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
+        let input = |c: &Check| {
+            program
+                .inputs()
+                .iter()
+                .any(|i| crate::relation::table_matches(&i.name, &c.table))
+        };
         let mut runner = Runner {
             checks: program
                 .checks()
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| !verified.knows(c))
+                .filter(|(_, c)| input(c) || !verified.knows(c))
                 .map(|(i, c)| (i, c.message.clone()))
                 .collect(),
             steps: steps.iter().map(|s| s.name.clone()).collect(),
@@ -208,6 +238,13 @@ impl<E> Runner<E> {
         };
         runner.settle();
         runner
+    }
+
+    /// Every check this run will ask for, numbered as the program numbers
+    /// them, in order: an engine may start them all at once and answer each
+    /// when [`Runner::next`] asks.
+    pub fn checks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.checks.iter().map(|(i, _)| *i)
     }
 
     /// The next action, or `None` once the run is over; then call
@@ -418,10 +455,11 @@ pub fn run_verified<B: Backend, P: Program + ?Sized>(
 /// The fact is about the table's rows, which ddx cannot watch: it holds only
 /// until the table's keys change, and keeping it past that is the caller's
 /// promise. [`Verified::forget`] a table whenever its keys may have changed:
-/// rewritten from another query, rows inserted, a new tangent or cotangent
-/// written under the same name. A fact kept for a table whose keys now
-/// repeat lets a program run that its check would have refused, and give
-/// rows that share keys their summed gradient.
+/// rewritten from another query, rows inserted. A program's inputs (its
+/// cotangent or tangents) are new on every run, so their checks always run.
+/// A fact kept for a table whose keys now repeat lets a program run that its
+/// check would have refused, and give rows that share keys their summed
+/// gradient.
 #[derive(Debug, Clone, Default)]
 pub struct Verified {
     facts: std::collections::BTreeSet<(Vec<String>, Vec<String>)>,

@@ -457,11 +457,9 @@ async fn a_filter_on_a_gradients_dims_computes_only_those_rows() {
     };
     let options = Options::new().restrict("lw", plan("SELECT * FROM lw WHERE layer = 1").await);
     let program = grad_with(&forward, &[ColumnRef::new("lw", "val")], &options).unwrap();
-    ad::run(&ctx, &program).await.unwrap();
-    let rows: usize = ctx
-        .sql(&format!("SELECT * FROM {}", program.gradients[0].step))
-        .await
-        .unwrap()
+    let out = ad::run(&ctx, &program, &[]).await.unwrap();
+    let rows: usize = out.gradients[0]
+        .clone()
         .collect()
         .await
         .unwrap()
