@@ -294,7 +294,7 @@ def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in():
     from ddxdb._ddxdb import _Statements
 
     stmt = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)"
-    assert len(_Statements([stmt], "duckdb").jobs()) == 1
+    assert _Statements([stmt], "duckdb").next() is not None
     with pytest.raises(ValueError, match="dialect"):
         _Statements([stmt], "klingon")
 
@@ -456,4 +456,16 @@ def test_vjp_in_sql_pulls_a_cotangent_back(ad, ctx):
     )
     # s = val², so the pull-back of c is 2 val c.
     assert pairs(df) == [(0, 2.0), (1, -8.0), (2, 3.0)]
+    assert not ddx_tables(ctx)
+
+
+def test_calls_nest_in_sql(ad, ctx):
+    # l = Σ val³: jvp of a query over grad is H·v = 6 val v, here v = 1.
+    got = ad.sql(
+        ctx,
+        "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w), "
+        "g AS (SELECT * FROM grad(loss, w.val)), v AS (SELECT i, 1.0 AS val FROM w) "
+        "SELECT i, val_tangent FROM jvp(g, w.val, v) ORDER BY i",
+    ).to_pydict()
+    assert got["val_tangent"] == pytest.approx([6.0, -12.0, 3.0])
     assert not ddx_tables(ctx)

@@ -329,6 +329,10 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
 ///   column that has one, its tangent along `tangent`, a CTE or table shaped
 ///   like `table`, as `{column}_tangent`.
 ///
+/// Calls nest: `f`, or the cotangent or tangent, may read another call, and
+/// the outer call differentiates through it, so `jvp` of a query over
+/// `grad(loss, w.val)` along `v` is the Hessian-vector product `H·v`.
+///
 /// Each program runs first, once, however many calls use it (one per
 /// objective for `grad`, per objective and cotangent for `vjp`, per call for
 /// `jvp`), and each call is replaced by a query over what it needs before
@@ -353,10 +357,9 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // Which programs to run, and how each statement reads them, are
     // ddx_ad::Statements'; planning queries, registering tables and running
     // the programs are DataFusion's.
-    let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
-    let mut ran: Vec<ddx_ad::JobProgram> = Vec::with_capacity(planned.jobs().len());
+    let mut planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
     let result = async {
-        for job in planned.jobs() {
+        while let Some(job) = planned.next().map_err(to_df_err)? {
             // Only the gradient rows the statements read, where they say.
             let mut options = ddx_ad::Options::new();
             for (table, predicate) in job.restrict() {
@@ -365,31 +368,24 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
                 }
             }
             let lp = ctx.sql(job.query()).await?.into_optimized_plan()?;
-            let program = job
-                .build(&*substrait_of(ctx, &lp)?, &options)
-                .map_err(to_df_err)?;
-            ran.push(program);
-            let program = ran.last().expect("just pushed");
-            for (name, seed) in job.seeds(program.inputs()).map_err(to_df_err)? {
+            let plan = substrait_of(ctx, &lp)?;
+            planned.build(&job, &plan, &options).map_err(to_df_err)?;
+            for (name, seed) in planned.seeds(&job).map_err(to_df_err)? {
                 register(ctx, &name, ctx.sql(&seed).await?).await?;
             }
+            let program = planned.programs().last().expect("just built");
             run(ctx, program).await?;
         }
-        let programs: Vec<&dyn ddx_ad::Differentiable> = ran
-            .iter()
-            .map(|p| p as &dyn ddx_ad::Differentiable)
-            .collect();
-        let rewritten = planned.rewrite(&programs).map_err(to_df_err)?;
-        let mut frames = Vec::with_capacity(rewritten.len());
-        for sql in &rewritten {
-            frames.push(ctx.sql(sql).await?);
+        let mut frames = Vec::with_capacity(statements.len());
+        for sql in planned.rewrite().map_err(to_df_err)? {
+            frames.push(ctx.sql(&sql).await?);
         }
         Ok(frames)
     }
     .await;
     // A planned DataFrame holds the tables it reads, so the programs'
     // tables, and the inputs registered here, can leave the catalog now.
-    for program in &ran {
+    for program in planned.programs() {
         release(ctx, program)?;
         for input in program.inputs() {
             ctx.deregister_table(input.name.as_str())?;

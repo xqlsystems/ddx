@@ -4,7 +4,6 @@
 
 //! `grad`, `vjp` and `jvp` in SQL: see [`Statements`].
 
-use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
@@ -16,7 +15,7 @@ use ddx_core::sqlparser::parser::Parser;
 use ddx_core::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 use substrait::proto::Plan;
 
-use crate::compose::{sealed::Sealed, Differentiable, Subject};
+use crate::compose::{sealed::Sealed, After, Differentiable, Subject};
 use crate::error::{AdError, Result};
 use crate::program::{BackwardProgram, Check, ForwardProgram, Options, Step};
 use crate::relation::{table_matches, ColumnRef};
@@ -112,12 +111,11 @@ pub(crate) struct Calls {
     sql: String,
 }
 
-/// One program to build and run for [`Statements`]: [`Job::query`] to plan,
-/// [`Job::restrict`] to plan as options, [`Job::build`] to build it, then
-/// [`Job::seeds`] to register before it runs.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Job {
+/// One program to build: what [`Statements::plan`] found a call needs.
+#[derive(Debug, Clone)]
+struct Spec {
     kind: Kind,
+    /// The query to differentiate, as the statement wrote it.
     query: String,
     /// The columns, each once, compared case-insensitively: of every table
     /// a `grad` or `vjp` call on this query asks about, of one table for
@@ -127,6 +125,28 @@ pub struct Job {
     /// which the program's input table holds.
     seed: Option<String>,
     restrict: Vec<(String, String)>,
+    /// `query` and `seed`, with the calls they hold themselves.
+    query_text: Text,
+    seed_text: Option<Text>,
+}
+
+/// The next program to build, from [`Statements::next`]: its query to plan,
+/// and the rows of the gradient to restrict it to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    index: usize,
+    query: String,
+    restrict: Vec<(String, String)>,
+}
+
+/// SQL that may hold calls (a statement, or a job's query or cotangent or
+/// tangent), with the job each call needs.
+#[derive(Debug, Clone)]
+struct Text {
+    sql: String,
+    calls: Option<Calls>,
+    /// One per call, in order.
+    jobs: Vec<usize>,
 }
 
 /// The program a [`Job`] builds: a `grad` or `vjp` job's
@@ -142,7 +162,7 @@ pub enum JobProgram {
 }
 
 impl JobProgram {
-    /// The tables it reads that no step writes: [`Job::seeds`] says what to
+    /// The tables it reads that no step writes: [`Statements::seeds`] says what to
     /// register as each.
     pub fn inputs(&self) -> &[InputTable] {
         match self {
@@ -191,7 +211,9 @@ impl crate::Program for JobProgram {
 }
 
 impl Job {
-    /// The query to differentiate, for the engine to plan.
+    /// The query to differentiate, for the engine to plan: as the statement
+    /// wrote it, but with each call it holds itself replaced by a read of
+    /// what that call's program, built and run before it, computed.
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -204,37 +226,85 @@ impl Job {
     pub fn restrict(&self) -> &[(String, String)] {
         &self.restrict
     }
+}
 
-    /// The job's program, from `plan`, the engine's plan of [`Job::query`],
-    /// with `options`.
-    pub fn build(&self, plan: &Plan, options: &Options) -> Result<JobProgram> {
+impl Spec {
+    /// Does `call` need this job?
+    fn takes(&self, call: &Call) -> bool {
+        self.kind == call.kind
+            && self.query == call.query
+            && self.seed == call.seed
+            && (call.kind != Kind::Jvp || pushes_along(&self.wrt, call))
+    }
+
+    fn build<D: Differentiable + ?Sized>(&self, of: &D, options: &Options) -> Result<JobProgram> {
         Ok(match self.kind {
-            Kind::Grad => JobProgram::Backward(crate::grad_with(plan, &self.wrt, options)?),
-            Kind::Vjp => JobProgram::Backward(crate::vjp_with(plan, &self.wrt, options)?),
-            Kind::Jvp => JobProgram::Forward(crate::jvp_with(plan, &self.wrt, options)?),
+            Kind::Grad => JobProgram::Backward(crate::grad_with(of, &self.wrt, options)?),
+            Kind::Vjp => JobProgram::Backward(crate::vjp_with(of, &self.wrt, options)?),
+            Kind::Jvp => JobProgram::Forward(crate::jvp_with(of, &self.wrt, options)?),
+        })
+    }
+}
+
+impl Text {
+    /// `sql`, with its calls, each matched to the one of `specs` it needs.
+    fn of(sql: &str, dialect: &dyn Dialect, specs: &[Spec]) -> Result<Text> {
+        let calls = Calls::find(sql, dialect)?;
+        let jobs = calls
+            .iter()
+            .flat_map(|c| &c.calls)
+            .map(|call| {
+                specs.iter().position(|s| s.takes(call)).ok_or_else(|| {
+                    AdError::Internal(format!(
+                        "a {} call inside another's query that the statement lacks",
+                        call.kind.name()
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Text {
+            sql: sql.to_string(),
+            calls,
+            jobs,
         })
     }
 
-    /// What to register before the program [`Job::build`] built runs, given
-    /// its `inputs` ([`JobProgram::inputs`]): each table's name and a query
-    /// for its rows, the cotangent or tangent with the columns the program
-    /// asks for, by name.
-    pub fn seeds(&self, inputs: &[InputTable]) -> Result<Vec<(String, String)>> {
-        inputs
-            .iter()
-            .map(|input| {
-                let seed = self.seed.as_ref().ok_or_else(|| {
-                    AdError::Internal(format!(
-                        "a {} job has no table to register as `{}`",
-                        self.kind.name(),
-                        input.name
-                    ))
-                })?;
-                let columns: Vec<String> = input.columns.iter().map(|c| quote(c)).collect();
-                let query = format!("SELECT {} FROM ({seed}) AS __ddx_seed", columns.join(", "));
-                Ok((input.name.clone(), query))
-            })
-            .collect()
+    /// The jobs whose programs it reads, each once.
+    fn needs(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for &j in &self.jobs {
+            if !out.contains(&j) {
+                out.push(j);
+            }
+        }
+        out
+    }
+
+    /// The text with each call replaced by a read of what its job's program
+    /// computed. A `grad` or `vjp` call reads its table's dims, then the
+    /// columns it named, from the gradient its job's program wrote. A
+    /// column is one of the table's values when some `wrt` entry of the job
+    /// names it; every other is a dim. A `jvp` call reads its program's
+    /// value: `f`'s columns, then each tangent as `{column}_tangent`.
+    fn rewrite(&self, specs: &[Spec], programs: &[JobProgram]) -> Result<String> {
+        let Some(calls) = &self.calls else {
+            return Ok(self.sql.clone());
+        };
+        let mut relations = Vec::with_capacity(calls.calls.len());
+        for (call, &j) in calls.calls.iter().zip(&self.jobs) {
+            let program = programs
+                .get(j)
+                .ok_or_else(|| AdError::Internal(format!("job {j} is read before it is built")))?;
+            let Subject::Program(parts) = program.subject() else {
+                return Err(AdError::Internal(format!("job {j}'s program is a query")));
+            };
+            relations.push(match call.kind {
+                Kind::Jvp => value_and_tangents(parts.value),
+                _ => gradient(call, &specs[j], parts.gradients)?,
+            });
+        }
+        let mut relations = relations.into_iter();
+        Ok(calls.rewrite(&mut |_| relations.next().expect("one per call")))
     }
 }
 
@@ -284,16 +354,41 @@ impl Job {
 /// No engine could run those calls: a table function receives values, and
 /// `f` is a query. So, like v1's `grad` (design.md §3.3, Path A), each is
 /// rewritten before the engine sees the statement. [`Statements::plan`] finds
-/// the calls in several statements at once and the [`Job`]s they need, one
-/// per program: a job differentiates one query, with respect to every column
-/// any call of its kind asks about (one table's, for `jvp`), so statements
-/// that update different tables from one objective pay for one backward pass.
-/// The adapter builds each job's program ([`Job::build`]) from the engine's
-/// plan of its query, registers its cotangent or tangent ([`Job::seeds`]) as
-/// the program's input table, runs it, and hands the programs back to
-/// [`Statements::rewrite`], which splices a relation over what each call
-/// needs in its place, by source span, leaving the rest of each statement
-/// byte-identical. Only building and running the programs needs the engine.
+/// the calls in several statements at once and the jobs they need, one per
+/// program: a job differentiates one query, with respect to every column any
+/// call of its kind asks about (one table's, for `jvp`), so statements that
+/// update different tables from one objective pay for one backward pass.
+///
+/// Calls nest, as JAX's transformations do: `f`, or the cotangent or
+/// tangent, can read another call, and `jvp` of a query over a `grad` is a
+/// Hessian-vector product:
+///
+/// ```sql
+/// WITH loss AS (SELECT SUM(val * val * val) AS l FROM w),
+///      g AS (SELECT * FROM grad(loss, w.val)),
+///      v AS (SELECT i, 1.0 AS val FROM w)
+/// SELECT i, val_tangent AS hv FROM jvp(g, w.val, v)
+/// ```
+///
+/// The adapter drives it, as it does a program with [`crate::Runner`]: it
+/// asks for the [next](Statements::next) job, plans its query, has it
+/// [built](Statements::build), registers its [seeds](Statements::seeds) and
+/// runs the program, until no job is left. A job's query reads what the jobs
+/// before it computed, and its program differentiates through theirs. Then
+/// [`Statements::rewrite`] splices a relation over what each call needs in
+/// its place, by source span, leaving the rest of each statement
+/// byte-identical. Only planning and running needs the engine.
+///
+/// ```ignore
+/// let mut planned = Statements::plan(&[sql], &dialect)?;
+/// while let Some(job) = planned.next()? {
+///     let plan = engine.plan(job.query());
+///     let program = planned.build(&job, &plan, &Options::new())?;
+///     for (name, query) in planned.seeds(&job)? { engine.register(name, query) }
+///     engine.run(program);
+/// }
+/// let rewritten = planned.rewrite()?;
+/// ```
 ///
 /// This is the one part of `ddx-ad` about SQL text rather than Substrait, so
 /// its API names `sqlparser` (a [`Dialect`]), through the `ddx-core` this
@@ -304,11 +399,10 @@ impl Job {
 /// The rewriter tells them apart by where they appear.
 #[derive(Debug, Clone)]
 pub struct Statements {
-    statements: Vec<String>,
-    found: Vec<Option<Calls>>,
-    jobs: Vec<Job>,
-    /// (statement, call within it) → its job.
-    job_of: BTreeMap<(usize, usize), usize>,
+    statements: Vec<Text>,
+    specs: Vec<Spec>,
+    /// The programs built so far, one per spec, in order.
+    programs: Vec<JobProgram>,
 }
 
 /// Does a `jvp` job along `wrt` push forward along exactly `call`'s columns?
@@ -332,34 +426,34 @@ fn pushes_along(wrt: &[ColumnRef], call: &Call) -> bool {
 impl Statements {
     /// Find every statement's calls, and the jobs they need: for `grad`
     /// and for `vjp`, one per query (and cotangent), with respect to every
-    /// column asked about; for `jvp`, one per distinct call.
+    /// column asked about; for `jvp`, one per distinct call. A call inside
+    /// another's query or cotangent or tangent (in a CTE it reads) comes
+    /// first in the statement, so its job comes first.
     pub fn plan(statements: &[&str], dialect: &dyn Dialect) -> Result<Statements> {
-        let mut found = Vec::with_capacity(statements.len());
+        let mut specs: Vec<Spec> = Vec::new();
+        let mut texts = Vec::with_capacity(statements.len());
         for sql in statements {
-            found.push(Calls::find(sql, dialect)?);
-        }
-        let mut jobs: Vec<Job> = Vec::new();
-        let mut job_of = BTreeMap::new();
-        for (s, calls) in found.iter().enumerate() {
-            let Some(calls) = calls else { continue };
-            for (c, call) in calls.calls.iter().enumerate() {
-                let same = |j: &Job| {
-                    j.kind == call.kind
-                        && j.query == call.query
-                        && j.seed == call.seed
-                        && (call.kind != Kind::Jvp || pushes_along(&j.wrt, call))
-                };
-                let j = match jobs.iter().position(same) {
+            let calls = Calls::find(sql, dialect)?;
+            let mut jobs = Vec::new();
+            for call in calls.iter().flat_map(|c| &c.calls) {
+                let j = match specs.iter().position(|s| s.takes(call)) {
                     Some(j) => j,
                     None => {
-                        jobs.push(Job {
+                        let query_text = Text::of(&call.query, dialect, &specs)?;
+                        let seed_text = match &call.seed {
+                            Some(seed) => Some(Text::of(seed, dialect, &specs)?),
+                            None => None,
+                        };
+                        specs.push(Spec {
                             kind: call.kind,
                             query: call.query.clone(),
                             wrt: Vec::new(),
                             seed: call.seed.clone(),
                             restrict: Vec::new(),
+                            query_text,
+                            seed_text,
                         });
-                        jobs.len() - 1
+                        specs.len() - 1
                     }
                 };
                 for column in &call.columns {
@@ -368,24 +462,29 @@ impl Statements {
                         x.table.eq_ignore_ascii_case(&w.table)
                             && x.column.eq_ignore_ascii_case(&w.column)
                     };
-                    if !jobs[j].wrt.iter().any(same) {
-                        jobs[j].wrt.push(w);
+                    if !specs[j].wrt.iter().any(same) {
+                        specs[j].wrt.push(w);
                     }
                 }
-                job_of.insert((s, c), j);
+                jobs.push(j);
             }
+            texts.push(Text {
+                sql: sql.to_string(),
+                calls,
+                jobs,
+            });
         }
         // A table's rows can be restricted only if every call reading its
         // gradient in the job says which rows it reads.
-        for (j, job) in jobs.iter_mut().enumerate() {
-            if job.kind == Kind::Jvp {
+        for (j, spec) in specs.iter_mut().enumerate() {
+            if spec.kind == Kind::Jvp {
                 continue;
             }
             let mut by_table: Vec<(String, Vec<Option<String>>)> = Vec::new();
-            for (s, calls) in found.iter().enumerate() {
-                let Some(calls) = calls else { continue };
-                for (c, call) in calls.calls.iter().enumerate() {
-                    if job_of.get(&(s, c)) != Some(&j) {
+            for text in &texts {
+                let Some(calls) = &text.calls else { continue };
+                for (call, &k) in calls.calls.iter().zip(&text.jobs) {
+                    if k != j {
                         continue;
                     }
                     match by_table
@@ -416,68 +515,123 @@ impl Statements {
                         .collect::<Vec<_>>()
                         .join(" OR ")
                 };
-                job.restrict.push((table, predicate));
+                spec.restrict.push((table, predicate));
             }
         }
         Ok(Statements {
-            statements: statements.iter().map(|s| s.to_string()).collect(),
-            found,
-            jobs,
-            job_of,
+            statements: texts,
+            specs,
+            programs: Vec::new(),
         })
     }
 
-    /// The programs to build and run, in the order [`Statements::rewrite`]
-    /// expects them.
-    pub fn jobs(&self) -> &[Job] {
-        &self.jobs
+    /// The next job to build, once every job before it is built and has
+    /// run, or `None` when none is left. Until it is built, this is the
+    /// same job again.
+    pub fn next(&self) -> Result<Option<Job>> {
+        let index = self.programs.len();
+        let Some(spec) = self.specs.get(index) else {
+            return Ok(None);
+        };
+        Ok(Some(Job {
+            index,
+            query: spec.query_text.rewrite(&self.specs, &self.programs)?,
+            restrict: spec.restrict.clone(),
+        }))
     }
 
-    /// Each statement with its calls replaced by reads of what `programs`
-    /// computed, one per [job](Statements::jobs) in order (a
-    /// [`JobProgram`], or the program it holds), each already run so its
-    /// tables exist. A statement with no call comes back as it was.
-    ///
-    /// A `grad` or `vjp` call reads its table's dims, then the columns it
-    /// named, from the gradient its job's program wrote. A column is one of
-    /// the table's values when some `wrt` entry of the job names it; every
-    /// other is a dim. A `jvp` call reads its program's value: `f`'s
-    /// columns, then each tangent as `{column}_tangent`.
-    pub fn rewrite(&self, programs: &[&dyn Differentiable]) -> Result<Vec<String>> {
-        if programs.len() != self.jobs.len() {
+    /// `job`'s program, from `plan`, the engine's plan of [`Job::query`],
+    /// with `options`. If the query reads what other calls computed, the
+    /// program differentiates through their programs too.
+    pub fn build(&mut self, job: &Job, plan: &Plan, options: &Options) -> Result<&JobProgram> {
+        if job.index != self.programs.len() {
             return Err(AdError::Internal(format!(
-                "{} programs for {} jobs",
-                programs.len(),
-                self.jobs.len()
+                "job {} built out of turn, after {}",
+                job.index,
+                self.programs.len()
             )));
         }
-        let mut out = Vec::with_capacity(self.statements.len());
-        for (s, sql) in self.statements.iter().enumerate() {
-            let Some(calls) = &self.found[s] else {
-                out.push(sql.clone());
+        let spec = &self.specs[job.index];
+        let needs = spec.query_text.needs();
+        let program = if needs.is_empty() {
+            spec.build(plan, options)?
+        } else {
+            let inner: Vec<&dyn Differentiable> = needs
+                .iter()
+                .map(|&j| &self.programs[j] as &dyn Differentiable)
+                .collect();
+            spec.build(&After::new(&inner, plan)?, options)?
+        };
+        self.programs.push(program);
+        Ok(self.programs.last().expect("just pushed"))
+    }
+
+    /// What to register before `job`'s program, [built](Statements::build),
+    /// runs: each of its input tables' names, and a query for its rows, the
+    /// cotangent or tangent with the columns the program asks for, by name.
+    /// An input it carries from a program it reads was registered for that
+    /// one.
+    pub fn seeds(&self, job: &Job) -> Result<Vec<(String, String)>> {
+        let spec = &self.specs[job.index];
+        let program = self.programs.get(job.index).ok_or_else(|| {
+            AdError::Internal(format!("job {}'s seeds before it is built", job.index))
+        })?;
+        let carried: Vec<&str> = spec
+            .query_text
+            .needs()
+            .into_iter()
+            .flat_map(|j| self.programs[j].inputs())
+            .map(|i| i.name.as_str())
+            .collect();
+        let mut out = Vec::new();
+        for input in program.inputs() {
+            if carried.contains(&input.name.as_str()) {
                 continue;
-            };
-            let mut relations = Vec::with_capacity(calls.calls.len());
-            for (c, call) in calls.calls.iter().enumerate() {
-                let j = self.job_of[&(s, c)];
-                let Subject::Program(parts) = programs[j].subject() else {
-                    return Err(AdError::Internal(format!("job {j}'s program is a query")));
-                };
-                relations.push(match call.kind {
-                    Kind::Jvp => value_and_tangents(parts.value),
-                    _ => gradient(call, &self.jobs[j], parts.gradients)?,
-                });
             }
-            let mut relations = relations.into_iter();
-            out.push(calls.rewrite(&mut |_| relations.next().expect("one per call")));
+            let seed = match &spec.seed_text {
+                Some(text) => text.rewrite(&self.specs, &self.programs)?,
+                None => {
+                    return Err(AdError::Internal(format!(
+                        "a {} job has no table to register as `{}`",
+                        spec.kind.name(),
+                        input.name
+                    )))
+                }
+            };
+            let columns: Vec<String> = input.columns.iter().map(|c| quote(c)).collect();
+            let query = format!("SELECT {} FROM ({seed}) AS __ddx_seed", columns.join(", "));
+            out.push((input.name.clone(), query));
         }
         Ok(out)
+    }
+
+    /// The programs built so far, in order: what an adapter releases once
+    /// the statements are planned.
+    pub fn programs(&self) -> &[JobProgram] {
+        &self.programs
+    }
+
+    /// Each statement with its calls replaced by reads of what their
+    /// programs computed, once every job is built and has run. A statement
+    /// with no call comes back as it was.
+    pub fn rewrite(&self) -> Result<Vec<String>> {
+        if self.programs.len() != self.specs.len() {
+            return Err(AdError::Internal(format!(
+                "{} programs built for {} jobs",
+                self.programs.len(),
+                self.specs.len()
+            )));
+        }
+        self.statements
+            .iter()
+            .map(|t| t.rewrite(&self.specs, &self.programs))
+            .collect()
     }
 }
 
 /// SQL for a `grad` or `vjp` call's relation: its table's dims, then the
 /// columns it named, from the gradient of that table in `gradients`.
-fn gradient(call: &Call, job: &Job, gradients: &[OutputTable]) -> Result<String> {
+fn gradient(call: &Call, job: &Spec, gradients: &[OutputTable]) -> Result<String> {
     let found = gradients.iter().find_map(|g| {
         let table = g.of.table()?;
         table_matches(&call.table, table).then_some((g, table))
@@ -1093,7 +1247,7 @@ mod tests {
         let plan = |ws: &[&str]| {
             let stmts: Vec<String> = ws.iter().map(|w| stmt(w)).collect();
             let refs: Vec<&str> = stmts.iter().map(String::as_str).collect();
-            Statements::plan(&refs, &GenericDialect {}).unwrap().jobs()[0]
+            Statements::plan(&refs, &GenericDialect {}).unwrap().specs[0]
                 .restrict
                 .clone()
         };
@@ -1144,9 +1298,9 @@ mod tests {
                    SELECT * FROM grad(loss, w.val) gw, grad(loss, b.val) gb";
         let found = Calls::find(sql, &GenericDialect {}).unwrap().unwrap();
         let planned = Statements::plan(&[sql], &GenericDialect {}).unwrap();
-        assert_eq!(planned.jobs().len(), 1);
+        assert_eq!(planned.specs.len(), 1);
         assert_eq!(
-            planned.jobs()[0].wrt,
+            planned.specs[0].wrt,
             vec![ColumnRef::new("w", "val"), ColumnRef::new("b", "val")]
         );
         let out = found.rewrite(&mut |c| format!("g_{}", c.table));
@@ -1158,7 +1312,7 @@ mod tests {
         let sql = "WITH loss AS (SELECT SUM(val) AS l FROM w) \
                    SELECT * FROM grad(loss, w.val) a, grad(loss, W.VAL) b";
         let planned = Statements::plan(&[sql], &GenericDialect {}).unwrap();
-        assert_eq!(planned.jobs()[0].wrt, vec![ColumnRef::new("w", "val")]);
+        assert_eq!(planned.specs[0].wrt, vec![ColumnRef::new("w", "val")]);
     }
 
     #[test]
@@ -1231,7 +1385,7 @@ mod tests {
     #[test]
     fn a_job_takes_its_kind_s_calls_and_jvps_of_two_tables_are_two_jobs() {
         let planned = Statements::plan(&[CALLS, CALLS], &GenericDialect {}).unwrap();
-        let jobs = planned.jobs();
+        let jobs = &planned.specs;
         // jvp along w, jvp along b, vjp: twice over, the same three jobs.
         assert_eq!(jobs.len(), 3);
         assert_eq!(jobs[0].wrt, vec![ColumnRef::new("w", "val")]);
@@ -1246,24 +1400,44 @@ mod tests {
         let two = "WITH h AS (SELECT w.o, w.val * b.val AS y FROM w JOIN b ON w.o = b.o) \
                    SELECT * FROM vjp(h, w.val, c) g, vjp(h, b.val, c) gb, vjp(h, b.val, d) gd";
         let planned = Statements::plan(&[two], &GenericDialect {}).unwrap();
-        assert_eq!(planned.jobs().len(), 2);
-        assert_eq!(planned.jobs()[0].wrt.len(), 2);
+        assert_eq!(planned.specs.len(), 2);
+        assert_eq!(planned.specs[0].wrt.len(), 2);
+    }
+
+    /// A program that takes `inputs`, as if `planned` had built it for
+    /// its next job.
+    fn built(planned: &mut Statements, inputs: Vec<InputTable>) -> Job {
+        let job = planned.next().unwrap().unwrap();
+        planned
+            .programs
+            .push(JobProgram::Forward(crate::ForwardProgram {
+                inputs,
+                checks: Vec::new(),
+                steps: Vec::new(),
+                value: OutputTable {
+                    step: "__ddx_1_value".into(),
+                    of: crate::tables::Of::Output,
+                    columns: Vec::new(),
+                    tangents: Vec::new(),
+                },
+                gradients: Vec::new(),
+            }));
+        job
     }
 
     #[test]
     fn a_job_s_seed_has_the_columns_its_program_asks_for() {
-        let planned = Statements::plan(&[CALLS], &GenericDialect {}).unwrap();
+        let mut planned = Statements::plan(&[CALLS], &GenericDialect {}).unwrap();
         let input = InputTable {
             name: "__ddx_1_tangent_0_w".into(),
             of: crate::tables::Of::Table(vec!["w".into()]),
             columns: vec!["i".into(), "o".into(), "val".into()],
             keys: 2,
         };
-        let seeds = planned.jobs()[1]
-            .seeds(std::slice::from_ref(&input))
-            .unwrap();
+        built(&mut planned, vec![]);
+        let job = built(&mut planned, vec![input.clone()]);
         assert_eq!(
-            seeds,
+            planned.seeds(&job).unwrap(),
             vec![(
                 input.name.clone(),
                 "SELECT \"i\", \"o\", \"val\" FROM (SELECT * FROM db) AS __ddx_seed".into()
@@ -1271,8 +1445,54 @@ mod tests {
         );
         // A grad job writes its cotangent, 1, into its plan: it has none.
         let grad = "WITH l AS (SELECT SUM(val) AS l FROM w) SELECT * FROM grad(l, w.val)";
-        let planned = Statements::plan(&[grad], &GenericDialect {}).unwrap();
-        assert!(planned.jobs()[0].seeds(&[input]).is_err());
+        let mut planned = Statements::plan(&[grad], &GenericDialect {}).unwrap();
+        let job = built(&mut planned, vec![input]);
+        assert!(planned.seeds(&job).is_err());
+    }
+
+    #[test]
+    fn a_call_inside_another_s_query_is_a_job_before_it_and_its_query_reads_it() {
+        let sql = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w), \
+                        g AS (SELECT * FROM grad(loss, w.val)), \
+                        v AS (SELECT i, 1.0 AS val FROM w) \
+                   SELECT * FROM jvp(g, w.val, v) j";
+        let mut planned = Statements::plan(&[sql], &GenericDialect {}).unwrap();
+        assert_eq!(planned.specs.len(), 2);
+        assert_eq!(planned.specs[0].kind, Kind::Grad);
+        assert_eq!(planned.specs[1].query_text.needs(), vec![0]);
+        let first = planned.next().unwrap().unwrap();
+        assert!(!first.query().contains("grad("), "{}", first.query());
+        // The outer job's query cannot be written until the inner one is
+        // built: it reads its program's table.
+        planned
+            .programs
+            .push(JobProgram::Backward(crate::BackwardProgram {
+                inputs: Vec::new(),
+                checks: Vec::new(),
+                forward_steps: Vec::new(),
+                backward_steps: Vec::new(),
+                value: OutputTable {
+                    step: "__ddx_1_value".into(),
+                    of: crate::tables::Of::Output,
+                    columns: vec!["l".into()],
+                    tangents: Vec::new(),
+                },
+                gradients: vec![OutputTable {
+                    step: "__ddx_1_grad_0_w".into(),
+                    of: crate::tables::Of::Table(vec!["w".into()]),
+                    columns: vec!["i".into(), "val".into()],
+                    tangents: Vec::new(),
+                }],
+            }));
+        let second = planned.next().unwrap().unwrap();
+        assert!(
+            second
+                .query()
+                .contains("(SELECT \"i\", \"val\" FROM \"__ddx_1_grad_0_w\")"),
+            "{}",
+            second.query()
+        );
+        assert!(!second.query().contains("grad("), "{}", second.query());
     }
 
     #[test]

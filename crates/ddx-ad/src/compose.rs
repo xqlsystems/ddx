@@ -34,16 +34,20 @@
 
 use std::collections::HashMap;
 
+use substrait::proto::expression::RexType;
+use substrait::proto::function_argument::ArgType;
+use substrait::proto::plan_rel::RelType as PlanRelType;
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
-use substrait::proto::{Plan, ReadRel, Rel};
+use substrait::proto::rel_common::EmitKind;
+use substrait::proto::{Expression, FunctionArgument, Plan, ReadRel, Rel};
 
-use crate::emit::{plan as plan_of, select, unbound_reads};
+use crate::emit::{filter, is_identity, plan as plan_of, read_step, select, unbound_reads};
 use crate::error::{AdError, Result};
-use crate::forward::{inline_references, rel_inputs_mut, root_of};
+use crate::forward::{inline_references, read_outputs, rel_inputs_mut, root_of};
 use crate::functions::{Extensions, Functions};
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step};
-use crate::tables::{InputTable, OutputTable};
+use crate::tables::{InputTable, Of, OutputTable};
 
 pub(crate) mod sealed {
     /// What a [`Differentiable`](super::Differentiable) is, to this crate.
@@ -244,4 +248,367 @@ fn step_of(read: &ReadRel, steps: &HashMap<&str, (Rel, Vec<String>)>) -> Result<
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(select(rel.clone(), picked)))
+}
+
+/// A query over the tables of earlier programs, as one program: theirs
+/// steps, renamed into one namespace, then the query, as the step that
+/// writes its value. [`grad`](crate::grad), [`vjp`](crate::vjp) and
+/// [`jvp`](crate::jvp) of it differentiate through the programs as of any
+/// program, so a call in SQL can take a query over another call: `jvp` of
+/// a query over `grad(loss, w.val)` is `H·v`.
+///
+/// The query is the engine's plan: it reads the programs' tables as the
+/// engine registered them, with their types and any filter or projection
+/// the engine pushed into the read, and declares functions under its own
+/// anchors. Each such read becomes a read of the step, as a program's steps
+/// read each other, and every plan is declared from one set of functions.
+pub(crate) struct After {
+    inputs: Vec<InputTable>,
+    checks: Vec<Check>,
+    steps: Vec<Step>,
+    value: OutputTable,
+}
+
+impl After {
+    pub(crate) fn new(programs: &[&dyn Differentiable], query: &Plan) -> Result<After> {
+        let namespace = crate::forward::new_namespace();
+        let mut ext = Extensions::new(&Functions::from_plan(&Plan::default())?);
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        let mut inputs: Vec<InputTable> = Vec::new();
+        let mut checks: Vec<Check> = Vec::new();
+        let mut steps: Vec<Step> = Vec::new();
+        for (k, program) in programs.iter().enumerate() {
+            let Subject::Program(parts) = program.subject() else {
+                return Err(AdError::Internal(
+                    "a query over a query, not a program".into(),
+                ));
+            };
+            let old = parts.namespace()?;
+            for step in &parts.steps {
+                let rest = step.name.strip_prefix(old).ok_or_else(|| {
+                    AdError::Internal(format!(
+                        "step `{}` is outside its program's namespace",
+                        step.name
+                    ))
+                })?;
+                renamed.insert(step.name.clone(), format!("{namespace}{k}_{rest}"));
+            }
+            for input in parts.inputs {
+                if !inputs.iter().any(|i| i.name == input.name) {
+                    inputs.push(input.clone());
+                }
+            }
+            for check in parts.checks {
+                let mut check = check.clone();
+                redeclare(&mut check.plan, &HashMap::new(), &mut ext)?;
+                if !checks.iter().any(|c| c.message == check.message) {
+                    checks.push(check);
+                }
+            }
+            for step in &parts.steps {
+                let mut plan = step.plan.clone();
+                redeclare(&mut plan, &renamed, &mut ext)?;
+                steps.push(Step {
+                    name: renamed[&step.name].clone(),
+                    plan,
+                });
+            }
+        }
+        let (root, names) = root_of(query)?;
+        let mut rel = inline_references(root, &query.relations)?;
+        let mut plan = plan_of(Rel::default(), names.clone(), &ext);
+        let from = Functions::from_plan(query)?;
+        redeclare_rel(&mut rel, &from, &renamed, &mut ext)?;
+        set_root(&mut plan, rel);
+        let value = OutputTable {
+            step: format!("{namespace}value"),
+            of: Of::Output,
+            columns: names,
+            tangents: Vec::new(),
+        };
+        steps.push(Step {
+            name: value.step.clone(),
+            plan,
+        });
+        // Every plan declares the whole set, which only grew, so an anchor
+        // names one function in all of them.
+        for plan in steps
+            .iter_mut()
+            .map(|s| &mut s.plan)
+            .chain(checks.iter_mut().map(|c| &mut c.plan))
+        {
+            plan.extensions = ext.declarations();
+            plan.extension_urns = ext.urns();
+        }
+        Ok(After {
+            inputs,
+            checks,
+            steps,
+            value,
+        })
+    }
+}
+
+impl sealed::Sealed for After {
+    fn subject(&self) -> Subject<'_> {
+        Subject::Program(Parts {
+            inputs: &self.inputs,
+            checks: &self.checks,
+            steps: self.steps.iter().collect(),
+            value: &self.value,
+            gradients: &[],
+        })
+    }
+}
+impl Differentiable for After {}
+
+fn set_root(plan: &mut Plan, rel: Rel) {
+    for r in plan.relations.iter_mut() {
+        if let Some(PlanRelType::Root(root)) = r.rel_type.as_mut() {
+            root.input = Some(rel);
+            return;
+        }
+    }
+}
+
+/// A read of a table `renamed` names, made a read of that step under its
+/// new name. The engine wrote the read typed, maybe filtered and projected:
+/// it becomes an unbound read of every column the step has, then that
+/// filter, then that projection, then its emit.
+fn step_read(read: &ReadRel, renamed: &HashMap<String, String>) -> Result<Option<Rel>> {
+    let (Some(ReadType::NamedTable(t)), Some(schema)) = (&read.read_type, &read.base_schema) else {
+        return Ok(None);
+    };
+    let Some(new) = t.names.last().and_then(|n| renamed.get(n)) else {
+        return Ok(None);
+    };
+    let mut rel = read_step(new, schema.names.clone());
+    if let Some(f) = &read.filter {
+        rel = filter(rel, (**f).clone());
+    }
+    let outputs = read_outputs(read)?;
+    if !is_identity(&outputs, schema.names.len()) {
+        rel = select(rel, outputs.clone());
+    }
+    if let Some(EmitKind::Emit(e)) = read.common.as_ref().and_then(|c| c.emit_kind.as_ref()) {
+        let emit = e
+            .output_mapping
+            .iter()
+            .map(|&i| {
+                usize::try_from(i)
+                    .ok()
+                    .filter(|&i| i < outputs.len())
+                    .ok_or_else(|| AdError::InvalidPlan(format!("a read emits column {i}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rel = select(rel, emit);
+    }
+    Ok(Some(rel))
+}
+
+/// `plan`'s function anchors, re-declared by name in `ext`, and its reads of
+/// the tables `renamed` names made reads of those steps (see
+/// [`redeclare_rel`]).
+fn redeclare(
+    plan: &mut Plan,
+    renamed: &HashMap<String, String>,
+    ext: &mut Extensions,
+) -> Result<()> {
+    let from = Functions::from_plan(plan)?;
+    for r in plan.relations.iter_mut() {
+        match r.rel_type.as_mut() {
+            Some(PlanRelType::Root(root)) => {
+                if let Some(rel) = root.input.as_mut() {
+                    redeclare_rel(rel, &from, renamed, ext)?;
+                }
+            }
+            Some(PlanRelType::Rel(rel)) => redeclare_rel(rel, &from, renamed, ext)?,
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every function anchor in `rel` and beneath it, `from`'s, re-declared by
+/// name in `ext`, and every read of a table `renamed` names made a read of
+/// that step ([`step_read`]), subqueries included: a read left behind would
+/// read the table as data, and the derivative through it would be lost. A
+/// relation this crate does not know is refused, since a function it calls
+/// would keep an anchor that names another.
+fn redeclare_rel(
+    rel: &mut Rel,
+    from: &Functions,
+    renamed: &HashMap<String, String>,
+    ext: &mut Extensions,
+) -> Result<()> {
+    let mut stack = vec![rel];
+    while let Some(r) = stack.pop() {
+        if let Some(RelType::Read(read)) = &r.rel_type {
+            if let Some(step) = step_read(read, renamed)? {
+                // Walk what replaced it, for the filter's functions: its
+                // read names a step under a new name, which `renamed` lacks.
+                *r = step;
+                stack.push(r);
+                continue;
+            }
+        }
+        let Some(kind) = r.rel_type.as_mut() else {
+            continue;
+        };
+        match kind {
+            RelType::Read(_)
+            | RelType::Filter(_)
+            | RelType::Fetch(_)
+            | RelType::Sort(_)
+            | RelType::Project(_)
+            | RelType::Join(_)
+            | RelType::Cross(_)
+            | RelType::Set(_) => {}
+            RelType::Aggregate(a) => {
+                for m in a.measures.iter_mut() {
+                    if let Some(f) = m.measure.as_mut() {
+                        f.function_reference = ext.anchor(from.name(f.function_reference)?);
+                        redeclare_args(&mut f.arguments, from, renamed, ext)?;
+                        for s in f.sorts.iter_mut() {
+                            if let Some(e) = s.expr.as_mut() {
+                                redeclare_expr(e, from, renamed, ext)?;
+                            }
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(AdError::NotImplemented(format!(
+                    "a {} in a query over another call",
+                    crate::forward::rel_name(other)
+                )))
+            }
+        }
+        for e in crate::forward::rel_expressions_mut(kind) {
+            redeclare_expr(e, from, renamed, ext)?;
+        }
+        stack.extend(rel_inputs_mut(kind));
+    }
+    Ok(())
+}
+
+fn redeclare_args(
+    args: &mut [FunctionArgument],
+    from: &Functions,
+    renamed: &HashMap<String, String>,
+    ext: &mut Extensions,
+) -> Result<()> {
+    for a in args.iter_mut() {
+        if let Some(ArgType::Value(e)) = a.arg_type.as_mut() {
+            redeclare_expr(e, from, renamed, ext)?;
+        }
+    }
+    Ok(())
+}
+
+fn redeclare_expr(
+    e: &mut Expression,
+    from: &Functions,
+    renamed: &HashMap<String, String>,
+    ext: &mut Extensions,
+) -> Result<()> {
+    use substrait::proto::expression::nested::NestedType;
+    use substrait::proto::expression::subquery::SubqueryType;
+    let Some(rex) = e.rex_type.as_mut() else {
+        return Ok(());
+    };
+    let mut each = |es: &mut dyn Iterator<Item = &mut Expression>| -> Result<()> {
+        for x in es {
+            redeclare_expr(x, from, renamed, ext)?;
+        }
+        Ok(())
+    };
+    match rex {
+        RexType::Literal(_) | RexType::Selection(_) | RexType::DynamicParameter(_) => Ok(()),
+        RexType::ScalarFunction(f) => {
+            f.function_reference = ext.anchor(from.name(f.function_reference)?);
+            #[allow(deprecated)]
+            for x in f.args.iter_mut() {
+                redeclare_expr(x, from, renamed, ext)?;
+            }
+            redeclare_args(&mut f.arguments, from, renamed, ext)
+        }
+        RexType::WindowFunction(w) => {
+            w.function_reference = ext.anchor(from.name(w.function_reference)?);
+            #[allow(deprecated)]
+            for x in w.args.iter_mut() {
+                redeclare_expr(x, from, renamed, ext)?;
+            }
+            redeclare_args(&mut w.arguments, from, renamed, ext)?;
+            for x in w.partitions.iter_mut() {
+                redeclare_expr(x, from, renamed, ext)?;
+            }
+            for s in w.sorts.iter_mut() {
+                if let Some(x) = s.expr.as_mut() {
+                    redeclare_expr(x, from, renamed, ext)?;
+                }
+            }
+            Ok(())
+        }
+        RexType::IfThen(it) => {
+            for c in it.ifs.iter_mut() {
+                each(&mut c.r#if.iter_mut().chain(c.then.iter_mut()))?;
+            }
+            each(&mut it.r#else.iter_mut().map(|b| &mut **b))
+        }
+        RexType::SwitchExpression(sw) => {
+            each(&mut sw.r#match.iter_mut().map(|b| &mut **b))?;
+            each(&mut sw.ifs.iter_mut().filter_map(|c| c.then.as_mut()))?;
+            each(&mut sw.r#else.iter_mut().map(|b| &mut **b))
+        }
+        RexType::SingularOrList(l) => {
+            each(&mut l.value.iter_mut().map(|b| &mut **b))?;
+            each(&mut l.options.iter_mut())
+        }
+        RexType::MultiOrList(l) => {
+            each(&mut l.value.iter_mut())?;
+            each(&mut l.options.iter_mut().flat_map(|r| r.fields.iter_mut()))
+        }
+        RexType::Cast(c) => each(&mut c.input.iter_mut().map(|b| &mut **b)),
+        RexType::Nested(n) => match n.nested_type.as_mut() {
+            Some(NestedType::Struct(s)) => each(&mut s.fields.iter_mut()),
+            Some(NestedType::List(l)) => each(&mut l.values.iter_mut()),
+            Some(NestedType::Map(m)) => each(
+                &mut m
+                    .key_values
+                    .iter_mut()
+                    .flat_map(|kv| kv.key.iter_mut().chain(kv.value.iter_mut())),
+            ),
+            None => Ok(()),
+        },
+        RexType::Subquery(sq) => match sq.subquery_type.as_mut() {
+            Some(SubqueryType::Scalar(s)) => match s.input.as_deref_mut() {
+                Some(r) => redeclare_rel(r, from, renamed, ext),
+                None => Ok(()),
+            },
+            Some(SubqueryType::InPredicate(p)) => {
+                each(&mut p.needles.iter_mut())?;
+                match p.haystack.as_deref_mut() {
+                    Some(r) => redeclare_rel(r, from, renamed, ext),
+                    None => Ok(()),
+                }
+            }
+            Some(SubqueryType::SetPredicate(p)) => match p.tuples.as_deref_mut() {
+                Some(r) => redeclare_rel(r, from, renamed, ext),
+                None => Ok(()),
+            },
+            Some(SubqueryType::SetComparison(c)) => {
+                each(&mut c.left.iter_mut().map(|b| &mut **b))?;
+                match c.right.as_deref_mut() {
+                    Some(r) => redeclare_rel(r, from, renamed, ext),
+                    None => Ok(()),
+                }
+            }
+            None => Ok(()),
+        },
+        #[allow(unreachable_patterns)]
+        _ => Err(AdError::NotImplemented(
+            "this kind of expression in a query over another call".into(),
+        )),
+    }
 }

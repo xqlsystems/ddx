@@ -828,9 +828,14 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
 }
 
 /// `ddx_ad::Statements`: several statements' `grad`, `vjp` and `jvp`
-/// calls, planned together, their programs built by ddx-ad.
-#[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Statements")]
-struct Statements(ddx_ad::Statements);
+/// calls, planned together, their programs built by ddx-ad. Python drives it
+/// as the Rust adapter does: `next()`, plan the query, `build(…)`, register
+/// the seeds, run the program, until `next()` is `None`; then `rewrite()`.
+#[pyclass(module = "ddxdb._ddxdb", name = "_Statements")]
+struct Statements {
+    planned: ddx_ad::Statements,
+    job: Option<ddx_ad::Job>,
+}
 
 #[pymethods]
 impl Statements {
@@ -841,63 +846,58 @@ impl Statements {
     fn new(statements: Vec<String>, dialect: &str) -> PyResult<Self> {
         let (_, parser) = engine_for(dialect)?;
         let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-        Ok(Statements(
-            ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?,
-        ))
+        Ok(Statements {
+            planned: ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?,
+            job: None,
+        })
     }
 
-    /// The programs to build and run, in order, as `(query, [(table,
-    /// predicate), …])` (`ddx_ad::Job`): the query to plan, and the rows of
-    /// a table's gradient every statement reads, where they say.
-    fn jobs(&self) -> Vec<(String, Vec<(String, String)>)> {
-        self.0
-            .jobs()
-            .iter()
-            .map(|j| (j.query().to_string(), j.restrict().to_vec()))
-            .collect()
+    /// The next job, as `(query, [(table, predicate), …])` (`ddx_ad::Job`):
+    /// the query to plan, and the rows of a table's gradient every statement
+    /// reads, where they say; `None` once every job is built.
+    #[allow(clippy::type_complexity)]
+    fn next(&mut self) -> PyResult<Option<(String, Vec<(String, String)>)>> {
+        self.job = self.planned.next().map_err(ad_to_py_err)?;
+        Ok(self
+            .job
+            .as_ref()
+            .map(|j| (j.query().to_string(), j.restrict().to_vec())))
     }
 
-    /// Job `job`'s program, from `plan`, the engine's serialized plan of its
-    /// query, with `restrict` as for `grad_plan` (`ddx_ad::Job::build`): a
-    /// `BackwardProgram` for `grad` and `vjp`, a `ForwardProgram` for `jvp`.
-    /// Then what to register before it runs (`ddx_ad::Job::seeds`), as
-    /// `[(name, query), …]`: each input table and the query computing its
-    /// cotangent or tangent.
-    #[pyo3(signature = (job, plan, restrict = None))]
+    /// The next job's program, from `plan`, the engine's serialized plan of
+    /// its query, with `restrict` as for `grad_plan`
+    /// (`ddx_ad::Statements::build`): a `BackwardProgram` for `grad` and
+    /// `vjp`, a `ForwardProgram` for `jvp`. Then what to register before it
+    /// runs (`ddx_ad::Statements::seeds`), as `[(name, query), …]`.
+    #[pyo3(signature = (plan, restrict = None))]
     #[allow(clippy::type_complexity)]
     fn build(
-        &self,
+        &mut self,
         py: Python<'_>,
-        job: usize,
         plan: &[u8],
         restrict: Option<Vec<(String, Vec<u8>)>>,
     ) -> PyResult<(Py<PyAny>, Vec<(String, String)>)> {
         let job = self
-            .0
-            .jobs()
-            .get(job)
-            .ok_or_else(|| PyValueError::new_err(format!("there is no job {job}")))?;
-        let built = job
-            .build(&decode(plan)?, &options(None, restrict)?)
+            .job
+            .take()
+            .ok_or_else(|| DdxError::new_err("build() before next()"))?;
+        let built = self
+            .planned
+            .build(&job, &decode(plan)?, &options(None, restrict)?)
             .map_err(ad_to_py_err)?;
-        let seeds = job.seeds(built.inputs()).map_err(ad_to_py_err)?;
         let program = match built {
-            ddx_ad::JobProgram::Backward(p) => Py::new(py, BackwardProgram(p))?.into_any(),
-            ddx_ad::JobProgram::Forward(p) => Py::new(py, ForwardProgram(p))?.into_any(),
+            ddx_ad::JobProgram::Backward(p) => Py::new(py, BackwardProgram(p.clone()))?.into_any(),
+            ddx_ad::JobProgram::Forward(p) => Py::new(py, ForwardProgram(p.clone()))?.into_any(),
             _ => return Err(DdxError::new_err("a kind of program ddxdb does not know")),
         };
+        let seeds = self.planned.seeds(&job).map_err(ad_to_py_err)?;
         Ok((program, seeds))
     }
 
-    /// Each statement over what `programs`, one per job, each run, computed.
-    fn rewrite(&self, programs: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
-        let subjects = programs
-            .iter()
-            .map(Subject::of)
-            .collect::<PyResult<Vec<_>>>()?;
-        let programs: Vec<&dyn ddx_ad::Differentiable> =
-            subjects.iter().map(Subject::get).collect();
-        self.0.rewrite(&programs).map_err(ad_to_py_err)
+    /// Each statement over what the programs, every one built and run,
+    /// computed.
+    fn rewrite(&self) -> PyResult<Vec<String>> {
+        self.planned.rewrite().map_err(ad_to_py_err)
     }
 }
 

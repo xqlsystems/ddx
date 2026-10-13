@@ -1691,6 +1691,35 @@ pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
     }
 }
 
+/// [`rel_expressions`], mutably.
+pub(crate) fn rel_expressions_mut(kind: &mut RelType) -> Vec<&mut Expression> {
+    match kind {
+        RelType::Filter(r) => r.condition.as_deref_mut().into_iter().collect(),
+        RelType::Project(r) => r.expressions.iter_mut().collect(),
+        RelType::Join(r) => {
+            let (e, p) = (&mut r.expression, &mut r.post_join_filter);
+            e.as_deref_mut().into_iter().chain(p.as_deref_mut()).collect()
+        }
+        RelType::Sort(r) => r.sorts.iter_mut().filter_map(|s| s.expr.as_mut()).collect(),
+        RelType::Aggregate(r) => {
+            let (g, ms) = (&mut r.grouping_expressions, &mut r.measures);
+            let mut out: Vec<&mut Expression> = g.iter_mut().collect();
+            out.extend(ms.iter_mut().filter_map(|m| m.filter.as_mut()));
+            out
+        }
+        RelType::Read(r) => {
+            let (f, b, t) = (&mut r.filter, &mut r.best_effort_filter, &mut r.read_type);
+            let mut out: Vec<&mut Expression> =
+                f.as_deref_mut().into_iter().chain(b.as_deref_mut()).collect();
+            if let Some(ReadType::VirtualTable(v)) = t {
+                out.extend(v.expressions.iter_mut().flat_map(|row| row.fields.iter_mut()));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn rel_name(kind: &RelType) -> &'static str {
     match kind {
         RelType::Read(_) => "read",

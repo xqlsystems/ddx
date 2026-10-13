@@ -66,7 +66,7 @@ class Context(SessionContext):
         parsed by ddx, so routing every query through here is free.
         """
         planned = None if args or kwargs else _Statements([query], self._ddx_dialect)
-        if planned is not None and planned.jobs():
+        if planned is not None and planned.next() is not None:
             from . import ad
 
             # ad.sql runs the loss's program, then plans the rewritten

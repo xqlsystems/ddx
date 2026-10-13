@@ -1240,17 +1240,45 @@ FROM jvp(h, w.val, dw) j JOIN jvp(h, b.val, db) k ON j.n = k.n AND j.o = k.o
 `ddx_ad::Statements` finds the calls of several statements and plans
 one job per program: per objective for `grad`, per objective and cotangent
 for `vjp` (so statements updating different tables pay for one backward
-pass), per call for `jvp`. The adapter builds each job's program
-(`Job::build`), registers its cotangent or tangent as the program's input
-table (`Job::seeds`), runs it, and splices a read of what each call needs in
-its place (`Statements::rewrite`). A `jvp` relation names a tangent
-`{column}_tangent_{n}` if `f` has a column of that name. The scalar
-`jvp(expr, x, dx)` of v1 is an expression in a select list; the rewriter
-tells them apart by where they appear. *Verified* (`tests/sql_jvp.rs`,
-`tests/sql_vjp.rs`): against the closed forms, against the programs row by
-row, two `jvp` calls against one program along both tangents, `vjp` along 1
-against `grad`, a `vjp`'s `WHERE` restricting its rows, and nothing left
-behind.
+pass), per call for `jvp`. The adapter drives it as it drives a program with
+`Runner`: it asks for the next job, plans its query, has it built
+(`Statements::build`), registers its cotangent or tangent as the program's
+input table (`Statements::seeds`) and runs it, until no job is left; then
+`Statements::rewrite` splices a read of what each call needs in its place.
+A `jvp` relation names a tangent `{column}_tangent_{n}` if `f` has a column
+of that name. The scalar `jvp(expr, x, dx)` of v1 is an expression in a
+select list; the rewriter tells them apart by where they appear.
+
+**Calls nest**, as JAX's transformations do. A call's `f`, or its cotangent
+or tangent, may read another call, which comes earlier in the statement, so
+its job comes first:
+
+```sql
+WITH loss AS (SELECT SUM(val * val * val) AS l FROM w),
+     g AS (SELECT * FROM grad(loss, w.val)),
+     v AS (SELECT i, 1.0 AS val FROM w)
+SELECT i, val_tangent AS hv FROM jvp(g, w.val, v)     -- H·v
+```
+
+The outer job's query is written over the inner programs' tables, and the
+engine plans it as any query. Its program is built from that plan *after*
+the inner programs (`compose::After`): their steps, renamed into one
+namespace, then the plan as the step that writes the value. The engine's
+reads of their tables become reads of those steps, and every plan is
+declared from one set of functions, since the engine numbers them its own
+way. `grad`, `vjp` and `jvp` of that program then differentiate through the
+inner ones as of any program (§4.9): forward over reverse, reverse over
+forward, forward over forward. A cotangent or tangent that reads a call is
+only computed, never differentiated. Every job also runs on its own, so a
+nested call costs its inner program once more than a composed program from
+Rust does. Reverse over reverse is refused as it is elsewhere.
+
+*Verified* (`tests/sql_jvp.rs`, `tests/sql_vjp.rs`, `tests/sql_nesting.rs`):
+against the closed forms, against the programs row by row, two `jvp` calls
+against one program along both tangents, `vjp` along 1 against `grad`, a
+`vjp`'s `WHERE` restricting its rows, `H·v` in SQL against `jvp` of the
+`grad` program, `grad` of a `jvp` and a query over a call, a tangent that is
+another call, and nothing left behind.
 
 ### 4.9 Composition
 

@@ -121,12 +121,8 @@ async fn vjps_along_one_cotangent_share_a_backward_pass_across_tables() {
                 c AS (SELECT i, i AS j, 1.0 AS s FROM w)";
     let a = format!("{with} SELECT * FROM vjp(f, w.val, c)");
     let b = format!("{with} SELECT * FROM vjp(f, b.val, c)");
-    let planned = ddx_ad::Statements::plan(
-        &[a.as_str(), b.as_str()],
-        &datafusion::sql::sqlparser::dialect::GenericDialect {},
-    )
-    .unwrap();
-    assert_eq!(planned.jobs().len(), 1);
+    // That they are one job is ddx_ad::Statements' unit test; here, that
+    // the one program gives each statement its table's gradient.
     let frames = ad::sql_all(&ctx, &[&a, &b]).await.unwrap();
     let mut out = Vec::new();
     for f in frames {

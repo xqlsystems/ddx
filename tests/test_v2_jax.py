@@ -244,6 +244,34 @@ def test_mlp_hessian_vector_products_match_jax_both_ways(env):
         np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"vjp(jvp) {name}")
 
 
+def test_mlp_hessian_vector_product_in_nested_sql_matches_jax(env):
+    # H·v's block for w2, written in SQL as jvp of a query over grad: one
+    # jvp(…) call per parameter table's tangent, their tangents added.
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, _, jax_loss = mlp(env)
+    tangents = directions(params, 2)
+    for name, value in tangents.items():
+        register(ctx, f"d{name}", value, dims_of(name))
+    primals = tuple(map(jnp.array, params.values()))
+    dirs = tuple(map(jnp.array, tangents.values()))
+    grad = jax.grad(jax_loss, argnums=tuple(range(6)))
+    _, expected = jax.jvp(lambda *p: grad(*p), primals, dirs)
+
+    names = list(params)
+    first = names[0]
+    on = lambda n: f"{n}.inp = {first}.inp AND {n}.out = {first}.out"
+    joins = " ".join(f"JOIN jvp(g, {n}.val, d{n}) {n} ON {on(n)}" for n in names[1:])
+    total = " + ".join(f"{n}.val_tangent" for n in names)
+    t = ad.sql(
+        ctx,
+        f"{with_loss}, g AS (SELECT * FROM grad(loss, w2.val)) "
+        f"SELECT {first}.inp, {first}.out, {total} AS hv FROM jvp(g, {first}.val, d{first}) {first} {joins}",
+    ).to_arrow_table()
+    got = dense(t, params["w2"].shape, list(dims_of("w2")), "hv")
+    np.testing.assert_allclose(got, np.asarray(expected[names.index("w2")]), rtol=0, atol=TOLERANCE)
+
+
 def test_attention_matches_jax_grad(env):
     jax, ad, ctx = env
     jnp = jax.numpy

@@ -190,7 +190,9 @@ SELECT sample, out, val, val_tangent FROM jvp(h, w.val, dw)
 ```
 
 Each call takes the columns of one table; several tables are several calls,
-and tangents along two tables add. `vjp(f, table.column, cotangent)` is the
+and tangents along two tables add. Calls nest: `f`, or the tangent, can read
+another call, so `jvp` of a CTE over `grad(loss, w.val)` is a
+Hessian-vector product, in SQL. `vjp(f, table.column, cotangent)` is the
 reverse: a gradient shaped like the table, pulled back from any CTE `f` along
 a cotangent shaped like `f`'s output. As programs, `ddxdb.ad.grad`, `vjp` and `jvp`
 each take SQL or a program, so they compose: `ad.jvp(ctx, ad.grad(ctx, loss,

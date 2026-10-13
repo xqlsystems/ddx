@@ -336,7 +336,8 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     cotangent)`` the same for any CTE ``f`` along a cotangent; and ``jvp(f,
     table.column, …, tangent)`` the CTE ``f``'s output with each column's
     tangent beside it, as ``{column}_tangent`` (see the module docs).
-    Returns a DataFrame.
+    Calls nest: ``f``, or the cotangent or tangent, may read another call,
+    and is differentiated through it. Returns a DataFrame.
 
     Each program runs first, once, however many calls use it. A statement
     with no such call is planned as it is. The programs' tables are
@@ -360,7 +361,8 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     planned = _Statements(list(statements), dialect)
     ran: list[Program] = []
     try:
-        for j, (query, restrict) in enumerate(planned.jobs()):
+        while (job := planned.next()) is not None:
+            query, restrict = job
             # Only the gradient rows the statements read, where they say.
             selects = []
             for table, predicate in restrict:
@@ -369,12 +371,12 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
                 except Exception:  # every row is computed, which is always right
                     pass
             _refuse_not_in(query)
-            program, seeds = planned.build(j, Serde.serialize_bytes(query, ctx), selects)
+            program, seeds = planned.build(Serde.serialize_bytes(query, ctx), selects)
             ran.append(program)
             for name, seed in seeds:
                 _register(ctx, name, ctx.sql(seed).to_arrow_table())
             run(ctx, program)
-        return [ctx.sql(s) for s in planned.rewrite(ran)]
+        return [ctx.sql(s) for s in planned.rewrite()]
     finally:
         # A planned DataFrame holds the tables it reads, so the programs'
         # tables, and the inputs registered here, can leave the catalog now.
