@@ -46,7 +46,10 @@ async fn run_does_not_replace_a_users_table() {
     .await
     .unwrap();
     // Refusing to run is acceptable; silently dropping the user's table is not.
-    if ad::run(&ctx, &program).await.is_err() {
+    if ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .is_err()
+    {
         return;
     }
     let still_mine = ctx
@@ -94,11 +97,13 @@ async fn interleaved_programs_do_not_read_each_others_tape() {
     .await
     .unwrap();
     for s in &a.forward_steps {
-        ad::run_step(&ctx, s).await.unwrap();
+        ddx_datafusion::engine::run_step(&ctx, s).await.unwrap();
     }
-    ad::run(&ctx, &b).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &b, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     for s in &a.backward_steps {
-        ad::run_step(&ctx, s).await.unwrap();
+        ddx_datafusion::engine::run_step(&ctx, s).await.unwrap();
     }
     let got = f64s(
         &ctx,
@@ -124,7 +129,9 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
     .await
     .unwrap();
     assert!(program.intermediate_steps().next().is_some());
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     for step in program.intermediate_steps() {
         assert!(
             !ctx.table_exist(step.name.as_str()).unwrap(),
@@ -142,8 +149,10 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
         vec![5.0, 11.0]
     );
     // Running again works from a context with no intermediates left.
-    ad::run(&ctx, &program).await.unwrap();
-    ad::release(&ctx, &program).unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
+    ddx_datafusion::engine::release(&ctx, &program).unwrap();
     for step in program.steps() {
         assert!(
             !ctx.table_exist(step.name.as_str()).unwrap(),
@@ -173,7 +182,9 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let program = ad::grad(&ctx, &plan, &[ColumnRef::new("b", "val")])
         .await
         .unwrap();
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     // The branches are constant, so the gradient is 0 at every row.
     let got = f64s(
         &ctx,
@@ -214,9 +225,11 @@ async fn a_deep_chain_of_maps_plans_to_a_small_plan() {
         .unwrap();
     let mut bytes = 0;
     for step in program.steps() {
-        let lp = ad::logical_plan(&ctx, &step.plan).await.unwrap();
+        let lp = ddx_datafusion::engine::logical_plan(&ctx, &step.plan)
+            .await
+            .unwrap();
         bytes += lp.display_indent().to_string().len();
-        ad::run_step(&ctx, step).await.unwrap();
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
     }
     assert!(
         bytes < 2_000_000,
@@ -263,6 +276,9 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat_through_ad_run() {
         ),
     )
     .await;
-    let err = ad::run(&ctx, &program).await.unwrap_err();
+    let err =
+        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap_err();
     assert!(err.to_string().contains("share their keys"), "{err}");
 }

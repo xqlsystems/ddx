@@ -1949,7 +1949,7 @@ async fn run_and_read(
     ctx: &SessionContext,
     program: &BackwardProgram,
 ) -> Result<BTreeMap<String, Grad>, String> {
-    ad::run(ctx, program)
+    ddx_datafusion::engine::execute(ctx, program, &mut ddx_datafusion::ad::Verified::new())
         .await
         .map_err(|e| format!("[accepted-but-failed] ad::run of a program ddx accepted: {e}"))?;
     read_grads(ctx, program).await
@@ -3309,7 +3309,10 @@ async fn twin_checks(
             return Ok(());
         }
     };
-    if let Err(e) = ad::run(ctx, &program).await {
+    if let Err(e) =
+        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+    {
         out.fail(format!("[names] twins: {e}"));
         return Ok(());
     }
@@ -3739,8 +3742,8 @@ async fn cost_checks(case: &Case, sql: &str, out: &mut Outcome) -> Result<(), St
     let mut worst = (0usize, String::new());
     for step in program.steps() {
         // The plan ad::run builds for the step, which names computed columns
-        // briefly (ddx_datafusion::ad::logical_plan).
-        let Ok(lp) = ad::logical_plan(&ctx, &step.plan).await else {
+        // briefly (ddx_datafusion::engine::logical_plan).
+        let Ok(lp) = ddx_datafusion::engine::logical_plan(&ctx, &step.plan).await else {
             return Ok(());
         };
         let bytes = lp.display_indent().to_string().len();
@@ -3752,11 +3755,11 @@ async fn cost_checks(case: &Case, sql: &str, out: &mut Outcome) -> Result<(), St
         if total > 20_000_000 {
             break;
         }
-        if ad::run_step(&ctx, step).await.is_err() {
+        if ddx_datafusion::engine::run_step(&ctx, step).await.is_err() {
             return Ok(());
         }
     }
-    let _ = ad::release(&ctx, &program);
+    let _ = ddx_datafusion::engine::release(&ctx, &program);
     let bound = (200 * forward).max(2_000_000);
     if total > bound {
         out.fail(format!(
@@ -3927,7 +3930,7 @@ async fn mutation_checks(
                             out.fail(format!("{f}\n  {label}"));
                         }
                     }
-                    let _ = ad::release(ctx, &program);
+                    let _ = ddx_datafusion::engine::release(ctx, &program);
                 }
                 Err(e) => match engine_fault(&e) {
                     Some(kind) => out.engine.push(kind),
@@ -4256,7 +4259,9 @@ async fn contract_checks(
             return Ok(());
         }
     };
-    if let Err(e) = ad::run(&ctx, &p).await {
+    if let Err(e) =
+        ddx_datafusion::engine::execute(&ctx, &p, &mut ddx_datafusion::ad::Verified::new()).await
+    {
         out.fail(format!("[accepted-but-failed] {e}"));
         return Ok(());
     }
@@ -4312,7 +4317,7 @@ async fn contract_checks(
             ));
         }
     }
-    if let Err(e) = ad::release(&ctx, &p) {
+    if let Err(e) = ddx_datafusion::engine::release(&ctx, &p) {
         out.fail(format!("[catalog] release failed: {e}"));
     }
     let left = ddx_tables(&ctx);
@@ -4431,7 +4436,13 @@ async fn contract_checks(
     if !dup.table(&target).dims.is_empty() {
         let ctx = setup(&dup, 4).await?;
         if let Ok(p) = ad::grad(&ctx, sql, wrt).await {
-            match ad::run(&ctx, &p).await {
+            match ddx_datafusion::engine::execute(
+                &ctx,
+                &p,
+                &mut ddx_datafusion::ad::Verified::new(),
+            )
+            .await
+            {
                 Ok(()) => out.fail(format!(
                     "[dims-check] {target} has two rows with the same dims, and the program ran \
                      instead of refusing"
@@ -5000,7 +5011,7 @@ async fn debug_steps(case: &Case) {
         }
     }
     for step in program.steps() {
-        if let Err(e) = ad::run_step(&ctx, step).await {
+        if let Err(e) = ddx_datafusion::engine::run_step(&ctx, step).await {
             return eprintln!("step {} failed: {e}", step.name);
         }
         match query(&ctx, &format!("SELECT * FROM \"{}\"", step.name)).await {

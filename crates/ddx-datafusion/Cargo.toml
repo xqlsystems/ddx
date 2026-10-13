@@ -27,7 +27,14 @@ async-trait = "0.1"
 # through datafusion.
 tokio = { version = "1", features = ["rt"] }
 
+[features]
+# Step-level access to a program's run (`ddx_datafusion::engine`), for ddx's
+# own tests and benchmarks. Not part of the API.
+internals = []
+
 [dev-dependencies]
+# The tests reach the step-level engine (`ddx_datafusion::engine`).
+ddx-datafusion = { path = ".", features = ["internals"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # The shared simulation harness (`ddx_core::test_utils`). Deliberately the SAME
 # generator and reference interpreter ddx-core fuzzes against: a cross-crate

@@ -100,22 +100,32 @@ def test_context_sql_understands_grad(ad):
 
 def test_grad_as_a_program_can_be_rerun_after_the_table_changes(ad, ctx):
     program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
-    ad.run(ctx, program)
-    assert pairs(ctx.table(program.gradients[0].step)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
-    assert ctx.table(program.value.step).to_arrow_table().column(0)[0].as_py() == 1.0 + 4.0 + 0.25
+    out = ad.run(ctx, program)
+    assert pairs(out.gradients[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    assert out.value.to_pydict() == {"loss": [1.0 + 4.0 + 0.25]}
     ctx.deregister_table("w")
     ctx.register_record_batches("w", [table([0, 1, 2], [5.0, 6.0, 7.0]).to_batches()])
-    ad.run(ctx, program)
-    assert pairs(ctx.table(program.gradients[0].step)) == [(0, 10.0), (1, 12.0), (2, 14.0)]
+    again = ad.run(ctx, program)
+    assert pairs(again.gradients[0]) == [(0, 10.0), (1, 12.0), (2, 14.0)]
+    # The first run's outputs hold their own rows.
+    assert pairs(out.gradients[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
 def test_vjp_pulls_a_cotangent_back(ad, ctx):
     program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
     [cotangent] = program.inputs
     assert (cotangent.of, cotangent.columns, cotangent.keys) == (None, ("i", "s"), 1)
-    ctx.register_record_batches(cotangent.name, [pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 10.0, 100.0]}).to_batches()])
-    ad.run(ctx, program)
-    assert pairs(ctx.table(program.gradients[0].step)) == [(0, 2.0), (1, -40.0), (2, 100.0)]
+    c = pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 10.0, 100.0]})
+    out = ad.run(ctx, program, [c])
+    assert pairs(out.gradients[0]) == [(0, 2.0), (1, -40.0), (2, 100.0)]
+    # A DataFrame works too, and extra columns are ignored.
+    out = ad.run(ctx, program, [ctx.sql("SELECT 'x' AS note, i, 1.0 AS s FROM w")])
+    assert pairs(out.gradients[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    with pytest.raises(ValueError, match=cotangent.name):
+        ad.run(ctx, program)
+    with pytest.raises(TypeError, match="ddxdb.run"):
+        ad.run(LoggingBackend(ad, ctx), program, [c])
+    assert not ddx_tables(ctx)
 
 
 def test_refusals_are_typed(ad, ctx):
@@ -143,22 +153,21 @@ def ddx_tables(ctx):
     return sorted(n for n in ctx.catalog().schema().names() if n.startswith("__ddx_"))
 
 
-def test_run_keeps_the_value_and_gradients_and_release_drops_them(ad, ctx):
+def test_run_leaves_none_of_the_programs_tables(ad, ctx):
     program = ad.grad(ctx, "SELECT MAX(val) * SUM(val) AS loss FROM w", [("w", "val")])
     assert list(program.intermediate_steps())
-    ad.run(ctx, program)
-    assert ddx_tables(ctx) == sorted([program.value.step, program.gradients[0].step])
-    ad.release(ctx, program)
+    out = ad.run(ctx, program)
     assert ddx_tables(ctx) == []
+    assert out.value.to_pydict() == {"loss": [1.0 * -0.5]}  # MAX(w) * SUM(w)
 
 
 def test_programs_do_not_share_tables(ad, ctx):
     a = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
     b = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM b", [("b", "val")])
     assert not {s.name for s in a.steps()} & {s.name for s in b.steps()}
-    ad.run(ctx, a)
+    out = ad.run(ctx, a)
     ad.run(ctx, b)
-    assert pairs(ctx.table(a.gradients[0].step)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    assert pairs(out.gradients[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
 def test_sql_leaves_no_tables_behind(ad, ctx):
@@ -212,12 +221,10 @@ def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
 def test_vjp_refuses_a_cotangent_whose_keys_repeat(ad, ctx):
     # From the v2 soak (#98): a repeated key added its rows' cotangents.
     program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
-    ctx.register_record_batches(
-        program.inputs[0].name,
-        [pa.table({"i": pa.array([0, 0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0, 1.0]}).to_batches()],
-    )
+    c = pa.table({"i": pa.array([0, 0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0, 1.0]})
     with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
-        ad.run(ctx, program)
+        ad.run(ctx, program, [c])
+    assert not ddx_tables(ctx)
 
 
 class LoggingBackend:
@@ -269,10 +276,9 @@ def test_any_backend_runs_a_program(ad, ctx):
 
 def test_a_failed_run_leaves_none_of_the_programs_tables(ad, ctx):
     prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
-    ad.run(ctx, prog)  # an earlier run's value and gradient
     backend = LoggingBackend(ad, ctx, fail_on=prog.gradients[0].step)
     with pytest.raises(RuntimeError, match="disk full"):
-        ad.run(backend, prog)
+        ddxdb.run(backend, prog)
     assert not ddx_tables(ctx)
 
 
@@ -330,25 +336,27 @@ def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
 LOSS = "SELECT SUM(val * val * val) AS l FROM w"
 
 
-def register_tangent(ctx, input_table, values):
-    """Register ``input_table``, a tangent of w, as ``values`` by row of w."""
+def tangent_of_w(input_table, values):
+    """``input_table``, a tangent of w, as ``values`` by row of w."""
     assert input_table.of == ("w",) and input_table.columns == ("i", "val") and input_table.keys == 1
-    ctx.register_record_batches(input_table.name, [table([0, 1, 2], values).to_batches()])
+    return table([0, 1, 2], values)
+
+
+def register_tangent(ctx, input_table, values):
+    """Register ``input_table`` for a run on a Backend, which reads it by name."""
+    ctx.register_record_batches(input_table.name, [tangent_of_w(input_table, values).to_batches()])
 
 
 def test_jvp_of_a_query_is_its_value_and_its_tangent(ad, ctx):
     program = ad.jvp(ctx, LOSS, [("w", "val")])
     assert isinstance(program, ddxdb.ForwardProgram) and not program.gradients
-    register_tangent(ctx, program.inputs[0], [1.0, 1.0, 1.0])
-    ad.run(ctx, program)
+    out = ad.run(ctx, program, [tangent_of_w(program.inputs[0], [1.0, 1.0, 1.0])])
     [tangent] = program.value.tangents
     assert tangent.column == "l" and tangent.tangent in program.value.columns
-    row = ctx.sql(f'SELECT l, "{tangent.tangent}" AS t FROM "{program.value.step}"').to_arrow_table()
-    assert row.column("l")[0].as_py() == 1.0 - 8.0 + 0.125
-    assert row.column("t")[0].as_py() == pytest.approx(3.0 * (1.0 + 4.0 + 0.25))
-    ad.release(ctx, program)
-    # The tangent is the caller's, and stays.
-    assert ddx_tables(ctx) == [program.inputs[0].name]
+    row = out.value.to_pydict()
+    assert row["l"] == [1.0 - 8.0 + 0.125]
+    assert row["l_tangent"] == pytest.approx([3.0 * (1.0 + 4.0 + 0.25)])
+    assert ddx_tables(ctx) == []
 
 
 def test_jvp_of_a_grad_program_is_a_hessian_vector_product(ad, ctx):
@@ -356,10 +364,8 @@ def test_jvp_of_a_grad_program_is_a_hessian_vector_product(ad, ctx):
     hvp = ad.jvp(ctx, grad, [("w", "val")])
     [g] = hvp.gradients
     assert g.of == ("w",)
-    register_tangent(ctx, hvp.inputs[0], [1.0, 2.0, 3.0])
-    ad.run(ctx, hvp)
-    [t] = g.tangents
-    got = ctx.sql(f'SELECT i, "{t.tangent}" FROM "{g.step}"')
+    out = ad.run(ctx, hvp, [tangent_of_w(hvp.inputs[0], [1.0, 2.0, 3.0])])
+    got = out.gradients[0].select("i", "val_tangent")
     assert pairs(got) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
 
 
@@ -368,12 +374,10 @@ def test_vjp_of_a_jvp_program_is_a_hessian_vector_product_too(ad, ctx):
     program = ad.vjp(ctx, jvp, [("w", "val")])
     tangent, cotangent = program.inputs
     assert tangent.name == jvp.inputs[0].name and cotangent.of is None
-    register_tangent(ctx, tangent, [1.0, 2.0, 3.0])
     # 0 on the loss, 1 on its tangent: the gradient of ∇l·v.
-    columns = {c: [0.0 if c == "l" else 1.0] for c in cotangent.columns}
-    ctx.register_record_batches(cotangent.name, [pa.table(columns).to_batches()])
-    ad.run(ctx, program)
-    assert pairs(ctx.table(program.gradients[0].step)) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
+    seed = pa.table({c: [0.0 if c == "l" else 1.0] for c in cotangent.columns})
+    out = ad.run(ctx, program, [tangent_of_w(tangent, [1.0, 2.0, 3.0]), seed])
+    assert pairs(out.gradients[0]) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
 
 
 def test_any_backend_runs_a_forward_program(ad, ctx):
@@ -408,13 +412,10 @@ def test_a_query_deeper_than_datafusion_python_decodes_is_split_and_runs(ad, ctx
     query = f"WITH {', '.join(ctes)} SELECT SUM(v) AS l FROM h39"
     program = ad.jvp(ctx, query, [("w", "val")])
     assert any("_part_" in s.name for s in program.steps())
-    register_tangent(ctx, program.inputs[0], [1.0, 2.0, 3.0])
-    ad.run(ctx, program)
-    t = program.value.tangents[0].tangent
-    got = ctx.sql(f'SELECT "{t}" FROM "{program.value.step}"').to_arrow_table().column(0)[0].as_py()
+    out = ad.run(ctx, program, [tangent_of_w(program.inputs[0], [1.0, 2.0, 3.0])])
+    got = out.value.to_pydict()["l_tangent"][0]
     grad = ad.grad(ctx, query, [("w", "val")])
-    ad.run(ctx, grad)
-    g = pairs(ctx.table(grad.gradients[0].step))
+    g = pairs(ad.run(ctx, grad).gradients[0])
     assert got == pytest.approx(sum(v * d for (_, v), d in zip(g, [1.0, 2.0, 3.0])))
 
 

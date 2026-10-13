@@ -23,11 +23,13 @@ let step = ad::sql(&ctx, "
 
 Nothing in the loss is labelled; the one function ddx claims is
 `ddx_stop_gradient` (`register_stop_gradient`). `ad::sql_all` runs several
-statements that take `grad` of one loss for one backward pass, and
-`ad::grad`/`ad::vjp` with `ad::run` give the program underneath. A program's
-tables are named under a prefix of its own (`__ddx_{id}_`, a reserved
-prefix), so programs never touch each other's tables or yours; `ad::sql`
-leaves none behind, and `ad::release` drops what `ad::run` keeps.
+statements that take `grad` of one loss for one backward pass. Calls nest,
+so `jvp` of a CTE over `grad(loss, w.val)` is a Hessian-vector product.
+`ad::grad`, `ad::vjp` and `ad::jvp` give the program underneath, and
+`ad::run(ctx, &program, &inputs)` returns what it computed as DataFrames.
+While it runs, a program's tables are named under a prefix of its own
+(`__ddx_{id}_`, a reserved prefix), so programs never touch each other's
+tables or yours, and neither `ad::sql` nor `ad::run` leaves any behind.
 [`examples/nn`](examples/nn) trains a small MLP written entirely in SQL
 (adapted from [a neural network written entirely in SQL](https://github.com/xqlsystems/xarray-sql/pull/196) in xarray-sql) with one SQL statement per
 parameter table: `cargo run -p ddx-datafusion --example nn`.
