@@ -7,8 +7,6 @@
 
 use sqlparser::ast::{Expr, Ident};
 
-use crate::error::{DiffError, Result};
-
 /// How a dialect folds identifiers for case-insensitive comparison.
 ///
 /// SQL unquoted identifiers are case-insensitive, so `grad(Temp*Temp, temp)`
@@ -126,19 +124,6 @@ impl ColRef {
             Expr::Nested(inner) => ColRef::from_expr(inner),
             _ => None,
         }
-    }
-
-    /// Parse the `wrt` argument of a marker: it must be a bare column
-    /// (`Identifier`/`CompoundIdentifier`), never an expression (F: the design
-    /// rejects `grad(x*y, x+y)`).
-    pub fn from_wrt_arg(func: &str, e: &Expr) -> Result<ColRef> {
-        ColRef::from_expr(e).ok_or_else(|| {
-            DiffError::InvalidMarker(format!(
-                "{func}(): the differentiation variable must be a bare column, but got `{e}`. \
-                 Differentiate with respect to a single column (e.g. `{func}(x * y, x)`), not an \
-                 expression like `x + y`"
-            ))
-        })
     }
 
     /// Classify an occurrence `self` against the differentiation variable

@@ -12,14 +12,13 @@
 [project]
 name = "ddx-oracle-tests"
 version = "0"
-description = "Numeric-agreement suites: ddx against jax.grad, on DuckDB and DataFusion."
+description = "Numeric-agreement suites: ddx against jax.grad, on DataFusion."
 requires-python = ">=3.10"
 dependencies = [
     "ddxdb",           # the thing under test, built from ../python/ddxdb
     "jax>=0.4",        # the oracle, and the jaxpr IR the harness interprets
-    "duckdb>=1.0",     # the two engines the rewrite is checked on
-    "datafusion==54.0.0",  # exact, like ddxdb's extra
-    "pyarrow>=14",     # how row fixtures reach both engines with identical dtypes
+    "datafusion==54.0.0",  # the engine, exact, like ddxdb's extra
+    "pyarrow>=14",     # how row fixtures reach the engine as float64
     "numpy>=1.24",
     "pytest>=7",
 ]

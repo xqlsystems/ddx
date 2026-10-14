@@ -22,7 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from engines import ENGINES
+from engines import grad_column, grad_values, values
 
 jax = pytest.importorskip("jax", reason="the JAX oracle needs jax installed")
 ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
@@ -30,21 +30,17 @@ ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
 jax.config.update("jax_enable_x64", True)
 
 
-@pytest.mark.parametrize("engine", ENGINES, ids=str)
-def test_abs_at_its_kink_is_zero_on_every_engine(engine):
-    """`d/dx |x|` at 0 is 0 in ddx — a pinned convention, identical everywhere.
+def test_abs_at_its_kink_is_zero():
+    """`d/dx |x|` at 0 is 0 in ddx — a pinned convention.
 
-    ddx emits a portable `CASE` rather than an engine `signum`/`sign` builtin,
+    ddx writes a portable `CASE` rather than an engine `signum`/`sign` builtin,
     for two reasons that both bite here: the builtins are not portable (DuckDB
     has only `sign`, DataFusion only `signum`), and `signum(0)` is 1, so a bare
     builtin would silently break this pin on the engine that had it.
     """
     xs = np.array([-2.0, -0.5, 0.0, 0.5, 2.0])
     ys = np.zeros_like(xs)
-    sql = ddxdb.rewrite_sql(
-        "SELECT grad(abs(x), x) AS d FROM t ORDER BY i", engine.dialect
-    )
-    got = engine.column(sql, xs, ys)
+    got = grad_column("abs(x)", "x", xs, ys)
     assert list(got) == [-1.0, -1.0, 0.0, 1.0, 1.0]
 
 
@@ -61,38 +57,7 @@ def test_jax_disagrees_with_ddx_at_the_kink():
     assert float(jax.grad(jax.numpy.abs)(0.0)) == 1.0
     assert float(jax.grad(jax.numpy.abs)(-0.0)) == 1.0
 
-    ddx_at_zero = ddxdb.rewrite_sql("SELECT grad(abs(x), x) AS d FROM t")
-    assert "CASE" in ddx_at_zero.upper(), (
-        "the abs rule must emit a portable CASE, not an engine signum/sign "
-        f"builtin: {ddx_at_zero}"
-    )
-
-
-def test_the_second_derivative_of_abs_is_refused_rather_than_guessed():
-    """`abs` differentiates once and not twice, and ddx says so.
-
-    The first derivative is a `CASE` — the portable sign — and ddx does not
-    differentiate `CASE`, so the second derivative is a typed error. The honest
-    answer is not `0`: `|x|` has no second derivative at 0, and returning the
-    almost-everywhere value would hand back a number that is wrong at exactly
-    the point anyone would ask about.
-
-    This is pinned because the failure is *useful*, and a later change that made
-    it return `0` instead would look like added coverage while removing the
-    warning. JAX takes the other branch and returns 0 here, which is why this is
-    a convention rather than a bug on either side.
-    """
-    once = ddxdb.rewrite_sql("SELECT grad(abs(x), x) AS d FROM t")
-    assert "CASE" in once.upper()
-
-    with pytest.raises(ddxdb.UnsupportedExpression) as raised:
-        ddxdb.rewrite_sql("SELECT grad(grad(abs(x), x), x) AS d FROM t")
-    assert "CASE" in str(raised.value), (
-        "the error must name what it could not differentiate, so a caller can "
-        f"tell why: {raised.value}"
-    )
-
-    assert float(jax.grad(jax.grad(jax.numpy.abs))(1.5)) == 0.0
+    assert list(grad_column("abs(x)", "x", np.zeros(1), np.zeros(1))) == [0.0]
 
 
 def test_an_integer_cast_is_refused_where_jax_returns_zero():
@@ -105,18 +70,18 @@ def test_an_integer_cast_is_refused_where_jax_returns_zero():
     and silent at them, so the two differ on purpose. A cast that does not
     depend on the variable is a constant, and differentiates to 0 in both.
     """
+    xs, ys = np.array([1.5, 2.5]), np.array([1.5, 2.5])
     with pytest.raises(ddxdb.UnsupportedExpression) as raised:
-        ddxdb.rewrite_sql("SELECT grad(CAST(x AS BIGINT), x) AS d FROM t")
-    assert "DOUBLE" in str(raised.value)
+        grad_column("CAST(x AS BIGINT) * 1.0", "x", xs, ys)
+    assert "float type" in str(raised.value)
 
     jnp = jax.numpy
     assert float(jax.grad(lambda x: x.astype(jnp.int32).astype(jnp.float64))(1.5)) == 0.0
 
-    assert "0" in ddxdb.rewrite_sql("SELECT grad(CAST(y AS BIGINT), x) AS d FROM t")
+    assert list(grad_column("x + CAST(y AS BIGINT)", "x", xs, ys)) == [1.0, 1.0]
 
 
-@pytest.mark.parametrize("engine", ENGINES, ids=str)
-def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside(engine):
+def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside():
     """`sqrt(x)` is defined at 0; `1/(2*sqrt(x))` is not.
 
     Differentiation widens the domain requirement, and this is the reason the
@@ -128,21 +93,17 @@ def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside(engine):
     xs = np.array([0.0, 1.0, 4.0])
     ys = np.zeros_like(xs)
 
-    primal = engine.column("SELECT sqrt(x) AS v FROM t ORDER BY i", xs, ys)
+    primal = values("SELECT sqrt(x) AS v FROM t ORDER BY i", xs, ys)
     assert list(primal) == [0.0, 1.0, 2.0], "the primal is fine at 0"
 
-    sql = ddxdb.rewrite_sql(
-        "SELECT grad(sqrt(x), x) AS d FROM t ORDER BY i", engine.dialect
-    )
-    got = engine.column(sql, xs, ys)
+    got = grad_column("sqrt(x)", "x", xs, ys)
     assert not np.isfinite(got[0]), (
-        f"{engine.name}: the derivative at the domain edge came back as "
+        f"the derivative at the domain edge came back as "
         f"{got[0]!r}, which would be a finite answer to a question with none"
     )
     assert np.allclose(got[1:], [0.5, 0.25])
 
 
-@pytest.mark.parametrize("engine", ENGINES, ids=str)
 @pytest.mark.parametrize(
     "body",
     [
@@ -152,7 +113,7 @@ def test_a_derivative_can_leave_the_domain_its_primal_stayed_inside(engine):
         "sin(x)",     # a chain-rule factor
     ],
 )
-def test_a_null_input_stays_null_rather_than_becoming_zero(engine, body):
+def test_a_null_input_stays_null_rather_than_becoming_zero(body):
     """A missing value propagates through the derivative as it does the primal.
 
     A derivative of NULL that came back `0` would be indistinguishable from a
@@ -179,18 +140,13 @@ def test_a_null_input_stays_null_rather_than_becoming_zero(engine, body):
     )
     ys = pa.array([0.0, 0.0, 0.0], type=pa.float64())
 
-    sql = ddxdb.rewrite_sql(
-        f"SELECT grad({body}, x) AS d FROM t ORDER BY i", engine.dialect
-    )
-    assert list(engine.nulls(sql, xs, ys)) == [False, True, False], (
-        f"{engine.name}: d/dx {body} did not keep the missing row missing\n"
-        f"  rewritten: {sql}\n"
-        f"  returned : {engine.values(sql, xs, ys)}"
+    got = grad_values(body, "x", xs, ys)
+    assert [v is None for v in got] == [False, True, False], (
+        f"d/dx {body} did not keep the missing row missing: {got}"
     )
 
 
-@pytest.mark.parametrize("engine", ENGINES, ids=str)
-def test_the_derivative_of_abs_is_a_double_not_a_decimal(engine):
+def test_the_derivative_of_abs_is_a_double_not_a_decimal():
     """The sign CASE must not come back in a type of its own.
 
     Its branches are bare literals, which DuckDB reads as `DECIMAL(2,1)` — so
@@ -199,12 +155,8 @@ def test_the_derivative_of_abs_is_a_double_not_a_decimal(engine):
     typed NULL in `ELSE` fixes the whole CASE at DOUBLE, which is the same
     branch that carries missingness.
     """
-    sql = ddxdb.rewrite_sql(
-        "SELECT grad(abs(x), x) AS d FROM t ORDER BY i", engine.dialect
+    got = grad_values("abs(x)", "x", np.array([2.0, -2.0, 0.0]), np.zeros(3))
+    assert [type(v) for v in got] == [float, float, float], (
+        f"expected float64, got {[type(v).__name__ for v in got]}"
     )
-    values = engine.values(sql, np.array([2.0, -2.0, 0.0]), np.zeros(3))
-    assert [type(v) for v in values] == [float, float, float], (
-        f"{engine.name}: expected float64, got {[type(v).__name__ for v in values]} "
-        f"from {sql}"
-    )
-    assert values == [1.0, -1.0, 0.0]
+    assert got == [1.0, -1.0, 0.0]

@@ -904,7 +904,7 @@ impl Gen<'_> {
                     .ok()
                     .and_then(|e| {
                         let dv = ddx_core::test_utils::try_parse("dv").ok()?;
-                        ddx_core::Ddx::for_datafusion()
+                        ddx_core::Ddx::new()
                             .jvp(&e, &[(ddx_core::ColRef::bare("v"), dv)])
                             .ok()
                     })

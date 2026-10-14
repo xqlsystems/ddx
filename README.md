@@ -6,61 +6,36 @@ _[JAX](https://docs.jax.dev/en/latest/)-style [automatic differentiation](https:
 [![PyPI](https://img.shields.io/pypi/v/ddxdb.svg?label=ddxdb)](https://pypi.org/project/ddxdb/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Write calculus directly in SQL and get derivatives back as ordinary columns,
-evaluated row by row by the engine alongside everything else:
+Write a model's forward pass and loss as SQL, and take its gradient in SQL, as
+JAX takes the gradient of a function:
 
 ```sql
-SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
+WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+SELECT w.i, w.val - 0.1 * g.val AS val
+FROM w JOIN grad(loss, w.val) g ON w.i = g.i
 ```
 
-`grad`/`jvp` are compile-time **markers**: they carry a differentiation request
-through parsing and are rewritten away — to plain derivative SQL — before the
-query ever runs. Differentiating a column expression and letting the engine
-evaluate it per row is the relational equivalent of `jax.vmap(jax.grad(f))`, with
-the rows as the batch dimension.
-
-One engine-neutral Rust core, thin per-engine adapters.
+The engine plans the query and writes it as Substrait; ddx differentiates the
+plan and hands back Substrait plans for the engine to run.
 
 ## Try it
 
 ```sh
-pip install ddxdb
+pip install "ddxdb[datafusion]"
 ```
 
 ```python
-import ddxdb
+from ddxdb import Context
 
-ddxdb.rewrite_sql("SELECT grad(sin(x), x) AS d FROM t")
-# 'SELECT (cos(x)) AS d FROM t'
+ctx = Context()
+ctx.sql("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
+ctx.sql("""
+    WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+    SELECT i, val FROM grad(loss, w.val) ORDER BY i
+""").collect()   # 2.0, 4.0
 ```
 
-`rewrite_sql` is text in, text out, so it works with **any** engine that accepts
-SQL — pass the result wherever you would have passed the original:
-
-```python
-con.sql(ddxdb.rewrite_sql(q, "duckdb"))        # DuckDB
-session.sql(ddxdb.rewrite_sql(q, "spark"))     # Spark
-ctx.sql(ddxdb.rewrite_sql(q))                  # DataFusion
-```
-
-It has no required runtime dependencies — the engines are optional extras — so
-depending on it costs nothing until you use it.
-
-From Rust:
-
-```rust
-use ddx_core::Ddx;
-use ddx_core::sqlparser::dialect::GenericDialect;
-
-let out = Ddx::new()
-    .rewrite_sql("SELECT grad(sin(x), x) AS d FROM t", &GenericDialect {})
-    .unwrap();
-assert_eq!(out, "SELECT (cos(x)) AS d FROM t");
-```
-
-On DataFusion, `ddx-datafusion` installs an `AnalyzerRule` so bare `grad()` works
-in ordinary SQL *and* through the DataFrame API, with columns resolved by the
-planner rather than syntactically.
+From Rust, `ddx_datafusion::ad::sql(&ctx, statement)` does the same.
 
 ## Training: gradients of whole queries
 
@@ -95,27 +70,28 @@ equal `jax.grad` to 1e-12.
 
 ## Status
 
-**M2 is released; M3 and M4 are built.** The scalar engine, the DataFusion
-adapter and the Python wheel are published. Query-level AD (`ddx-ad`, with
-`ddx_datafusion::ad` and `ddxdb.ad` on top) trains an MLP on DataFusion and
-matches `jax.grad`, and ships with the next release.
+Query-level AD (`ddx-ad`, with `ddx_datafusion::ad` and `ddxdb.ad` on top) is
+built: it trains an MLP on DataFusion and matches `jax.grad`, and ships with
+the next release. ddx's first design, which rewrote `grad(x * y, x)` in a
+select list to derivative SQL one row at a time, has been removed; its
+derivative rules live on as `ddx-core`, which `ddx-ad` uses for each
+expression.
 
-**DataFusion is the engine with native support**: `ddx-datafusion` installs an
-`AnalyzerRule`, so bare `grad()` works in ordinary SQL and through the DataFrame
-API. Every other engine — DuckDB included — goes through `rewrite_sql` today: you
-rewrite the text and hand the result to your own connection. A native DuckDB
-extension, with `grad()` understood in-database, comes eventually (M5).
+**DataFusion is the engine with native support.** Any other engine whose
+Substrait producer and consumer ddx-ad understands can run the programs
+through `ddxdb.run` and the `ddxdb.Backend` protocol.
 
 | | | |
 |---|---|---|
-| [`ddx-core`](crates/ddx-core) | the v1 engine | [crates.io](https://crates.io/crates/ddx-core) |
-| [`ddxdb`](python/ddxdb) | Python wheel — `rewrite_sql`, a DataFusion `Context`, and `ad` | [PyPI](https://pypi.org/project/ddxdb/) |
-| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `AnalyzerRule` + `ddx_sql` + `ad` | [crates.io](https://crates.io/crates/ddx-datafusion) |
-| [`ddx-ad`](crates/ddx-ad) | v2 — query-level reverse-mode AD over Substrait | next release |
-| `ddx-duckdb` | DuckDB community extension | M5 |
+| [`ddx-ad`](crates/ddx-ad) | query-level AD over Substrait | next release |
+| [`ddx-core`](crates/ddx-core) | the scalar derivative rules `ddx-ad` uses | [crates.io](https://crates.io/crates/ddx-core) |
+| [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `ad` | [crates.io](https://crates.io/crates/ddx-datafusion) |
+| [`ddxdb`](python/ddxdb) | Python wheel: a DataFusion `Context`, `ad`, and the programs for any engine | [PyPI](https://pypi.org/project/ddxdb/) |
+| `ddx-duckdb` | DuckDB community extension | planned |
 
-Next is **M5**, DuckDB: the `ddx('<sql>')` extension, and v2's backward program
-run through DuckDB's Substrait consumer. See [docs/design.md](docs/design.md) §8.
+Next is DuckDB: a community extension that runs ddx's programs through
+DuckDB's own Substrait consumer. The milestone plan is in
+[docs/design.md](docs/design.md).
 
 ## Correctness
 
@@ -142,11 +118,11 @@ a plausible number. What backs that up:
 
 ```
 crates/
-  ddx-core/         # v1 engine — differentiate sqlparser::ast::Expr + rewrite_sql
-  ddx-ad/           # v2 engine — query-level reverse-mode AD over Substrait
-  ddx-datafusion/   # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql + ad (v2)
-python/ddxdb/       # PyO3/maturin wheel: rewrite_sql + a DataFusion Context + ad (v2)
-tests/              # cross-engine numeric-agreement suites (vs JAX)
+  ddx-ad/           # query-level AD over Substrait
+  ddx-core/         # the scalar derivative rules ddx-ad uses
+  ddx-datafusion/   # DataFusion adapter: ad
+python/ddxdb/       # PyO3/maturin wheel: a DataFusion Context + ad
+tests/              # numeric-agreement suites (vs JAX)
 docs/spikes/        # runnable evidence for every design claim
 docs/design.md      # the design
 docs/fast-linalg-notes.md  # notes seeding a future fast linear-algebra project

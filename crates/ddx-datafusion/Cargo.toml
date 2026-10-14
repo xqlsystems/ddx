@@ -1,6 +1,6 @@
 [package]
 name = "ddx-datafusion"
-description = "DataFusion adapter for ddx: grad and vjp of a whole query, and grad(loss, table.column) in SQL (v2); bare grad()/jvp() on expressions (v1)."
+description = "DataFusion adapter for ddx: grad, vjp and jvp of a whole query, and grad(loss, table.column) in SQL."
 # Versioned independently of ddx-core: the two publish on their own cadence, and
 # an adapter that had to move whenever the engine did would force a release for
 # changes that do not touch it.
@@ -14,15 +14,10 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# M2: the real adapter. `datafusion` and `ddx-core` must resolve the SAME
-# `sqlparser` version or Path B's bridge won't compile — the workspace
-# Cargo.toml documents the pin and tests/sqlparser_pin.rs enforces it in CI.
-#
-# `ddx-ad` and `datafusion-substrait` carry v2: DataFusion produces the forward
+# `ddx-ad` and `datafusion-substrait` carry the work: DataFusion produces the forward
 # query's Substrait plan, ddx-ad differentiates it, and DataFusion consumes the
 # steps it returns. tests/substrait_pin.rs checks they share one `substrait`.
 [dependencies]
-ddx-core = { workspace = true }
 ddx-ad = { workspace = true }
 datafusion = { workspace = true }
 datafusion-substrait = { workspace = true }

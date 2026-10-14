@@ -173,12 +173,11 @@ jobs:
           uv pip install --no-index --find-links dist ddxdb
           uv run python -c "
           import ddxdb
-          assert ddxdb.rewrite_sql('SELECT grad(sin(x), x) AS d FROM t') == 'SELECT (cos(x)) AS d FROM t'
-          assert ddxdb.rewrite_sql('SELECT 1') == 'SELECT 1'
+          assert 'tanh' in ddxdb.supported_functions()
           try:
-              ddxdb.rewrite_sql('SELECT grad(atan2(x,y), x) FROM t')
-              raise SystemExit('an unsupported construct must raise')
-          except ddxdb.UnsupportedExpression:
+              ddxdb.grad_plan(b'', [('t', 'x')])
+              raise SystemExit('a plan with no root must raise')
+          except ddxdb.DdxError:
               pass
           print('ddxdb', ddxdb.__version__, 'OK')
           "

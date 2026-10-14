@@ -12,9 +12,9 @@
 //! agreement test stops proving anything.
 //!
 //! What lives here is the *setup*: a deterministic PRNG, a generator over the
-//! derivable v1 grammar, a reference interpreter for that grammar, the numeric
-//! conditioning gates that keep a float oracle honest, statement-level
-//! generators for `rewrite_sql`, and the failure-reporting loop. The
+//! derivable scalar grammar, a reference interpreter for that grammar, the numeric
+//! conditioning gates that keep a float oracle honest, and the
+//! failure-reporting loop. The
 //! *properties* stay with the crate that owns the behaviour they assert.
 //!
 //! Everything is dependency-free and seed-reproducible: a failure reported with
@@ -24,11 +24,11 @@ use std::ops::ControlFlow;
 
 use crate::sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectNamePart, Statement, UnaryOperator, Value, Visit, Visitor,
+    ObjectNamePart, UnaryOperator, Value, Visit, Visitor,
 };
 use crate::sqlparser::dialect::GenericDialect;
 use crate::sqlparser::parser::Parser;
-use crate::{ColRef, Ddx};
+use crate::ColRef;
 
 // ---------------------------------------------------------------------------
 // A tiny deterministic PRNG (SplitMix64) — reproducible, no dependencies.
@@ -139,7 +139,7 @@ fn gen_exponent(rng: &mut Rng) -> String {
         .to_string()
 }
 
-/// A random expression over the derivable v1 grammar, as SQL text.
+/// A random expression over the derivable scalar grammar, as SQL text.
 ///
 /// `depth` bounds the tree height; leaves appear early with ~30% probability at
 /// every level, so the size distribution is broad rather than uniform.
@@ -212,11 +212,6 @@ pub fn try_parse(text: &str) -> Result<Expr, String> {
 /// where a parse failure is a harness bug worth surfacing immediately.
 pub fn parse_expr(text: &str) -> Expr {
     try_parse(text).unwrap_or_else(|e| panic!("reparse of `{text}` failed: {e}"))
-}
-
-/// Parse a whole statement (not just an expression).
-pub fn try_parse_stmt(sql: &str) -> Result<Vec<Statement>, String> {
-    Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -664,264 +659,6 @@ pub fn metamorphic_mismatch(
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// Statement-level generators (the `rewrite_sql` / marker-placement surface).
-// ---------------------------------------------------------------------------
-
-/// Valid SELECT-list prefixes to place before a marker. Several carry multibyte
-/// characters (in string literals / comments) *before* the marker, so the
-/// marker's character-column no longer equals its byte offset — the case a
-/// char→byte conversion must get right.
-pub const STMT_PREFIXES: &[&str] = &[
-    "SELECT ",
-    "SELECT x, ",
-    "SELECT 'héllo', ",
-    "SELECT 'naïve café ☕' AS greeting, ",
-    "SELECT /* café ☕ */ ",
-    "SELECT   ",
-    "SELECT y AS why, ",
-];
-
-/// Valid statement tails (ASCII identifiers only — unicode kept to string
-/// literals/comments, since unquoted-identifier unicode support is dialect-
-/// dependent and not what this fuzz is testing).
-pub const STMT_SUFFIXES: &[&str] = &[
-    " FROM t",
-    " AS d FROM t",
-    " FROM data",
-    " AS d FROM t WHERE label <> 'niño'",
-    "",
-];
-
-/// Valid separators between two markers — as sibling select items (`, `) or
-/// inside one arithmetic select item (` + `, ` * `).
-pub const STMT_MIDS: &[&str] = &[", ", " + ", " * ", ", z, "];
-
-/// Build one marker call and the exact text `rewrite_sql` must splice in its
-/// place (`(derivative)`), or `None` if the marker's derivative is undefined
-/// (in which case `rewrite_sql` must error on the whole statement).
-pub fn gen_marker_segment(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
-    let wrt = if rng.below(2) == 0 { "x" } else { "y" };
-    let wrt_col = ColRef::bare(wrt);
-    let depth = 2 + rng.below(2) as u32;
-    let expr_text = gen_expr(rng, depth);
-    let expr = parse_expr(&expr_text);
-
-    match rng.below(3) {
-        // Nested higher-order: grad(grad(expr, wrt), wrt).
-        0 => {
-            let marker = format!("grad(grad({expr_text}, {wrt}), {wrt})");
-            let repl = ddx
-                .differentiate(&expr, &wrt_col)
-                .and_then(|d1| ddx.differentiate(&d1, &wrt_col))
-                .ok()
-                .map(|dd| format!("({dd})"));
-            (marker, repl)
-        }
-        // jvp(expr, wrt, tangent).
-        1 => {
-            let tan_depth = 1 + rng.below(2) as u32;
-            let tan_text = gen_expr(rng, tan_depth);
-            let tan = parse_expr(&tan_text);
-            let marker = format!("jvp({expr_text}, {wrt}, {tan_text})");
-            match ddx.jvp(&expr, &[(wrt_col, tan)]) {
-                Ok(v) => (marker, Some(format!("({v})"))),
-                Err(_) => (marker, None),
-            }
-        }
-        // grad(expr, wrt)
-        _ => {
-            let marker = format!("grad({expr_text}, {wrt})");
-            match ddx.differentiate(&expr, &wrt_col) {
-                Ok(d) => (marker, Some(format!("({d})"))),
-                Err(_) => (marker, None),
-            }
-        }
-    }
-}
-
-/// Assemble a random marker-bearing statement: 1–3 markers wrapped in random
-/// (Unicode-bearing) scaffolding. Returns `(input, expected)` where `expected`
-/// is the exact byte-for-byte `rewrite_sql` output, or `None` if some marker's
-/// derivative is undefined (in which case the whole rewrite must error).
-pub fn gen_marker_statement(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
-    let n = 1 + rng.below(3) as usize;
-    let prefix = *rng.pick(STMT_PREFIXES);
-    let suffix = *rng.pick(STMT_SUFFIXES);
-
-    let mut input = String::from(prefix);
-    let mut expected = String::from(prefix);
-    let mut any_undefined = false;
-    for i in 0..n {
-        if i > 0 {
-            let mid = *rng.pick(STMT_MIDS);
-            input.push_str(mid);
-            expected.push_str(mid);
-        }
-        let (marker, repl) = gen_marker_segment(rng, ddx);
-        input.push_str(&marker);
-        match repl {
-            Some(r) => expected.push_str(&r),
-            None => any_undefined = true,
-        }
-    }
-    input.push_str(suffix);
-    expected.push_str(suffix);
-
-    (input, if any_undefined { None } else { Some(expected) })
-}
-
-/// A marker-free statement — some deliberately containing a `grad(`/`jvp(`
-/// substring inside a string literal, a comment, or a *qualified* call, so a
-/// pre-gate's substring filter hits and the statement is parsed but no real
-/// marker is found. Every one must come back byte-identical.
-pub fn gen_marker_free_stmt(rng: &mut Rng) -> String {
-    match rng.below(6) {
-        0 => {
-            let depth = 2 + rng.below(2) as u32;
-            format!("SELECT {} FROM t", gen_expr(rng, depth))
-        }
-        1 => "SELECT 'grad(x, x)' AS s FROM t".to_string(),
-        2 => "SELECT x /* grad(y, y) */ FROM t".to_string(),
-        3 => "SELECT myschema.grad(x, x) AS d FROM t".to_string(),
-        4 => "SELECT 'jvp(sin(x), x, dx)' AS label, x FROM t".to_string(),
-        _ => format!(
-            "SELECT {} AS val FROM t WHERE label <> 'grad('",
-            gen_expr(rng, 2)
-        ),
-    }
-}
-
-/// Unicode strings used to stress char↔byte offset arithmetic.
-pub const UNICODE_STRESSORS: &[&str] = &[
-    "héllo",
-    "☕🔥",
-    "naïve",
-    "Ωμέγα",
-    "🇺🇸",
-    "e\u{0301}",
-    "\u{202E}rtl",
-    "𝕏𝕐",
-];
-
-/// Adversarial / malformed inputs for the never-panic invariant.
-pub fn gen_adversarial_sql(rng: &mut Rng) -> String {
-    match rng.below(8) {
-        // Malformed marker arities / shapes — must be typed errors, not panics.
-        0 => rng
-            .pick(&[
-                "SELECT grad() FROM t",
-                "SELECT grad(x) FROM t",
-                "SELECT grad(x, y, z) FROM t",
-                "SELECT jvp(x, x) FROM t",
-                "SELECT jvp(x) FROM t",
-                "SELECT grad(x, 1 + 2) FROM t",
-                "SELECT grad(*, x) FROM t",
-                "SELECT grad(x, ) FROM t",
-            ])
-            .to_string(),
-        // A valid marker behind a Unicode-heavy prefix (stresses offset math).
-        1 => {
-            let u = *rng.pick(UNICODE_STRESSORS);
-            let depth = 2 + rng.below(2) as u32;
-            format!(
-                "SELECT '{u}' AS c, grad({}, x) FROM t",
-                gen_expr(rng, depth)
-            )
-        }
-        // Deeply nested markers.
-        2 => {
-            let k = 1 + rng.below(12) as usize;
-            let mut s = String::from("SELECT ");
-            for _ in 0..k {
-                s.push_str("grad(");
-            }
-            s.push('x');
-            for _ in 0..k {
-                s.push_str(", x)");
-            }
-            s.push_str(" FROM t");
-            s
-        }
-        // A valid marker statement truncated at a random char boundary.
-        3 => {
-            let full = "SELECT café AS c, grad(sin(x) * y, x) FROM t";
-            let cut = full
-                .char_indices()
-                .nth(1 + rng.below(full.chars().count() as u64) as usize)
-                .map(|(i, _)| i)
-                .unwrap_or(full.len());
-            full[..cut].to_string()
-        }
-        // Marker with a Unicode identifier argument.
-        4 => {
-            let u = *rng.pick(UNICODE_STRESSORS);
-            format!("SELECT grad({u}, x) FROM t")
-        }
-        // Unicode injected into a valid marker statement at a char boundary.
-        5 => {
-            let u = *rng.pick(UNICODE_STRESSORS);
-            let base = "SELECT grad(sin(x), x) FROM t";
-            let at = base
-                .char_indices()
-                .nth(rng.below(base.chars().count() as u64) as usize)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            let mut s = String::from(&base[..at]);
-            s.push_str(u);
-            s.push_str(&base[at..]);
-            s
-        }
-        // Odd whitespace and comments around the marker — the shapes that
-        // stress the parse-free pre-gate's substring scan.
-        6 => "SELECT grad\t(\n x , x )/* ☕ */ FROM t".to_string(),
-        // A deep but valid marker payload.
-        _ => {
-            let depth = 3 + rng.below(3) as u32;
-            format!("SELECT grad({}, x) FROM t", gen_expr(rng, depth))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Residual-marker detection.
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct MarkerScan {
-    found: bool,
-}
-
-impl Visitor for MarkerScan {
-    type Break = ();
-    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-        // Deliberately the *rewriter's own* definition of a marker, not a copy
-        // of it. This scan is the oracle for "the rewrite left nothing behind",
-        // so if the rewriter's notion of what counts as a marker ever changes,
-        // the oracle has to follow it or it quietly stops checking the new case.
-        if let Expr::Function(f) = e {
-            if crate::rewrite::marker_kind(f).is_some() {
-                self.found = true;
-                return ControlFlow::Break(());
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Does an AST still contain an *unqualified* `grad`/`jvp` call — a marker that
-/// should have been rewritten away?
-pub fn has_residual_marker(stmts: &[Statement]) -> bool {
-    let mut scan = MarkerScan::default();
-    for s in stmts {
-        let _ = Visit::visit(s, &mut scan);
-        if scan.found {
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
