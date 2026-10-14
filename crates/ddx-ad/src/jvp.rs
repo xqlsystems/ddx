@@ -22,8 +22,8 @@
 //! program, forward mode over reverse mode, which gives a Hessian-vector
 //! product.
 //!
-//! The run protocol is a [`BackwardProgram`]'s ([`crate::run`], with
-//! [`crate::Runner`]): checks first, then the steps.
+//! It runs as a [`BackwardProgram`] does ([`crate::run`]): checks first,
+//! then the steps.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -35,7 +35,9 @@ use crate::error::{AdError, Result};
 use crate::expr::field;
 use crate::forward::{check_every_wrt_was_read, inline_references, root_of, wrt_table};
 use crate::functions::{Extensions, Functions};
-use crate::program::{dims_check, readable, repeated_keys, Check, ForwardProgram, Options, Step};
+use crate::program::{
+    dims_check, readable, repeated_keys, Check, ForwardProgram, Options, Step, Unbound,
+};
 use crate::relation::{table_matches, ColumnRef, Table};
 use crate::tables::{InputTable, Of, OutputTable, Tangent};
 use crate::tangent::{Dualizer, Source, Tan};
@@ -116,7 +118,7 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
     let (inputs, checks) = sources.inputs(&mut dp.ext, Vec::new());
     let mut steps = vec![Step {
         name,
-        plan: dp.plan,
+        plan: Unbound(dp.plan),
     }];
     crate::opt::steps(&mut steps);
     Ok(ForwardProgram {
@@ -167,7 +169,7 @@ fn jvp_of_steps(parts: &Parts, wrt: &[ColumnRef], options: &Options) -> Result<F
         );
         steps.push(Step {
             name,
-            plan: std::mem::take(&mut dp.plan),
+            plan: Unbound(std::mem::take(&mut dp.plan)),
         });
         ext = dp.ext;
     }
@@ -383,7 +385,7 @@ fn tangent_check(ext: &mut Extensions, table: &Table, tt: &InputTable) -> Check 
     let keys: Vec<usize> = (0..k).collect();
     let repeated = repeated_keys(ext, read_step(&tt.name, tt.columns.clone()), &keys);
     Check {
-        plan: plan_of(repeated, tt.columns[..k].to_vec(), ext),
+        plan: Unbound(plan_of(repeated, tt.columns[..k].to_vec(), ext)),
         message: format!(
             "the tangent table `{}` has rows that share their dims ({}); it needs one row per \
              row of `{}`",

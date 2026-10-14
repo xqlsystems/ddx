@@ -483,7 +483,7 @@ async fn every_plan_for_a_three_layer_mlp_decodes_within_protobufs_default_nesti
         .chain(&hvp.steps)
         .map(|s| (&s.name, &s.plan));
     for (name, plan) in plans {
-        let bytes = prost::Message::encode_to_vec(plan);
+        let bytes = plan.to_bytes();
         let decoded = <ddx_ad::substrait::proto::Plan as prost::Message>::decode(bytes.as_slice());
         assert!(
             decoded.is_ok(),
@@ -517,7 +517,7 @@ async fn every_plan_for_nn_py_decodes_within_protobufs_default_nesting_limit() {
         .chain(&hvp.steps)
         .map(|s| (&s.name, &s.plan));
     for (name, plan) in plans {
-        let bytes = prost::Message::encode_to_vec(plan);
+        let bytes = plan.to_bytes();
         let decoded = <ddx_ad::substrait::proto::Plan as prost::Message>::decode(bytes.as_slice());
         assert!(
             decoded.is_ok(),

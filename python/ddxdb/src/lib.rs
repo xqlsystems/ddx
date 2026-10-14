@@ -9,7 +9,9 @@
 //! Python caller can actually branch on. Nothing here decides anything about
 //! differentiation, and nothing here should grow to.
 
-use std::collections::HashMap;
+use std::future::{ready, Future, Ready};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
@@ -89,7 +91,11 @@ fn ad_to_py_err(e: AdError) -> PyErr {
 /// since DataFusion has no dialect of its own and parses as generic SQL.
 fn parser_for(dialect: &str) -> PyResult<Box<dyn Dialect>> {
     let name = dialect.to_ascii_lowercase();
-    let lookup = if name == "datafusion" { "generic" } else { &name };
+    let lookup = if name == "datafusion" {
+        "generic"
+    } else {
+        &name
+    };
     dialect_from_str(lookup)
         .ok_or_else(|| PyValueError::new_err(format!("unknown SQL dialect {dialect:?}")))
 }
@@ -320,7 +326,7 @@ fn to_checks(checks: &[ddx_ad::Check]) -> Vec<Check> {
     checks
         .iter()
         .map(|c| Check {
-            plan: c.plan_bytes(),
+            plan: c.plan.to_bytes(),
             message: c.message.clone(),
         })
         .collect()
@@ -336,7 +342,7 @@ fn to_steps(steps: &[ddx_ad::Step]) -> Vec<Step> {
         .iter()
         .map(|s| Step {
             name: s.name.clone(),
-            plan: s.plan_bytes(),
+            plan: s.plan.to_bytes(),
         })
         .collect()
 }
@@ -395,7 +401,7 @@ impl BackwardProgram {
             .intermediate_steps()
             .map(|s| Step {
                 name: s.name.clone(),
-                plan: s.plan_bytes(),
+                plan: s.plan.to_bytes(),
             })
             .collect()
     }
@@ -612,38 +618,70 @@ fn jvp_plan(
 }
 
 /// A Python engine object as a `ddx_ad::Backend`: the four primitives, with
-/// plans crossing as serialized Substrait.
-struct PyBackend<'py>(Bound<'py, PyAny>);
+/// plans crossing as serialized Substrait. Each method calls Python and
+/// returns a future already done, so a run is driven by [`now`].
+struct PyBackend(Py<PyAny>);
 
-impl ddx_ad::Backend for PyBackend<'_> {
+impl PyBackend {
+    fn call<T>(&self, f: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>) -> Ready<PyResult<T>> {
+        ready(Python::attach(|py| f(self.0.bind(py))))
+    }
+}
+
+impl ddx_ad::Backend for PyBackend {
     type Error = PyErr;
 
-    fn table_schema(&mut self, name: &str) -> PyResult<NamedStruct> {
-        let plan: Vec<u8> = self.0.call_method1("select_all", (name,))?.extract()?;
-        base_schema(&decode(&plan)?).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "select_all({name:?}) returned a plan with no table read in it"
-            ))
+    fn table_schema(&mut self, name: &str) -> impl Future<Output = PyResult<NamedStruct>> + Send {
+        self.call(|b| {
+            let plan: Vec<u8> = b.call_method1("select_all", (name,))?.extract()?;
+            base_schema(&decode(&plan)?).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "select_all({name:?}) returned a plan with no table read in it"
+                ))
+            })
         })
     }
 
-    fn returns_rows(&mut self, plan: &Plan) -> PyResult<bool> {
-        let py = self.0.py();
-        self.0
-            .call_method1("returns_rows", (bytes(py, plan),))?
-            .extract()
+    fn returns_rows(
+        &mut self,
+        plans: &[ddx_ad::Bound],
+    ) -> impl Future<Output = PyResult<Vec<bool>>> + Send {
+        self.call(|b| {
+            plans
+                .iter()
+                .map(|plan| {
+                    b.call_method1("returns_rows", (bytes(b.py(), plan),))?
+                        .extract()
+                })
+                .collect()
+        })
     }
 
-    fn materialize(&mut self, name: &str, plan: &Plan) -> PyResult<()> {
-        let py = self.0.py();
-        self.0
-            .call_method1("materialize", (name, bytes(py, plan)))?;
-        Ok(())
+    fn materialize(
+        &mut self,
+        name: &str,
+        plan: &ddx_ad::Bound,
+    ) -> impl Future<Output = PyResult<()>> + Send {
+        self.call(|b| {
+            b.call_method1("materialize", (name, bytes(b.py(), plan)))?;
+            Ok(())
+        })
     }
 
-    fn drop_table(&mut self, name: &str) -> PyResult<()> {
-        self.0.call_method1("drop_table", (name,))?;
-        Ok(())
+    fn drop_table(&mut self, name: &str) -> impl Future<Output = PyResult<()>> + Send {
+        self.call(|b| {
+            b.call_method1("drop_table", (name,))?;
+            Ok(())
+        })
+    }
+}
+
+/// The output of a future whose every await is already done, as a run on a
+/// [`PyBackend`] is.
+fn now<F: Future>(f: F) -> F::Output {
+    match pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(out) => out,
+        Poll::Pending => unreachable!("a Python backend's future is never pending"),
     }
 }
 
@@ -663,11 +701,11 @@ impl ddx_ad::Backend for PyBackend<'_> {
 /// `InvalidColumn` when a check returns a row, or what the backend raised.
 #[pyfunction]
 fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
-    let mut backend = PyBackend(backend);
+    let mut backend = PyBackend(backend.unbind());
     let result = if let Ok(p) = program.extract::<PyRef<'_, BackwardProgram>>() {
-        ddx_ad::run(&mut backend, &p.0)
+        now(ddx_ad::run(&mut backend, &p.0))
     } else if let Ok(p) = program.extract::<PyRef<'_, ForwardProgram>>() {
-        ddx_ad::run(&mut backend, &p.0)
+        now(ddx_ad::run(&mut backend, &p.0))
     } else {
         return Err(pyo3::exceptions::PyTypeError::new_err(
             "run takes a BackwardProgram or a ForwardProgram",
@@ -753,34 +791,6 @@ fn _not_in_subquery(sql: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The tables a step's plan reads without their types: the earlier steps it
-/// depends on.
-#[pyfunction]
-fn _unbound_reads(plan: &[u8]) -> PyResult<Vec<String>> {
-    Ok(ddx_ad::unbound_reads(&decode(plan)?))
-}
-
-/// Bind a step's reads. `schemas` maps each table it reads to the serialized
-/// plan of `SELECT * FROM table` on the engine, whose read states the table's
-/// types in the engine's own terms.
-#[pyfunction]
-fn _bind_reads<'py>(
-    py: Python<'py>,
-    plan: &[u8],
-    schemas: HashMap<String, Vec<u8>>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let mut plan = decode(plan)?;
-    let mut structs = HashMap::new();
-    for (name, select_all) in schemas {
-        let s = base_schema(&decode(&select_all)?).ok_or_else(|| {
-            PyValueError::new_err(format!("no table read in the plan given for `{name}`"))
-        })?;
-        structs.insert(name, s);
-    }
-    ddx_ad::bind_reads(&mut plan, &mut |n| structs.get(n).cloned()).map_err(ad_to_py_err)?;
-    Ok(bytes(py, &plan))
-}
-
 /// The base schema of the table read at the bottom of `SELECT * FROM t`.
 fn base_schema(plan: &Plan) -> Option<NamedStruct> {
     let mut rel: Option<&Rel> = plan.relations.iter().find_map(|r| match &r.rel_type {
@@ -814,8 +824,6 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OutputTable>()?;
     m.add_class::<Tangent>()?;
     m.add_class::<Statements>()?;
-    m.add_function(wrap_pyfunction!(_unbound_reads, m)?)?;
-    m.add_function(wrap_pyfunction!(_bind_reads, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(

@@ -47,7 +47,7 @@ use std::collections::BTreeSet;
 
 use ddx_core::Ddx;
 use substrait::proto::join_rel::JoinType;
-use substrait::proto::{Expression, Plan, Rel};
+use substrait::proto::{Expression, NamedStruct, Plan, Rel};
 
 use crate::compose::{output_plan, Differentiable, Subject};
 use crate::emit::{aggregate, join, plan, project_emit, read_step, read_table, select, union_all};
@@ -60,6 +60,73 @@ use crate::relation::Table;
 use crate::tables::{InputTable, Of, OutputTable};
 use crate::transpose::{Contribution, Transposer};
 
+/// A plan as a program holds it. Its reads of tables the program writes, or
+/// that the caller registers before it runs, name a table without its
+/// column types, which only the engine knows once the table exists.
+/// [`Unbound::bind`] fills them in; [`crate::run`] does it for every plan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Unbound(pub(crate) Plan);
+
+/// A plan ready to run: every read states its table's column types. Only
+/// [`Unbound::bind`] makes one, so an engine is never handed a plan whose
+/// reads it cannot resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bound(Plan);
+
+impl std::ops::Deref for Unbound {
+    type Target = Plan;
+    fn deref(&self) -> &Plan {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Bound {
+    type Target = Plan;
+    fn deref(&self) -> &Plan {
+        &self.0
+    }
+}
+
+impl Unbound {
+    /// `plan`, as a plan to bind: one an engine was handed raw, or one built
+    /// by hand, whose reads may name tables without their types.
+    pub fn from_plan(plan: Plan) -> Unbound {
+        Unbound(plan)
+    }
+
+    /// The tables it reads without their types, in the order they appear.
+    pub fn reads(&self) -> Vec<String> {
+        crate::emit::unbound_reads(&self.0)
+    }
+
+    /// The plan with each such read's types from `schema`, asked by table
+    /// name; a missing table or column is an error.
+    pub fn bind(&self, schema: &mut dyn FnMut(&str) -> Option<NamedStruct>) -> Result<Bound> {
+        let mut plan = self.0.clone();
+        crate::emit::bind_reads(&mut plan, schema)?;
+        Ok(Bound(plan))
+    }
+
+    /// The plan as Substrait protobuf bytes, for a host that holds plans as
+    /// bytes rather than as this crate's `substrait` types (see
+    /// [`decode_plan`]).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.0)
+    }
+}
+
+impl Bound {
+    /// The plan as Substrait protobuf bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.0)
+    }
+
+    /// The plan.
+    pub fn into_plan(self) -> Plan {
+        self.0
+    }
+}
+
 /// One step of a program: a plan, and the name its result is materialized
 /// under.
 #[derive(Debug, Clone)]
@@ -67,9 +134,8 @@ use crate::transpose::{Contribution, Transposer};
 pub struct Step {
     /// The table name to materialize the result as.
     pub name: String,
-    /// The plan. Its reads of earlier steps are unbound; see
-    /// [`crate::emit::bind_reads`].
-    pub plan: Plan,
+    /// The plan, to bind before it runs.
+    pub plan: Unbound,
 }
 
 /// The steps that compute a query's value and its gradient.
@@ -107,8 +173,7 @@ impl BackwardProgram {
         self.forward_steps.iter().chain(&self.backward_steps)
     }
 
-    /// Step `i` of [`BackwardProgram::steps`], as [`crate::Action`] numbers
-    /// them.
+    /// Step `i` of [`BackwardProgram::steps`], in the order they run.
     pub fn step(&self, i: usize) -> &Step {
         self.steps().nth(i).expect("a step index from this program")
     }
@@ -156,26 +221,10 @@ pub struct ForwardProgram {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Check {
-    /// The plan.
-    pub plan: Plan,
+    /// The plan, to bind before it runs.
+    pub plan: Unbound,
     /// What a returned row means, for the error.
     pub message: String,
-}
-
-impl Step {
-    /// The plan as Substrait protobuf bytes, for a host that holds plans as
-    /// bytes rather than as this crate's `substrait` types (see
-    /// [`decode_plan`]).
-    pub fn plan_bytes(&self) -> Vec<u8> {
-        prost::Message::encode_to_vec(&self.plan)
-    }
-}
-
-impl Check {
-    /// The plan as Substrait protobuf bytes (see [`Step::plan_bytes`]).
-    pub fn plan_bytes(&self) -> Vec<u8> {
-        prost::Message::encode_to_vec(&self.plan)
-    }
 }
 
 /// A Substrait plan from its protobuf bytes.
@@ -184,7 +233,7 @@ impl Check {
 /// that links `substrait` must link the same version (it is re-exported as
 /// [`crate::substrait`]). Most of the Substrait ecosystem holds plans as
 /// bytes instead; such a host never names the type:
-/// `grad(&decode_plan(bytes)?, wrt)`, then [`Step::plan_bytes`].
+/// `grad(&decode_plan(bytes)?, wrt)`, then [`Unbound::to_bytes`].
 pub fn decode_plan(bytes: &[u8]) -> Result<Plan> {
     <Plan as prost::Message>::decode(bytes)
         .map_err(|e| AdError::InvalidPlan(format!("not a Substrait plan: {e}")))
@@ -408,16 +457,20 @@ fn build(
     for (n, saved) in f.saved.iter().enumerate() {
         forward_steps.push(Step {
             name: saved_name(&f.namespace, n),
-            plan: plan(saved.rel.clone(), step_columns(saved.outputs.len()), &t.ext),
+            plan: Unbound(plan(
+                saved.rel.clone(),
+                step_columns(saved.outputs.len()),
+                &t.ext,
+            )),
         });
     }
     forward_steps.push(Step {
         name: format!("{}value", f.namespace),
-        plan: plan(
+        plan: Unbound(plan(
             select(f.output.rel.clone(), f.output.outputs.clone()),
             f.output_names.clone(),
             &t.ext,
-        ),
+        )),
     });
 
     let mut backward_steps = Vec::new();
@@ -427,7 +480,7 @@ fn build(
         for (name, rel, names) in t.steps.drain(..) {
             steps.push(Step {
                 name,
-                plan: plan(rel, names, &t.ext),
+                plan: Unbound(plan(rel, names, &t.ext)),
             });
         }
     };
@@ -471,7 +524,7 @@ fn build(
         let names: Vec<String> = dims.iter().chain(&cols).map(|c| format!("c{c}")).collect();
         backward_steps.push(Step {
             name: cotangent_name(&f.namespace, n),
-            plan: plan(rel, names.clone(), &t.ext),
+            plan: Unbound(plan(rel, names.clone(), &t.ext)),
         });
         t.saved(n, &cols, read_step(&cotangent_name(&f.namespace, n), names))?;
         drain(&mut t, &mut backward_steps);
@@ -490,7 +543,7 @@ fn build(
             .collect();
         backward_steps.push(Step {
             name: step.clone(),
-            plan: plan(rel, columns.clone(), &t.ext),
+            plan: Unbound(plan(rel, columns.clone(), &t.ext)),
         });
         gradients.push(OutputTable {
             step,
@@ -956,7 +1009,7 @@ fn cotangent_check(t: &mut Transposer, f: &Forward, names: &[String], keys: usiz
     let keys: Vec<usize> = (0..keys).collect();
     let repeated = repeated_keys(&mut t.ext, read_step(&table, names.to_vec()), &keys);
     Check {
-        plan: plan(repeated, names[..keys.len()].to_vec(), &t.ext),
+        plan: Unbound(plan(repeated, names[..keys.len()].to_vec(), &t.ext)),
         message: format!(
             "the cotangent table `{table}` has rows that share their keys ({}); it needs one \
              row per output row",
@@ -977,7 +1030,7 @@ pub(crate) fn dims_check(ext: &mut Extensions, table: &Table) -> Check {
         .map(|&d| table.columns()[d].clone())
         .collect();
     Check {
-        plan: plan(repeated, names.clone(), ext),
+        plan: Unbound(plan(repeated, names.clone(), ext)),
         message: format!(
             "table `{}` has rows that share their dims ({}), so their gradients cannot be \
              told apart; ddx takes the columns not named in wrt as the table's dims, and \

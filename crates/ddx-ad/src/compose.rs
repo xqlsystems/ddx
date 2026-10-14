@@ -123,8 +123,8 @@ impl Parts<'_> {
     pub fn plans(&self) -> impl Iterator<Item = &Plan> {
         self.checks
             .iter()
-            .map(|c| &c.plan)
-            .chain(self.steps.iter().map(|s| &s.plan))
+            .map(|c| &c.plan.0)
+            .chain(self.steps.iter().map(|s| &s.plan.0))
     }
 
     /// The namespace the program writes under: its value step's name up to

@@ -77,10 +77,8 @@ except ImportError as e:  # pragma: no cover - depends on the environment
 
 from ._ddxdb import (
     UnsupportedExpression,
-    _bind_reads,
     _not_in_subquery,
     _Statements,
-    _unbound_reads,
 )
 from . import Backend
 from ._ddxdb import (
@@ -302,18 +300,6 @@ def _release(ctx: SessionContext, program: Program) -> None:
     """Drop every table ``program`` registered on ``ctx``."""
     for step in program.steps():
         ctx.deregister_table(step.name)
-
-
-def _consume(ctx: SessionContext, plan: bytes):
-    """``plan`` (a step or a check) as a DataFusion logical plan. Its reads of
-    earlier steps, or of an input table, name their columns but not their
-    types; the types come from the tables themselves, as the engine states
-    them."""
-    schemas = {
-        name: Serde.serialize_bytes(f'SELECT * FROM "{name}"', ctx)
-        for name in _unbound_reads(plan)
-    }
-    return Consumer.from_substrait_plan(ctx, _deserialize(_bind_reads(plan, schemas)))
 
 
 def _deserialize(plan: bytes):

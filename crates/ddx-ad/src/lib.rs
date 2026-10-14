@@ -19,9 +19,8 @@
 //! [`grad`] and [`vjp`] take a plan and the `wrt` columns and return a
 //! [`BackwardProgram`]: plain Substrait plans for an engine to run in order,
 //! the last of which hold the gradients, shaped like the tables they are
-//! gradients of. An adapter runs the steps in order, late-binding each step's
-//! reads of earlier steps with [`unbound_reads`] and [`bind_reads`], and runs
-//! the program's [`checks`](BackwardProgram::checks) first. The table names
+//! gradients of. An engine runs a program with [`run`], given a [`Backend`]:
+//! the four things only the engine can do. The table names
 //! a program writes all start with a prefix unique to the program,
 //! `__ddx_{id}_`; the `__ddx_` prefix is reserved.
 //!
@@ -50,9 +49,9 @@
 //! - **What not to differentiate.** `ddx_stop_gradient(x)`, an identity the
 //!   engine registers under that name, is a constant to ddx, like JAX's
 //!   `lax.stop_gradient`.
-//! - **The engine.** A program is plain Substrait plans plus the run protocol
-//!   ([`Runner`], or [`Backend`] and [`run`] for a synchronous engine), so a
-//!   new engine writes four primitives and nothing about AD.
+//! - **The engine.** A program is plain Substrait plans, and [`run`] runs one
+//!   on any [`Backend`], so a new engine writes four primitives and nothing
+//!   about AD.
 //!
 //! A relational operator of the host's own has no extension point: a
 //! user-defined aggregate, or a Substrait `ExtensionSingleRel`,
@@ -103,16 +102,15 @@ internal! {
 }
 
 pub use compose::Differentiable;
-pub use emit::{bind_reads, unbound_reads};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
 pub use jvp::{jvp, jvp_with};
 pub use program::{
-    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Check, ForwardProgram, Options,
-    Step,
+    decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Bound, Check, ForwardProgram,
+    Options, Step, Unbound,
 };
 pub use relation::ColumnRef;
-pub use run::{run, Action, Backend, Program, RunError, Runner};
+pub use run::{run, Backend, Program, RunError};
 pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]

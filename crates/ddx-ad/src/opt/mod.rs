@@ -41,7 +41,7 @@ pub(crate) fn steps(steps: &mut Vec<Step>) {
 /// steps too deep for a consumer.
 pub(crate) fn backward_program(program: &mut BackwardProgram) {
     for c in program.checks.iter_mut() {
-        plan(&mut c.plan);
+        plan(&mut c.plan.0);
     }
     let keep: BTreeSet<String> = std::iter::once(program.value.step.clone())
         .chain(program.gradients.iter().map(|g| g.step.clone()))
@@ -68,12 +68,12 @@ pub(crate) fn backward_program(program: &mut BackwardProgram) {
         };
         let narrowed = !keep.contains(&step.name) && {
             let used = read.get(&step.name).cloned().unwrap_or_default();
-            prune::prune_plan_to_names(&mut step.plan, &used)
+            prune::prune_plan_to_names(&mut step.plan.0, &used)
         };
         if narrowed {
-            fuse::fuse_plan(&mut step.plan);
+            fuse::fuse_plan(&mut step.plan.0);
         } else {
-            plan(&mut step.plan);
+            plan(&mut step.plan.0);
         }
         note_reads(&step.plan, &mut read);
     }
