@@ -187,8 +187,8 @@ enum Phase {
 /// from it (across an FFI boundary, say).
 #[derive(Debug)]
 pub struct Runner<E> {
-    /// The checks to run: each one's index in the program, and its message.
-    checks: Vec<(usize, String)>,
+    /// Each check's message, in the program's order.
+    checks: Vec<String>,
     steps: Vec<String>,
     intermediates: Vec<String>,
     /// What the drop phase drops: the intermediates after a success, every
@@ -202,29 +202,9 @@ pub struct Runner<E> {
 impl<E> Runner<E> {
     /// A run of `program`, not yet started.
     pub fn new<P: Program + ?Sized>(program: &P) -> Self {
-        Runner::verified(program, &Verified::new())
-    }
-
-    /// A run of `program` that skips each check whose fact `verified` already
-    /// holds (see [`Verified`]), except a check of one of the program's
-    /// [`Program::inputs`]: a cotangent or a tangent is new on every run.
-    /// [`Action::Check`] still numbers checks as the program does.
-    pub fn verified<P: Program + ?Sized>(program: &P, verified: &Verified) -> Self {
         let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
-        let input = |c: &Check| {
-            program
-                .inputs()
-                .iter()
-                .any(|i| crate::relation::table_matches(&i.name, &c.table))
-        };
         let mut runner = Runner {
-            checks: program
-                .checks()
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| input(c) || !verified.knows(c))
-                .map(|(i, c)| (i, c.message.clone()))
-                .collect(),
+            checks: program.checks().iter().map(|c| c.message.clone()).collect(),
             steps: steps.iter().map(|s| s.name.clone()).collect(),
             intermediates: steps
                 .iter()
@@ -240,13 +220,6 @@ impl<E> Runner<E> {
         runner
     }
 
-    /// Every check this run will ask for, numbered as the program numbers
-    /// them, in order: an engine may start them all at once and answer each
-    /// when [`Runner::next`] asks.
-    pub fn checks(&self) -> impl Iterator<Item = usize> + '_ {
-        self.checks.iter().map(|(i, _)| *i)
-    }
-
     /// The next action, or `None` once the run is over; then call
     /// [`Runner::finish`]. Each action must be answered, with
     /// [`Runner::checked`] for a check and [`Runner::done`] otherwise, before
@@ -258,7 +231,7 @@ impl<E> Runner<E> {
             "answer the last action before asking for the next"
         );
         let action = match self.phase {
-            Phase::Check(k) => Action::Check(self.checks[k].0),
+            Phase::Check(k) => Action::Check(k),
             Phase::Step(i) => Action::Materialize(i),
             Phase::Drop(i) => Action::Drop(self.dropping[i].clone()),
             Phase::Done => return None,
@@ -276,7 +249,7 @@ impl<E> Runner<E> {
         match result {
             Ok(false) => self.phase = Phase::Check(i + 1),
             Ok(true) => self.fail(RunError::Refused(AdError::InvalidWrt(
-                self.checks[i].1.clone(),
+                self.checks[i].clone(),
             ))),
             Err(e) => self.fail(RunError::Engine(e)),
         }
@@ -389,17 +362,7 @@ pub fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
-    run_verified(backend, program, &mut Verified::new())
-}
-
-/// [`run`], skipping each check whose fact `verified` holds, and recording
-/// in it every check's fact once the run has succeeded (see [`Verified`]).
-pub fn run_verified<B: Backend, P: Program + ?Sized>(
-    backend: &mut B,
-    program: &P,
-    verified: &mut Verified,
-) -> Result<(), RunError<B::Error>> {
-    let mut runner = Runner::verified(program, verified);
+    let mut runner = Runner::new(program);
     let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     while let Some(action) = runner.next() {
         let plan = match &action {
@@ -436,71 +399,7 @@ pub fn run_verified<B: Backend, P: Program + ?Sized>(
             Action::Drop(_) => unreachable!("handled above"),
         }
     }
-    runner.finish()?;
-    verified.record_all(program);
-    Ok(())
-}
-
-/// Facts a program's checks have proved, kept by a caller across runs: that
-/// in a table, the key columns a check names identify its rows. A run given
-/// them ([`Runner::verified`], [`run_verified`]) skips each check whose fact
-/// is already known, and a run that succeeds records every check's fact.
-///
-/// A check costs a grouped scan of its table, every run. When many runs read
-/// the same tables, most of those scans prove again what the first proved:
-/// conjugate gradient runs one `H·v` program per iteration against the same
-/// parameters, and a training loop one `grad` program per step whose update
-/// joins on the parameters' dims and so keeps them.
-///
-/// The fact is about the table's rows, which ddx cannot watch: it holds only
-/// until the table's keys change, and keeping it past that is the caller's
-/// promise. [`Verified::forget`] a table whenever its keys may have changed:
-/// rewritten from another query, rows inserted. A program's inputs (its
-/// cotangent or tangents) are new on every run, so their checks always run.
-/// A fact kept for a table whose keys now repeat lets a program run that its
-/// check would have refused, and give rows that share keys their summed
-/// gradient.
-#[derive(Debug, Clone, Default)]
-pub struct Verified {
-    facts: std::collections::BTreeSet<(Vec<String>, Vec<String>)>,
-}
-
-impl Verified {
-    /// No facts.
-    pub fn new() -> Self {
-        Verified::default()
-    }
-
-    /// Does it hold the fact `check` proves?
-    pub fn knows(&self, check: &Check) -> bool {
-        self.facts
-            .contains(&(check.table.clone(), check.keys.clone()))
-    }
-
-    /// Hold the fact `check` proves, as a run that passed it would.
-    pub fn record(&mut self, check: &Check) {
-        self.facts.insert((check.table.clone(), check.keys.clone()));
-    }
-
-    /// Hold the facts every check of `program` proves.
-    pub fn record_all<P: Program + ?Sized>(&mut self, program: &P) {
-        for c in program.checks() {
-            self.record(c);
-        }
-    }
-
-    /// Drop every fact about the table `table` (named as a
-    /// [`crate::ColumnRef`] names one: a bare name matches a table whose last
-    /// part it is), because its keys may have changed.
-    pub fn forget(&mut self, table: &str) {
-        self.facts
-            .retain(|(names, _)| !crate::relation::table_matches(table, names));
-    }
-
-    /// Drop every fact.
-    pub fn clear(&mut self) {
-        self.facts.clear();
-    }
+    runner.finish()
 }
 
 enum Bind<E> {
@@ -537,7 +436,7 @@ mod tests {
         outcome: &dyn Fn(&Action) -> Result<bool, &'static str>,
     ) -> (Vec<Action>, Result<(), String>) {
         let mut runner: Runner<&'static str> = Runner {
-            checks: (0..checks).map(|i| (i, format!("check {i}"))).collect(),
+            checks: (0..checks).map(|i| format!("check {i}")).collect(),
             steps: steps.iter().map(|s| s.to_string()).collect(),
             intermediates: intermediates.iter().map(|s| s.to_string()).collect(),
             dropping: Vec::new(),

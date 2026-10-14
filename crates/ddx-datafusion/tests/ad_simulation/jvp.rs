@@ -197,7 +197,7 @@ async fn run_jvp(
     f32: bool,
 ) -> Result<JvpRun, String> {
     register_tangents(ctx, case, &program.inputs, tan, f32, false)?;
-    let ran = ddx_datafusion::engine::execute(ctx, program, &mut ad::Verified::new()).await;
+    let ran = ddx_datafusion::engine::execute(ctx, program).await;
     let result = match ran {
         Err(e) => Err(format!("[jvp-run] ad::run of a jvp program ddx built: {e}")),
         Ok(()) => {
@@ -520,7 +520,7 @@ pub(super) async fn jvp_checks(
                 .iter()
                 .any(Option::is_some)
         });
-        match ddx_datafusion::engine::execute(ctx, &jp, &mut ad::Verified::new()).await {
+        match ddx_datafusion::engine::execute(ctx, &jp).await {
             Ok(()) if repeated => {
                 out.fail("[jvp-contract] a tangent table with a repeated dim tuple was not refused")
             }

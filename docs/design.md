@@ -947,18 +947,10 @@ repeat), and an adapter runs the checks before the steps and refuses the
 program if one returns a row. Without it, rows sharing dims got their summed
 gradient, and an SGD join then multiplied rows.
 
-A check is a grouped scan of its table on every run, and on a large `wrt`
-table the checks are most of a `jvp`'s run. Each says what it proves (a
-table, and key columns that identify its rows), and a caller running many
-programs against the same tables keeps those facts in a `Verified`:
-`run_verified` skips a check whose fact it holds and records the facts of a
-run that succeeds. Conjugate gradient checks its parameters once and each
-new direction every time; on an 8M-row table that is 712 ms a run against
-1,007. The fact holds only until the table's keys change, which ddx cannot
-watch, so keeping it is the caller's promise: `Verified::forget` a table
-whenever its keys may change. Skipping is opt-in; `run` checks everything,
-and a program's inputs (a cotangent, a tangent) are new on every run, so
-their checks always run.
+A check is a grouped scan of its table, run on every run: on a large `wrt`
+table the checks are most of a `jvp`'s run, and the adapter runs them at once.
+ddx cannot see whether a table changed between runs, so it never skips one
+(`S16`).
 
 **Every table a program materializes is named under a prefix fresh to that
 program** (`__ddx_{id}_`), so two programs on one engine never read or
@@ -1533,8 +1525,7 @@ breadth, not de-risking.
   ⟨∇L, t⟩, linearity, a missing tangent row as 0, the dot-product test
   against `vjp`, `H·t`'s symmetry and its value, a repeated tangent key
   refused); 332 cases and 3,350 comparisons in a five-minute run, none
-  failing. Still to come: `jvp(…)` in SQL, and
-  `Verified` from Python.
+  failing. Still to come: `jvp(…)` in SQL.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
@@ -2038,6 +2029,17 @@ marker rewrite, the DataFusion analyzer and text paths, and `ddxdb.rewrite_sql`
 were removed. The scalar differentiator stays as `ddx-core`, v2's map rule.
 The JAX oracle suite now checks each scalar rule through v2, as the gradient
 of a sum, on DataFusion. → §1, §3.
+
+**S16 — Every run checks its tables.** A program's checks (that each `wrt`
+table's dims, and each input's keys, identify their rows) cost a grouped scan
+each, every run. `Verified` let a caller keep the facts a run proved and skip
+those checks on later runs over the same tables: about a quarter off a `jvp`
+run in conjugate gradient (712 ms against 1,007 on 8M rows). But ddx cannot
+see a table change, so the fact was the caller's promise, and a broken one
+gave rows that share keys their summed gradient with no error: the one place
+the API traded correctness for speed. It was removed, from Rust and Python. A
+faster check, or a cache keyed on something an engine can vouch for, can come
+back as an internal detail. → §4.4.
 
 ## References
 

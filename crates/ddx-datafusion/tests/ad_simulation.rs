@@ -1953,7 +1953,7 @@ async fn run_and_read(
     ctx: &SessionContext,
     program: &BackwardProgram,
 ) -> Result<BTreeMap<String, Grad>, String> {
-    ddx_datafusion::engine::execute(ctx, program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(ctx, program)
         .await
         .map_err(|e| format!("[accepted-but-failed] ad::run of a program ddx accepted: {e}"))?;
     read_grads(ctx, program).await
@@ -3322,10 +3322,7 @@ async fn twin_checks(
             return Ok(());
         }
     };
-    if let Err(e) =
-        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
-            .await
-    {
+    if let Err(e) = ddx_datafusion::engine::execute(ctx, &program).await {
         out.fail(format!("[names] twins: {e}"));
         return Ok(());
     }
@@ -4272,9 +4269,7 @@ async fn contract_checks(
             return Ok(());
         }
     };
-    if let Err(e) =
-        ddx_datafusion::engine::execute(&ctx, &p, &mut ddx_datafusion::ad::Verified::new()).await
-    {
+    if let Err(e) = ddx_datafusion::engine::execute(&ctx, &p).await {
         out.fail(format!("[accepted-but-failed] {e}"));
         return Ok(());
     }
@@ -4449,13 +4444,7 @@ async fn contract_checks(
     if !dup.table(&target).dims.is_empty() {
         let ctx = setup(&dup, 4).await?;
         if let Ok(p) = ad::grad(&ctx, sql, wrt).await {
-            match ddx_datafusion::engine::execute(
-                &ctx,
-                &p,
-                &mut ddx_datafusion::ad::Verified::new(),
-            )
-            .await
-            {
+            match ddx_datafusion::engine::execute(&ctx, &p).await {
                 Ok(()) => out.fail(format!(
                     "[dims-check] {target} has two rows with the same dims, and the program ran \
                      instead of refusing"
