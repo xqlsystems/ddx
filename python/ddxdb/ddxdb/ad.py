@@ -249,8 +249,8 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     statement with no such call is planned as it is. The programs' tables are
     dropped once the statement is planned; the DataFrame keeps what it reads.
     A loss defined in a ``WITH RECURSIVE`` clause is refused. ``dialect``
-    is how the statement is parsed to find the calls, one of the names
-    :func:`ddxdb.rewrite_sql` accepts.
+    is how the statement is parsed to find the calls: a dialect name
+    ``sqlparser`` knows, or ``"datafusion"``.
     """
     return sql_all(ctx, [statement], dialect=dialect)[0]
 

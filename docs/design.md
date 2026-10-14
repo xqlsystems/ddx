@@ -3,20 +3,23 @@
 _author_: Alex Merose
 _co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
 _status_: Design — iterating toward implementation
-_last updated_: 2026-09-24
+_last updated_: 2026-10-13
 
 ---
 
 ## 1. What `ddx` is
 
-`ddx` is autograd for composable databases: you write calculus directly in SQL,
+`ddx` is autograd for composable databases: you write a model's forward pass
+and loss as SQL, and take its gradient in SQL,
 
 ```sql
-SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
+WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+SELECT w.i, w.val - 0.1 * g.val AS val
+FROM w JOIN grad(loss, w.val) g ON w.i = g.i
 ```
 
-and derivatives come back as ordinary columns, evaluated row by row by the
-engine alongside everything else. The destination is training ML models in
+and the gradient comes back as a relation shaped like the table, computed by
+the engine as a sequence of plans. The destination is training ML models in
 SQL — a [differentiable](https://www.youtube.com/watch?v=LNNU33TmBFk) [database](https://www.youtube.com/watch?v=jUe3rvTmv7Q). It ships as one engine-neutral Rust core with
 thin per-engine adapters, into DataFusion (via a Python package, `ddxdb`, into
 [xarray-sql](https://github.com/xqlsystems/xarray-sql)) and DuckDB (via a
@@ -72,6 +75,12 @@ differentiation engine:
 Both layers follow the same shape: a minimal-dependency, engine-neutral core,
 with thin adapters per engine. v1's core depends on `sqlparser` only; v2's
 depends on `substrait` and v1's core. Neither depends on `datafusion` or `duckdb`.
+
+**v1's SQL surface is removed (2026-10-13, `S15`).** v2 covers what v1 did: a
+row's derivative is the gradient of a sum over rows, or a `jvp` with a tangent
+of 1. Two meanings of `grad` in one SQL statement were a correctness hazard.
+v1's scalar differentiator stays, as `ddx-core`: it is v2's map rule. §3 is
+kept as the record of how that differentiator was designed.
 
 ### 1.1 Non-goals
 
@@ -140,6 +149,11 @@ depends on `substrait` and v1's core. Neither depends on `datafusion` or `duckdb
 ---
 
 ## 3. v1: calculus as columns
+
+> **Removed (2026-10-13, `S15`).** The marker rewrite (`rewrite_sql`), both
+> DataFusion paths (§3.3) and the per-engine integration (§3.4) are gone. The
+> scalar engine of §3.2 and the differentiation surface of §3.6 remain, as
+> `ddx-core`, the map rule of v2 (§4.3). The rest of this section is history.
 
 ### 3.1 The core insight: markers, not UDFs
 
@@ -1339,15 +1353,15 @@ layered:
 ```
 ddx/                               (repo; crates published under the ddx-* names)
 ├── crates/
-│   ├── ddx-core/                   # v1 engine — differentiate sqlparser::ast::Expr
-│   │                               #   + rewrite_sql; dep: sqlparser only
-│   ├── ddx-ad/                      # v2 engine — grad/vjp over substrait::proto
+│   ├── ddx-core/                   # the scalar rules — differentiate sqlparser::ast::Expr
+│   │                               #   dep: sqlparser only
+│   ├── ddx-ad/                      # query-level AD over substrait::proto
 │   │                               #   deps: substrait, ddx-core
-│   ├── ddx-datafusion/             # grad/jvp UDFs + AnalyzerRule (Path B) + ddx_sql + v2
-│   │                               #   deps: ddx-core, ddx-ad, datafusion
-│   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` + v2 table fn
+│   ├── ddx-datafusion/             # DataFusion adapter: ad
+│   │                               #   deps: ddx-ad, datafusion
+│   └── ddx-duckdb/                 # DuckDB community extension (M5)
 ├── python/
-│   └── ddxdb/                      # PyO3/maturin wheel: rewrite_sql + Context.sql() shim
+│   └── ddxdb/                      # PyO3/maturin wheel: Context.sql() + ad
 ├── docs/
 │   └── design.md                   # this file
 ├── tests/                          # cross-engine numeric-agreement suites (vs JAX)
@@ -1363,8 +1377,8 @@ can be driven from a new engine without pulling in DataFusion or DuckDB. The
 heavy per-engine dependencies are quarantined in the adapter crates.
 
 **`sqlparser` version policy — a real cost of "one IR," paid once.**
-`ddx-core`'s public API takes and returns `sqlparser::ast::Expr`, and the
-Path B bridge (§3.3) requires `ddx-core` and DataFusion to resolve the
+`ddx-core`'s public API takes and returns `sqlparser::ast::Expr`. (Until v1's
+SQL surface was removed, `S15`, the Path B bridge (§3.3) required `ddx-core` and DataFusion to resolve the
 identical `sqlparser` version — a mismatch makes them two unrelated Rust
 types and the bridge won't compile. `sqlparser` ships roughly one breaking
 release every 1–3 months, and DataFusion adopts each with a lag, while the
@@ -1374,7 +1388,8 @@ a v1 deliverable and a broken bridge is a compile failure; the DuckDB-coverage
 cost is bounded, §3.3); re-export it (`pub use sqlparser`) so downstream
 consumers can't accidentally link a mismatch; treat a `sqlparser` bump as a
 breaking release of `ddx-core`; and if the pins ever must diverge, degrade
-the bridge to a string round-trip rather than break it `[G2]`.
+the bridge to a string round-trip rather than break it `[G2]`.) The pin now
+only keeps the build to one `sqlparser`.
 
 **`datafusion` is pinned exactly too, always** (`=54.1.0`, with
 `datafusion-substrait`; `==54.0.0` for the Python package, the PyPI release of the
@@ -1977,6 +1992,17 @@ stated, with an ambiguous one refused. Two suggestions wait for a second
 in-repo adapter: emitting the portable form of the windows in the reduce
 rules (§4.6), and putting the simulation harness behind an engine trait so
 it doubles as a conformance suite. → §4.2.
+
+**S15 — v1's SQL surface is removed.** Once `grad`, `vjp` and `jvp` were
+query-level calls in SQL, `grad` meant two things in one statement: v1's
+derivative of an expression, row by row, and v2's gradient of a loss. Telling
+them apart took a guess from the arguments, and a guess about meaning is the
+kind of silent ambiguity principle 5 forbids. v2 covers v1: a row's derivative
+of `f` is the gradient of `SUM(f)`, or a `jvp` with a tangent of 1. So the
+marker rewrite, the DataFusion analyzer and text paths, and `ddxdb.rewrite_sql`
+were removed. The scalar differentiator stays as `ddx-core`, v2's map rule.
+The JAX oracle suite now checks each scalar rule through v2, as the gradient
+of a sum, on DataFusion. → §1, §3.
 
 ## References
 

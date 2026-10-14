@@ -1,7 +1,7 @@
 # Cross-engine tests (vs JAX)
 
-The **numeric-agreement suites**: the same function, rewritten by ddx and
-evaluated on DuckDB and DataFusion, must produce the numbers `jax.grad` produces.
+The **numeric-agreement suites**: the same function, differentiated by ddx and
+evaluated on DataFusion, must produce the numbers `jax.grad` produces.
 
 JAX is the natural oracle rather than a convenient one — ddx mirrors its
 forward/reverse structure and the same seed/cotangent semantics — so a
@@ -25,20 +25,11 @@ wrong virtualenv.
 
 **`--reinstall-package ddxdb` is the load-bearing part.** A plain `uv sync` sees
 that `ddxdb` is already installed and audits it in milliseconds — including after
-you have edited `crates/ddx-core`, because uv is watching the Python package and
-the Rust source is not in it. The suite would then pass against the engine you
-had *before* your change, which is the most expensive kind of green. Verified,
-not assumed:
-
-```
-$ uv sync                            # after editing the cos rule
-Audited 17 packages in 2ms
->>> ddxdb.rewrite_sql("SELECT grad(cos(x), x) ...")   # the OLD rule
-'SELECT (-sin(x)) AS d FROM t'
-
-$ uv sync --reinstall-package ddxdb
-'SELECT (sin(x)) AS d FROM t'                          # the edited one
-```
+you have edited `crates/`, because uv is watching the Python package and the
+Rust source is not in it. The suite would then pass against the engine you had
+*before* your change, which is the most expensive kind of green. Verified, not
+assumed: after editing the `cos` rule, `uv sync` reported "Audited 17 packages
+in 2ms" and the suite still ran the old rule.
 
 Every suite skips cleanly if `jax` or `ddxdb` is missing, so a partial
 environment reports "skipped" rather than failing for the wrong reason.
@@ -63,7 +54,7 @@ interpreter over that single object:
 | interpreter | produces | written by |
 |---|---|---|
 | `jax.grad` / `jax.jvp` | the oracle | JAX |
-| `oracle.to_sql` | the SQL ddx rewrites | this repo |
+| `oracle.to_sql` | the SQL ddx differentiates | this repo |
 | `oracle.trace` | intermediates for the conditioning gates | this repo |
 
 `to_sql` is the only hand-written translation, and a bug in it *cannot* cause a
@@ -79,16 +70,14 @@ traces to `log(x)/log(2)`, so no generated expression will ever render SQL's
 ## The files
 
 - **`oracle.py`** — the jaxpr interpreters, the conditioning gates, the generator.
-- **`engines.py`** — runs a statement on DuckDB or DataFusion and returns the
-  column. Rows arrive as Arrow, not as a `VALUES` literal, because DuckDB reads a
-  bare `1.5` as `DECIMAL(2,1)` and the two engines would otherwise be handed
-  different types for the same fixture.
-- **`test_jax_agreement.py`** — generated: `grad` vs `jax.vmap(jax.grad)`, `jvp`
-  vs `jax.jvp`, second derivatives vs nested `jax.grad`, and central differences
-  as an independent cross-check. JAX and ddx share a structure, so a misconception
+- **`engines.py`** — takes the gradient of `SUM(f)` over a table `t(i, x, y)`
+  on DataFusion and returns it row by row, which is `jax.vmap(jax.grad(f))`.
+  Rows arrive as Arrow, not as a `VALUES` literal, so every column is float64.
+- **`test_jax_agreement.py`** — generated: `grad` vs `jax.vmap(jax.grad)`, and
+  central differences as an independent cross-check. JAX and ddx share a structure, so a misconception
   common to both would be invisible between them; a finite difference shares
   nothing with either, because it only ever evaluates the primal.
-- **`test_rules.py`** — every v1 rule by name, so a failure names the rule rather
+- **`test_rules.py`** — every scalar rule by name, so a failure names the rule rather
   than a seed, and so `log2`/`log10`/constant-base `power` are covered at all.
 - **`test_conventions.py`** — the places ddx and JAX differ *on purpose*, pinned
   from both sides rather than compared.
@@ -96,7 +85,7 @@ traces to `log(x)/log(2)`, so no generated expression will ever render SQL's
   fixtures of `docs/spikes/`, built with the spikes' seeds, each written as a
   plain SQL loss, with `grad(loss, table.val)` taken in SQL on DataFusion. Every
   gradient entry must match `jax.grad` to 1e-12, `MAX` at a tie included. So
-  must the gradients of the M4 example's network, a two-layer MLP written in
+  must the gradients of the example network, a two-layer MLP written in
   SQL (`crates/ddx-datafusion/examples/nn`), whose queries are used verbatim.
 
 ## Why points get skipped, and why the rate is asserted
@@ -124,9 +113,6 @@ still matched JAX. So both sides are pinned:
   rather than an engine `signum`/`sign` builtin, which is what makes the pin hold
   everywhere: DuckDB has only `sign`, DataFusion only `signum`, and `signum(0)`
   is `1`.
-- **The second derivative of `abs`** — refused with a typed error, not answered
-  with `0`. Its first derivative is a `CASE`, and ddx does not differentiate
-  `CASE`. JAX takes the other branch and returns `0`.
 - **Domain widening** — `sqrt(x)` is defined at 0 and `1/(2*sqrt(x))` is not, so
   the derivative must not come back as a finite number.
 - **NULL** — a missing input stays missing rather than becoming `0`, which would
@@ -143,25 +129,18 @@ still matched JAX. So both sides are pinned:
 
 ## What this suite does not cover
 
-**Cross-engine equivalence as its own axis.** Every check here compares one
-engine against JAX; none compares DuckDB against DataFusion directly. Agreement
-with a common oracle implies agreement with each other *at the points both were
-admitted*, and the interesting disagreements are likely to be at the domain edges
-the conditioning gates deliberately screen out. Tracked as GitHub issue #30.
-
-**Identifier folding beyond these two engines.** ddx maps each SQL dialect to a
-case-folding rule, and only DuckDB and DataFusion are asserted against a running
-engine; the rest (Snowflake and Oracle fold unquoted identifiers to *upper* case,
-ClickHouse folds nothing) come from their documented semantics. Also GitHub #30.
+**Other engines.** Every check here runs on DataFusion, the engine ddxdb runs
+programs on. Another engine running the same programs through `ddxdb.Backend`
+is not compared against JAX here.
 
 **A soak.** Every suite here is seeded, so it explores the same expressions every
 run and will not find something new by running longer. That is deliberate — it is
 a blocking pull-request gate, and a gate has to be reproducible — but it means
 this is a fixed sample rather than a search. The unbounded random exploration
-lives on the Rust side, in `crates/ddx-core/tests/simulation.rs`.
+lives on the Rust side, in `crates/ddx-core/tests/simulation.rs` for the scalar
+rules and `crates/ddx-datafusion/tests/ad_simulation.rs` for whole queries.
 
-The Rust unit and integration tests for the engine itself live with the crate in
-[`../crates/ddx-core/tests`](../crates/ddx-core/tests): the ported rule tests,
-span splicing, the guards, identifier folding, and the semantic round-trip
-property test. The runnable spikes behind each design claim are in
+The Rust tests for the scalar rules live with the crate in
+[`../crates/ddx-core/tests`](../crates/ddx-core/tests), and those for
+query-level AD in [`../crates/ddx-datafusion/tests`](../crates/ddx-datafusion/tests). The runnable spikes behind each design claim are in
 [`../docs/spikes`](../docs/spikes).

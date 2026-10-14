@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Every v1 rule, one named test each, against `jax.grad`.
+"""Every scalar rule, one named test each, against `jax.grad`.
 
 The generated suite in `test_jax_agreement.py` is the stronger check — it finds
 compositions nobody thought to write — but it can only test rules that survive
@@ -32,7 +32,7 @@ jax = pytest.importorskip("jax", reason="the JAX oracle needs jax installed")
 ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
 
 import oracle  # noqa: E402  (must follow the skip guards above)
-from engines import ENGINES  # noqa: E402
+from engines import grad_column, grad_sql  # noqa: E402
 
 jnp = jax.numpy
 
@@ -82,24 +82,24 @@ RULES = [
 POINTS = 16
 
 
-@pytest.mark.parametrize("engine", ENGINES, ids=str)
 @pytest.mark.parametrize("rule, body, fn, domain", RULES, ids=[r[1] for r in RULES])
 @pytest.mark.parametrize("wrt", ["x", "y"])
-def test_rule_agrees_with_jax(engine, rule, body, fn, domain, wrt):
+def test_rule_agrees_with_jax(rule, body, fn, domain, wrt):
     """ddx's derivative of `body` matches `jax.grad` across the rule's domain.
 
     Differentiating with respect to `y` as well as `x` is not padding: most of
     these bodies do not mention `y`, so it checks that a rule contributes `0`
-    for a variable it does not contain rather than leaking a term.
+    for a variable it does not contain rather than leaking a term. A loss must
+    read the column it is differentiated along, so `+ y` is added to the body
+    then: its derivative is 1, and anything else is a leak.
     """
+    if wrt == "y":
+        body, fn = f"({body}) + y", (lambda x, y, _f=fn: _f(x, y) + y)
     lo, hi = domain
     xs = np.linspace(lo, hi, POINTS)
     ys = np.linspace(0.5, 2.5, POINTS)
 
-    sql = ddxdb.rewrite_sql(
-        f"SELECT grad({body}, {wrt}) AS d FROM t ORDER BY i", engine.dialect
-    )
-    got = engine.column(sql, xs, ys)
+    got = grad_column(body, wrt, xs, ys)
 
     grad = jax.grad(fn, argnums=0 if wrt == "x" else 1)
     want = np.asarray(jax.vmap(grad)(jnp.asarray(xs), jnp.asarray(ys)))
@@ -107,8 +107,8 @@ def test_rule_agrees_with_jax(engine, rule, body, fn, domain, wrt):
     for i, (x, y) in enumerate(zip(xs, ys)):
         scale = max(abs(float(want[i])), abs(float(fn(float(x), float(y)))), 1.0)
         assert oracle.close_at_scale(float(got[i]), float(want[i]), scale), (
-            f"{engine.name}: d/d{wrt} {body} disagrees with JAX\n"
-            f"  rewritten : {sql}\n"
+            f"d/d{wrt} {body} disagrees with JAX\n"
+            f"  statement : {grad_sql(body, wrt)}\n"
             f"  at        : x={float(x)!r}, y={float(y)!r}\n"
             f"  ddx={float(got[i])!r}  jax={float(want[i])!r}"
         )

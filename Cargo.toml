@@ -1,10 +1,9 @@
 # ddx — portable autograd for composable databases.
 #
-# One engine-neutral differentiation core (`ddx-core`, v1 / M0) plus thin
-# per-engine adapters. See docs/design.md §6 for the layout and the
-# dependency policy: `ddx-core` depends on `sqlparser` only; the heavy
-# per-engine dependencies (datafusion, duckdb) are quarantined in the
-# adapter crates.
+# Query-level AD over Substrait (`ddx-ad`), the scalar derivative rules it
+# uses for each expression (`ddx-core`), and thin per-engine adapters. The
+# heavy per-engine dependencies (datafusion, duckdb) are quarantined in the
+# adapter crates, so the cores can be driven from any engine.
 [workspace]
 resolver = "2"
 members = [
@@ -26,24 +25,14 @@ authors = ["Alexander Merose <al@merose.com>"]
 rust-version = "1.88"
 
 [workspace.dependencies]
-# The single load-bearing dependency of the core. Pinned exactly (see the
-# `sqlparser` version policy in docs/design.md §6): a bump is a breaking
-# release of ddx-core. 0.62 is the version every M0 spike was verified
-# against (spikes/sqlparser-spike, decision-log G1/G3).
+# ddx-core's expression type and ddx-ad's SQL parser. Pinned exactly, since
+# ddx-core's API takes and returns its types: a bump is a breaking release of
+# ddx-core. Kept at the version DataFusion uses, so the build
+# compiles one `sqlparser`.
 sqlparser = { version = "=0.62.0", features = ["visitor"] }
 
 # The DataFusion adapter's engine dependency (M2), quarantined to
 # `ddx-datafusion` — neither core crate may depend on it.
-#
-# The version is load-bearing for Path B, not incidental. The bridge unparses a
-# bound DataFusion `Expr` into a `sqlparser::ast::Expr` and hands it to
-# ddx-core, so the two crates MUST resolve the *identical* `sqlparser` — a
-# mismatch makes them two unrelated Rust types and the bridge stops compiling
-# datafusion 54.x requires `sqlparser ^0.62.0`,
-# which unifies with the exact `=0.62.0` pin above; 53.x wanted ^0.61 and would
-# NOT. `crates/ddx-datafusion/tests/sqlparser_pin.rs` asserts the resolved tree
-# still has exactly one `sqlparser`, so a future bump fails loudly at the pin
-# instead of confusingly at the bridge.
 #
 # Pinned exactly, always, as `sqlparser` and `substrait` are: `ddx-datafusion`'s
 # public API takes and returns DataFusion's own types (`SessionContext`,

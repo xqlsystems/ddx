@@ -29,8 +29,6 @@ const N: usize = 24;
 
 async fn setup() -> SessionContext {
     let ctx = SessionContext::new();
-    // nn.py's hand-written backward pass uses v1's grad() for tanh'.
-    ddx_datafusion::install(&ctx);
     let mut rng = Rng::new(7);
     model::register_data(&ctx, N, &mut rng).unwrap();
     model::register_model(&ctx, &mut rng).unwrap();
@@ -138,7 +136,7 @@ async fn hand_written_backward(ctx: &SessionContext) {
           FROM delta2 d JOIN weight w ON d.out = w.out AND w.layer = 2
           GROUP BY d.sample, w.inp)
         SELECT dc.sample, dc.out,
-               dc.val * grad(tanh(fwd1.z), fwd1.z) AS val
+               dc.val * (1 - tanh(fwd1.z) * tanh(fwd1.z)) AS val
         FROM dc JOIN fwd1 ON dc.sample = fwd1.sample AND dc.out = fwd1.out",
     )
     .await;
@@ -169,7 +167,7 @@ async fn hand_written_backward(ctx: &SessionContext) {
           FROM delta1 d JOIN weight w ON d.out = w.out AND w.layer = 1
           GROUP BY d.sample, w.inp)
         SELECT dc.sample, dc.out,
-               dc.val * grad(tanh(fwd0.z), fwd0.z) AS val
+               dc.val * (1 - tanh(fwd0.z) * tanh(fwd0.z)) AS val
         FROM dc JOIN fwd0 ON dc.sample = fwd0.sample AND dc.out = fwd0.out",
     )
     .await;

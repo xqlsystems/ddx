@@ -2,16 +2,17 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx-ad`: query-level reverse-mode automatic differentiation (ddx v2).
+//! `ddx-ad`: query-level automatic differentiation.
 //!
-//! v1 ([`ddx_core`]) differentiates one scalar expression. v2 differentiates a
-//! whole query, the way `jax.grad` differentiates a function: given a Substrait
-//! plan whose result is a loss, it emits the queries that compute the loss's
-//! gradient with respect to chosen table columns (design.md §4).
+//! `ddx-ad` differentiates a whole query, the way `jax.grad` differentiates a
+//! function: given a Substrait plan whose result is a loss, it emits the
+//! queries that compute the loss's gradient with respect to chosen table
+//! columns.
 //!
 //! A query is a composition of relational operators (map, select, join,
-//! aggregate), and each has a transpose rule, as each JAX primitive does. The
-//! map rule's local derivatives come from `ddx-core`. Nothing in the query has
+//! aggregate), and each has a transpose rule, as each JAX primitive does. A
+//! map computes each output row from one input row with scalar expressions;
+//! the partial derivatives of those expressions come from `ddx-core`. Nothing in the query has
 //! to be labelled for this; the one function ddx claims is
 //! `ddx_stop_gradient`, JAX's `lax.stop_gradient`.
 //!

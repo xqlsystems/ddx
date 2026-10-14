@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Simulation / property-based tests for the v1 differentiation engine
+//! Simulation / property-based tests for the scalar differentiation engine
 //! (design.md §5: "numeric agreement" + "round-trip property tests").
 //!
 //! These are adversarial: instead of hand-picked expressions, they generate
@@ -53,12 +53,10 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 
 use ddx_core::sqlparser::ast::Expr;
-use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::test_utils::{
-    central_diff, divides_by_noise, eval, fd_noise_floor, gen_adversarial_sql, gen_expr,
-    gen_expr_and_wrt, gen_marker_free_stmt, gen_marker_statement, has_residual_marker,
+    central_diff, divides_by_noise, eval, fd_noise_floor, gen_expr, gen_expr_and_wrt,
     max_intermediate_mag, metamorphic_mismatch, min_domain_margin, parse_expr, run_bounded, seeded,
-    try_parse, try_parse_stmt, Rng, Var,
+    try_parse, Rng, Var,
 };
 use ddx_core::{ColRef, Ddx, DiffError};
 
@@ -297,133 +295,8 @@ fn self_consumption_failure(ddx: &Ddx, wrt: &ColRef, original: &str) -> Option<S
 }
 
 // ---------------------------------------------------------------------------
-// Property 4: `rewrite_sql` splice fidelity (design.md §3.2, G3/F5).
-// ---------------------------------------------------------------------------
-//
-// The three properties above drive `differentiate` on bare expressions; none of
-// them exercise `rewrite_sql` — the parse-free pre-gate, the UTF-8-aware source
-// span → byte-offset splice, multiple/nested markers, or the marker-free
-// identity guarantee. That subsystem is exactly where bug #52 lived. The
-// invariant here is *structural* (byte-level), not numeric: rewriting a marker
-// statement must replace **only** each marker's span with `(derivative)` and
-// leave every other byte identical.
-
-/// Property 4a: assemble a statement with 1–3 markers wrapped in random
-/// (Unicode-bearing) scaffolding and assert `rewrite_sql` splices each marker
-/// exactly, byte-for-byte, leaving all surrounding text untouched. If any
-/// marker's derivative is undefined, the whole rewrite must error instead.
-fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
-    let (input, expected) = gen_marker_statement(rng, ddx);
-    let got = ddx.rewrite_sql(&input, &GenericDialect {});
-    let Some(expected) = expected else {
-        // At least one marker's derivative is undefined → the whole rewrite must
-        // fail loud, never partially rewrite.
-        return match got {
-            Err(_) => None,
-            Ok(o) => Some(format!(
-                "[splice] expected an error (a marker derivative is undefined) but got Ok:\n  input  = {input}\n  output = {o}"
-            )),
-        };
-    };
-    match got {
-        Ok(o) if o == expected => None,
-        Ok(o) => Some(format!(
-            "[splice] rewrite_sql splice mismatch:\n  input    = {input}\n  expected = {expected}\n  actual   = {o}"
-        )),
-        Err(e) => Some(format!(
-            "[splice] rewrite_sql errored on a valid marker statement:\n  input = {input}\n  error = {e}"
-        )),
-    }
-}
-
-/// Property 4b: a marker-free statement is returned byte-identical.
-fn marker_free_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
-    let s = gen_marker_free_stmt(rng);
-    match ddx.rewrite_sql(&s, &GenericDialect {}) {
-        Ok(o) if o == s => None,
-        Ok(o) => Some(format!(
-            "[identity] marker-free statement was modified:\n  input  = {s}\n  output = {o}"
-        )),
-        Err(e) => Some(format!(
-            "[identity] marker-free statement errored:\n  input = {s}\n  error = {e}"
-        )),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Additional invariants (issue #58).
 // ---------------------------------------------------------------------------
-
-/// Invariant 1: the SQL `rewrite_sql` emits must always re-parse and contain no
-/// residual marker. A *broad* net over the rewrite path — it needs no predicted
-/// output, so it tolerates arbitrary scaffolding, and it independently catches
-/// corruption bugs like #57 (the corrupt output fails to re-parse).
-fn rewrite_validity_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
-    let (input, expected) = gen_marker_statement(rng, ddx);
-    let out = match ddx.rewrite_sql(&input, &GenericDialect {}) {
-        Ok(o) => o,
-        // An undefined-derivative marker legitimately errors (fail loud).
-        Err(_) if expected.is_none() => return None,
-        Err(e) => {
-            return Some(format!(
-                "[validity] rewrite_sql errored on a valid marker statement:\n  input = {input}\n  error = {e}"
-            ))
-        }
-    };
-    match try_parse_stmt(&out) {
-        Err(e) => Some(format!(
-            "[validity] rewrite_sql emitted unparseable SQL:\n  input  = {input}\n  output = {out}\n  parse error = {e}"
-        )),
-        Ok(stmts) if has_residual_marker(&stmts) => Some(format!(
-            "[validity] rewrite_sql left a residual grad/jvp marker:\n  input  = {input}\n  output = {out}"
-        )),
-        Ok(_) => None,
-    }
-}
-
-/// Invariant 5: `rewrite_sql` is idempotent — a second pass over its own output
-/// is a no-op (no markers remain to rewrite, and the text is stable).
-fn idempotence_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
-    let (input, _) = gen_marker_statement(rng, ddx);
-    let once = match ddx.rewrite_sql(&input, &GenericDialect {}) {
-        Ok(o) => o,
-        Err(_) => return None, // undefined-derivative markers error; fine here
-    };
-    match ddx.rewrite_sql(&once, &GenericDialect {}) {
-        Ok(twice) if twice == once => None,
-        Ok(twice) => Some(format!(
-            "[idempotence] rewrite_sql is not idempotent:\n  input = {input}\n  once  = {once}\n  twice = {twice}"
-        )),
-        Err(e) => Some(format!(
-            "[idempotence] rewrite_sql errored on its own output:\n  input = {input}\n  once  = {once}\n  error = {e}"
-        )),
-    }
-}
-
-/// Invariant 2: `rewrite_sql` never *panics* — for any input, adversarial or
-/// malformed, it returns `Ok` or a typed `DiffError` (design principle 5: fail
-/// loud, never crash). The prime suspects are the UTF-8 `locate` math and the
-/// span logic.
-fn panic_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
-    let input = gen_adversarial_sql(rng);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Return a bool so nothing non-UnwindSafe crosses the boundary.
-        ddx.rewrite_sql(&input, &GenericDialect {}).is_ok()
-    }));
-    match result {
-        Ok(_) => None,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic>".to_string());
-            Some(format!(
-                "[panic] rewrite_sql PANICKED (must return a typed error instead):\n  input = {input:?}\n  panic = {msg}"
-            ))
-        }
-    }
-}
 
 /// Invariant 4: `d/dv` of an expression that does not mention `v` is exactly
 /// zero. Differentiating w.r.t. the fresh variable `w` (which the generator
@@ -569,23 +442,6 @@ fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String>
     if let Some(f) = linearity_failure(rng, ddx, text, wrt) {
         out.push(f);
     }
-    // Statement-level rewrite_sql properties (self-generating; the `text`/`wrt`
-    // above are for the expression-level checks).
-    if let Some(f) = splice_failure(rng, ddx) {
-        out.push(f);
-    }
-    if let Some(f) = marker_free_failure(rng, ddx) {
-        out.push(f);
-    }
-    if let Some(f) = rewrite_validity_failure(rng, ddx) {
-        out.push(f);
-    }
-    if let Some(f) = idempotence_failure(rng, ddx) {
-        out.push(f);
-    }
-    if let Some(f) = panic_failure(rng, ddx) {
-        out.push(f);
-    }
     out
 }
 
@@ -699,102 +555,6 @@ fn higher_order_self_consumption_is_stable() {
 }
 
 #[test]
-fn rewrite_sql_splice_is_byte_faithful() {
-    // Statement-level fuzz of `rewrite_sql`: markers wrapped in random
-    // (Unicode-bearing) scaffolding must be spliced exactly, leaving every other
-    // byte identical (design.md §3.2, G3/F5).
-    let ddx = Ddx::new();
-    let mut failures: Vec<String> = Vec::new();
-
-    for seed in 0..4000u64 {
-        let mut rng = seeded(seed, 0x5719_C0DE);
-        if let Some(report) = splice_failure(&mut rng, &ddx) {
-            failures.push(report);
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "splice-fidelity fuzz found {} failure(s):\n\n{}",
-        failures.len(),
-        failures
-            .iter()
-            .take(15)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    );
-}
-
-#[test]
-fn splice_handles_marker_with_cast_or_nested_tail() {
-    // The splice must cover the *whole* marker call. When the last argument's
-    // tail is a CAST (span excludes ` AS <type>`) or a Nested `( … )` (span
-    // excludes the closing `)`), rewrite_sql currently stops early and leaves
-    // trailing bytes behind, producing unbalanced/corrupt SQL (#57).
-    let ddx = Ddx::new();
-    // jvp(sin(x), x, CAST(y AS DOUBLE)) — tangent tail is a CAST.
-    assert_eq!(
-        ddx.rewrite_sql(
-            "SELECT jvp(sin(x), x, CAST(y AS DOUBLE)) FROM t",
-            &GenericDialect {}
-        )
-        .unwrap(),
-        "SELECT (cos(x) * CAST(y AS DOUBLE)) FROM t"
-    );
-    // jvp(x, x, (y + z)) — tangent tail is a Nested `( … )`.
-    assert_eq!(
-        ddx.rewrite_sql("SELECT jvp(x, x, (y + z)) FROM t", &GenericDialect {})
-            .unwrap(),
-        "SELECT ((y + z)) FROM t"
-    );
-}
-
-#[test]
-fn marker_free_statements_are_byte_identical() {
-    // The pre-gate / no-marker guarantee: a statement with no real marker —
-    // including one whose text carries a `grad(`/`jvp(` substring in a string,
-    // comment, or qualified call — comes back byte-identical (design.md §3.2).
-    let ddx = Ddx::new();
-    let mut failures: Vec<String> = Vec::new();
-
-    for seed in 0..2000u64 {
-        let mut rng = seeded(seed, 0x1DE0_7175);
-        if let Some(report) = marker_free_failure(&mut rng, &ddx) {
-            failures.push(report);
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "marker-free identity fuzz found {} failure(s):\n\n{}",
-        failures.len(),
-        failures
-            .iter()
-            .take(15)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    );
-}
-
-#[test]
-fn rewrite_sql_output_is_valid_and_marker_free() {
-    let ddx = Ddx::new();
-    run_bounded("rewrite validity fuzz", 4000, 0x5A11_D000, |rng| {
-        rewrite_validity_failure(rng, &ddx)
-    });
-}
-
-#[test]
-fn rewrite_sql_never_panics_on_adversarial_input() {
-    let ddx = Ddx::new();
-    run_bounded("never-panic fuzz", 5000, 0x9A11_C000, |rng| {
-        panic_failure(rng, &ddx)
-    });
-}
-
-#[test]
 fn jvp_equals_tangent_times_grad() {
     let ddx = Ddx::new();
     run_bounded("jvp↔grad consistency fuzz", 4000, 0x0F5E_ED00, |rng| {
@@ -810,14 +570,6 @@ fn derivative_of_absent_variable_is_zero() {
         let depth = 2 + rng.below(4) as u32;
         let text = gen_expr(rng, depth);
         zero_derivative_failure(rng, &ddx, &text)
-    });
-}
-
-#[test]
-fn rewrite_sql_is_idempotent() {
-    let ddx = Ddx::new();
-    run_bounded("idempotence fuzz", 4000, 0x1DE1_1000, |rng| {
-        idempotence_failure(rng, &ddx)
     });
 }
 

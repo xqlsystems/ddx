@@ -7,9 +7,8 @@
 //!
 //! A projection maps each row to a new row, one scalar expression per new
 //! column. Its transpose needs, for each output column, the partial derivative
-//! with respect to each input column of the same row. This is the seam
-//! between v1 and v2 (design.md §4.3): v1 already differentiates scalar
-//! expressions. So the rule translates the Substrait
+//! with respect to each input column of the same row, and `ddx-core`
+//! differentiates scalar expressions. So the rule translates the Substrait
 //! expression into the `sqlparser` expression `ddx-core` takes, asks for one
 //! derivative per input column, and translates each answer back.
 //!

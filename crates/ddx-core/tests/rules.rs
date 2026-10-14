@@ -10,13 +10,27 @@
 //! `div()` casts its numerator to `DOUBLE` (F4), and composite operands are
 //! `Nested`-wrapped for precedence safety (G1). Both are asserted here.
 
+use ddx_core::sqlparser::ast::Expr;
 use ddx_core::sqlparser::dialect::GenericDialect;
-use ddx_core::{Ddx, DiffError};
+use ddx_core::sqlparser::parser::Parser;
+use ddx_core::{ColRef, Ddx, DiffError};
+
+fn parse(text: &str) -> Expr {
+    Parser::new(&GenericDialect {})
+        .try_with_sql(text)
+        .and_then(|mut p| p.parse_expr())
+        .unwrap_or_else(|e| panic!("`{text}` does not parse: {e}"))
+}
+
+/// The derivative of `expr` with respect to the column `wrt`, as SQL text.
+fn diff(expr: &str, wrt: &str) -> Result<String, DiffError> {
+    Ok(Ddx::new()
+        .differentiate(&parse(expr), &ColRef::bare(wrt))?
+        .to_string())
+}
 
 fn d(expr: &str, wrt: &str) -> String {
-    Ddx::new()
-        .differentiate_sql(expr, wrt, &GenericDialect {})
-        .unwrap_or_else(|e| panic!("differentiate_sql({expr}, {wrt}) failed: {e}"))
+    diff(expr, wrt).unwrap_or_else(|e| panic!("d({expr})/d{wrt} failed: {e}"))
 }
 
 #[test]
@@ -107,17 +121,13 @@ fn higher_order_derivative() {
 
 #[test]
 fn unsupported_operator_errors() {
-    assert!(Ddx::new()
-        .differentiate_sql("x % y", "x", &GenericDialect {})
-        .is_err());
+    assert!(diff("x % y", "x").is_err());
 }
 
 #[test]
 fn unsupported_function_errors() {
     // atan2 is binary and has no rule yet.
-    assert!(Ddx::new()
-        .differentiate_sql("atan2(x, y)", "x", &GenericDialect {})
-        .is_err());
+    assert!(diff("atan2(x, y)", "x").is_err());
 }
 
 #[test]
@@ -150,7 +160,7 @@ fn power_fractional_exponent_output_is_reconsumable() {
     let once = d("power(x, 0.5)", "x");
     assert!(once.contains("/ power(x, 0.5)"), "unexpected: {once}");
     // Re-parse and differentiate the emitted text again — no error.
-    let twice = Ddx::new().differentiate_sql(&once, "x", &GenericDialect {});
+    let twice = diff(&once, "x");
     assert!(twice.is_ok(), "engine rejected its own output: {twice:?}");
 }
 
@@ -180,11 +190,9 @@ fn a_negative_power_is_a_division_so_a_zero_base_gives_infinity() {
 fn power_non_positive_constant_base_errors() {
     // d/dx power(0, x) would need ln(0) = -inf; must fail loud, not emit
     // "power(0, x) * -inf" (review #33).
-    let err = Ddx::new()
-        .differentiate_sql("power(0, x)", "x", &GenericDialect {})
-        .unwrap_err();
+    let err = diff("power(0, x)", "x").unwrap_err();
     assert!(matches!(err, DiffError::NotImplemented(_)), "got {err:?}");
-    let out = Ddx::new().differentiate_sql("power(2, x)", "x", &GenericDialect {});
+    let out = diff("power(2, x)", "x");
     assert!(out.is_ok(), "positive base should differentiate: {out:?}");
     assert!(!out.unwrap().to_lowercase().contains("inf"));
 }
@@ -194,9 +202,7 @@ fn power_non_finite_constant_exponent_errors() {
     // The mirror of the non-positive-base guard, on the exponent side: an
     // out-of-range literal exponent (1e400 overflows f64 to +inf) must fail
     // loud rather than emit an `inf` token (review #33).
-    let err = Ddx::new()
-        .differentiate_sql("power(x, 1e400)", "x", &GenericDialect {})
-        .unwrap_err();
+    let err = diff("power(x, 1e400)", "x").unwrap_err();
     assert!(matches!(err, DiffError::NotImplemented(_)), "got {err:?}");
 }
 
@@ -214,9 +220,7 @@ fn non_finite_exponent_still_differentiates_to_zero_when_base_is_constant_in_wrt
 fn schema_qualified_call_does_not_match_builtin_rule() {
     // myschema.sin(x) may be an unrelated user function; it must NOT silently
     // differentiate via the built-in sin rule (review #47).
-    assert!(Ddx::new()
-        .differentiate_sql("myschema.sin(x)", "x", &GenericDialect {})
-        .is_err());
+    assert!(diff("myschema.sin(x)", "x").is_err());
     // The unqualified builtin still works.
     assert_eq!(d("sin(x)", "x"), "cos(x)");
 }
@@ -224,9 +228,7 @@ fn schema_qualified_call_does_not_match_builtin_rule() {
 #[test]
 fn general_power_uv_errors() {
     // power(x, x): both base and exponent vary — not supported yet.
-    assert!(Ddx::new()
-        .differentiate_sql("power(x, x)", "x", &GenericDialect {})
-        .is_err());
+    assert!(diff("power(x, x)", "x").is_err());
 }
 
 #[test]
@@ -253,9 +255,7 @@ fn cast_to_numeric_type_is_differentiable() {
 fn cast_to_non_numeric_type_errors() {
     // Differentiating through CAST(... AS VARCHAR) would emit a nonsensical
     // CAST(1.0 AS VARCHAR); it must be a typed error instead.
-    assert!(Ddx::new()
-        .differentiate_sql("CAST(x AS VARCHAR)", "x", &GenericDialect {})
-        .is_err());
+    assert!(diff("CAST(x AS VARCHAR)", "x").is_err());
 }
 
 #[test]
@@ -269,9 +269,7 @@ fn cast_to_an_integer_or_decimal_type_is_refused_where_it_depends_on_the_variabl
         "CAST(x AS DECIMAL(10, 2))",
         "CAST(x AS SMALLINT) + x",
     ] {
-        let err = Ddx::new()
-            .differentiate_sql(sql, "x", &GenericDialect {})
-            .unwrap_err();
+        let err = diff(sql, "x").unwrap_err();
         assert!(
             matches!(err, DiffError::NotImplemented(ref m) if m.contains("Cast to DOUBLE")),
             "{sql}: {err}"
@@ -315,21 +313,18 @@ fn abs_derivative_is_portable_and_pins_the_kink_at_zero() {
 fn jvp_seeds_a_tangent_on_one_input() {
     // jvp(x*y, x, dx) = product rule with tangent(x)=dx, tangent(y)=0 = dx*y
     let out = Ddx::new()
-        .rewrite_sql("SELECT jvp(x * y, x, dx) AS t FROM g", &GenericDialect {})
+        .jvp(&parse("x * y"), &[(ColRef::bare("x"), parse("dx"))])
         .unwrap();
-    assert_eq!(out, "SELECT (dx * y) AS t FROM g");
+    assert_eq!(out.to_string(), "dx * y");
 }
 
 #[test]
 fn jvp_with_unit_seed_matches_grad() {
     // A one-hot tangent reproduces the partial derivative.
     let jvp = Ddx::new()
-        .rewrite_sql("SELECT jvp(sin(x), x, 1.0) AS t FROM g", &GenericDialect {})
+        .jvp(&parse("sin(x)"), &[(ColRef::bare("x"), parse("1.0"))])
         .unwrap();
-    let grad = Ddx::new()
-        .rewrite_sql("SELECT grad(sin(x), x) AS t FROM g", &GenericDialect {})
-        .unwrap();
-    assert_eq!(jvp, grad);
+    assert_eq!(jvp.to_string(), d("sin(x)", "x"));
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +333,7 @@ fn jvp_with_unit_seed_matches_grad() {
 // ---------------------------------------------------------------------------
 
 fn err_msg(expr: &str, wrt: &str) -> String {
-    Ddx::new()
-        .differentiate_sql(expr, wrt, &GenericDialect {})
-        .unwrap_err()
-        .to_string()
+    diff(expr, wrt).unwrap_err().to_string()
 }
 
 #[test]
@@ -366,16 +358,6 @@ fn unsupported_operator_error_lists_supported_operators() {
         m.contains("+ - * /"),
         "should list differentiable operators: {m}"
     );
-}
-
-#[test]
-fn wrt_not_a_column_error_shows_the_right_form() {
-    let m = err_msg("x * y", "x + y");
-    assert!(
-        m.contains("bare column"),
-        "should say a bare column is required: {m}"
-    );
-    assert!(m.contains("x + y"), "should echo the offending wrt: {m}");
 }
 
 #[test]

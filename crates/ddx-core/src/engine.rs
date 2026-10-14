@@ -30,7 +30,7 @@ use crate::constructors::{
 };
 use crate::error::{DiffError, Result};
 
-/// A one-line summary of what v1 differentiates, appended to "unsupported"
+/// A one-line summary of what ddx-core differentiates, appended to "unsupported"
 /// errors so a user reading the message learns what *is* supported and can act.
 const SUPPORTED: &str = "ddx differentiates the operators + - * /, unary calls to \
 sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs, power(...) with a \
@@ -63,7 +63,7 @@ fn rule(f: impl Fn(&Expr) -> Expr + Send + Sync + 'static) -> Rule {
 }
 
 impl RuleRegistry {
-    /// A registry populated with the built-in v1 rule set: `+ - * /`, the unary
+    /// A registry populated with the built-in rule set: `+ - * /`, the unary
     /// chain rule for the trig / inverse-trig / exp / log / hyperbolic set plus
     /// `abs`, and `power` with a constant base or exponent (design.md §3.6).
     pub fn new() -> Self {
