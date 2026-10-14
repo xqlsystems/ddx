@@ -1528,7 +1528,12 @@ breadth, not de-risking.
   `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); the Python
   API (`ddxdb` 0.3: `jvp`, `jvp_plan`, `ForwardProgram`, composition),
   checked against `jax.jvp` and, both ways, `jax.jvp(jax.grad(f))` on the
-  MLP fixture. Still to come: `jvp(…)` in SQL, a soak oracle for `jvp`, and
+  MLP fixture; `run` returning values. The soak checks `jvp` on its random
+  queries against reverse mode, exactly (`tests/ad_simulation/jvp.rs`:
+  ⟨∇L, t⟩, linearity, a missing tangent row as 0, the dot-product test
+  against `vjp`, `H·t`'s symmetry and its value, a repeated tangent key
+  refused); 332 cases and 3,350 comparisons in a five-minute run, none
+  failing. Still to come: `jvp(…)` in SQL, and
   `Verified` from Python.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
