@@ -23,7 +23,7 @@ use ddx_ad::substrait::proto::join_rel::JoinType;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan};
-use ddx_ad::{Extensions, Functions};
+use ddx_ad::{Extensions, Function, Functions};
 
 async fn ctx() -> SessionContext {
     let ctx = SessionContext::new();
@@ -76,7 +76,7 @@ async fn run_sql(ctx: &SessionContext, sql: &str) -> String {
 async fn project_and_grouped_aggregate() {
     let ctx = ctx().await;
     let mut ext = Extensions::new(&Functions::default());
-    let (mul, sum) = (ext.anchor("multiply"), ext.anchor("sum"));
+    let (mul, sum) = (ext.anchor(Function::Multiply), ext.anchor(Function::Sum));
     // SELECT i, SUM(val * 2.0) FROM a GROUP BY i
     let rel = aggregate(
         project(
@@ -97,8 +97,8 @@ async fn project_and_grouped_aggregate() {
 async fn null_safe_join_filter_select_and_union() {
     let ctx = ctx().await;
     let mut ext = Extensions::new(&Functions::default());
-    let same = ext.anchor("is_not_distinct_from");
-    let gt = ext.anchor("gt");
+    let same = ext.anchor(Function::IsNotDistinctFrom);
+    let gt = ext.anchor(Function::Gt);
     let a = || async { read_table(vec!["a".into()], schema_of(&ctx, "a").await) };
     // SELECT a.i, a.val * b.w FROM a JOIN b ON a.i IS NOT DISTINCT FROM b.i
     // WHERE a.val > 1.5, then UNION ALL of it with itself.
@@ -108,7 +108,7 @@ async fn null_safe_join_filter_select_and_union() {
         call(same, vec![field(0), field(3)]),
         JoinType::Inner,
     );
-    let mul = ext.anchor("multiply");
+    let mul = ext.anchor(Function::Multiply);
     let one = select(
         project(
             filter(joined, call(gt, vec![field(2), lit_f64(1.5)])),
@@ -144,7 +144,7 @@ async fn an_unbound_read_runs_once_bound_to_the_materialized_step() {
     ctx.register_table("__ddx_fwd_0", Arc::new(table)).unwrap();
 
     let mut ext = Extensions::new(&Functions::default());
-    let mul = ext.anchor("multiply");
+    let mul = ext.anchor(Function::Multiply);
     let rel = project(
         read_step("__ddx_fwd_0", vec!["c1".into(), "c0".into()]),
         vec![call(mul, vec![field(0), lit_f64(3.0)])],

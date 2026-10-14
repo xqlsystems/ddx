@@ -51,7 +51,7 @@ use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
 use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
 use crate::forward::{subquery_rounds, width, Def, Forward, Input, Output, Region};
-use crate::functions::Extensions;
+use crate::functions::{Extensions, Function};
 
 /// An input's cotangent from one place that reads it: the input's dims, then
 /// the cotangent of each of its columns in `cols`.
@@ -141,9 +141,9 @@ impl<'a> Transposer<'a> {
         // need not be bit-identical to the forward pass (a grouped SUM over
         // several partitions adds in arrival order), and a saved maximum no
         // recomputed row equals would silently send no gradient at all.
-        let count = self.ext.anchor("count");
-        let sum = self.ext.anchor("sum");
-        let isnan = self.ext.anchor("isnan");
+        let count = self.ext.anchor(Function::Count);
+        let sum = self.ext.anchor(Function::Sum);
+        let isnan = self.ext.anchor(Function::IsNan);
         let mut rel = rows;
         let mut next = rows_width;
         let mut stat_at = BTreeMap::new();
@@ -204,8 +204,8 @@ impl<'a> Transposer<'a> {
         let key_positions: Vec<usize> = (0..dims.len()).collect();
         let base = self.join_on(rel, cotangent, keys, &key_positions, next)?;
 
-        let divide = self.ext.anchor("divide");
-        let is_null = self.ext.anchor("is_null");
+        let divide = self.ext.anchor(Function::Divide);
+        let is_null = self.ext.anchor(Function::IsNull);
         let mut seeds = Vec::new();
         for (arg_col, rule, i, _) in rules {
             let cot = field(cotangent_at + i);
@@ -255,9 +255,9 @@ impl<'a> Transposer<'a> {
         if terms.len() == 1 {
             return terms.pop().expect("one term");
         }
-        let add = self.ext.anchor("add");
-        let and = self.ext.anchor("and");
-        let is_null = self.ext.anchor("is_null");
+        let add = self.ext.anchor(Function::Add);
+        let and = self.ext.anchor(Function::And);
+        let is_null = self.ext.anchor(Function::IsNull);
         let none = terms
             .iter()
             .map(|t| call(is_null, vec![t.clone()]))
@@ -283,16 +283,16 @@ impl<'a> Transposer<'a> {
     /// of its values a few ulps apart do not tie (MAX(1, 1 + 2 ulps) has
     /// gradient (0, 1), as jax.grad gives).
     fn attains(&mut self, arg: usize, extreme: usize, tolerant: bool) -> Expression {
-        let equal = self.ext.anchor("equal");
+        let equal = self.ext.anchor(Function::Equal);
         if !tolerant {
             return call(equal, vec![field(arg), field(extreme)]);
         }
-        let or = self.ext.anchor("or");
-        let and = self.ext.anchor("and");
-        let lte = self.ext.anchor("lte");
-        let abs = self.ext.anchor("abs");
-        let subtract = self.ext.anchor("subtract");
-        let multiply = self.ext.anchor("multiply");
+        let or = self.ext.anchor(Function::Or);
+        let and = self.ext.anchor(Function::And);
+        let lte = self.ext.anchor(Function::Lte);
+        let abs = self.ext.anchor(Function::Abs);
+        let subtract = self.ext.anchor(Function::Subtract);
+        let multiply = self.ext.anchor(Function::Multiply);
         let size = call(abs, vec![field(extreme)]);
         let finite = call(lte, vec![size.clone(), lit_f64(f64::MAX)]);
         let gap = call(abs, vec![call(subtract, vec![field(arg), field(extreme)])]);
@@ -331,8 +331,8 @@ impl<'a> Transposer<'a> {
             });
         }
         // IS NOT DISTINCT FROM, so a NULL group keeps its gradient.
-        let same = self.ext.anchor("is_not_distinct_from");
-        let and = self.ext.anchor("and");
+        let same = self.ext.anchor(Function::IsNotDistinctFrom);
+        let and = self.ext.anchor(Function::And);
         let cond = left_keys
             .into_iter()
             .zip(right_keys)
@@ -581,7 +581,7 @@ impl<'a> Transposer<'a> {
         cotangent: usize,
         varied: &[bool],
     ) -> Result<Vec<(usize, Expression)>> {
-        let mul = self.ext.anchor("multiply");
+        let mul = self.ext.anchor(Function::Multiply);
         let partials = self.ew.partials(f, &|c| varied[c], &mut self.ext)?;
         Ok(partials
             .into_iter()
@@ -615,7 +615,7 @@ impl<'a> Transposer<'a> {
             AdError::Internal("gradient reached an input that is not part of the output".into())
         })?;
         let dims = self.slot_dims(region, slot)?;
-        let sum = self.ext.anchor("sum");
+        let sum = self.ext.anchor(Function::Sum);
         let groupings = dims.iter().map(|d| field(at(offset + d))).collect();
         let measures = cols.values().map(|&c| (sum, vec![field(at(c))])).collect();
         self.contributions
@@ -723,7 +723,7 @@ enum Rule {
     Mean,
     /// `MAX` or `MIN` (the name): the rows attaining it share the group's
     /// cotangent.
-    Extreme(&'static str),
+    Extreme(Function),
 }
 
 /// What the reduce rules do with one measure.
@@ -750,8 +750,8 @@ fn reduce_rule(functions: &crate::functions::Functions, f: &AggregateFunction) -
         "count" => return Ok(Reduce::Constant),
         "sum" => Rule::Sum,
         "avg" | "mean" => Rule::Mean,
-        "max" => Rule::Extreme("max"),
-        "min" => Rule::Extreme("min"),
+        "max" => Rule::Extreme(Function::Max),
+        "min" => Rule::Extreme(Function::Min),
         other => {
             return Err(AdError::NotImplemented(format!(
                 "the aggregate `{other}` over a value that carries gradient; ddx has transpose \

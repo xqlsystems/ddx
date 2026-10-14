@@ -32,6 +32,88 @@ use substrait::proto::Plan;
 
 use crate::error::{AdError, Result};
 
+/// Defines [`Function`] from one table of variants and names, so the two
+/// cannot drift apart.
+macro_rules! functions {
+    ($($variant:ident => $name:literal,)*) => {
+        /// A function ddx writes into a plan.
+        ///
+        /// Each was checked by name on both DataFusion's and DuckDB 1.5.6's
+        /// Substrait consumers, with a plan calling that one function. A
+        /// function an engine might refuse cannot be written: add a variant
+        /// only once both engines know its name. (`negate` is missing on
+        /// purpose: DuckDB's consumer does not know it, so ddx multiplies by
+        /// -1.)
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Function {
+            $(
+                #[doc = concat!("`", $name, "`")]
+                $variant,
+            )*
+        }
+
+        impl Function {
+            /// Every function ddx may write.
+            pub const ALL: &'static [Function] = &[$(Function::$variant,)*];
+
+            /// Its name in a plan's extension declarations.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Function::$variant => $name,)*
+                }
+            }
+        }
+    };
+}
+
+functions! {
+    Add => "add",
+    Subtract => "subtract",
+    Multiply => "multiply",
+    Divide => "divide",
+    Abs => "abs",
+    Lt => "lt",
+    Lte => "lte",
+    Gt => "gt",
+    Gte => "gte",
+    Equal => "equal",
+    IsNull => "is_null",
+    IsNotDistinctFrom => "is_not_distinct_from",
+    And => "and",
+    Or => "or",
+    IsNan => "isnan",
+    Sqrt => "sqrt",
+    Ln => "ln",
+    Exp => "exp",
+    Sin => "sin",
+    Cos => "cos",
+    Tan => "tan",
+    Tanh => "tanh",
+    Sinh => "sinh",
+    Cosh => "cosh",
+    Asin => "asin",
+    Acos => "acos",
+    Atan => "atan",
+    Power => "power",
+    Log2 => "log2",
+    Log10 => "log10",
+    Sign => "sign",
+    Sum => "sum",
+    Count => "count",
+    Max => "max",
+    Min => "min",
+    Avg => "avg",
+}
+
+impl Function {
+    /// The function named `name`, compared as [`normalize`] does; `None` if
+    /// it is not one ddx may write.
+    pub fn from_name(name: &str) -> Option<Function> {
+        let name = normalize(name);
+        Function::ALL.iter().copied().find(|f| f.name() == name)
+    }
+}
+
 /// The SQL name of the stop-gradient function: `ddx_stop_gradient(x)` is `x`,
 /// and no gradient flows into `x` through it.
 pub const STOP_GRADIENT: &str = "ddx_stop_gradient";
@@ -208,12 +290,20 @@ impl Extensions {
         }
     }
 
-    /// The anchor for function `name`, declaring it if needed.
+    /// The anchor for `function`, declaring it if needed.
+    pub fn anchor(&mut self, function: Function) -> u32 {
+        self.anchor_named(function.name())
+    }
+
+    /// The anchor for a function the input plans already call, by name,
+    /// declaring it if needed: copying a plan's own calls (a user's function
+    /// included) into a plan ddx writes. A function ddx adds goes through
+    /// [`Extensions::anchor`].
     ///
     /// A new declaration has no extension URN, which is how DataFusion 54
     /// declares every function, its own included; its consumer resolves
     /// functions by name.
-    pub fn anchor(&mut self, name: &str) -> u32 {
+    pub fn anchor_named(&mut self, name: &str) -> u32 {
         if let Some(a) = self.by_name.get(&normalize(name)) {
             return *a;
         }
@@ -293,7 +383,7 @@ pub(crate) mod tests {
         plan.extensions.push(ty.clone());
         let functions = Functions::from_plan(&plan).unwrap();
         let mut ext = Extensions::new(&functions);
-        ext.anchor("multiply");
+        ext.anchor(Function::Multiply);
         assert_eq!(ext.urns(), plan.extension_urns);
         let declared = ext.declarations();
         assert_eq!(declared[0], plan.extensions[0]);
@@ -318,13 +408,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_function_is_found_by_its_own_name_in_any_case() {
+        for &f in Function::ALL {
+            assert_eq!(Function::from_name(f.name()), Some(f));
+            assert_eq!(Function::from_name(&f.name().to_uppercase()), Some(f));
+        }
+        assert_eq!(Function::from_name("negate"), None);
+    }
+
+    #[test]
     fn extensions_keep_the_input_anchors_and_add_new_ones_after_them() {
         let plan = plan_declaring(&[(0, "multiply"), (4, "sum:fp64")]);
         let mut ext = Extensions::new(&Functions::from_plan(&plan).unwrap());
-        assert_eq!(ext.anchor("multiply"), 0);
-        assert_eq!(ext.anchor("SUM"), 4);
-        assert_eq!(ext.anchor("add"), 5);
-        assert_eq!(ext.anchor("add"), 5);
+        assert_eq!(ext.anchor(Function::Multiply), 0);
+        assert_eq!(ext.anchor_named("SUM"), 4);
+        assert_eq!(ext.anchor(Function::Add), 5);
+        assert_eq!(ext.anchor(Function::Add), 5);
         let out = Plan {
             extensions: ext.declarations(),
             ..Default::default()

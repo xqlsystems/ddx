@@ -409,3 +409,160 @@ fn vjp_of_a_jvp_program_does_not_overflow_a_worker_threads_stack() {
         "vjp of a jvp program on a 2 MB stack: {status}"
     );
 }
+
+#[tokio::test]
+async fn every_plan_for_a_three_layer_mlp_decodes_within_protobufs_default_nesting_limit() {
+    // datafusion-python decodes a plan with protobuf's default limit of 100
+    // nested messages, two per relation. jvp of a three-layer MLP's loss
+    // nested 61 relations deep, so ddxdb could not run it; fusing each
+    // projection that only picks columns into its neighbour (ddx-ad's
+    // opt::fuse) takes it to 43.
+    let ctx = SessionContext::new();
+    let table = |name: &str, dims: &[(&str, usize)]| {
+        let n: usize = dims.iter().map(|d| d.1).product();
+        let mut stride = n;
+        let cols: Vec<String> = dims
+            .iter()
+            .map(|(d, size)| {
+                stride /= size;
+                format!("CAST((r / {stride}) % {size} AS BIGINT) AS {d}")
+            })
+            .collect();
+        format!(
+            "CREATE TABLE {name} AS SELECT {}, 0.1 * sin(CAST(r AS DOUBLE)) AS val \
+             FROM (SELECT unnest(range(0, {n})) AS r)",
+            cols.join(", ")
+        )
+    };
+    for sql in [
+        table("x", &[("sample", 8), ("inp", 6)]),
+        table("w0", &[("inp", 6), ("out", 5)]),
+        table("b0", &[("out", 5)]),
+        table("w1", &[("inp", 5), ("out", 4)]),
+        table("b1", &[("out", 4)]),
+        table("w2", &[("inp", 4), ("out", 3)]),
+        table("b2", &[("out", 3)]),
+        "CREATE TABLE y AS SELECT CAST(r AS BIGINT) AS sample, CAST(r % 3 AS BIGINT) AS label \
+         FROM (SELECT unnest(range(0, 8)) AS r)"
+            .to_string(),
+    ] {
+        ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    }
+    let layer = |i: usize, src: &str| {
+        format!(
+            "c{i} AS (SELECT a.sample, w.out, SUM(a.val * w.val) AS z FROM {src} a \
+             JOIN w{i} w ON a.inp = w.inp GROUP BY a.sample, w.out), \
+             z{i} AS (SELECT c.sample, c.out, c.z + b.val AS z FROM c{i} c JOIN b{i} b ON c.out = b.out)"
+        )
+    };
+    let loss = format!(
+        "WITH {}, h0 AS (SELECT sample, out AS inp, tanh(z) AS val FROM z0), {}, \
+         h1 AS (SELECT sample, out AS inp, tanh(z) AS val FROM z1), {}, \
+         m AS (SELECT sample, MAX(z) AS m FROM z2 GROUP BY sample), \
+         e AS (SELECT z2.sample, z2.out, exp(z2.z - m.m) AS e FROM z2 JOIN m ON z2.sample = m.sample), \
+         s AS (SELECT sample, SUM(e) AS s FROM e GROUP BY sample), \
+         loss AS (SELECT -AVG(ln(e.e / s.s)) AS loss FROM e JOIN s ON e.sample = s.sample \
+                  JOIN y ON y.sample = e.sample WHERE e.out = y.label) \
+         SELECT * FROM loss",
+        layer(0, "x"),
+        layer(1, "h0"),
+        layer(2, "h1")
+    );
+    let wrt: Vec<ColumnRef> = ["w0", "b0", "w1", "b1", "w2", "b2"]
+        .iter()
+        .map(|t| ColumnRef::new(*t, "val"))
+        .collect();
+    let grad = ad::grad(&ctx, loss.as_str(), &wrt).await.unwrap();
+    let jvp = ad::jvp(&ctx, loss.as_str(), &wrt).await.unwrap();
+    let hvp = ad::jvp(&ctx, &grad, &wrt).await.unwrap();
+    let plans = grad
+        .steps()
+        .chain(&jvp.steps)
+        .chain(&hvp.steps)
+        .map(|s| (&s.name, &s.plan));
+    for (name, plan) in plans {
+        let bytes = prost::Message::encode_to_vec(plan);
+        let decoded = <ddx_ad::substrait::proto::Plan as prost::Message>::decode(bytes.as_slice());
+        assert!(
+            decoded.is_ok(),
+            "step {name}: {:?}",
+            decoded.err().map(|e| e.to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_plan_for_nn_py_decodes_within_protobufs_default_nesting_limit() {
+    // nn.py's jvp step is deeper than fusion alone flattens: every subtree
+    // 32 relations deep becomes a step of its own (ddx-ad's opt::split), so
+    // no step passes datafusion-python's decoding limit.
+    let ctx = SessionContext::new();
+    let mut rng = model::Rng::new(7);
+    model::register_data(&ctx, 10, &mut rng).unwrap();
+    model::register_model(&ctx, &mut rng).unwrap();
+    let loss = model::loss_sql();
+    let wrt = [
+        ColumnRef::new("weight", "val"),
+        ColumnRef::new("bias", "val"),
+    ];
+    let grad = ad::grad(&ctx, loss.as_str(), &wrt).await.unwrap();
+    let jvp = ad::jvp(&ctx, loss.as_str(), &wrt).await.unwrap();
+    let hvp = ad::jvp(&ctx, &grad, &wrt).await.unwrap();
+    assert!(jvp.steps.iter().any(|s| s.name.contains("_part_")));
+    let plans = grad
+        .steps()
+        .chain(&jvp.steps)
+        .chain(&hvp.steps)
+        .map(|s| (&s.name, &s.plan));
+    for (name, plan) in plans {
+        let bytes = prost::Message::encode_to_vec(plan);
+        let decoded = <ddx_ad::substrait::proto::Plan as prost::Message>::decode(bytes.as_slice());
+        assert!(
+            decoded.is_ok(),
+            "step {name}: {:?}",
+            decoded.err().map(|e| e.to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_split_step_computes_what_it_did_whole() {
+    // jvp through forty stacked aggregates is split into parts; its
+    // directional derivative is still ⟨∇l, v⟩ from grad.
+    let ctx = setup(&[w()]).await;
+    let mut ctes = vec!["h0 AS (SELECT i, o, val AS v FROM w)".to_string()];
+    for k in 1..40 {
+        ctes.push(format!(
+            "h{k} AS (SELECT i, o, SUM(tanh(v) + 0.5 * v) AS v FROM h{} GROUP BY i, o)",
+            k - 1
+        ));
+    }
+    let loss = format!("WITH {} SELECT SUM(v) AS l FROM h39", ctes.join(", "));
+    let wrt = [ColumnRef::new("w", "val")];
+    let jvp = ad::jvp(&ctx, loss.as_str(), &wrt).await.unwrap();
+    assert!(
+        jvp.steps.len() > 1,
+        "{:?}",
+        jvp.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    register_tangent(&ctx, &jvp.inputs[0], 0.0).await;
+    ad::run(&ctx, &jvp).await.unwrap();
+    let t = &jvp.value.tangents[0].tangent;
+    let got = rows(&ctx, &format!("SELECT {t} FROM {}", jvp.value.step)).await[0][0];
+
+    let grad = ad::grad(&ctx, loss.as_str(), &wrt).await.unwrap();
+    common::ad::run(&ctx, &grad).await;
+    let g = &grad.gradients[0].step;
+    let want = rows(
+        &ctx,
+        &format!(
+            "SELECT SUM(g.val * v.val) FROM {g} g JOIN {} v ON g.i = v.i AND g.o = v.o",
+            jvp.inputs[0].name
+        ),
+    )
+    .await[0][0];
+    assert!(
+        (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+        "{got} vs {want}"
+    );
+}

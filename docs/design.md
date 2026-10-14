@@ -1103,6 +1103,26 @@ max and sum, the weighted values, the output projection, two layer norms'
 means and variances, two feed-forward contractions), so about `28·D` steps:
 roughly `84·D` ms of fixed cost per training step.
 
+**Depth.** `ddx-ad`'s `opt` module optimizes every plan and program ddx
+writes, without changing what they compute: `prune` drops the columns
+nothing reads (above); `fuse` folds a projection into its neighbour when one
+of the two only picks columns, nothing is computed twice, no expression
+grows and no window function moves (two levels of computed columns keep
+their boundary, since DataFusion names a computed column by its expression
+and the boundary keeps names short: without it, a tangent through stacked
+aggregates grows its names exponentially); and `split` makes every subtree
+32 relations deep a step of its own, run first and read by name in its
+place, so no step is deeper. Depth matters beyond planning time:
+datafusion-python decodes a plan with protobuf's default limit of 100 nested
+messages, two per relation, and a consumer recurses once per relation.
+Fusion takes a three-layer MLP's `jvp` step from 61 relations to 43;
+splitting brings nn.py's, and a `jvp` through forty stacked aggregates,
+within 32. A part costs writing it, on deep steps only. On nn.py and a
+contraction, programs run 1–9% faster for fusion, with plans 2–4% smaller
+and builds about 5% slower. Reverse mode's lowering walks chains of
+projections, filters, sorts, limits and aggregates with a loop, so a deep
+query does not overflow a 2 MB worker stack.
+
 **How the overhead scales with a model.** In the data sizes (batch `B`,
 sequence length `L`, width `d`, heads `H`) the backward-to-forward ratio is a
 constant: every backward contraction mirrors a forward one, and the

@@ -54,7 +54,7 @@ use crate::emit::{aggregate, join, plan, project_emit, read_step, read_table, se
 use crate::error::{AdError, Result};
 use crate::expr::{call, cast, field, if_then, lit_f64, map_fields, null_f64};
 use crate::forward::{saved_name, step_columns, Forward, Input};
-use crate::functions::{Extensions, Functions};
+use crate::functions::{Extensions, Function, Functions};
 use crate::relation::ColumnRef;
 use crate::relation::Table;
 use crate::tables::{InputTable, Of, OutputTable};
@@ -399,7 +399,7 @@ fn build(
         restrictions[i] = Some(match restrictions[i].take() {
             // Two restrictions of one table: rows both allow.
             Some(prev) => {
-                let and = t.ext.anchor("and");
+                let and = t.ext.anchor(Function::And);
                 call(and, vec![prev, pred])
             }
             None => pred,
@@ -439,7 +439,7 @@ fn build(
             // A NULL loss does not move with anything in it, as with vjp's
             // NULL output rows (seed_cotangent): its seed is NULL, so no
             // gradient flows back through it.
-            let is_null = t.ext.anchor("is_null");
+            let is_null = t.ext.anchor(Function::IsNull);
             let seed = if_then(
                 vec![(call(is_null, vec![field(col)]), null_f64())],
                 lit_f64(1.0),
@@ -525,50 +525,8 @@ fn build(
         },
         gradients,
     };
-    prune_program(&mut program);
+    crate::opt::backward_program(&mut program);
     Ok(program)
-}
-
-/// Drop the columns nothing reads (see [`crate::prune`]): within each plan,
-/// then across steps, from the last back, so each step keeps only the columns
-/// some later step reads. The value and the gradients keep all theirs.
-fn prune_program(program: &mut BackwardProgram) {
-    use std::collections::{BTreeSet, HashMap};
-    for c in program.checks.iter_mut() {
-        crate::prune::prune_plan(&mut c.plan);
-    }
-    let keep: BTreeSet<String> = std::iter::once(program.value.step.clone())
-        .chain(program.gradients.iter().map(|g| g.step.clone()))
-        .collect();
-    // Every step's columns that plans after it read, by name.
-    let mut read: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let note_reads = |plan: &Plan, read: &mut HashMap<String, BTreeSet<String>>| {
-        crate::emit::for_each_unbound_read(plan, &mut |name, cols| {
-            read.entry(name.to_string())
-                .or_default()
-                .extend(cols.iter().cloned());
-        });
-    };
-    for c in &program.checks {
-        note_reads(&c.plan, &mut read);
-    }
-    let n_forward = program.forward_steps.len();
-    let total = n_forward + program.backward_steps.len();
-    for i in (0..total).rev() {
-        let step = if i < n_forward {
-            &mut program.forward_steps[i]
-        } else {
-            &mut program.backward_steps[i - n_forward]
-        };
-        let narrowed = !keep.contains(&step.name) && {
-            let used = read.get(&step.name).cloned().unwrap_or_default();
-            crate::prune::prune_plan_to_names(&mut step.plan, &used)
-        };
-        if !narrowed {
-            crate::prune::prune_plan(&mut step.plan);
-        }
-        note_reads(&step.plan, &mut read);
-    }
 }
 
 /// The loss column for [`grad`]: the query must return one column, on one
@@ -678,7 +636,7 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<(Vec<String>, usize
     // An output row whose value is NULL does not move with anything in it,
     // as an aggregate that skips it would say: its cotangent is NULL, so none
     // flows through it to its other inputs (the `p` of `p + q`, `q` NULL).
-    let is_null = t.ext.anchor("is_null");
+    let is_null = t.ext.anchor(Function::IsNull);
     let seeds = value_cols
         .iter()
         .enumerate()
@@ -781,7 +739,7 @@ fn redeclare_functions(
         match e.rex_type.as_mut() {
             Some(RexType::Literal(_)) | Some(RexType::Selection(_)) => Ok(()),
             Some(RexType::ScalarFunction(f)) => {
-                f.function_reference = ext.anchor(from.name(f.function_reference)?);
+                f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
                 for a in f.arguments.iter_mut() {
                     if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
                         walk(x, from, ext)?;
@@ -855,7 +813,7 @@ fn combine(
     if aligned.len() == 1 {
         return Ok((aligned.pop().unwrap(), cols));
     }
-    let sum = t.ext.anchor("sum");
+    let sum = t.ext.anchor(Function::Sum);
     let rel = aggregate(
         union_all(aligned),
         (0..dims).map(field).collect(),
@@ -927,8 +885,8 @@ fn dense_gradient(
         (rows, Vec::new(), k + v)
     } else {
         let (summed, cols) = combine(t, contribs, k)?;
-        let same = t.ext.anchor("is_not_distinct_from");
-        let and = t.ext.anchor("and");
+        let same = t.ext.anchor(Function::IsNotDistinctFrom);
+        let and = t.ext.anchor(Function::And);
         let cond = (0..k)
             .map(|d| call(same, vec![field(d), field(k + v + d)]))
             .reduce(|a, b| call(and, vec![a, b]))
@@ -938,7 +896,7 @@ fn dense_gradient(
     // CASE, not coalesce: DataFusion 54 runs coalesce only after its
     // simplifier has rewritten it to a CASE, and a context may not run that
     // rule.
-    let is_null = t.ext.anchor("is_null");
+    let is_null = t.ext.anchor(Function::IsNull);
     let grads: Vec<Expression> = values
         .iter()
         .enumerate()
@@ -978,8 +936,8 @@ fn set_nullable(ty: &mut substrait::proto::Type) {
 /// more than once. Must return no rows.
 /// The key tuples of `rel` (its columns `keys`) that more than one row has.
 pub(crate) fn repeated_keys(ext: &mut Extensions, rel: Rel, keys: &[usize]) -> Rel {
-    let count = ext.anchor("count");
-    let gt = ext.anchor("gt");
+    let count = ext.anchor(Function::Count);
+    let gt = ext.anchor(Function::Gt);
     let k = keys.len();
     let grouped = aggregate(
         rel,

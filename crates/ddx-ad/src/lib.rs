@@ -88,8 +88,8 @@ mod elementwise;
 mod error;
 mod functions;
 mod jvp;
+mod opt;
 mod program;
-mod prune;
 mod run;
 pub mod sql;
 mod tables;
@@ -120,7 +120,7 @@ pub use tables::{InputTable, Of, OutputTable, Tangent};
 pub use {
     elementwise::Elementwise,
     forward::Forward,
-    functions::{normalize, Extensions, Functions},
+    functions::{normalize, Extensions, Function, Functions},
     relation::Table,
 };
 
