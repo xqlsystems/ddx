@@ -402,7 +402,7 @@ async fn resnet(blocks: usize, n: usize, d: usize) {
 /// the filter on the gradient's dims is pushed into the program, so only
 /// that layer's rows are computed.
 async fn rows(n: usize) {
-    for (label, filter) in [("all layers", ""), ("layer 2", " WHERE g.layer = 2")] {
+    for (label, filter) in [("all layers", ""), ("layer 2", " WHERE layer = 2")] {
         let ctx = SessionContext::new();
         ddx_datafusion::register_stop_gradient(&ctx);
         let mut rng = model::Rng::new(7);

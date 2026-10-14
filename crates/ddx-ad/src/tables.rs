@@ -94,7 +94,7 @@ impl OutputTable {
     /// SQL for its rows as a caller reads them, once its program has run:
     /// its own columns, then each tangent, named `{column}_tangent` (or
     /// `{column}_tangent_{n}`, for the first free `n`, if that name is
-    /// taken).
+    /// taken), as an unnamed `jvp` of a column in SQL names its tangent.
     pub fn query(&self) -> String {
         use crate::sql::quote;
         let own = &self.columns[..self.columns.len() - self.tangents.len()];

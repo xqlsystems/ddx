@@ -9,13 +9,14 @@ The first three fixtures come from the small Python programs that tested
 ddx's design before it was built (`docs/spikes/relational_ad_spike.py`,
 `attention_ad_spike.py`, `route_ad_spike.py`); each test builds one with the
 same seeds, writes its forward pass and loss as plain SQL, takes
-`grad(loss, table.val)` in SQL on DataFusion, and compares every gradient
-entry with `jax.grad` of the same function written in JAX. The spikes showed
+`grad(loss, val)` in SQL on DataFusion, and compares every gradient entry with
+`jax.grad` of the same function written in JAX. The spikes showed
 hand-applied transpose rules match JAX to machine precision; these show `grad`
 in SQL does too. The last test does the same for the network that
 `crates/ddx-datafusion/examples/nn` trains, using its queries verbatim. On
-the MLP, Hessian-vector products, forward over reverse and reverse over
-forward, are checked against `jax.jvp(jax.grad(f))`.
+the MLP, `jvp(…)` in SQL is checked against `jax.jvp`, and Hessian-vector
+products, forward over reverse and reverse over forward, against
+`jax.jvp(jax.grad(f))`.
 """
 
 from __future__ import annotations
@@ -57,16 +58,16 @@ def register(ctx, name: str, array: np.ndarray, dims: tuple[str, ...]) -> None:
 
 
 def gradients(ad, ctx, with_loss: str, tables: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """`SELECT * FROM grad(loss, t.val)` for each table `t`, back as dense
+    """`SELECT *, grad(loss, val) FROM t` for each table `t`, back as dense
     arrays shaped like the table. One statement per table, sharing one
     program."""
-    statements = [f"{with_loss} SELECT * FROM grad(loss, {t}.val)" for t in tables]
+    statements = [f"{with_loss} SELECT *, grad(loss, val) AS grad FROM {t}" for t in tables]
     out = {}
     for (name, value), df in zip(tables.items(), ad.sql_all(ctx, statements)):
         t = df.to_arrow_table()
         got = np.full(value.shape, np.nan)
-        dims = t.column_names[:-1]
-        got[tuple(t.column(d).to_numpy() for d in dims)] = t.column("val").to_numpy()
+        dims = [c for c in t.column_names if c not in ("val", "grad")]
+        got[tuple(t.column(d).to_numpy() for d in dims)] = t.column("grad").to_numpy()
         assert not np.isnan(got).any(), f"{name}: a gradient row is missing"
         out[name] = got
     return out
@@ -164,6 +165,47 @@ def test_mlp_matches_jax_grad(env):
         np.testing.assert_allclose(got[name], np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=name)
 
 
+def test_mlp_jvp_in_sql_matches_jax_jvp(env):
+    # The loss and the logits, each with its tangent along every parameter's
+    # tangent: one jvp(…) SELECT per parameter table, their tangents added.
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, jax_logits, jax_loss = mlp(env)
+    tangents = directions(params, 1)
+    for name, value in tangents.items():
+        register(ctx, f"d{name}", value, dims_of(name))
+    primals = tuple(map(jnp.array, params.values()))
+    dirs = tuple(map(jnp.array, tangents.values()))
+    # One SELECT per parameter table; the tangents along each add up to the
+    # tangent along all of them.
+    names = list(params)
+    selects = ", ".join(f"j{n} AS (SELECT loss, jvp(loss, {n}.val, d{n}) AS t FROM loss)" for n in names)
+    total = " + ".join(f"j{n}.t" for n in names)
+    joined = " CROSS JOIN ".join(f"j{n}" for n in names)
+    t = ad.sql(ctx, f"{with_loss}, {selects} SELECT j{names[0]}.loss, {total} AS t FROM {joined}").to_arrow_table()
+    value, tangent = jax.jvp(jax_loss, primals, dirs)
+    assert abs(t.column("loss")[0].as_py() - float(value)) < TOLERANCE
+    assert abs(t.column("t")[0].as_py() - float(tangent)) < TOLERANCE
+
+    first = names[0]
+    selects = ", ".join(f"j{n} AS (SELECT sample, out, z, jvp(z, {n}.val, d{n}) AS t FROM z2)" for n in names)
+    joins = " ".join(
+        f"JOIN j{n} ON j{n}.sample = j{first}.sample AND j{n}.out = j{first}.out" for n in names[1:]
+    )
+    total = " + ".join(f"j{n}.t" for n in names)
+    t = ad.sql(
+        ctx,
+        f"{with_loss}, {selects} SELECT j{first}.sample, j{first}.out, j{first}.z, {total} AS z_tangent "
+        f"FROM j{first} {joins}",
+    ).to_arrow_table()
+    value, tangent = jax.jvp(jax_logits, primals, dirs)
+    shape = np.asarray(value).shape
+    np.testing.assert_allclose(dense(t, shape, ["sample", "out"], "z"), np.asarray(value), rtol=0, atol=TOLERANCE)
+    np.testing.assert_allclose(
+        dense(t, shape, ["sample", "out"], "z_tangent"), np.asarray(tangent), rtol=0, atol=TOLERANCE
+    )
+
+
 def tangent_tables(inputs, tangents: dict[str, np.ndarray]) -> list:
     """Each of a program's tangent inputs from `tangents`, by the table it is
     a tangent of, as a table to pass to `ad.run`."""
@@ -200,6 +242,35 @@ def test_mlp_hessian_vector_products_match_jax_both_ways(env):
     for out, (name, want) in zip(outs.gradients, zip(params, expected)):
         got = dense(out.to_arrow_table(), params[name].shape, list(dims_of(name)), "val")
         np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"vjp(jvp) {name}")
+
+
+def test_mlp_hessian_vector_product_in_nested_sql_matches_jax(env):
+    # H·v's block for w2, written in SQL as jvp of a gradient: one jvp(…)
+    # SELECT per parameter table's tangent, their tangents added.
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    with_loss, params, _, jax_loss = mlp(env)
+    tangents = directions(params, 2)
+    for name, value in tangents.items():
+        register(ctx, f"d{name}", value, dims_of(name))
+    primals = tuple(map(jnp.array, params.values()))
+    dirs = tuple(map(jnp.array, tangents.values()))
+    grad = jax.grad(jax_loss, argnums=tuple(range(6)))
+    _, expected = jax.jvp(lambda *p: grad(*p), primals, dirs)
+
+    names = list(params)
+    first = names[0]
+    selects = ", ".join(f"h{n} AS (SELECT inp, out, jvp(val, {n}.val, d{n}) AS t FROM g)" for n in names)
+    on = lambda n: f"h{n}.inp = h{first}.inp AND h{n}.out = h{first}.out"
+    joins = " ".join(f"JOIN h{n} ON {on(n)}" for n in names[1:])
+    total = " + ".join(f"h{n}.t" for n in names)
+    t = ad.sql(
+        ctx,
+        f"{with_loss}, g AS (SELECT inp, out, grad(loss, val) AS val FROM w2), {selects} "
+        f"SELECT h{first}.inp, h{first}.out, {total} AS hv FROM h{first} {joins}",
+    ).to_arrow_table()
+    got = dense(t, params["w2"].shape, list(dims_of("w2")), "hv")
+    np.testing.assert_allclose(got, np.asarray(expected[names.index("w2")]), rtol=0, atol=TOLERANCE)
 
 
 def test_attention_matches_jax_grad(env):
@@ -378,8 +449,8 @@ loss AS (
     gw, gb = ad.sql_all(
         ctx,
         [
-            f"{with_loss} SELECT layer, inp, out, val FROM grad(loss, weight.val)",
-            f"{with_loss} SELECT layer, out, val FROM grad(loss, bias.val)",
+            f"{with_loss} SELECT layer, inp, out, grad(loss, val) AS val FROM weight",
+            f"{with_loss} SELECT layer, out, grad(loss, val) AS val FROM bias",
         ],
     )
 

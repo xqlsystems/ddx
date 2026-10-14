@@ -275,7 +275,7 @@ impl Options {
 
     /// Compute `table`'s gradient only on the rows where a predicate holds,
     /// because nothing reads the others (a `grad(…)` in SQL whose statement
-    /// filters it: [`crate::sql::Job::restrict`]). `select` is the engine's
+    /// filters it, as [`crate::rewrite`] passes it). `select` is the engine's
     /// own plan of `SELECT * FROM table WHERE predicate`; the predicate may
     /// read only the table's dims, since a gradient row is a sum grouped by
     /// them. Rows outside it are left out of the gradient step, and every

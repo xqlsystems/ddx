@@ -81,12 +81,10 @@ loss AS (
     )
 }
 
-/// One SGD step for `weight`: `weight - lr * grad(loss)(weight)`, as a join.
+/// One SGD step for `weight`: `weight - lr * grad(loss)(weight)`.
 pub fn update_weight(lr: f64) -> String {
     format!(
-        "{} SELECT w.layer, w.inp, w.out, w.val - {lr} * g.val AS val \
-         FROM weight w JOIN grad(loss, weight.val) g \
-           ON w.layer = g.layer AND w.inp = g.inp AND w.out = g.out",
+        "{} SELECT layer, inp, out, val - {lr} * grad(loss, val) AS val FROM weight",
         with_loss()
     )
 }
@@ -94,8 +92,7 @@ pub fn update_weight(lr: f64) -> String {
 /// One SGD step for `bias`.
 pub fn update_bias(lr: f64) -> String {
     format!(
-        "{} SELECT b.layer, b.out, b.val - {lr} * g.val AS val \
-         FROM bias b JOIN grad(loss, bias.val) g ON b.layer = g.layer AND b.out = g.out",
+        "{} SELECT layer, out, val - {lr} * grad(loss, val) AS val FROM bias",
         with_loss()
     )
 }

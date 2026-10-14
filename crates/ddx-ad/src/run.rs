@@ -174,6 +174,15 @@ pub trait Backend: Send {
 
     /// Drop the table `name` if it exists.
     fn drop_table(&mut self, name: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// The engine's Substrait plan of the SQL query `sql`, planned and
+    /// optimized as it would run it. Only [`crate::rewrite`] asks for one,
+    /// to differentiate a query a SQL statement names; an engine that only
+    /// runs programs may refuse.
+    fn plan_sql(
+        &mut self,
+        sql: &str,
+    ) -> impl Future<Output = Result<substrait::proto::Plan, Self::Error>> + Send;
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then
@@ -321,6 +330,12 @@ mod tests {
         }
         fn drop_table(&mut self, name: &str) -> impl Future<Output = Result<(), String>> + Send {
             ready(self.outcome(format!("drop {name}")))
+        }
+        fn plan_sql(
+            &mut self,
+            sql: &str,
+        ) -> impl Future<Output = Result<substrait::proto::Plan, String>> + Send {
+            ready(Err(format!("no SQL here: {sql}")))
         }
     }
 

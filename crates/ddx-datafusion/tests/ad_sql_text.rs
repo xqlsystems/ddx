@@ -2,12 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! A text-level fuzz of `grad(loss, table.column)` in SQL.
+//! A text-level fuzz of `grad(loss, column)` in SQL.
 //!
-//! `ad::sql` rewrites the statement's text before DataFusion sees it: it finds
-//! each `grad(…)` call and splices a relation in its place by byte span
-//! (`ddx_ad::sql::GradCalls`). Everything in that path is about text, so the
-//! fuzz is about text too. It takes valid statements and puts, between their
+//! `ad::sql` rewrites the statement before DataFusion sees it: it parses it,
+//! finds each `grad(…)` call, and writes the statement out again with a read
+//! of its gradient in its place (`ddx_ad::rewrite`). Everything in that path
+//! is about text, so the fuzz is about text too. It takes valid statements and puts, between their
 //! tokens, what SQL allows there: whitespace of every kind, CRLF, block and
 //! line comments (some holding parentheses, quotes or multibyte characters),
 //! and changes of case and quoting. Each variant means the same statement, so
@@ -57,22 +57,21 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Result<Vec<Vec<Option<u64>>>, 
 const STATEMENTS: &[&[&str]] = &[
     &[
         "WITH", "loss", "AS", "(", "SELECT", "SUM", "(", "val", "*", "val", ")", "AS", "l", "FROM",
-        "p", ")", "SELECT", "i", ",", "val", "FROM", "grad", "(", "loss", ",", "p", ".", "val",
-        ")",
+        "p", ")", "SELECT", "i", ",", "grad", "(", "loss", ",", "val", ")", "FROM", "p",
     ],
     &[
         "WITH", "loss", "AS", "(", "SELECT", "SUM", "(", "p", ".", "val", "*", "q", ".", "val",
         ")", "AS", "l", "FROM", "p", "JOIN", "q", "ON", "p", ".", "i", "=", "q", ".", "i", ")",
-        "SELECT", "p", ".", "i", ",", "p", ".", "val", "-", "0.1", "*", "g", ".", "val", "AS",
-        "val", "FROM", "p", "JOIN", "grad", "(", "loss", ",", "p", ".", "val", ")", "g", "ON", "p",
-        ".", "i", "=", "g", ".", "i",
+        "SELECT", "p", ".", "i", ",", "p", ".", "val", "-", "0.1", "*", "grad", "(", "loss", ",",
+        "p", ".", "val", ")", "AS", "val", "FROM", "p", "JOIN", "q", "ON", "p", ".", "i", "=", "q",
+        ".", "i",
     ],
     &[
         "WITH", "loss", "AS", "(", "SELECT", "SUM", "(", "p", ".", "val", "*", "q", ".", "val",
         ")", "AS", "l", "FROM", "p", "JOIN", "q", "ON", "p", ".", "i", "=", "q", ".", "i", ")",
-        "SELECT", "a", ".", "i", ",", "a", ".", "val", ",", "b", ".", "val", "AS", "qv", "FROM",
-        "grad", "(", "loss", ",", "p", ".", "val", ")", "a", "JOIN", "grad", "(", "loss", ",", "q",
-        ".", "val", ")", "b", "ON", "a", ".", "i", "=", "b", ".", "i",
+        "SELECT", "p", ".", "i", ",", "grad", "(", "loss", ",", "p", ".", "val", ")", ",", "grad",
+        "(", "loss", ",", "q", ".", "val", ")", "AS", "qv", "FROM", "p", "JOIN", "q", "ON", "p",
+        ".", "i", "=", "q", ".", "i",
     ],
     &[
         "WITH",
@@ -105,16 +104,14 @@ const STATEMENTS: &[&[&str]] = &[
         "SELECT",
         "i",
         ",",
-        "val",
-        "FROM",
         "grad",
         "(",
         "loss2",
         ",",
-        "p",
-        ".",
         "val",
         ")",
+        "FROM",
+        "p",
     ],
 ];
 

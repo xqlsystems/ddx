@@ -43,25 +43,24 @@ def pairs(df):
     return sorted(zip(t.column(0).to_pylist(), t.column(1).to_pylist()))
 
 
-def test_grad_in_sql_is_shaped_like_its_table(ad, ctx):
-    df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)")
+def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, ctx):
+    df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert pairs(df) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 
 
-def test_an_sgd_step_is_a_join(ad, ctx):
+def test_an_sgd_step_is_one_expression(ad, ctx):
     df = ad.sql(
         ctx,
         """WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-           SELECT w.i, w.val - 0.25 * g.val AS val
-           FROM w JOIN grad(loss, w.val) g ON w.i = g.i""",
+           SELECT i, val - 0.25 * grad(loss, val) AS val FROM w""",
     )
     assert pairs(df) == [(0, 0.5), (1, -1.0), (2, 0.25)]
 
 
 def test_statements_sharing_a_loss_share_its_program(ad, ctx):
     loss = "WITH loss AS (SELECT SUM(w.val * w.val * b.val) AS l FROM w JOIN b ON w.i = b.i) "
-    update_w = loss + "SELECT w.i, w.val - 0.5 * g.val AS v FROM w JOIN grad(loss, w.val) g ON w.i = g.i"
-    update_b = loss + "SELECT b.i, b.val - 0.5 * g.val AS v FROM b JOIN grad(loss, b.val) g ON b.i = g.i"
+    update_w = loss + "SELECT i, val - 0.5 * grad(loss, val) AS v FROM w"
+    update_b = loss + "SELECT i, val - 0.5 * grad(loss, val) AS v FROM b"
     fw, fb = ad.sql_all(ctx, [update_w, update_b])
     w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
     assert pairs(fw) == [(i, w[i] - 0.5 * 2 * w[i] * b[i]) for i in range(3)]
@@ -72,8 +71,7 @@ def test_case_variants_of_a_column_keep_the_dims(ad, ctx):
     df = ad.sql(
         ctx,
         """WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-           SELECT a.i, a.val + b.val AS v
-           FROM grad(loss, w.val) a JOIN grad(loss, W.VAL) b ON a.i = b.i""",
+           SELECT i, grad(loss, w.val) + grad(loss, W.VAL) AS v FROM w""",
     )
     assert pairs(df) == [(0, 4.0), (1, -8.0), (2, 2.0)]
 
@@ -85,7 +83,7 @@ def test_stop_gradient_on_a_real_column(ad, ctx):
     df = ad.sql(
         ctx,
         """WITH loss AS (SELECT SUM(w.val * ddx_stop_gradient(h.x)) AS l FROM w JOIN h ON w.i = h.i)
-           SELECT * FROM grad(loss, w.val)""",
+           SELECT i, grad(loss, val) FROM w""",
     )
     assert pairs(df) == [(0, 1.5), (1, 2.5), (2, 0.0)]
 
@@ -94,10 +92,8 @@ def test_context_sql_understands_grad(ad):
     pytest.importorskip("datafusion")
     ctx = ddxdb.Context()
     ctx.register_record_batches("w", [table([0, 1], [3.0, 4.0]).to_batches()])
-    df = ctx.sql("WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, val FROM grad(loss, w.val)")
+    df = ctx.sql("WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert pairs(df) == [(0, 6.0), (1, 8.0)]
-
-
 def test_grad_as_a_program_can_be_rerun_after_the_table_changes(ad, ctx):
     program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
     out = ad.run(ctx, program)
@@ -171,7 +167,7 @@ def test_programs_do_not_share_tables(ad, ctx):
 
 
 def test_sql_leaves_no_tables_behind(ad, ctx):
-    df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)")
+    df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert ddx_tables(ctx) == []
     assert pairs(df) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
@@ -191,8 +187,8 @@ def test_tables_whose_names_join_alike_keep_their_own_gradients(ad):
         ctx,
         """WITH loss AS (SELECT SUM(p.val * p.val) + SUM(q.val * q.val) AS l
                          FROM a_b.c p CROSS JOIN a.b_c q)
-           SELECT g1.i, g1.val * 1000.0 + g2.val AS v
-           FROM grad(loss, a_b.c.val) g1 CROSS JOIN grad(loss, a.b_c.val) g2""",
+           SELECT p.i, grad(loss, p.val) * 1000.0 + grad(loss, q.val) AS v
+           FROM a_b.c p CROSS JOIN a.b_c q""",
     )
     assert pairs(df) == [(0, 2020.0)]
 
@@ -204,7 +200,7 @@ def test_grad_in_sql_of_a_table_with_capitals(ad):
 
     ctx = datafusion.SessionContext()
     ctx.sql('CREATE TABLE "W" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)').collect()
-    df = ad.sql(ctx, 'WITH loss AS (SELECT SUM(val * val) AS l FROM "W") SELECT i, val FROM grad(loss, "W".val)')
+    df = ad.sql(ctx, 'WITH loss AS (SELECT SUM(val * val) AS l FROM "W") SELECT i, grad(loss, val) FROM "W"')
     assert pairs(df) == [(0, 2.0), (1, 4.0)]
 
 
@@ -213,7 +209,7 @@ def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
     ctx.register_record_batches("q", [table([0, 1, 2], [5.0, None, 1.0]).to_batches()])
     df = ad.sql(
         ctx,
-        "WITH loss AS (SELECT SUM(w.val + q.val) AS l FROM w JOIN q ON w.i = q.i) SELECT * FROM grad(loss, w.val)",
+        "WITH loss AS (SELECT SUM(w.val + q.val) AS l FROM w JOIN q ON w.i = q.i) SELECT i, grad(loss, val) FROM w",
     )
     assert pairs(df) == [(0, 1.0), (1, 0.0), (2, 1.0)]
 
@@ -296,13 +292,11 @@ def test_a_fixed_namespace_gives_the_same_program(ad, ctx):
         ad.grad(ctx, q, [("w", "val")], namespace="__ddx_Py_")
 
 
-def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in():
-    from ddxdb._ddxdb import _Statements
-
-    stmt = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT * FROM grad(loss, w.val)"
-    assert len(_Statements([stmt], "duckdb").jobs()) == 1
+def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in(ad, ctx):
+    stmt = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, stmt, dialect="duckdb")) == [(0, 2.0), (1, -4.0), (2, 1.0)]
     with pytest.raises(ValueError, match="dialect"):
-        _Statements([stmt], "klingon")
+        ad.sql(ctx, stmt, dialect="klingon")
 
 
 def test_not_in_over_a_subquery_is_refused(ad, ctx):
@@ -312,7 +306,7 @@ def test_not_in_over_a_subquery_is_refused(ad, ctx):
     with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
         ad.grad(ctx, loss, [("w", "val")])
     with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
-        ad.sql(ctx, f"WITH loss AS ({loss}) SELECT * FROM grad(loss, w.val)")
+        ad.sql(ctx, f"WITH loss AS ({loss}) SELECT i, grad(loss, val) FROM w")
     exists = (
         "SELECT SUM(val * val) AS l FROM w WHERE NOT EXISTS "
         "(SELECT 1 FROM b WHERE b.i = w.i AND b.val > 1.0)"
@@ -322,11 +316,11 @@ def test_not_in_over_a_subquery_is_refused(ad, ctx):
 
 
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
-    # The WHERE on g's dims is pushed into the program (ddx_ad::Options::restrict);
+    # The WHERE on w's dims is pushed into the program (ddx_ad::Options::restrict);
     # the rows read are the unrestricted gradient's.
     loss = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w)"
-    full = pairs(ad.sql(ctx, f"{loss} SELECT g.i, g.val FROM grad(loss, w.val) g"))
-    some = pairs(ad.sql(ctx, f"{loss} SELECT g.i, g.val FROM grad(loss, w.val) g WHERE g.i >= 1"))
+    full = pairs(ad.sql(ctx, f"{loss} SELECT i, grad(loss, val) FROM w"))
+    some = pairs(ad.sql(ctx, f"{loss} SELECT i, grad(loss, val) FROM w WHERE i >= 1"))
     assert some == [p for p in full if p[0] >= 1]
 
 
@@ -390,6 +384,36 @@ def test_any_backend_runs_a_forward_program(ad, ctx):
         ddxdb.run(backend, b"not a program")
 
 
+def test_jvp_in_sql_is_a_column_of_its_select_s_rows(ad, ctx):
+    df = ad.sql(
+        ctx,
+        """WITH v AS (SELECT i, 1.0 AS val FROM w)
+           SELECT SUM(val * val * val) AS l, jvp(SUM(val * val * val), w.val, v) AS l_tangent
+           FROM w""",
+    )
+    t = df.to_arrow_table()
+    assert t.column("l_tangent")[0].as_py() == pytest.approx(3.0 * 5.25)
+    assert not ddx_tables(ctx)
+
+
+def test_jvp_in_sql_is_one_select_per_table_and_context_sql_reads_it(ad, ctx):
+    from ddxdb import Context
+
+    c = Context()
+    c.register_record_batches("w", [table([0, 1, 2], [1.0, -2.0, 0.5]).to_batches()])
+    c.register_record_batches("b", [table([0, 1, 2], [0.25, 3.0, -1.0]).to_batches()])
+    c.register_record_batches("db", [table([0, 1, 2], [1.0, 1.0, 1.0]).to_batches()])
+    df = c.sql(
+        """WITH f AS (SELECT w.i, w.val * b.val AS y FROM w JOIN b ON w.i = b.i),
+                dw AS (SELECT i, 1.0 AS val FROM w),
+                j AS (SELECT i, jvp(y, w.val, dw) AS t FROM f),
+                k AS (SELECT i, jvp(y, b.val, db) AS t FROM f)
+           SELECT j.i, j.t + k.t FROM j JOIN k ON j.i = k.i ORDER BY j.i"""
+    )
+    # d(w·b) along (1, 1) is b + w: tangents along two tables add.
+    assert pairs(df) == [(0, 1.25), (1, 1.0), (2, -0.5)]
+
+
 def test_a_fixed_namespace_gives_the_same_forward_program(ad, ctx):
     from datafusion.substrait import Serde
 
@@ -419,3 +443,34 @@ def test_a_query_deeper_than_datafusion_python_decodes_is_split_and_runs(ad, ctx
     assert got == pytest.approx(sum(v * d for (_, v), d in zip(g, [1.0, 2.0, 3.0])))
 
 
+def test_vjp_in_sql_pulls_a_cotangent_back(ad, ctx):
+    df = ad.sql(
+        ctx,
+        """WITH f AS (SELECT i, val * val AS s FROM w),
+                c AS (SELECT i, CAST(i + 1 AS DOUBLE) AS s FROM w)
+           SELECT i, vjp(f, val, c) FROM w""",
+    )
+    # s = val², so the pull-back of c is 2 val c.
+    assert pairs(df) == [(0, 2.0), (1, -8.0), (2, 3.0)]
+    assert not ddx_tables(ctx)
+
+
+def test_calls_nest_in_sql(ad, ctx):
+    # l = Σ val³: jvp of a gradient is H·v = 6 val v, here v = 1.
+    got = ad.sql(
+        ctx,
+        "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w), "
+        "g AS (SELECT i, grad(loss, val) AS val FROM w), v AS (SELECT i, 1.0 AS val FROM w) "
+        "SELECT i, jvp(val, w.val, v) AS val_tangent FROM g ORDER BY i",
+    ).to_pydict()
+    assert got["val_tangent"] == pytest.approx([6.0, -12.0, 3.0])
+    assert not ddx_tables(ctx)
+
+
+
+
+def test_jvp_along_a_number_is_the_derivative_row_by_row(ad, ctx):
+    import math
+
+    got = ad.sql(ctx, "SELECT i, val, jvp(sin(val), w.val, 1) AS d FROM w ORDER BY i").to_pydict()
+    assert got["d"] == pytest.approx([math.cos(v) for v in got["val"]])

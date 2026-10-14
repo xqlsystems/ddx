@@ -674,6 +674,10 @@ impl ddx_ad::Backend for PyBackend {
             Ok(())
         })
     }
+
+    fn plan_sql(&mut self, sql: &str) -> impl Future<Output = PyResult<Plan>> + Send {
+        self.call(|b| decode(&b.call_method1("plan_sql", (sql,))?.extract::<Vec<u8>>()?))
+    }
 }
 
 /// The output of a future whose every await is already done, as a run on a
@@ -711,56 +715,36 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
             "run takes a BackwardProgram or a ForwardProgram",
         ));
     };
-    result.map_err(|e| match e {
+    result.map_err(run_err)
+}
+
+/// Compute what the `grad`, `vjp` and `jvp` calls in `statements` read, on
+/// `backend`, and rewrite each statement to read it (`ddx_ad::rewrite`).
+/// `backend` is as for `run`, with a fifth method, `plan_sql(sql) -> bytes`:
+/// the engine's serialized Substrait plan of a query. Returns the rewritten
+/// statements and the tables they read, for the caller to drop once it has
+/// planned them. `dialect` is how the statements are written (a name
+/// `sqlparser` knows, or `"datafusion"`).
+#[pyfunction]
+#[pyo3(signature = (backend, statements, dialect = "datafusion"))]
+fn rewrite(
+    backend: Bound<'_, PyAny>,
+    statements: Vec<String>,
+    dialect: &str,
+) -> PyResult<(Vec<String>, Vec<String>)> {
+    let parser = parser_for(dialect)?;
+    let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+    let mut backend = PyBackend(backend.unbind());
+    let out = now(ddx_ad::rewrite(&mut backend, &refs, parser.as_ref())).map_err(run_err)?;
+    Ok((out.statements, out.tables))
+}
+
+/// A run's failure as the exception a Python caller branches on.
+fn run_err(e: ddx_ad::RunError<PyErr>) -> PyErr {
+    match e {
         ddx_ad::RunError::Refused(e) => ad_to_py_err(e),
         ddx_ad::RunError::Engine(e) => e,
         other => DdxError::new_err(other.to_string()),
-    })
-}
-
-/// `ddx_ad::sql::Statements`: several statements' `grad` calls, planned
-/// together.
-#[pyclass(frozen, module = "ddxdb._ddxdb", name = "_Statements")]
-struct Statements(ddx_ad::Statements);
-
-#[pymethods]
-impl Statements {
-    /// Plan `statements`, parsed as `dialect` writes SQL (a name `sqlparser`
-    /// knows, or `"datafusion"`).
-    #[new]
-    #[pyo3(signature = (statements, dialect = "datafusion"))]
-    fn new(statements: Vec<String>, dialect: &str) -> PyResult<Self> {
-        let parser = parser_for(dialect)?;
-        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-        Ok(Statements(
-            ddx_ad::Statements::plan(&refs, parser.as_ref()).map_err(ad_to_py_err)?,
-        ))
-    }
-
-    /// The objectives to differentiate, as `(query, [(table, column), …],
-    /// [(table, predicate), …])`: the last, the rows of a table's gradient
-    /// every statement reads, where they say (`ddx_ad::sql::Job::restrict`).
-    #[allow(clippy::type_complexity)]
-    fn jobs(&self) -> Vec<(String, Vec<(String, String)>, Vec<(String, String)>)> {
-        self.0
-            .jobs()
-            .iter()
-            .map(|j| {
-                let wrt = j
-                    .wrt
-                    .iter()
-                    .map(|w| (w.table.clone(), w.column.clone()))
-                    .collect();
-                (j.query.clone(), wrt, j.restrict.clone())
-            })
-            .collect()
-    }
-
-    /// Each statement over the gradients `programs` (one per job, run)
-    /// computed.
-    fn rewrite(&self, programs: Vec<PyRef<'_, BackwardProgram>>) -> PyResult<Vec<String>> {
-        let programs: Vec<&ddx_ad::BackwardProgram> = programs.iter().map(|p| &p.0).collect();
-        self.0.rewrite(&programs).map_err(ad_to_py_err)
     }
 }
 
@@ -823,7 +807,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputTable>()?;
     m.add_class::<OutputTable>()?;
     m.add_class::<Tangent>()?;
-    m.add_class::<Statements>()?;
+    m.add_function(wrap_pyfunction!(rewrite, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(

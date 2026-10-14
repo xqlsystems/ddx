@@ -11,27 +11,26 @@ Write a model's forward pass and loss as SQL, and take its gradient in SQL::
     ad.sql(ctx, '''
         WITH loss AS (SELECT SUM(power(x.v * w.val - y.v, 2)) AS l
                       FROM x JOIN w ON x.i = w.i JOIN y ON x.s = y.s)
-        SELECT w.i, w.val - 0.1 * g.val AS val
-        FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+        SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
     ''')
 
-``grad(loss, table.column)`` in a ``FROM`` clause is the gradient of the loss
-the CTE ``loss`` computes: a relation shaped like the table, its dims and the
-named columns' gradients. An SGD step is then a join, ``params - lr *
-grad(loss)(params)``. ``vjp(f, table.column, cotangent)`` is the same for any
-CTE ``f``, pulled back along ``cotangent`` (a CTE or a table shaped like
-``f``'s output). ``jvp(f, table.column, tangent)`` is the CTE ``f``'s output
-with, beside each column, its tangent along ``tangent`` (a CTE or a table
-shaped like ``table``), as ``{column}_tangent``::
+In a ``SELECT`` over a table, ``grad(loss, column)`` is the gradient at each
+row of the loss the CTE ``loss`` computes (``table.column`` when the
+``SELECT`` reads more than one table), so an SGD step, ``params - lr *
+grad(loss)(params)``, is one expression. ``vjp(f, column, cotangent)`` is the
+same for any CTE ``f``, pulled back along ``cotangent`` (a CTE or a table
+shaped like ``f``'s output). ``jvp(e, table.column, tangent)``, a column of the
+statement's ``SELECT`` or a CTE's, is the tangent at each row of its
+expression ``e`` along ``tangent`` (a CTE or a table shaped like ``table``,
+or a number: ``jvp(sin(x), t.x, 1)`` is ``cos(x)``, row by row)::
 
     ad.sql(ctx, '''
-        WITH loss AS (SELECT SUM(val * val) AS l FROM w),
-             v AS (SELECT i, 1.0 AS val FROM w)
-        SELECT l, l_tangent FROM jvp(loss, w.val, v)
+        WITH v AS (SELECT i, 1.0 AS val FROM w)
+        SELECT SUM(val * val) AS l, jvp(SUM(val * val), w.val, v) AS dl FROM w
     ''')
 
-Each call takes the columns of one table; several tables are several calls,
-and tangents along two tables add. :class:`ddxdb.Context` understands the
+One ``SELECT``'s ``jvp`` columns share a tangent; tangents along two tables
+are two ``SELECT`` statements, and add. :class:`ddxdb.Context` understands the
 same syntax in its ``.sql()``.
 
 Underneath, :func:`grad` turns a loss query into a :class:`BackwardProgram` of
@@ -78,7 +77,6 @@ except ImportError as e:  # pragma: no cover - depends on the environment
 from ._ddxdb import (
     UnsupportedExpression,
     _not_in_subquery,
-    _Statements,
 )
 from . import Backend
 from ._ddxdb import (
@@ -93,6 +91,7 @@ from ._ddxdb import (
     jvp_plan,
     vjp_plan,
 )
+from ._ddxdb import rewrite as _rewrite
 from ._ddxdb import run as _run
 
 #: A program of either kind.
@@ -231,6 +230,10 @@ class DataFusionBackend:
     def select_all(self, name: str) -> bytes:
         return Serde.serialize_bytes(f'SELECT * FROM "{name}"', self.ctx)
 
+    def plan_sql(self, sql: str) -> bytes:
+        _refuse_not_in(sql)
+        return Serde.serialize_bytes(sql, self.ctx)
+
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
         return self.ctx.create_dataframe_from_logical_plan(lp).limit(1).count() > 0
@@ -247,7 +250,8 @@ class Outputs(NamedTuple):
     """What a program computed, as DataFrames that hold their rows."""
 
     #: The query's output: its columns, then for a ``jvp`` program each
-    #: column's tangent as ``{column}_tangent``.
+    #: column's tangent as ``{column}_tangent``, as ``jvp(…)`` in SQL returns
+    #: them.
     value: object
     #: One per ``wrt`` table, in the program's order: the table's dims, then
     #: each value's gradient under the value's name (and, for ``jvp`` of a
@@ -328,13 +332,13 @@ def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
 
 
 def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
-    """Run ``statement``, in which, in a ``FROM`` clause, ``grad(loss,
-    table.column, …)`` is the gradient of the loss the CTE ``loss`` computes,
-    as a relation shaped like ``table``; ``vjp(f, table.column, …,
-    cotangent)`` the same for any CTE ``f`` along a cotangent; and ``jvp(f,
-    table.column, …, tangent)`` the CTE ``f``'s output with each column's
-    tangent beside it, as ``{column}_tangent`` (see the module docs).
-    Returns a DataFrame.
+    """Run ``statement``, in which, as columns of a ``SELECT``, ``grad(loss,
+    column)`` is the gradient at each row of the loss the CTE ``loss``
+    computes; ``vjp(f, column, cotangent)`` the same for any CTE ``f`` along
+    a cotangent; and ``jvp(e, table.column, …, tangent)`` the tangent at each
+    row of the expression ``e`` (see the module docs). Calls nest: ``f``,
+    ``e``'s ``SELECT``, or the cotangent or tangent may read another call,
+    and is differentiated through it. Returns a DataFrame.
 
     Each program runs first, once, however many calls use it. A statement
     with no such call is planned as it is. The programs' tables are
@@ -350,28 +354,18 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     """:func:`sql` for several statements. Statements that take ``grad`` of the
     same loss query share one run of its program, so a training step can update
     each parameter table with its own statement and pay for the backward pass
-    once."""
-    # Which programs to run and how each statement reads their gradients are
-    # ddx_ad::sql::Statements'; running them and planning the result are
-    # DataFusion's.
-    planned = _Statements(list(statements), dialect)
-    ran: list[Program] = []
+    once; ``vjp`` calls along one cotangent share one too, and identical
+    ``jvp`` calls."""
+    # Which programs to run, how each is built and run, and how each
+    # statement reads them are ddx-ad's (ddx_ad::rewrite); DataFusion plans and
+    # runs.
+    rewritten, tables = _rewrite(DataFusionBackend(ctx), list(statements), dialect)
     try:
-        for query, wrt, restrict in planned.jobs():
-            # Only the gradient rows the statements read, where they say.
-            selects = []
-            for table, predicate in restrict:
-                try:
-                    selects.append((table, Serde.serialize_bytes(f"SELECT * FROM {table} WHERE {predicate}", ctx)))
-                except Exception:  # every row is computed, which is always right
-                    pass
-            _refuse_not_in(query)
-            program = grad_plan(Serde.serialize_bytes(query, ctx), wrt, restrict=selects)
-            ran.append(program)
-            _run(DataFusionBackend(ctx), program)
-        return [ctx.sql(s) for s in planned.rewrite(ran)]
+        # SessionContext's own sql, not a ddxdb.Context's, which would look for
+        # calls again.
+        return [SessionContext.sql(ctx, s) for s in rewritten]
     finally:
-        # A planned DataFrame holds the tables it reads, so the programs'
-        # tables can leave the catalog now.
-        for program in ran:
-            _release(ctx, program)
+        # A planned DataFrame holds the tables it reads, so they can leave the
+        # catalog now.
+        for table in tables:
+            ctx.deregister_table(table)

@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `grad(loss, table.column)` in SQL, through `ddx_datafusion::ad::sql`.
+//! `grad(loss, column)` in SQL, a column of a SELECT over the column's
+//! table, through `ddx_datafusion::ad::sql`.
 
 mod common;
 
@@ -50,26 +51,25 @@ async fn pairs(ctx: &SessionContext, sql: &str) -> Vec<(i64, f64)> {
 }
 
 #[tokio::test]
-async fn grad_is_a_relation_shaped_like_its_table() {
+async fn grad_is_a_column_of_its_table_s_rows() {
     let ctx = ctx().await;
     let got = pairs(
         &ctx,
         "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) \
-         SELECT * FROM grad(loss, w.val)",
+         SELECT i, grad(loss, val) FROM w",
     )
     .await;
     assert_eq!(got, vec![(0, 3.0), (1, 12.0), (2, 0.75)]);
 }
 
 #[tokio::test]
-async fn an_sgd_step_is_a_join() {
+async fn an_sgd_step_is_one_expression() {
     // params - lr * grad(loss)(params)
     let ctx = ctx().await;
     let got = pairs(
         &ctx,
         "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
-         SELECT w.i, w.val - 0.25 * g.val AS val \
-         FROM w JOIN grad(loss, w.val) g ON w.i = g.i",
+         SELECT i, val - 0.25 * grad(loss, val) AS val FROM w",
     )
     .await;
     // val - 0.25 · 2·val = val / 2
@@ -81,8 +81,8 @@ async fn one_loss_two_tables() {
     // loss = Σ_i w_i · b_i: ∂/∂w = b and ∂/∂b = w, from one program.
     let ctx = ctx().await;
     let sql = "WITH loss AS (SELECT SUM(w.val * b.val) AS l FROM w JOIN b ON w.i = b.i) \
-               SELECT gw.i, gw.val + 10.0 * gb.val AS v \
-               FROM grad(loss, w.val) gw JOIN grad(loss, b.val) gb ON gw.i = gb.i";
+               SELECT w.i, grad(loss, w.val) + 10.0 * grad(loss, b.val) AS v \
+               FROM w JOIN b ON w.i = b.i";
     let got = pairs(&ctx, sql).await;
     let want: Vec<(i64, f64)> = w()
         .rows
@@ -100,7 +100,7 @@ async fn the_loss_can_use_other_ctes() {
         &ctx,
         "WITH sq AS (SELECT i, val * val AS s FROM w), \
               loss AS (SELECT SUM(s) AS l FROM sq) \
-         SELECT i, val FROM grad(loss, w.val)",
+         SELECT i, grad(loss, val) FROM w",
     )
     .await;
     assert_eq!(got, vec![(0, 2.0), (1, -4.0), (2, 1.0)]);
@@ -118,7 +118,7 @@ async fn grad_of_something_that_is_not_a_loss_is_refused() {
     let ctx = ctx().await;
     let err = ad::sql(
         &ctx,
-        "WITH loss AS (SELECT i, val * val AS l FROM w) SELECT * FROM grad(loss, w.val)",
+        "WITH loss AS (SELECT i, val * val AS l FROM w) SELECT i, grad(loss, val) FROM w",
     )
     .await
     .unwrap_err();
@@ -136,12 +136,8 @@ async fn statements_sharing_a_loss_share_its_program() {
     // One training step, one statement per parameter table.
     let ctx = ctx().await;
     let loss = "WITH loss AS (SELECT SUM(w.val * w.val * b.val) AS l FROM w JOIN b ON w.i = b.i) ";
-    let update_w = format!(
-        "{loss} SELECT w.i, w.val - 0.5 * g.val AS val FROM w JOIN grad(loss, w.val) g ON w.i = g.i"
-    );
-    let update_b = format!(
-        "{loss} SELECT b.i, b.val - 0.5 * g.val AS val FROM b JOIN grad(loss, b.val) g ON b.i = g.i"
-    );
+    let update_w = format!("{loss} SELECT i, val - 0.5 * grad(loss, val) AS val FROM w");
+    let update_b = format!("{loss} SELECT i, val - 0.5 * grad(loss, val) AS val FROM b");
     let frames = ad::sql_all(&ctx, &[&update_w, &update_b]).await.unwrap();
     // Both gradients came from one program: the frames read tables with one
     // program's prefix, and the catalog keeps none of them.
@@ -195,8 +191,7 @@ async fn case_variants_of_a_column_keep_the_dims() {
     let got = pairs(
         &ctx,
         "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
-         SELECT a.i, a.val + b.val AS v \
-         FROM grad(loss, w.val) a JOIN grad(loss, W.VAL) b ON a.i = b.i",
+         SELECT i, grad(loss, w.val) + grad(loss, W.VAL) AS v FROM w",
     )
     .await;
     assert_eq!(got, vec![(0, 4.0), (1, -8.0), (2, 2.0)]);
@@ -221,8 +216,8 @@ async fn tables_whose_names_join_alike_keep_their_own_gradients() {
         &ctx,
         "WITH loss AS (SELECT SUM(p.val * p.val) + SUM(q.val * q.val) AS l \
                        FROM a_b.c p CROSS JOIN a.b_c q) \
-         SELECT g1.i, g1.val * 1000.0 + g2.val AS v \
-         FROM grad(loss, a_b.c.val) g1 CROSS JOIN grad(loss, a.b_c.val) g2",
+         SELECT p.i, grad(loss, p.val) * 1000.0 + grad(loss, q.val) AS v \
+         FROM a_b.c p CROSS JOIN a.b_c q",
     )
     .await;
     // d/dp = 2p = 2 and d/dq = 2q = 20, packed as 2 * 1000 + 20.
@@ -243,7 +238,7 @@ async fn grad_in_sql_of_a_table_with_capitals() {
     let got = pairs(
         &ctx,
         "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") \
-         SELECT i, val FROM grad(loss, \"W\".val) ORDER BY i",
+         SELECT i, grad(loss, val) FROM \"W\" ORDER BY i",
     )
     .await;
     assert_eq!(got, vec![(0, 2.0), (1, 4.0)]);
@@ -272,7 +267,7 @@ async fn grad_in_sql_reads_comments_as_comments() {
             &ctx,
             &format!(
                 "WITH loss AS (SELECT SUM(val * val) AS l FROM cp) \
-                 SELECT i, val FROM {call} ORDER BY i"
+                 SELECT i, {call} FROM cp ORDER BY i"
             ),
         )
         .await;
@@ -283,9 +278,8 @@ async fn grad_in_sql_reads_comments_as_comments() {
     let got = pairs(
         &ctx,
         "WITH loss AS (SELECT SUM(cp.val * cq.val) AS l FROM cp JOIN cq ON cp.i = cq.i) \
-         SELECT a.i, a.val + b.val AS v \
-         FROM grad(loss, cp.val /* ( */) a JOIN grad(loss, cq.val) b ON a.i = b.i /* ) */ \
-         ORDER BY a.i",
+         SELECT cp.i, grad(loss, cp.val /* ( */) + grad(loss, cq.val) AS v \
+         FROM cp JOIN cq ON cp.i = cq.i /* ) */ ORDER BY cp.i",
     )
     .await;
     assert_eq!(got, vec![(0, 4.0), (1, 6.0)]);
@@ -323,7 +317,7 @@ async fn not_in_over_a_nullable_subquery_is_refused_not_differentiated_wrongly()
     let lp = ctx.sql(loss).await.unwrap().into_unoptimized_plan();
     assert!(refused(ad::grad(&ctx, &lp, &wrt).await.unwrap_err()));
     // In SQL, the same.
-    let stmt = format!("WITH loss AS ({loss}) SELECT * FROM grad(loss, ny.val)");
+    let stmt = format!("WITH loss AS ({loss}) SELECT s, grad(loss, val) FROM ny");
     assert!(refused(ad::sql(&ctx, &stmt).await.unwrap_err()));
     // NOT EXISTS is a plain anti-join, and the round trip keeps it.
     let exists = "SELECT SUM(val * val) AS l FROM ny WHERE NOT EXISTS \
@@ -388,7 +382,7 @@ async fn the_gradient_of_a_spring_systems_energy_is_minus_the_force() {
            FROM spring s JOIN mass a ON s.lo = a.i JOIN mass b ON s.hi = b.i),
          gravity AS (SELECT SUM(w.w * m.y) AS e FROM mass m JOIN weight w ON m.i = w.i),
          energy AS (SELECT springs.e + gravity.e AS e FROM springs CROSS JOIN gravity)
-         SELECT i, y FROM grad(energy, mass.y)",
+         SELECT i, grad(energy, y) FROM mass",
     )
     .await;
     // dE/dy_i = w_i + Σ k·stretch over springs above i − Σ k·stretch below.
@@ -424,14 +418,12 @@ async fn a_filter_on_a_gradients_dims_computes_only_those_rows() {
         "WITH loss AS (SELECT SUM(power(lw.val * lx.x, 2)) AS l FROM lw JOIN lx ON lw.i = lx.i)";
     let all = pairs(
         &ctx,
-        &format!("{loss} SELECT g.layer * 10 + g.i, g.val FROM grad(loss, lw.val) g"),
+        &format!("{loss} SELECT layer * 10 + i, grad(loss, val) FROM lw"),
     )
     .await;
     let some = pairs(
         &ctx,
-        &format!(
-            "{loss} SELECT g.layer * 10 + g.i, g.val FROM grad(loss, lw.val) g WHERE g.layer = 1"
-        ),
+        &format!("{loss} SELECT layer * 10 + i, grad(loss, val) FROM lw WHERE layer = 1"),
     )
     .await;
     let want: Vec<(i64, f64)> = all.into_iter().filter(|(k, _)| k / 10 == 1).collect();
@@ -475,4 +467,26 @@ async fn a_filter_on_a_gradients_dims_computes_only_those_rows() {
     )
     .unwrap_err();
     assert!(matches!(err, AdError::InvalidOptions(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_star_beside_a_gradient_returns_the_table_s_columns_and_it() {
+    let ctx = ctx().await;
+    let df = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT *, grad(loss, val) AS g FROM w ORDER BY i",
+    )
+    .await
+    .unwrap();
+    let names: Vec<String> = df
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, vec!["i", "val", "g"]);
+    let batches = df.collect().await.unwrap();
+    let g = batches[0].column(2).as_primitive::<Float64Type>();
+    assert_eq!(g.values().to_vec(), vec![2.0, -4.0, 1.0]);
 }

@@ -34,7 +34,7 @@ jax = pytest.importorskip("jax", reason="the JAX oracle needs jax installed")
 ddxdb = pytest.importorskip("ddxdb", reason="needs the ddxdb wheel built")
 
 import oracle  # noqa: E402  (must follow the skip guards above)
-from engines import grad_column, grad_sql  # noqa: E402
+from engines import column, grad_column, grad_sql, jvp_sql, second_sql  # noqa: E402
 from oracle import candidate, sample_points, trace  # noqa: E402
 
 SEED = 20260809
@@ -108,6 +108,92 @@ def test_grad_agrees_with_jax_grad():
         f"only {judged}/{EXPRESSIONS} expressions had {MIN_POINTS} comparable "
         f"points; the generator or the conditioning gates have drifted and this "
         f"suite is no longer testing much"
+    )
+
+
+def test_jvp_agrees_with_jax_jvp():
+    """`jvp(f, t.v, tangent)` at each row equals JAX's forward-mode
+    directional derivative.
+
+    ddx seeds one column's tangent from a table and leaves the other at zero,
+    which is `jax.jvp` with a one-hot tangent — the same semantics, so this is
+    a direct comparison rather than an analogy.
+    """
+    rng = random.Random(SEED + 1)
+    judged = 0
+
+    for _ in range(EXPRESSIONS):
+        cand, xs, ys = _draw(rng)
+        if cand is None:
+            continue
+
+        # The tangent is the other column, so it varies per row: a rule that
+        # dropped it would not merely rescale the answer, it would change shape.
+        sql = jvp_sql(cand.sql, cand.wrt)
+        got = column(sql, xs, ys)
+
+        def directional(x, y, _f=cand.fn, _wrt=cand.wrt):
+            seed = (y, 0.0) if _wrt == "x" else (0.0, x)
+            return jax.jvp(_f, (x, y), seed)[1]
+
+        want = np.asarray(
+            jax.vmap(directional)(jax.numpy.asarray(xs), jax.numpy.asarray(ys))
+        )
+
+        _judge(cand, got, xs, ys, want, sql)
+        judged += 1
+
+    assert judged / EXPRESSIONS >= MIN_RETENTION
+
+
+def test_second_derivative_agrees_with_nested_jax_grad():
+    """`jvp` of a `SELECT` over `grad` gives the second derivative, as nesting
+    `jax.grad` does.
+
+    Higher order is not a separate mechanism: the calls nest, and the outer
+    program differentiates through the inner one. This checks the
+    composition, which no single-order test can.
+    """
+    rng = random.Random(SEED + 2)
+    judged = 0
+
+    for _ in range(EXPRESSIONS):
+        cand, xs, ys = _draw(rng, depth=2)
+        if cand is None:
+            continue
+
+        sql = second_sql(cand.sql, cand.wrt)
+        got = column(sql, xs, ys)
+
+        second = jax.grad(jax.grad(cand.fn, argnums=cand.argnum), argnums=cand.argnum)
+        want = np.asarray(
+            jax.vmap(second)(jax.numpy.asarray(xs), jax.numpy.asarray(ys))
+        )
+
+        # A second derivative squares the conditioning problem: its intermediates
+        # are the first derivative's, differentiated again. Points merely adequate
+        # for one order need not be for two, so rows where the *oracle* has left
+        # the finite range are dropped — there is nothing to compare against.
+        #
+        # The mask is JAX's alone, deliberately. Masking on `got` as well would
+        # discard exactly the rows worth seeing: where JAX has a finite second
+        # derivative and ddx returns NULL or an infinity, that is a regression,
+        # and a symmetric mask would file it as "nothing to compare" and pass.
+        keep = np.isfinite(want)
+        if keep.sum() < MIN_POINTS:
+            continue
+        assert np.isfinite(got[keep]).all(), (
+            f"ddx returned a non-finite second derivative where JAX has a finite one\n"
+            f"  expression: {cand.sql}   wrt {cand.wrt}\n"
+            f"  statement : {sql}\n"
+            f"  ddx       : {got[keep][~np.isfinite(got[keep])]}"
+        )
+
+        _judge(cand, got[keep], xs[keep], ys[keep], want[keep], sql)
+        judged += 1
+
+    assert judged / EXPRESSIONS >= 0.3, (
+        f"only {judged}/{EXPRESSIONS} second derivatives were comparable"
     )
 
 

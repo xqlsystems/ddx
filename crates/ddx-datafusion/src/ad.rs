@@ -4,15 +4,24 @@
 
 //! Query-level reverse-mode AD (ddx v2) on DataFusion.
 //!
-//! The simplest way in is SQL itself. [`sql`] runs a statement in which
-//! `grad(f, table.column)` is the gradient of the number a CTE computes (its
-//! objective: a loss, a likelihood, an energy, …), as a relation shaped like
-//! the table:
+//! The simplest way in is SQL itself. [`sql`] runs a statement in which,
+//! in a `SELECT` over a table, `grad(f, column)` is the gradient at each row
+//! of the number a CTE computes (its objective: a loss, a likelihood, an
+//! energy, …), so a training step is one expression:
 //!
 //! ```sql
 //! WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-//! SELECT w.i, w.val - 0.1 * g.val AS val
-//! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+//! SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
+//! ```
+//!
+//! `vjp(f, column, cotangent)` is the same for any CTE `f`, pulled back along
+//! `cotangent`, a relation shaped like `f`'s output; and `jvp(e,
+//! table.column, tangent)`, a column of any `SELECT`, is the tangent of its
+//! expression `e` along `tangent`, a relation shaped like the table:
+//!
+//! ```sql
+//! WITH v AS (SELECT i, 1.0 AS val FROM w)
+//! SELECT SUM(val * val) AS l, jvp(SUM(val * val), w.val, v) AS dl FROM w
 //! ```
 //!
 //! Underneath, [`grad`] turns a query whose result is one number into a
@@ -48,7 +57,7 @@
 //! let df = ad::sql(
 //!     &ctx,
 //!     "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
-//!      SELECT i, val FROM grad(loss, w.val) ORDER BY i",
+//!      SELECT i, grad(loss, val) AS val FROM w ORDER BY i",
 //! )
 //! .await?;
 //! # let _ = df.collect().await?;
@@ -80,8 +89,7 @@ pub use ddx_ad::{
     Program, Step, Tangent,
 };
 
-use crate::engine::{execute, register, release, to_df_err};
-use ddx_ad::Statements;
+use crate::engine::{execute, from_run_error, register, release, to_df_err, DataFusion};
 
 /// The gradient of `of` with respect to the `wrt` columns (see
 /// [`ddx_ad::grad`]): of SQL text or a plan, the number the query computes (a
@@ -221,18 +229,9 @@ impl sealed::Sealed for ForwardProgram {
 impl Differentiable for ForwardProgram {}
 
 /// `plan` as Substrait, refused if the conversion would lose its meaning.
-fn substrait_of(ctx: &SessionContext, plan: &LogicalPlan) -> Result<Box<Plan>> {
+pub(crate) fn substrait_of(ctx: &SessionContext, plan: &LogicalPlan) -> Result<Box<Plan>> {
     refuse_what_substrait_loses(plan)?;
     to_substrait_plan(plan, &ctx.state())
-}
-
-/// DataFusion's plan of `SELECT * FROM table WHERE predicate`, for
-/// [`ddx_ad::Options::restrict`]; `None` if it does not plan, and then every
-/// row of the gradient is computed, which is always right.
-async fn restriction_plan(ctx: &SessionContext, table: &str, predicate: &str) -> Option<Plan> {
-    let sql = format!("SELECT * FROM {table} WHERE {predicate}");
-    let lp = ctx.sql(&sql).await.ok()?.into_unoptimized_plan();
-    to_substrait_plan(&lp, &ctx.state()).ok().map(|p| *p)
 }
 
 /// Refuse a plan whose meaning DataFusion's Substrait producer does not
@@ -289,67 +288,66 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
     Ok(())
 }
 
-/// Run the SQL statement `sql`, in which `grad(f, table.column, …)` in a
-/// `FROM` clause is the gradient of the number the CTE `f` computes (see
-/// [`ddx_ad::sql`]): a relation shaped like `table`, its dims and the named
-/// columns' gradients.
+/// Run the SQL statement `sql`, in which, as columns of a `SELECT` (see
+/// [`ddx_ad::rewrite`], which this runs on DataFusion):
 ///
-/// Each objective's [`grad`] program runs first, once, however many calls use it,
-/// and each call is replaced by a query over the gradient it needs before the
-/// statement is planned. A statement with no such call is planned as it is.
-/// The programs' tables are dropped once the statement is planned; the
-/// returned DataFrame keeps what it reads.
+/// - `grad(f, column)`, in a `SELECT` over the column's table, is the
+///   gradient at each row of the number the CTE `f` computes;
+/// - `vjp(f, column, cotangent)` is the same for any `f`, pulled back along
+///   `cotangent`, a CTE or table shaped like `f`'s output;
+/// - `jvp(e, table.column, …, tangent)`, a column of the statement's
+///   `SELECT` or a CTE's, is the tangent of its expression `e` at each row,
+///   along `tangent`, a CTE or table shaped like `table`, or a number, the
+///   same at every row: `jvp(sin(x), t.x, 1)` is `cos(x)`.
 ///
-/// An objective defined in a `WITH RECURSIVE` clause is refused, so a training loop
-/// cannot yet be written as one recursive statement (design.md §5). This is
-/// ddx's own limit, separate from DataFusion 54's recursive-CTE planning bug
-/// (design.md §3.6).
+/// Calls nest: `f`, `e`'s `SELECT`, or the cotangent or tangent may read
+/// another call, and the outer call differentiates through it, so `jvp` of
+/// a column holding `grad(loss, val)` along `v` is the Hessian-vector
+/// product `H·v`.
+///
+/// Each program runs first, once, however many calls use it (one per
+/// objective for `grad`, per objective and cotangent for `vjp`, per
+/// `SELECT` and tangent for `jvp`), and each call is replaced by a read of
+/// what it needs before the statement is planned. A statement with no such
+/// call is planned as it is. The programs' tables and the cotangents and
+/// tangents are dropped once the statement is planned; the returned
+/// DataFrame keeps what it reads.
+///
+/// An objective defined in a `WITH RECURSIVE` clause is refused, so a
+/// training loop cannot yet be written as one recursive statement: each
+/// iteration would need its own program. This is ddx's own limit, separate
+/// from DataFusion 54's, which plans a recursive CTE wrongly unless the outer
+/// query reads every one of its columns.
 pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
     let mut frames = sql_all(ctx, &[sql]).await?;
     Ok(frames.pop().expect("one statement in, one frame out"))
 }
 
-/// [`sql`] for several statements at once. Statements whose `grad` calls
-/// differentiate the same objective share one run of its program, so a
-/// training step can update each parameter table with its own statement and
-/// pay for the backward pass once.
+/// [`sql`] for several statements at once. Statements whose calls need the
+/// same program share one run of it, so a training step can update each
+/// parameter table with its own statement and pay for the backward pass
+/// once.
 pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<DataFrame>> {
-    // Which programs to run, and how each statement reads their gradients,
-    // are ddx_ad::Statements'; running them and planning the result are
-    // DataFusion's.
-    let planned = Statements::plan(statements, &GenericDialect {}).map_err(to_df_err)?;
-    let mut ran: Vec<BackwardProgram> = Vec::with_capacity(planned.jobs().len());
-    let result = async {
-        for job in planned.jobs() {
-            // Only the gradient rows the statements read, where they say.
-            let mut options = ddx_ad::Options::new();
-            for (table, predicate) in &job.restrict {
-                if let Some(select) = restriction_plan(ctx, table, predicate).await {
-                    options = options.restrict(table.clone(), select);
-                }
-            }
-            let lp = ctx.sql(&job.query).await?.into_optimized_plan()?;
-            let plan = substrait_of(ctx, &lp)?;
-            let program = ddx_ad::grad_with(&*plan, &job.wrt, &options).map_err(to_df_err)?;
-            ran.push(program);
-            execute(ctx, ran.last().expect("just pushed")).await?;
-        }
-        let rewritten = planned
-            .rewrite(&ran.iter().collect::<Vec<_>>())
-            .map_err(to_df_err)?;
-        let mut frames = Vec::with_capacity(rewritten.len());
-        for sql in &rewritten {
-            frames.push(ctx.sql(sql).await?);
-        }
-        Ok(frames)
+    // Which programs to run, how each is built and run, and how each
+    // statement reads them are ddx_ad::rewrite's; DataFusion plans and runs.
+    let mut engine = DataFusion(ctx.clone());
+    let out = ddx_ad::rewrite(&mut engine, statements, &GenericDialect {})
+        .await
+        .map_err(from_run_error)?;
+    let frames = plan_each(ctx, &out.statements).await;
+    // A planned DataFrame holds the tables it reads, so they can leave the
+    // catalog now.
+    out.release(&mut engine).await?;
+    frames
+}
+
+/// Each of `statements`, planned.
+async fn plan_each(ctx: &SessionContext, statements: &[String]) -> Result<Vec<DataFrame>> {
+    let mut frames = Vec::with_capacity(statements.len());
+    for sql in statements {
+        frames.push(ctx.sql(sql).await?);
     }
-    .await;
-    // A planned DataFrame holds the tables it reads, so the programs' tables
-    // can leave the catalog now.
-    for program in &ran {
-        release(ctx, program)?;
-    }
-    result
+    Ok(frames)
 }
 
 /// What a program computed, as DataFrames that hold their rows: nothing it
@@ -358,7 +356,8 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 #[non_exhaustive]
 pub struct Outputs {
     /// The query's output: its columns, then, for a `jvp` program, each
-    /// column's tangent as `{column}_tangent` ([`OutputTable::query`]).
+    /// column's tangent as `{column}_tangent`, as `jvp(…)` in SQL returns
+    /// them ([`OutputTable::query`]).
     pub value: DataFrame,
     /// One per `wrt` table, in the program's order
     /// ([`Program::gradients`]): the table's dims, then each value's

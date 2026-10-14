@@ -297,7 +297,7 @@ async fn grad_in_sql_of_a_table_with_capitals() {
     .await;
     let df = ad::sql(
         &ctx,
-        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") SELECT i, val FROM grad(loss, \"W\".val) ORDER BY i",
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") SELECT i, grad(loss, val) FROM \"W\" ORDER BY i",
     )
     .await
     .unwrap();
@@ -647,7 +647,7 @@ async fn grad_in_sql_skips_comments_inside_the_call() {
         "grad(loss, -- )\n p.val)",
     ] {
         let sql =
-            format!("WITH loss AS (SELECT SUM(val * val) AS l FROM p) SELECT i, val FROM {call}");
+            format!("WITH loss AS (SELECT SUM(val * val) AS l FROM p) SELECT i, {call} FROM p");
         let df = ad::sql(&ctx, &sql)
             .await
             .unwrap_or_else(|e| panic!("{call:?}: {e}"));
@@ -722,7 +722,7 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
     // Found by ad_sql_text.rs, 18 panics in 3000 valid spellings. The first
     // call's `/* ( */` keeps call_span counting past its real end, into the
     // second call, until a `)` in a later comment closes it; the second
-    // call starts inside the first's span, and GradCalls::rewrite slices the
+    // call starts inside the first's span, and the rewrite slices the
     // statement from a later byte to an earlier one: a panic in the
     // library, on valid SQL.
     let ctx = SessionContext::new();
@@ -737,8 +737,8 @@ async fn grad_in_sql_does_not_panic_on_two_calls_and_a_comment() {
     )
     .await;
     let sql = "WITH loss AS (SELECT SUM(p.val * q.val) AS l FROM p JOIN q ON p.i = q.i) \
-               SELECT a.i, a.val, b.val AS qv \
-               FROM grad(loss, p.val /* ( */) a JOIN grad(loss, q.val) b ON a.i = b.i /* ) */";
+               SELECT p.i, grad(loss, p.val /* ( */), grad(loss, q.val) AS qv \
+               FROM p JOIN q ON p.i = q.i /* ) */";
     let df = ad::sql(&ctx, sql).await.unwrap();
     assert_eq!(
         df.collect()

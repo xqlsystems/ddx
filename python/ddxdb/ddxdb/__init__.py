@@ -12,8 +12,7 @@ Write a model's forward pass and loss as SQL, and take its gradient in SQL::
     ctx = Context()
     ctx.sql('''
         WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-        SELECT w.i, w.val - 0.1 * g.val AS val
-        FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+        SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
     ''')
 
 :class:`Context` is a DataFusion ``SessionContext`` whose ``.sql()``
@@ -54,10 +53,12 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
 
 
 class Backend(Protocol):
-    """An engine :func:`run` can run a program on: the four primitives of
-    ``ddx_ad::Backend``. Plans cross as serialized Substrait, with their reads
-    of earlier steps already bound. :class:`ddxdb.ad.DataFusionBackend` is
-    one; any object with these methods is another."""
+    """An engine ddx runs on: the primitives of ``ddx_ad::Backend``.
+    :func:`run` needs the first four to run a program; rewriting SQL that
+    calls ``grad``, ``vjp`` or ``jvp`` also needs :meth:`plan_sql`. Plans
+    cross as serialized Substrait, with their reads of earlier steps already
+    bound. :class:`ddxdb.ad.DataFusionBackend` is one; any object with these
+    methods is another."""
 
     def select_all(self, name: str) -> bytes:
         """The engine's own serialized Substrait plan of ``SELECT * FROM
@@ -75,6 +76,13 @@ class Backend(Protocol):
 
     def drop_table(self, name: str) -> None:
         """Drop the table ``name`` if it exists."""
+        ...
+
+    def plan_sql(self, sql: str) -> bytes:
+        """The engine's serialized Substrait plan of the SQL query ``sql``.
+        Only :func:`ddxdb.ad.sql`'s rewrite asks for one, to differentiate a
+        query a statement names; a backend that only runs programs may
+        leave it out."""
         ...
 
 

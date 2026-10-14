@@ -21,7 +21,6 @@ except ImportError as e:  # pragma: no cover - depends on the environment
         "For any other engine, run ddxdb.grad_plan's programs on a ddxdb.Backend."
     ) from e
 
-from ._ddxdb import _Statements
 
 __all__ = ["Context"]
 
@@ -38,7 +37,7 @@ class Context(SessionContext):
         ctx.sql("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
         ctx.sql(
             "WITH loss AS (SELECT SUM(val * val) AS l FROM w) "
-            "SELECT * FROM grad(loss, w.val)"
+            "SELECT i, grad(loss, val) FROM w"
         ).collect()
     """
 
@@ -49,15 +48,16 @@ class Context(SessionContext):
         object.__setattr__(self, "_ddx_dialect", dialect)
 
     def sql(self, query: str, *args, **kwargs):
-        """Run `grad` in `query`, then plan it as usual.
+        """Run `grad`, `vjp` and `jvp` in `query`, then plan it as usual.
 
-        In a `FROM` clause, `grad(loss, table.column)` is the gradient of the
-        loss a CTE computes, as a relation shaped like the table (see
-        :mod:`ddxdb.ad`). A statement with no `grad` is planned as it is.
+        As columns of a select list, `grad(loss, column)` is the gradient at
+        each row of the loss a CTE computes; `vjp(f, column, cotangent)` the
+        same for any CTE along a cotangent; and `jvp(e, table.column,
+        tangent)` the tangent of an expression along a tangent table (see
+        :mod:`ddxdb.ad`). A statement with none is planned as it is.
         """
-        planned = None if args or kwargs else _Statements([query], self._ddx_dialect)
-        if planned is not None and planned.jobs():
-            from . import ad
+        if args or kwargs:
+            return super().sql(query, *args, **kwargs)
+        from . import ad
 
-            return ad.sql(self, query, dialect=self._ddx_dialect)
-        return super().sql(query, *args, **kwargs)
+        return ad.sql(self, query, dialect=self._ddx_dialect)

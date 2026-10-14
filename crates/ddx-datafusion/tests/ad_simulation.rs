@@ -2962,7 +2962,8 @@ async fn name_checks(
             let moved = case.reading(&t, &reference);
             (
                 format!(
-                    "WITH {}, loss AS (SELECT {} AS loss FROM r{} c) SELECT {}val FROM grad(loss, {reference}.val)",
+                    "WITH {}, loss AS (SELECT {} AS loss FROM r{} c) \
+                     SELECT {}grad(loss, val) AS val FROM {reference}",
                     moved.ctes(),
                     case.head,
                     case.root,
@@ -2974,7 +2975,7 @@ async fn name_checks(
         "shadow" => (
             format!(
                 "WITH {t} AS (SELECT * FROM {t}), {}, loss AS (SELECT {} AS loss FROM r{} c) \
-                 SELECT {}val FROM grad(loss, {t}.val)",
+                 SELECT {}grad(loss, val) AS val FROM {t}",
                 case.ctes(),
                 case.head,
                 case.root,
@@ -2984,7 +2985,7 @@ async fn name_checks(
         ),
         "subquery" => (
             format!(
-                "{} SELECT * FROM (SELECT {}val FROM grad(loss, {t}.val)) AS g",
+                "{} SELECT * FROM (SELECT {}grad(loss, val) AS val FROM {t}) AS g",
                 loss_prefix(case),
                 lead(&dims, "")
             ),
@@ -2993,40 +2994,27 @@ async fn name_checks(
         "later-cte" => (
             format!(
                 "WITH {}, loss AS (SELECT {} AS loss FROM r{} c), \
-                 g AS (SELECT * FROM grad(loss, {t}.val)) SELECT {}val FROM g",
+                 g AS (SELECT {}grad(loss, val) AS val FROM {t}) SELECT {}val FROM g",
+                case.ctes(),
+                case.head,
+                case.root,
+                lead(&dims, ""),
+                lead(&dims, "")
+            ),
+            "val",
+        ),
+        "two-losses" => (
+            format!(
+                "WITH {}, loss AS (SELECT {} AS loss FROM r{} c), \
+                 loss2 AS (SELECT 2.0 * loss AS loss FROM loss) \
+                 SELECT {}grad(loss2, val) - 2.0 * grad(loss, val) AS val FROM {t}",
                 case.ctes(),
                 case.head,
                 case.root,
                 lead(&dims, "")
             ),
-            "val",
+            "zero",
         ),
-        "two-losses" => {
-            let on = if dims.is_empty() {
-                "ON true".to_string()
-            } else {
-                format!(
-                    "ON {}",
-                    dims.iter()
-                        .map(|d| format!("a.{d} = b.{d}"))
-                        .collect::<Vec<_>>()
-                        .join(" AND ")
-                )
-            };
-            (
-                format!(
-                    "WITH {}, loss AS (SELECT {} AS loss FROM r{} c), \
-                     loss2 AS (SELECT 2.0 * loss AS loss FROM loss) \
-                     SELECT {}b.val - 2.0 * a.val AS val \
-                     FROM grad(loss, {t}.val) a JOIN grad(loss2, {t}.val) b {on}",
-                    case.ctes(),
-                    case.head,
-                    case.root,
-                    lead(&dims, "a.")
-                ),
-                "zero",
-            )
-        }
         _ => {
             // Tables named like the steps ddx writes, minus the reserved
             // prefix: ddx must not read or replace them.
@@ -3051,7 +3039,7 @@ async fn name_checks(
             }
             (
                 format!(
-                    "{} SELECT {}val FROM grad(loss, {t}.val)",
+                    "{} SELECT {}grad(loss, val) AS val FROM {t}",
                     loss_prefix(case),
                     lead(&dims, "")
                 ),
@@ -3063,8 +3051,9 @@ async fn name_checks(
         Ok(g) => g,
         Err(e) => {
             // The shadowing CTE is a DataFusion question first: skip it if
-            // the loss alone does not plan that way.
-            if kind == "shadow" && e.contains("DataFusion") {
+            // the loss alone does not plan that way. And a SELECT over it
+            // reads the CTE's rows, not the table's, which ddx refuses.
+            if kind == "shadow" && (e.contains("DataFusion") || e.contains("is a CTE")) {
                 return Ok(());
             }
             if let Some(ad) = e.strip_prefix("External error: ") {
@@ -3194,10 +3183,11 @@ async fn two_value_checks(
         "WITH {}, base AS (SELECT {} AS loss FROM r{} c), \
          loss AS (SELECT b.loss + x.s AS loss FROM base b \
                   CROSS JOIN (SELECT SUM(val2 * val2) AS s FROM t2) x) \
-         SELECT * FROM grad(loss, t2.val, t2.VAL2)",
+         SELECT {}grad(loss, val) AS val, grad(loss, VAL2) AS val2 FROM t2",
         moved.ctes(),
         case.head,
-        case.root
+        case.root,
+        lead(&dims, "")
     );
     let r = match query_sql(ctx, &sql).await {
         Ok(r) => r,
@@ -3221,7 +3211,7 @@ async fn two_value_checks(
     let names: Vec<String> = r.names.iter().map(|n| n.to_ascii_lowercase()).collect();
     if names != want_names {
         out.fail(format!(
-            "[names] two-values: grad(loss, t2.val, t2.VAL2) has columns {:?}, expected the \
+            "[names] two-values: grad(loss, val), grad(loss, VAL2) have columns {:?}, expected the \
              dims then the values {want_names:?}\n  {sql}",
             r.names
         ));
@@ -3414,21 +3404,10 @@ async fn train_checks(
         for t in &case.wrt {
             let tb = theta.table(t);
             let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
-            let on = if dims.is_empty() {
-                "ON true".to_string()
-            } else {
-                format!(
-                    "ON {}",
-                    dims.iter()
-                        .map(|d| format!("p.{d} = g.{d}"))
-                        .collect::<Vec<_>>()
-                        .join(" AND ")
-                )
-            };
             statements.push(format!(
-                "{} SELECT {}p.val - {lr:e} * g.val AS val FROM {t} p JOIN grad(loss, {t}.val) g {on}",
+                "{} SELECT {}val - {lr:e} * grad(loss, val) AS val FROM {t}",
                 loss_prefix(&theta),
-                lead(&dims, "p.")
+                lead(&dims, "")
             ));
         }
         let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
@@ -4474,7 +4453,7 @@ fn rng_upper(t: &str) -> bool {
     t.bytes().map(u32::from).sum::<u32>() % 2 == 0
 }
 
-/// `grad(loss, t.val)` in SQL, and an SGD step written as a join.
+/// `grad(loss, t.val)` in SQL, and an SGD step written with it.
 async fn surface_checks(
     rng: &mut Rng,
     case: &Case,
@@ -4517,25 +4496,14 @@ async fn surface_checks(
         let tb = case.table(t);
         let dims: Vec<&str> = tb.dims.iter().map(String::as_str).collect();
         statements.push(format!(
-            "{loss_cte} SELECT {}val FROM {call}{name}, {})",
+            "{loss_cte} SELECT {}{call}{name}, {}) AS val FROM {t}",
             lead(&dims, ""),
             column(t)
         ));
-        let on = if dims.is_empty() {
-            "ON true".to_string()
-        } else {
-            format!(
-                "ON {}",
-                dims.iter()
-                    .map(|d| format!("p.{d} = g.{d}"))
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            )
-        };
+        let aliased = if rng_upper(t) { "p.VAL" } else { "p.val" };
         statements.push(format!(
-            "{loss_cte} SELECT {}p.val - 0.1 * g.val AS val FROM {t} p JOIN {call}{name}, {}) AS g {on}",
+            "{loss_cte} SELECT {}p.val - 0.1 * {call}{name}, {aliased}) AS val FROM {t} p",
             lead(&dims, "p."),
-            column(t)
         ));
     }
     let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
