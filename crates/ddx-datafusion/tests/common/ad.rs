@@ -32,7 +32,7 @@ pub async fn try_run(ctx: &SessionContext, program: &BackwardProgram) -> Result<
             step.name
         );
     }
-    ddx_datafusion::engine::execute(ctx, program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(ctx, program)
         .await
         .map_err(|e| e.to_string())
 }

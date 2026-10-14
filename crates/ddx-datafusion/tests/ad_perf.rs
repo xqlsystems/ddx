@@ -115,7 +115,7 @@ async fn measure_forward_mode(
     .await;
     register_tangents(ctx, &program.inputs, wrt).await;
     let jvp_run = best(|| async {
-        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        ddx_datafusion::engine::execute(ctx, &program)
             .await
             .unwrap()
     })
@@ -138,12 +138,8 @@ async fn measure_forward_mode(
     })
     .await;
     register_tangents(ctx, &hvp.inputs, wrt).await;
-    let hvp_run = best(|| async {
-        ddx_datafusion::engine::execute(ctx, &hvp, &mut ddx_datafusion::ad::Verified::new())
-            .await
-            .unwrap()
-    })
-    .await;
+    let hvp_run =
+        best(|| async { ddx_datafusion::engine::execute(ctx, &hvp).await.unwrap() }).await;
     let _ = ddx_datafusion::engine::release(ctx, &hvp);
     Ok(ForwardMode {
         jvp_build,
@@ -162,7 +158,7 @@ async fn measure(ctx: &SessionContext, loss: &str, wrt: &[ColumnRef]) -> Report 
     .await;
     let program = ad::grad(ctx, loss, wrt).await.unwrap();
     let run = best(|| async {
-        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        ddx_datafusion::engine::execute(ctx, &program)
             .await
             .unwrap()
     })
@@ -637,37 +633,18 @@ async fn perf_checks() {
     })
     .await;
     let run = best(|| async {
-        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        ddx_datafusion::engine::execute(&ctx, &program)
             .await
             .unwrap()
-    })
-    .await;
-    // As conjugate gradient runs it: p verified once, the tangent forgotten
-    // and checked again on every run.
-    let mut verified = ad::Verified::new();
-    ddx_datafusion::engine::execute(&ctx, &program, &mut verified)
-        .await
-        .unwrap();
-    let tangent = program.inputs[0].name.clone();
-    let verified_run = best(|| {
-        verified.forget(&tangent);
-        let mut v = verified.clone();
-        let (ctx, program) = (&ctx, &program);
-        async move {
-            ddx_datafusion::engine::execute(ctx, program, &mut v)
-                .await
-                .unwrap()
-        }
     })
     .await;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "PERFC rows={rows} forward {:.1} ms | checks one by one {:.1} ms | at once {:.1} ms | \
-         jvp run {:.1} ms | run with p verified {:.1} ms",
+         jvp run {:.1} ms",
         ms(forward),
         ms(one_by_one),
         ms(at_once),
-        ms(run),
-        ms(verified_run)
+        ms(run)
     );
 }

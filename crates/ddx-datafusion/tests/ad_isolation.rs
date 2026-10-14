@@ -46,7 +46,7 @@ async fn run_does_not_replace_a_users_table() {
     .await
     .unwrap();
     // Refusing to run is acceptable; silently dropping the user's table is not.
-    if ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    if ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .is_err()
     {
@@ -99,9 +99,7 @@ async fn interleaved_programs_do_not_read_each_others_tape() {
     for s in &a.forward_steps {
         ddx_datafusion::engine::run_step(&ctx, s).await.unwrap();
     }
-    ddx_datafusion::engine::execute(&ctx, &b, &mut ddx_datafusion::ad::Verified::new())
-        .await
-        .unwrap();
+    ddx_datafusion::engine::execute(&ctx, &b).await.unwrap();
     for s in &a.backward_steps {
         ddx_datafusion::engine::run_step(&ctx, s).await.unwrap();
     }
@@ -129,7 +127,7 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
     .await
     .unwrap();
     assert!(program.intermediate_steps().next().is_some());
-    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
     for step in program.intermediate_steps() {
@@ -149,7 +147,7 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
         vec![5.0, 11.0]
     );
     // Running again works from a context with no intermediates left.
-    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
     ddx_datafusion::engine::release(&ctx, &program).unwrap();
@@ -182,7 +180,7 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let program = ad::grad(&ctx, &plan, &[ColumnRef::new("b", "val")])
         .await
         .unwrap();
-    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
     // The branches are constant, so the gradient is 0 at every row.
@@ -276,9 +274,8 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat_through_ad_run() {
         ),
     )
     .await;
-    let err =
-        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
-            .await
-            .unwrap_err();
+    let err = ddx_datafusion::engine::execute(&ctx, &program)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("share their keys"), "{err}");
 }

@@ -27,35 +27,31 @@ use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, ProjectRel, Rel};
-use ddx_ad::{bind_reads, unbound_reads, Action, AdError, Program, RunError, Step, Verified};
+use ddx_ad::{bind_reads, unbound_reads, Action, AdError, Program, RunError, Step};
 
 pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
 /// Run `program`'s checks, then its steps, registering each step's result
-/// on `ctx` under its name, skipping each check whose fact `verified`
-/// holds and recording every check's fact in it once the run has
-/// succeeded. Its input tables must be registered. The value and the
+/// on `ctx` under its name. Its input tables must be registered. The value and the
 /// gradients stay registered until [`release`]; the intermediate tables are
 /// dropped.
-pub async fn execute<P: Program + ?Sized>(
-    ctx: &SessionContext,
-    program: &P,
-    verified: &mut Verified,
-) -> Result<()> {
+pub async fn execute<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
     // The order, and what is dropped when, are ddx_ad::Runner's. The checks
     // read no step and none reads another, so they run at once, each a task
     // of its own (polled together on one task, they ran one after another),
     // and the runner is told how each went in its own order: on a large wrt
     // table they are most of a run (the dims of a table, then of its
-    // tangent, each a grouped scan). Only those the runner will ask for.
-    let mut runner = ddx_ad::Runner::verified(program, verified);
+    // tangent, each a grouped scan).
+    let mut runner = ddx_ad::Runner::new(program);
     let mut checked: Vec<Option<Result<bool>>> = program.checks().iter().map(|_| None).collect();
-    let tasks: Vec<_> = runner
+    let tasks: Vec<_> = program
         .checks()
-        .map(|i| {
-            let (ctx, plan) = (ctx.clone(), program.checks()[i].plan.clone());
+        .iter()
+        .enumerate()
+        .map(|(i, check)| {
+            let (ctx, plan) = (ctx.clone(), check.plan.clone());
             (
                 i,
                 tokio::spawn(async move { returns_rows(&ctx, &plan).await }),
@@ -84,7 +80,6 @@ pub async fn execute<P: Program + ?Sized>(
         RunError::Engine(e) => e,
         other => DataFusionError::Internal(other.to_string()),
     })?;
-    verified.record_all(program);
     Ok(())
 }
 

@@ -817,7 +817,7 @@ async fn the_public_api_differentiates_sql_and_reports_refusals() {
     )
     .await
     .unwrap();
-    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
     let got = common::ad::rows(

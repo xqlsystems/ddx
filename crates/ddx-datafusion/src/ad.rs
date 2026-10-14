@@ -77,7 +77,7 @@ use ddx_ad::substrait::proto::Plan;
 
 pub use ddx_ad::{
     AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, InputTable, Of, OutputTable,
-    Program, Step, Tangent, Verified,
+    Program, Step, Tangent,
 };
 
 use crate::engine::{execute, register, release, to_df_err};
@@ -332,7 +332,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
             let plan = substrait_of(ctx, &lp)?;
             let program = ddx_ad::grad_with(&*plan, &job.wrt, &options).map_err(to_df_err)?;
             ran.push(program);
-            execute(ctx, ran.last().expect("just pushed"), &mut Verified::new()).await?;
+            execute(ctx, ran.last().expect("just pushed")).await?;
         }
         let rewritten = planned
             .rewrite(&ran.iter().collect::<Vec<_>>())
@@ -379,8 +379,7 @@ pub struct Outputs {
 /// A program depends on the tables' names and schemas, not their values, so
 /// build it once and run it on every training step. One program's runs must
 /// not overlap: they write the same tables while they run. Build a program
-/// per concurrent caller instead. When many runs read `wrt` tables whose
-/// keys do not change, see [`run_verified`].
+/// per concurrent caller instead.
 ///
 /// ```no_run
 /// # use datafusion::prelude::SessionContext;
@@ -400,46 +399,6 @@ pub async fn run<P: Program + ?Sized>(
     program: &P,
     inputs: &[DataFrame],
 ) -> Result<Outputs> {
-    run_verified(ctx, program, inputs, &mut Verified::new()).await
-}
-
-/// [`run`], skipping each check of a `wrt` table whose fact `verified`
-/// holds, and recording every check's fact in it once the run has
-/// succeeded (see [`Verified`]). The inputs are new on every run, so their
-/// checks always run.
-///
-/// A check is a grouped scan of its table on every run; on a large `wrt`
-/// table, the checks are most of a `jvp`'s run. Keep one [`Verified`] across
-/// the runs that read the same tables, and [`Verified::forget`] a table
-/// whenever its keys may change:
-///
-/// ```no_run
-/// # use datafusion::prelude::SessionContext;
-/// # use ddx_datafusion::ad::{self, ColumnRef, Verified};
-/// # async fn cg(ctx: &SessionContext) -> datafusion::error::Result<()> {
-/// let wrt = [ColumnRef::new("w", "val")];
-/// let grad = ad::grad(ctx, "SELECT SUM(val * val) AS l FROM w", &wrt).await?;
-/// let hvp = ad::jvp(ctx, &grad, &wrt).await?;
-/// let mut verified = Verified::new();
-/// for k in 0..10 {
-///     // A new direction each iteration; w's keys are checked on the first
-///     // run only.
-///     let v = ctx.sql(&format!("SELECT i, {k}.0 AS val FROM w")).await?;
-///     ad::run_verified(ctx, &hvp, &[v], &mut verified).await?;
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Keeping a fact for a table whose keys have changed is the caller's
-/// promise broken: a program its check would refuse runs, and rows that
-/// share keys get their summed gradient.
-pub async fn run_verified<P: Program + ?Sized>(
-    ctx: &SessionContext,
-    program: &P,
-    inputs: &[DataFrame],
-    verified: &mut Verified,
-) -> Result<Outputs> {
     let tables = program.inputs();
     if inputs.len() != tables.len() {
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
@@ -455,7 +414,7 @@ pub async fn run_verified<P: Program + ?Sized>(
             let columns: Vec<Expr> = table.columns.iter().map(ident).collect();
             register(ctx, &table.name, df.clone().select(columns)?).await?;
         }
-        execute(ctx, program, verified).await?;
+        execute(ctx, program).await?;
         let mut gradients = Vec::with_capacity(program.gradients().len());
         for g in program.gradients() {
             gradients.push(ctx.sql(&g.query()).await?);

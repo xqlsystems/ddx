@@ -57,7 +57,7 @@ async fn grad(ctx: &SessionContext, loss: &str, table: &str) -> Vec<(i64, Option
     let program = ad::grad(ctx, loss, &[ColumnRef::new(table, "val")])
         .await
         .unwrap();
-    ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(ctx, &program)
         .await
         .unwrap();
     let batches = ctx
@@ -197,7 +197,7 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let program = ad::grad(&ctx, &plan, &[ColumnRef::new("b", "val")])
         .await
         .unwrap();
-    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+    ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
 }
@@ -259,7 +259,7 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
         let program = ad::grad(&ctx, loss, &[ColumnRef::new("p", "val")])
             .await
             .unwrap();
-        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        ddx_datafusion::engine::execute(&ctx, &program)
             .await
             .unwrap();
         let batches = ctx
@@ -690,7 +690,7 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
     )
     .await;
     assert!(
-        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        ddx_datafusion::engine::execute(&ctx, &program)
             .await
             .is_err(),
         "a cotangent with two rows for i = 0 ran, and doubled that row's gradient"
