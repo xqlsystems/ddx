@@ -25,16 +25,19 @@ impl Backend for Sync {
 
     fn table_schema(&mut self, name: &str) -> Result<NamedStruct, Self::Error> {
         self.log.push(format!("schema {name}"));
-        self.rt.block_on(ad::table_schema(&self.ctx, name))
+        self.rt
+            .block_on(ddx_datafusion::engine::table_schema(&self.ctx, name))
     }
 
     fn returns_rows(&mut self, plan: &Plan) -> Result<bool, Self::Error> {
-        self.rt.block_on(ad::returns_rows(&self.ctx, plan))
+        self.rt
+            .block_on(ddx_datafusion::engine::returns_rows(&self.ctx, plan))
     }
 
     fn materialize(&mut self, name: &str, plan: &Plan) -> Result<(), Self::Error> {
         self.log.push(format!("write {name}"));
-        self.rt.block_on(ad::materialize(&self.ctx, name, plan))
+        self.rt
+            .block_on(ddx_datafusion::engine::materialize(&self.ctx, name, plan))
     }
 
     fn drop_table(&mut self, name: &str) -> Result<(), Self::Error> {

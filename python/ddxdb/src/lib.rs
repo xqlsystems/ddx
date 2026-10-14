@@ -262,10 +262,18 @@ struct OutputTable {
     of: Option<Vec<String>>,
     columns: Vec<String>,
     tangents: Vec<Tangent>,
+    query: String,
 }
 
 #[pymethods]
 impl OutputTable {
+    /// SQL for its rows as a caller reads them once its program has run:
+    /// its own columns, then each tangent as `{column}_tangent`
+    /// (`ddx_ad::OutputTable::query`).
+    fn query(&self) -> String {
+        self.query.clone()
+    }
+
     #[getter]
     fn of<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         of_tuple(py, &self.of)
@@ -303,6 +311,7 @@ impl From<&ddx_ad::OutputTable> for OutputTable {
                     tangent: x.tangent.clone(),
                 })
                 .collect(),
+            query: t.query(),
         }
     }
 }

@@ -57,7 +57,9 @@ async fn grad(ctx: &SessionContext, loss: &str, table: &str) -> Vec<(i64, Option
     let program = ad::grad(ctx, loss, &[ColumnRef::new(table, "val")])
         .await
         .unwrap();
-    ad::run(ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let batches = ctx
         .sql(&format!(
             "SELECT * FROM {} ORDER BY 1",
@@ -195,7 +197,9 @@ async fn an_unoptimized_case_over_integer_data_runs() {
     let program = ad::grad(&ctx, &plan, &[ColumnRef::new("b", "val")])
         .await
         .unwrap();
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -255,7 +259,9 @@ async fn max_finds_its_row_when_the_recomputed_values_jitter() {
         let program = ad::grad(&ctx, loss, &[ColumnRef::new("p", "val")])
             .await
             .unwrap();
-        ad::run(&ctx, &program).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap();
         let batches = ctx
             .sql(&format!(
                 "SELECT SUM(ABS(val)) FROM {}",
@@ -458,7 +464,7 @@ async fn upstream_max_treats_nan_alike_grouped_or_not() {
 // Round 2: found on the fixed stack by the forward-mode oracle and by probes
 // past the generator's reach. Each was ignored as a known bug until its fix:
 // the MAX/MIN near-tie in #76; fan-in, the stack overflow and vjp cotangent
-// keys in #74; the deep chain in #79 (ad::logical_plan names computed columns
+// keys in #74; the deep chain in #79 (ddx_datafusion::engine::logical_plan names computed columns
 // briefly); comments in grad(…) in #83; the simple CASE in #71.
 
 /// The bytes of DataFusion's logical plans for `program`'s steps, as ad::run
@@ -467,9 +473,11 @@ async fn upstream_max_treats_nan_alike_grouped_or_not() {
 async fn consumed_plan_bytes(ctx: &SessionContext, program: &ad::BackwardProgram) -> usize {
     let mut total = 0;
     for step in program.steps() {
-        let lp = ad::logical_plan(ctx, &step.plan).await.unwrap();
+        let lp = ddx_datafusion::engine::logical_plan(ctx, &step.plan)
+            .await
+            .unwrap();
         total += lp.display_indent().to_string().len();
-        ad::run_step(ctx, step).await.unwrap();
+        ddx_datafusion::engine::run_step(ctx, step).await.unwrap();
     }
     total
 }
@@ -682,7 +690,9 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
     )
     .await;
     assert!(
-        ad::run(&ctx, &program).await.is_err(),
+        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .is_err(),
         "a cotangent with two rows for i = 0 ran, and doubled that row's gradient"
     );
 }

@@ -114,14 +114,21 @@ async fn measure_forward_mode(
     })
     .await;
     register_tangents(ctx, &program.inputs, wrt).await;
-    let jvp_run = best(|| async { ad::run(ctx, &program).await.unwrap() }).await;
+    let jvp_run = best(|| async {
+        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap()
+    })
+    .await;
     let jvp_checks = best(|| async {
         for c in &program.checks {
-            ad::returns_rows(ctx, &c.plan).await.unwrap();
+            ddx_datafusion::engine::returns_rows(ctx, &c.plan)
+                .await
+                .unwrap();
         }
     })
     .await;
-    let _ = ad::release(ctx, &program);
+    let _ = ddx_datafusion::engine::release(ctx, &program);
     let grad = ad::grad(ctx, loss, wrt).await.map_err(|e| e.to_string())?;
     let hvp = ad::jvp(ctx, &grad, wrt).await.map_err(|e| e.to_string())?;
     let hvp_build = best(|| async {
@@ -131,8 +138,13 @@ async fn measure_forward_mode(
     })
     .await;
     register_tangents(ctx, &hvp.inputs, wrt).await;
-    let hvp_run = best(|| async { ad::run(ctx, &hvp).await.unwrap() }).await;
-    let _ = ad::release(ctx, &hvp);
+    let hvp_run = best(|| async {
+        ddx_datafusion::engine::execute(ctx, &hvp, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap()
+    })
+    .await;
+    let _ = ddx_datafusion::engine::release(ctx, &hvp);
     Ok(ForwardMode {
         jvp_build,
         jvp_run,
@@ -149,26 +161,35 @@ async fn measure(ctx: &SessionContext, loss: &str, wrt: &[ColumnRef]) -> Report 
     })
     .await;
     let program = ad::grad(ctx, loss, wrt).await.unwrap();
-    let run = best(|| async { ad::run(ctx, &program).await.unwrap() }).await;
+    let run = best(|| async {
+        ddx_datafusion::engine::execute(ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap()
+    })
+    .await;
     let mut df_bytes = 0;
     let mut slowest = (Duration::ZERO, String::new());
-    ad::run_checks(ctx, &program).await.unwrap();
+    for check in &program.checks {
+        assert!(!ddx_datafusion::engine::returns_rows(ctx, &check.plan)
+            .await
+            .unwrap());
+    }
     for step in program.steps() {
-        df_bytes += ad::logical_plan(ctx, &step.plan)
+        df_bytes += ddx_datafusion::engine::logical_plan(ctx, &step.plan)
             .await
             .unwrap()
             .display_indent()
             .to_string()
             .len();
         let t = Instant::now();
-        ad::run_step(ctx, step).await.unwrap();
+        ddx_datafusion::engine::run_step(ctx, step).await.unwrap();
         let d = t.elapsed();
         if d > slowest.0 {
             let name = step.name.splitn(4, '_').last().unwrap_or("").to_string();
             slowest = (d, name);
         }
     }
-    let _ = ad::release(ctx, &program);
+    let _ = ddx_datafusion::engine::release(ctx, &program);
     let forward_mode = measure_forward_mode(ctx, loss, wrt).await;
     Report {
         forward,
@@ -562,7 +583,9 @@ async fn perf_checks() {
     match std::env::var("DDX_PERF_CHECKS").as_deref() {
         Ok("one") => {
             for c in &program.checks {
-                ad::returns_rows(&ctx, &c.plan).await.unwrap();
+                ddx_datafusion::engine::returns_rows(&ctx, &c.plan)
+                    .await
+                    .unwrap();
             }
             return;
         }
@@ -572,7 +595,11 @@ async fn perf_checks() {
                 .iter()
                 .map(|c| {
                     let (ctx, plan) = (ctx.clone(), c.plan.clone());
-                    tokio::spawn(async move { ad::returns_rows(&ctx, &plan).await.unwrap() })
+                    tokio::spawn(async move {
+                        ddx_datafusion::engine::returns_rows(&ctx, &plan)
+                            .await
+                            .unwrap()
+                    })
                 })
                 .collect();
             for t in tasks {
@@ -585,7 +612,9 @@ async fn perf_checks() {
     let forward = best(|| async { exec(&ctx, loss).await }).await;
     let one_by_one = best(|| async {
         for c in &program.checks {
-            ad::returns_rows(&ctx, &c.plan).await.unwrap();
+            ddx_datafusion::engine::returns_rows(&ctx, &c.plan)
+                .await
+                .unwrap();
         }
     })
     .await;
@@ -595,7 +624,11 @@ async fn perf_checks() {
             .iter()
             .map(|c| {
                 let (ctx, plan) = (ctx.clone(), c.plan.clone());
-                tokio::spawn(async move { ad::returns_rows(&ctx, &plan).await.unwrap() })
+                tokio::spawn(async move {
+                    ddx_datafusion::engine::returns_rows(&ctx, &plan)
+                        .await
+                        .unwrap()
+                })
             })
             .collect();
         for t in tasks {
@@ -603,11 +636,16 @@ async fn perf_checks() {
         }
     })
     .await;
-    let run = best(|| async { ad::run(&ctx, &program).await.unwrap() }).await;
+    let run = best(|| async {
+        ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap()
+    })
+    .await;
     // As conjugate gradient runs it: p verified once, the tangent forgotten
     // and checked again on every run.
     let mut verified = ad::Verified::new();
-    ad::run_verified(&ctx, &program, &mut verified)
+    ddx_datafusion::engine::execute(&ctx, &program, &mut verified)
         .await
         .unwrap();
     let tangent = program.inputs[0].name.clone();
@@ -615,7 +653,11 @@ async fn perf_checks() {
         verified.forget(&tangent);
         let mut v = verified.clone();
         let (ctx, program) = (&ctx, &program);
-        async move { ad::run_verified(ctx, program, &mut v).await.unwrap() }
+        async move {
+            ddx_datafusion::engine::execute(ctx, program, &mut v)
+                .await
+                .unwrap()
+        }
     })
     .await;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;

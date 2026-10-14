@@ -194,7 +194,9 @@ async fn forward_over_reverse(
     for input in &hvp.inputs {
         register_tangent(ctx, input, 0.0).await;
     }
-    ad::run(ctx, &hvp).await.unwrap();
+    ddx_datafusion::engine::execute(ctx, &hvp, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     read(ctx, &hvp.gradients, wrt, true).await
 }
 
@@ -267,7 +269,9 @@ async fn forward_over_forward_is_a_second_directional_derivative() {
         for input in &outer.inputs[n..] {
             register_tangent(&ctx, input, 1.0).await;
         }
-        ad::run(&ctx, &outer).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &outer, &mut ddx_datafusion::ad::Verified::new())
+            .await
+            .unwrap();
 
         // uᵀ (H v), from H·v and u's tables.
         let mut want = 0.0;
@@ -362,7 +366,9 @@ async fn the_adapter_composes_from_sql() {
         register_tangent(&ctx, input, 0.0).await;
     }
     register_cotangent(&ctx, program.inputs.last().unwrap(), &[0.0, 1.0]).await;
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let got = read(&ctx, &program.gradients, &wrt, false).await;
     assert_close("ad::vjp of ad::jvp", &got, &want);
 }
@@ -546,7 +552,9 @@ async fn a_split_step_computes_what_it_did_whole() {
         jvp.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
     register_tangent(&ctx, &jvp.inputs[0], 0.0).await;
-    ad::run(&ctx, &jvp).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &jvp, &mut ddx_datafusion::ad::Verified::new())
+        .await
+        .unwrap();
     let t = &jvp.value.tangents[0].tangent;
     let got = rows(&ctx, &format!("SELECT {t} FROM {}", jvp.value.step)).await[0][0];
 

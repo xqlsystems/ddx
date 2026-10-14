@@ -89,3 +89,26 @@ pub struct Tangent {
     /// The column holding its tangent.
     pub tangent: String,
 }
+
+impl OutputTable {
+    /// SQL for its rows as a caller reads them, once its program has run:
+    /// its own columns, then each tangent, named `{column}_tangent` (or
+    /// `{column}_tangent_{n}`, for the first free `n`, if that name is
+    /// taken).
+    pub fn query(&self) -> String {
+        use crate::sql::quote;
+        let own = &self.columns[..self.columns.len() - self.tangents.len()];
+        let mut taken: Vec<String> = own.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let mut picked: Vec<String> = own.iter().map(|c| quote(c)).collect();
+        for t in &self.tangents {
+            let base = format!("{}_tangent", t.column);
+            let name = std::iter::once(base.clone())
+                .chain((2..).map(|n| format!("{base}_{n}")))
+                .find(|n| !taken.contains(&n.to_ascii_lowercase()))
+                .expect("a free name");
+            taken.push(name.to_ascii_lowercase());
+            picked.push(format!("{} AS {}", quote(&t.tangent), quote(&name)));
+        }
+        format!("SELECT {} FROM {}", picked.join(", "), quote(&self.step))
+    }
+}

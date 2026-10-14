@@ -1370,6 +1370,7 @@ dependencies = [
  "datafusion-substrait",
  "ddx-ad",
  "ddx-core",
+ "ddx-datafusion",
  "prost",
  "tokio",
 ]
