@@ -26,8 +26,9 @@ you wrote, ``InvalidColumn`` that a column cannot be differentiated. Catch the
 one you can act on rather than matching on message text.
 """
 
+from dataclasses import dataclass
 from importlib import metadata as _metadata
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from ._ddxdb import (  # noqa: F401  (re-exported)
     DdxError,
@@ -50,6 +51,7 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     run,
     vjp_plan,
 )
+from ._ddxdb import _rewrite
 
 
 class Backend(Protocol):
@@ -86,6 +88,60 @@ class Backend(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class Rewritten:
+    """SQL statements rewritten by :func:`rewrite`, and the tables they read.
+
+    Use it as a context manager: the tables are dropped from the backend when
+    the block ends, once the statements have been planned or run::
+
+        with ddxdb.rewrite(backend, statements) as rewritten:
+            for sql in rewritten.statements:
+                con.sql(sql)
+    """
+
+    #: Each statement, its ``grad``, ``vjp`` and ``jvp`` calls replaced by
+    #: reads of what their programs computed; one with no call, as it was.
+    statements: list
+    #: The tables the statements read: the programs' values and gradients,
+    #: and the cotangents and tangents registered for them.
+    tables: list
+    backend: "Backend"
+
+    def release(self) -> None:
+        """Drop :attr:`tables` from the backend, every one even after a failed
+        drop; the first failure is raised."""
+        first = None
+        for table in self.tables:
+            try:
+                self.backend.drop_table(table)
+            except Exception as e:  # noqa: BLE001 - re-raised below
+                first = first or e
+        if first is not None:
+            raise first
+
+    def __enter__(self) -> "Rewritten":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "datafusion") -> Rewritten:
+    """Compute what the ``grad``, ``vjp`` and ``jvp`` calls in ``statements``
+    read, on ``backend`` (any :class:`Backend` with :meth:`Backend.plan_sql`),
+    and rewrite each statement to read it. ``dialect`` is how the statements
+    are written: a dialect name ``sqlparser`` knows, or ``"datafusion"``.
+
+    This is ``ddx_ad::rewrite``, ddx-ad's own Rust: it plans one program per
+    distinct derivative, runs each on the backend, and rewrites the
+    statements' parsed trees. Raises a :class:`DdxError` subclass when ddx
+    cannot differentiate a call, or what the backend raised.
+    """
+    out, tables = _rewrite(backend, list(statements), dialect)
+    return Rewritten(out, tables, backend)
+
+
 # Single-sourced from the installed distribution metadata, which maturin fills
 # from pyproject.toml. Hardcoding it here would be a third copy of the version
 # (pyproject, Cargo.toml, here) with nothing keeping them equal, and the one
@@ -106,6 +162,8 @@ __all__ = [
     "UnknownColumn",
     "InvalidColumn",
     "Backend",
+    "Rewritten",
+    "rewrite",
     "BackwardProgram",
     "Check",
     "ForwardProgram",

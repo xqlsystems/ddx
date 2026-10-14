@@ -169,29 +169,23 @@ impl Check {
 }
 
 /// What an `InputTable` or `OutputTable` is of, for Python: `None` for the
-/// query's output, or a `wrt` table's name parts.
-fn of_py(of: &ddx_ad::Of) -> Option<Vec<String>> {
-    of.table().map(<[String]>::to_vec)
-}
-
-/// `of` as Python sees it: `None`, or a tuple of name parts.
-fn of_tuple<'py>(
-    py: Python<'py>,
-    of: &Option<Vec<String>>,
-) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    of.as_ref().map(|t| PyTuple::new(py, t)).transpose()
+/// query's output, or a `wrt` table's name as `wrt` writes it, its parts
+/// joined by dots (`"w"`, `"schema.w"`).
+fn of_py(of: &ddx_ad::Of) -> Option<String> {
+    of.table().map(|t| t.join("."))
 }
 
 /// A table the caller registers before a program runs (`ddx_ad::InputTable`):
 /// a vjp's cotangent of the output (`of` is `None`), or a jvp's tangent of a
-/// `wrt` table (`of` is its name parts). Its `columns` are its keys, the
+/// `wrt` table (`of` is its name). Its `columns` are its keys, the
 /// first `keys` of them, then its values, named as in what it is of.
 #[pyclass(frozen, eq, skip_from_py_object, module = "ddxdb", name = "InputTable")]
 #[derive(Clone, PartialEq)]
 struct InputTable {
     #[pyo3(get)]
     name: String,
-    of: Option<Vec<String>>,
+    #[pyo3(get)]
+    of: Option<String>,
     columns: Vec<String>,
     #[pyo3(get)]
     keys: usize,
@@ -199,11 +193,6 @@ struct InputTable {
 
 #[pymethods]
 impl InputTable {
-    #[getter]
-    fn of<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
-        of_tuple(py, &self.of)
-    }
-
     #[getter]
     fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.columns)
@@ -249,8 +238,8 @@ impl Tangent {
 }
 
 /// A table a program leaves once it has run (`ddx_ad::OutputTable`): the
-/// value (`of` is `None`), or a `wrt` table's gradient (`of` is its name
-/// parts), written by `step`. A gradient's `columns` are the table's dims,
+/// value (`of` is `None`), or a `wrt` table's gradient (`of` is its name),
+/// written by `step`. A gradient's `columns` are the table's dims,
 /// then its `wrt` values, named as in the table, each holding the gradient:
 /// `0` where none reached, `NULL` where the value itself is `NULL`. For a jvp
 /// program, `tangents` says which column holds each column's tangent.
@@ -265,7 +254,8 @@ impl Tangent {
 struct OutputTable {
     #[pyo3(get)]
     step: String,
-    of: Option<Vec<String>>,
+    #[pyo3(get)]
+    of: Option<String>,
     columns: Vec<String>,
     tangents: Vec<Tangent>,
     query: String,
@@ -278,11 +268,6 @@ impl OutputTable {
     /// (`ddx_ad::OutputTable::query`).
     fn query(&self) -> String {
         self.query.clone()
-    }
-
-    #[getter]
-    fn of<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
-        of_tuple(py, &self.of)
     }
 
     #[getter]
@@ -503,8 +488,29 @@ fn options(
     Ok(options)
 }
 
-fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
-    wrt.into_iter().map(|(t, c)| ColumnRef::new(t, c)).collect()
+/// `wrt` as Python gives it: a column as `"table.column"` (the table may be
+/// qualified, `"schema.table.column"`), or a sequence of them.
+fn wrt_of(wrt: &Bound<'_, PyAny>) -> PyResult<Vec<ColumnRef>> {
+    // A string is itself a sequence in Python: test for one first.
+    let names: Vec<String> = match wrt.extract::<String>() {
+        Ok(one) => vec![one],
+        Err(_) => wrt.extract().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "wrt is a column as \"table.column\", or a sequence of them",
+            )
+        })?,
+    };
+    names
+        .iter()
+        .map(|n| match n.rsplit_once('.') {
+            Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+                Ok(ColumnRef::new(table, column))
+            }
+            _ => Err(PyValueError::new_err(format!(
+                "`{n}` is not a column as \"table.column\""
+            ))),
+        })
+        .collect()
 }
 
 /// `grad_plan`, `vjp_plan` and `jvp_plan` are one path, `derivative`, over
@@ -512,11 +518,11 @@ fn wrt_of(wrt: Vec<(String, String)>) -> Vec<ColumnRef> {
 /// same code with the 1 inlined (no input table to register, none to check).
 fn derivative<T>(
     plan: &Bound<'_, PyAny>,
-    wrt: Vec<(String, String)>,
+    wrt: &Bound<'_, PyAny>,
     options: ddx_ad::Options,
     of: impl FnOnce(&dyn ddx_ad::Differentiable, &[ColumnRef], &ddx_ad::Options) -> ddx_ad::Result<T>,
 ) -> PyResult<T> {
-    of(Subject::of(plan)?.get(), &wrt_of(wrt), &options).map_err(ad_to_py_err)
+    of(Subject::of(plan)?.get(), &wrt_of(wrt)?, &options).map_err(ad_to_py_err)
 }
 
 /// What `grad_plan`, `vjp_plan` and `jvp_plan` differentiate: a serialized
@@ -555,8 +561,8 @@ impl<'py> Subject<'py> {
     }
 }
 
-/// The gradient of the number `plan` computes, with respect to the `(table,
-/// column)` pairs in `wrt` (`ddx_ad::grad`). `plan` is a serialized Substrait
+/// The gradient of the number `plan` computes, with respect to `wrt`, a
+/// column as `"table.column"` or a sequence of them (`ddx_ad::grad`). `plan` is a serialized Substrait
 /// plan, or a program of either kind, whose one output table is
 /// differentiated: `grad`, `vjp` and `jvp` compose.
 ///
@@ -572,7 +578,7 @@ impl<'py> Subject<'py> {
 #[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn grad_plan(
     plan: &Bound<'_, PyAny>,
-    wrt: Vec<(String, String)>,
+    wrt: &Bound<'_, PyAny>,
     namespace: Option<String>,
     restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
@@ -588,7 +594,7 @@ fn grad_plan(
 #[pyo3(signature = (plan, wrt, *, namespace = None, restrict = None))]
 fn vjp_plan(
     plan: &Bound<'_, PyAny>,
-    wrt: Vec<(String, String)>,
+    wrt: &Bound<'_, PyAny>,
     namespace: Option<String>,
     restrict: Option<Vec<(String, Vec<u8>)>>,
 ) -> PyResult<BackwardProgram> {
@@ -599,8 +605,8 @@ fn vjp_plan(
 }
 
 /// The Jacobian-vector product of what `plan` computes, a serialized
-/// Substrait plan or a program, with respect to the `(table, column)` pairs
-/// in `wrt` (`ddx_ad::jvp`): its output with, beside it, its tangent along
+/// Substrait plan or a program, with respect to `wrt`, as for `grad_plan`
+/// (`ddx_ad::jvp`): its output with, beside it, its tangent along
 /// the tangents the caller registers as the program's `inputs`. Of a grad
 /// program, each gradient's tangent is the Hessian-vector product `H·v`.
 /// `namespace` is as for `grad_plan`.
@@ -608,7 +614,7 @@ fn vjp_plan(
 #[pyo3(signature = (plan, wrt, *, namespace = None))]
 fn jvp_plan(
     plan: &Bound<'_, PyAny>,
-    wrt: Vec<(String, String)>,
+    wrt: &Bound<'_, PyAny>,
     namespace: Option<String>,
 ) -> PyResult<ForwardProgram> {
     derivative(plan, wrt, options(namespace, None)?, |p, w, o| {
@@ -727,7 +733,7 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
 /// `sqlparser` knows, or `"datafusion"`).
 #[pyfunction]
 #[pyo3(signature = (backend, statements, dialect = "datafusion"))]
-fn rewrite(
+fn _rewrite(
     backend: Bound<'_, PyAny>,
     statements: Vec<String>,
     dialect: &str,
@@ -807,7 +813,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputTable>()?;
     m.add_class::<OutputTable>()?;
     m.add_class::<Tangent>()?;
-    m.add_function(wrap_pyfunction!(rewrite, m)?)?;
+    m.add_function(wrap_pyfunction!(_rewrite, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(

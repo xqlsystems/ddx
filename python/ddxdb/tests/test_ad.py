@@ -95,7 +95,7 @@ def test_context_sql_understands_grad(ad):
     df = ctx.sql("WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert pairs(df) == [(0, 6.0), (1, 8.0)]
 def test_grad_as_a_program_can_be_rerun_after_the_table_changes(ad, ctx):
-    program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
+    program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", "w.val")
     out = ad.run(ctx, program)
     assert pairs(out.gradients[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
     assert out.value.to_pydict() == {"loss": [1.0 + 4.0 + 0.25]}
@@ -108,7 +108,7 @@ def test_grad_as_a_program_can_be_rerun_after_the_table_changes(ad, ctx):
 
 
 def test_vjp_pulls_a_cotangent_back(ad, ctx):
-    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
+    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", "w.val")
     [cotangent] = program.inputs
     assert (cotangent.of, cotangent.columns, cotangent.keys) == (None, ("i", "s"), 1)
     c = pa.table({"i": pa.array([0, 1, 2], pa.int64()), "s": [1.0, 10.0, 100.0]})
@@ -124,15 +124,39 @@ def test_vjp_pulls_a_cotangent_back(ad, ctx):
     assert not ddx_tables(ctx)
 
 
+def test_wrt_is_one_column_or_several(ad, ctx):
+    loss = "SELECT SUM(w.val * b.val) AS loss FROM w JOIN b ON w.i = b.i"
+    one = ad.run(ctx, ad.grad(ctx, loss, "w.val"))
+    both = ad.run(ctx, ad.grad(ctx, loss, ["w.val", "b.val"]))
+    assert pairs(one.gradients[0]) == pairs(both.gradients[0]) == [(0, 0.25), (1, 3.0), (2, -1.0)]
+    assert pairs(both.gradients[1]) == [(0, 1.0), (1, -2.0), (2, 0.5)]
+    with pytest.raises(ValueError, match="table.column"):
+        ad.grad(ctx, loss, "val")
+    with pytest.raises(TypeError, match="table.column"):
+        ad.grad(ctx, loss, [("w", "val")])
+
+
+def test_rewrite_releases_its_tables_when_the_block_ends(ad, ctx):
+    backend = ad.DataFusionBackend(ctx)
+    before = set(ctx.catalog().schema().names())
+    sql = "WITH f AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(f, val) AS g FROM w"
+    with ddxdb.rewrite(backend, [sql, "SELECT 1 AS one"]) as rewritten:
+        assert "grad(" not in rewritten.statements[0]
+        assert rewritten.statements[1] == "SELECT 1 AS one"
+        assert set(rewritten.tables) <= set(ctx.catalog().schema().names())
+        assert pairs(ctx.sql(rewritten.statements[0])) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    assert set(ctx.catalog().schema().names()) == before
+
+
 def test_refusals_are_typed(ad, ctx):
     with pytest.raises(ddxdb.NotScalar):
-        ad.grad(ctx, "SELECT i, val FROM w", [("w", "val")])
+        ad.grad(ctx, "SELECT i, val FROM w", "w.val")
     with pytest.raises(ddxdb.UnknownColumn, match="weights"):
-        ad.grad(ctx, "SELECT SUM(val) AS loss FROM w", [("weights", "val")])
+        ad.grad(ctx, "SELECT SUM(val) AS loss FROM w", "weights.val")
     with pytest.raises(ddxdb.UnsupportedExpression):
-        ad.grad(ctx, "SELECT STDDEV(val) AS loss FROM w", [("w", "val")])
+        ad.grad(ctx, "SELECT STDDEV(val) AS loss FROM w", "w.val")
     with pytest.raises(ddxdb.InvalidColumn, match="float"):
-        ad.grad(ctx, "SELECT SUM(i) AS loss FROM w", [("w", "i")])
+        ad.grad(ctx, "SELECT SUM(i) AS loss FROM w", "w.i")
     assert issubclass(ddxdb.NotScalar, ddxdb.DdxError)
     assert issubclass(ddxdb.UnknownColumn, ddxdb.DdxError)
     assert issubclass(ddxdb.InvalidColumn, ddxdb.DdxError)
@@ -140,7 +164,7 @@ def test_refusals_are_typed(ad, ctx):
 
 def test_run_refuses_rows_that_share_their_dims(ad, ctx):
     ctx.register_record_batches("d", [table([0, 0, 1], [1.0, 2.0, 3.0]).to_batches()])
-    program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM d", [("d", "val")])
+    program = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM d", "d.val")
     with pytest.raises(ddxdb.InvalidColumn, match="share their dims"):
         ad.run(ctx, program)
 
@@ -150,7 +174,7 @@ def ddx_tables(ctx):
 
 
 def test_run_leaves_none_of_the_programs_tables(ad, ctx):
-    program = ad.grad(ctx, "SELECT MAX(val) * SUM(val) AS loss FROM w", [("w", "val")])
+    program = ad.grad(ctx, "SELECT MAX(val) * SUM(val) AS loss FROM w", "w.val")
     assert list(program.intermediate_steps())
     out = ad.run(ctx, program)
     assert ddx_tables(ctx) == []
@@ -158,8 +182,8 @@ def test_run_leaves_none_of_the_programs_tables(ad, ctx):
 
 
 def test_programs_do_not_share_tables(ad, ctx):
-    a = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", [("w", "val")])
-    b = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM b", [("b", "val")])
+    a = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM w", "w.val")
+    b = ad.grad(ctx, "SELECT SUM(val * val) AS loss FROM b", "b.val")
     assert not {s.name for s in a.steps()} & {s.name for s in b.steps()}
     out = ad.run(ctx, a)
     ad.run(ctx, b)
@@ -216,7 +240,7 @@ def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
 
 def test_vjp_refuses_a_cotangent_whose_keys_repeat(ad, ctx):
     # From the v2 soak (#98): a repeated key added its rows' cotangents.
-    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", [("w", "val")])
+    program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", "w.val")
     c = pa.table({"i": pa.array([0, 0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0, 1.0]})
     with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):
         ad.run(ctx, program, [c])
@@ -253,7 +277,7 @@ class LoggingBackend:
 def test_any_backend_runs_a_program(ad, ctx):
     # Composability re-review (#81): the runner takes a Backend, not only a
     # DataFusion context, and asks each table's schema once per write.
-    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
+    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", "w.val")
     backend = LoggingBackend(ad, ctx)
     ddxdb.run(backend, prog)
     kinds = [e[0] for e in backend.log]
@@ -271,7 +295,7 @@ def test_any_backend_runs_a_program(ad, ctx):
 
 
 def test_a_failed_run_leaves_none_of_the_programs_tables(ad, ctx):
-    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", [("w", "val")])
+    prog = ad.grad(ctx, "SELECT SUM(val * val) / COUNT(val) AS l FROM w", "w.val")
     backend = LoggingBackend(ad, ctx, fail_on=prog.gradients[0].step)
     with pytest.raises(RuntimeError, match="disk full"):
         ddxdb.run(backend, prog)
@@ -285,11 +309,11 @@ def test_a_fixed_namespace_gives_the_same_program(ad, ctx):
 
     q = "SELECT SUM(val * val) AS l FROM w"
     plan = Serde.serialize_bytes(q, ctx)
-    a = ddxdb.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
-    b = ddxdb.grad_plan(plan, [("w", "val")], namespace="__ddx_py_")
+    a = ddxdb.grad_plan(plan, "w.val", namespace="__ddx_py_")
+    b = ddxdb.grad_plan(plan, "w.val", namespace="__ddx_py_")
     assert a == b and a.value.step == "__ddx_py_value"
     with pytest.raises(ddxdb.DdxError, match="namespace"):
-        ad.grad(ctx, q, [("w", "val")], namespace="__ddx_Py_")
+        ad.grad(ctx, q, "w.val", namespace="__ddx_Py_")
 
 
 def test_grad_in_sql_is_found_in_the_dialect_it_is_written_in(ad, ctx):
@@ -304,14 +328,14 @@ def test_not_in_over_a_subquery_is_refused(ad, ctx):
     # refused, rather than differentiated as a different query.
     loss = "SELECT SUM(val * val) AS l FROM w WHERE i NOT IN (SELECT i FROM b WHERE val > 1.0)"
     with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
-        ad.grad(ctx, loss, [("w", "val")])
+        ad.grad(ctx, loss, "w.val")
     with pytest.raises(ddxdb.UnsupportedExpression, match="NOT IN"):
         ad.sql(ctx, f"WITH loss AS ({loss}) SELECT i, grad(loss, val) FROM w")
     exists = (
         "SELECT SUM(val * val) AS l FROM w WHERE NOT EXISTS "
         "(SELECT 1 FROM b WHERE b.i = w.i AND b.val > 1.0)"
     )
-    ad.grad(ctx, exists, [("w", "val")])
+    ad.grad(ctx, exists, "w.val")
 
 
 
@@ -332,7 +356,7 @@ LOSS = "SELECT SUM(val * val * val) AS l FROM w"
 
 def tangent_of_w(input_table, values):
     """``input_table``, a tangent of w, as ``values`` by row of w."""
-    assert input_table.of == ("w",) and input_table.columns == ("i", "val") and input_table.keys == 1
+    assert input_table.of == "w" and input_table.columns == ("i", "val") and input_table.keys == 1
     return table([0, 1, 2], values)
 
 
@@ -342,7 +366,7 @@ def register_tangent(ctx, input_table, values):
 
 
 def test_jvp_of_a_query_is_its_value_and_its_tangent(ad, ctx):
-    program = ad.jvp(ctx, LOSS, [("w", "val")])
+    program = ad.jvp(ctx, LOSS, "w.val")
     assert isinstance(program, ddxdb.ForwardProgram) and not program.gradients
     out = ad.run(ctx, program, [tangent_of_w(program.inputs[0], [1.0, 1.0, 1.0])])
     [tangent] = program.value.tangents
@@ -354,18 +378,18 @@ def test_jvp_of_a_query_is_its_value_and_its_tangent(ad, ctx):
 
 
 def test_jvp_of_a_grad_program_is_a_hessian_vector_product(ad, ctx):
-    grad = ad.grad(ctx, LOSS, [("w", "val")])
-    hvp = ad.jvp(ctx, grad, [("w", "val")])
+    grad = ad.grad(ctx, LOSS, "w.val")
+    hvp = ad.jvp(ctx, grad, "w.val")
     [g] = hvp.gradients
-    assert g.of == ("w",)
+    assert g.of == "w"
     out = ad.run(ctx, hvp, [tangent_of_w(hvp.inputs[0], [1.0, 2.0, 3.0])])
     got = out.gradients[0].select("i", "val_tangent")
     assert pairs(got) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
 
 
 def test_vjp_of_a_jvp_program_is_a_hessian_vector_product_too(ad, ctx):
-    jvp = ad.jvp(ctx, LOSS, [("w", "val")])
-    program = ad.vjp(ctx, jvp, [("w", "val")])
+    jvp = ad.jvp(ctx, LOSS, "w.val")
+    program = ad.vjp(ctx, jvp, "w.val")
     tangent, cotangent = program.inputs
     assert tangent.name == jvp.inputs[0].name and cotangent.of is None
     # 0 on the loss, 1 on its tangent: the gradient of ∇l·v.
@@ -375,7 +399,7 @@ def test_vjp_of_a_jvp_program_is_a_hessian_vector_product_too(ad, ctx):
 
 
 def test_any_backend_runs_a_forward_program(ad, ctx):
-    program = ad.jvp(ctx, LOSS, [("w", "val")])
+    program = ad.jvp(ctx, LOSS, "w.val")
     register_tangent(ctx, program.inputs[0], [1.0, 0.0, 0.0])
     backend = LoggingBackend(ad, ctx)
     ddxdb.run(backend, program)
@@ -418,11 +442,11 @@ def test_a_fixed_namespace_gives_the_same_forward_program(ad, ctx):
     from datafusion.substrait import Serde
 
     plan = Serde.serialize_bytes(LOSS, ctx)
-    a = ddxdb.jvp_plan(plan, [("w", "val")], namespace="__ddx_py_")
-    b = ddxdb.jvp_plan(plan, [("w", "val")], namespace="__ddx_py_")
+    a = ddxdb.jvp_plan(plan, "w.val", namespace="__ddx_py_")
+    b = ddxdb.jvp_plan(plan, "w.val", namespace="__ddx_py_")
     assert a == b and a.value.step == "__ddx_py_jvp"
     with pytest.raises(TypeError, match="Substrait"):
-        ddxdb.jvp_plan("SELECT 1", [("w", "val")])
+        ddxdb.jvp_plan("SELECT 1", "w.val")
 
 
 def test_a_query_deeper_than_datafusion_python_decodes_is_split_and_runs(ad, ctx):
@@ -434,11 +458,11 @@ def test_a_query_deeper_than_datafusion_python_decodes_is_split_and_runs(ad, ctx
     for k in range(1, 40):
         ctes.append(f"h{k} AS (SELECT i, SUM(tanh(v) + 0.5 * v) AS v FROM h{k - 1} GROUP BY i)")
     query = f"WITH {', '.join(ctes)} SELECT SUM(v) AS l FROM h39"
-    program = ad.jvp(ctx, query, [("w", "val")])
+    program = ad.jvp(ctx, query, "w.val")
     assert any("_part_" in s.name for s in program.steps())
     out = ad.run(ctx, program, [tangent_of_w(program.inputs[0], [1.0, 2.0, 3.0])])
     got = out.value.to_pydict()["l_tangent"][0]
-    grad = ad.grad(ctx, query, [("w", "val")])
+    grad = ad.grad(ctx, query, "w.val")
     g = pairs(ad.run(ctx, grad).gradients[0])
     assert got == pytest.approx(sum(v * d for (_, v), d in zip(g, [1.0, 2.0, 3.0])))
 

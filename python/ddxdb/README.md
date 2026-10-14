@@ -75,8 +75,10 @@ the price of one backward pass.
 ## Programs, and how they compose
 
 `ddxdb.ad.grad`, `vjp` and `jvp` give the programs underneath, and each takes
-SQL or a program, so they compose: `ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)`
-gives Hessian-vector products, checked against `jax.jvp(jax.grad(f))`. Both
+SQL or a program, and the columns to differentiate with respect to (`wrt`): a
+column as `"table.column"`, or a list of them, which one backward pass
+differentiates together. They compose: `ad.jvp(ctx, ad.grad(ctx, loss, wrt),
+wrt)` gives Hessian-vector products, checked against `jax.jvp(jax.grad(f))`. Both
 kinds of program (`BackwardProgram`, `ForwardProgram`) list the tables you
 register before they run (`inputs`, as `InputTable`s) and the tables they
 leave (`value` and `gradients`, as `OutputTable`s). `ad.run(ctx, program,
@@ -86,7 +88,7 @@ Arrow tables, in the order of `program.inputs`) and returns what it computed,
 nothing stays on the context:
 
 ```python
-hvp = ad.jvp(ctx, ad.grad(ctx, "SELECT SUM(val * val * val) AS l FROM w", [("w", "val")]), [("w", "val")])
+hvp = ad.jvp(ctx, ad.grad(ctx, "SELECT SUM(val * val * val) AS l FROM w", "w.val"), "w.val")
 out = ad.run(ctx, hvp, [ctx.sql("SELECT i, 1.0 AS val FROM w")])
 out.gradients[0]   # i, val (the gradient), val_tangent (H·v)
 ```
@@ -100,6 +102,18 @@ and `drop_table` (the `ddxdb.Backend` protocol); `vjp_plan` and `jvp_plan`
 are the same for the other two. They are ddx-ad's own Rust, the same code the
 Rust adapter runs. Pass `namespace="__ddx_mine_"` to get the
 same program from the same plan every time.
+
+The SQL calls run on another engine too: `ddxdb.rewrite(backend, statements)`
+runs the programs the statements' `grad`, `vjp` and `jvp` calls need on a
+backend that also has `plan_sql` (SQL to a serialized Substrait plan), and
+returns the statements rewritten to read what they computed. Run them on the
+engine inside the `with` block; the tables they read are dropped when it ends:
+
+```python
+with ddxdb.rewrite(backend, [step_w, step_b]) as rewritten:
+    for sql in rewritten.statements:
+        engine.sql(sql)
+```
 
 ## What you can write
 

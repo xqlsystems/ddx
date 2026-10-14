@@ -78,7 +78,7 @@ from ._ddxdb import (
     UnsupportedExpression,
     _not_in_subquery,
 )
-from . import Backend
+from . import Backend, rewrite
 from ._ddxdb import (
     BackwardProgram,
     Check,
@@ -91,7 +91,6 @@ from ._ddxdb import (
     jvp_plan,
     vjp_plan,
 )
-from ._ddxdb import rewrite as _rewrite
 from ._ddxdb import run as _run
 
 #: A program of either kind.
@@ -140,12 +139,13 @@ def register_stop_gradient(ctx: SessionContext) -> None:
 def grad(
     ctx: SessionContext,
     of: Union[str, Program],
-    wrt: Sequence[tuple[str, str]],
+    wrt: Union[str, Sequence[str]],
     *,
     namespace: Optional[str] = None,
 ) -> BackwardProgram:
-    """The gradient of ``of`` with respect to the ``(table, column)`` pairs in
-    ``wrt``: of SQL, the loss the query computes, which must be one row and
+    """The gradient of ``of`` with respect to ``wrt``, a column as
+    ``"table.column"`` or a list of them (one program, one backward pass, a
+    gradient for each table): of SQL, the loss the query computes, which must be one row and
     one column; of a program, its one output table, which must be too (its
     gradient if it has one, otherwise its value).
 
@@ -163,7 +163,7 @@ def grad(
 def vjp(
     ctx: SessionContext,
     of: Union[str, Program],
-    wrt: Sequence[tuple[str, str]],
+    wrt: Union[str, Sequence[str]],
     *,
     namespace: Optional[str] = None,
 ) -> BackwardProgram:
@@ -177,12 +177,12 @@ def vjp(
 def jvp(
     ctx: SessionContext,
     of: Union[str, Program],
-    wrt: Sequence[tuple[str, str]],
+    wrt: Union[str, Sequence[str]],
     *,
     namespace: Optional[str] = None,
 ) -> ForwardProgram:
-    """The Jacobian-vector product of ``of`` with respect to the ``(table,
-    column)`` pairs in ``wrt``: of SQL, a program computing the query's output
+    """The Jacobian-vector product of ``of`` with respect to ``wrt``, a column
+    as ``"table.column"`` or a list of them: of SQL, a program computing the query's output
     and, beside it, its tangent (``program.value.tangents`` says which column
     holds which); of a program, its steps rewritten, so that of a
     :func:`grad` program each gradient's tangent is the Hessian-vector product
@@ -262,8 +262,10 @@ class Outputs(NamedTuple):
 def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs:
     """Run ``program``, of either kind, on ``inputs``, one per
     ``program.inputs`` in order (a ``vjp``'s cotangent, a ``jvp``'s tangents;
-    none for ``grad``), each a DataFrame or a ``pyarrow.Table`` with at least
-    the columns its table names, and return what it computed.
+    none for ``grad``), each any object that exports an Arrow stream (a
+    DataFrame, a ``pyarrow.Table``, a Polars or DuckDB result: the Arrow
+    PyCapsule interface) with at least the columns its table names, and
+    return what it computed.
 
     First its checks, then every step. Nothing it writes stays on ``ctx``,
     whether it succeeds or fails. Raises :class:`ddxdb.InvalidColumn` when a
@@ -288,7 +290,9 @@ def run(ctx: SessionContext, program: Program, inputs: Sequence = ()) -> Outputs
         )
     try:
         for table, given in zip(tables, inputs):
-            arrow = given if isinstance(given, pa.Table) else given.to_arrow_table()
+            # Anything that exports an Arrow stream (DataFusion, Polars, DuckDB,
+            # pandas, pyarrow), read without copying where it can be.
+            arrow = given if isinstance(given, pa.Table) else pa.table(given)
             _register(ctx, table.name, arrow.select(list(table.columns)))
         _run(DataFusionBackend(ctx), program)
         return Outputs(ctx.sql(program.value.query()), [ctx.sql(g.query()) for g in program.gradients])
@@ -359,13 +363,9 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     # Which programs to run, how each is built and run, and how each
     # statement reads them are ddx-ad's (ddx_ad::rewrite); DataFusion plans and
     # runs.
-    rewritten, tables = _rewrite(DataFusionBackend(ctx), list(statements), dialect)
-    try:
+    # A planned DataFrame holds the tables it reads, so they can leave the
+    # catalog once every statement is planned.
+    with rewrite(DataFusionBackend(ctx), statements, dialect) as rewritten:
         # SessionContext's own sql, not a ddxdb.Context's, which would look for
         # calls again.
-        return [SessionContext.sql(ctx, s) for s in rewritten]
-    finally:
-        # A planned DataFrame holds the tables it reads, so they can leave the
-        # catalog now.
-        for table in tables:
-            ctx.deregister_table(table)
+        return [SessionContext.sql(ctx, s) for s in rewritten.statements]

@@ -209,7 +209,7 @@ def test_mlp_jvp_in_sql_matches_jax_jvp(env):
 def tangent_tables(inputs, tangents: dict[str, np.ndarray]) -> list:
     """Each of a program's tangent inputs from `tangents`, by the table it is
     a tangent of, as a table to pass to `ad.run`."""
-    return [table_of(tangents[t.of[-1]], dims_of(t.of[-1])) for t in inputs]
+    return [table_of(tangents[t.of], dims_of(t.of)) for t in inputs]
 
 
 def test_mlp_hessian_vector_products_match_jax_both_ways(env):
@@ -219,7 +219,7 @@ def test_mlp_hessian_vector_products_match_jax_both_ways(env):
     jax, ad, ctx = env
     jnp = jax.numpy
     with_loss, params, _, jax_loss = mlp(env)
-    wrt = [(name, "val") for name in params]
+    wrt = [f"{name}.val" for name in params]
     tangents = directions(params, 2)
     primals = tuple(map(jnp.array, params.values()))
     dirs = tuple(map(jnp.array, tangents.values()))
@@ -230,7 +230,7 @@ def test_mlp_hessian_vector_products_match_jax_both_ways(env):
     hvp = ad.jvp(ctx, ad.grad(ctx, loss, wrt), wrt)
     outs = ad.run(ctx, hvp, tangent_tables(hvp.inputs, tangents))
     for g, out, (name, want) in zip(hvp.gradients, outs.gradients, zip(params, expected)):
-        assert g.of[-1] == name
+        assert g.of == name
         got = dense(out.to_arrow_table(), params[name].shape, list(dims_of(name)), "val_tangent")
         np.testing.assert_allclose(got, np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=f"jvp(grad) {name}")
 
