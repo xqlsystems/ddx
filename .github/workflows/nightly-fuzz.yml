@@ -1,13 +1,13 @@
-name: Nightly fuzz (ddx-core and v2 simulation soaks)
+name: Nightly fuzz (scalar-rule and query-AD simulation soaks)
 
 # Runs two seed-reproducible property-fuzz soaks over three disjoint random
 # seed regions each, in parallel, then files/updates a single GitHub issue if
 # any property fails:
 #
-# - v1: crates/ddx-core/tests/simulation.rs :: soak_continuous_property_fuzz
-#   (finite-difference numeric agreement, render fidelity, higher-order
-#   self-consumption of scalar derivatives).
-# - v2: crates/ddx-datafusion/tests/ad_simulation.rs :: soak_v2_query_ad
+# - scalar rules: crates/ddx-core/tests/simulation.rs ::
+#   soak_continuous_property_fuzz (finite-difference numeric agreement, render
+#   fidelity, higher-order self-consumption of scalar derivatives).
+# - query AD: crates/ddx-datafusion/tests/ad_simulation.rs :: soak_v2_query_ad
 #   (generated loss queries: gradients against finite differences of the
 #   query, the calculus and vjp identities, invariance, the program contract,
 #   and grad(loss, table.column) in SQL).

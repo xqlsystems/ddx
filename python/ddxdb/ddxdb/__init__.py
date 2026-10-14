@@ -2,49 +2,40 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""SQL-portable autograd — write calculus in SQL, get derivatives back as columns.
+"""Autograd for SQL: the gradient of a whole query, as JAX takes the gradient
+of a function.
 
-    SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
+Write a model's forward pass and loss as SQL, and take its gradient in SQL::
 
-`grad` and `jvp` are *markers*, not row functions. :func:`rewrite_sql` turns them
-into ordinary derivative SQL before any engine sees them, so what runs is a plain
-expression evaluated per row — the relational equivalent of
-``jax.vmap(jax.grad(f))``, with the rows as the batch dimension.
+    from ddxdb import Context
 
-:func:`rewrite_sql` is the whole library. It is text in, text out, so it works
-with **any** engine that accepts SQL — pass the result wherever you would have
-passed the original::
+    ctx = Context()
+    ctx.sql('''
+        WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+        SELECT w.i, w.val - 0.1 * g.val AS val
+        FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+    ''')
 
-    con.sql(ddxdb.rewrite_sql(q, "duckdb"))        # DuckDB
-    session.sql(ddxdb.rewrite_sql(q, "spark"))     # Spark
-    ctx.sql(ddxdb.rewrite_sql(q))                  # DataFusion
-
-:class:`Context` is sugar for one engine — a DataFusion ``SessionContext``
-subclass whose ``.sql()`` rewrites first — because DataFusion is ddx's
-integration target. It lives in :mod:`ddxdb.datafusion` and is re-exported here,
-so it costs an engine import only if you use it. Every other engine uses the
-line above, which is why there are no per-engine helpers here to keep in sync.
+:class:`Context` is a DataFusion ``SessionContext`` whose ``.sql()``
+understands ``grad``. It lives in :mod:`ddxdb.datafusion` and is re-exported
+here, so it costs an engine import only if you use it. :mod:`ddxdb.ad` has the
+programs underneath (:func:`grad_plan`, :func:`vjp_plan`, :func:`run`), which
+run on any engine that implements :class:`Backend`.
 
 Errors are typed: ``UnsupportedExpression`` means ddx has no rule for something
-you wrote, ``AmbiguousColumn`` means your query needs a qualifier. Catch the one
-you can act on rather than matching on message text.
+you wrote, ``InvalidColumn`` that a column cannot be differentiated. Catch the
+one you can act on rather than matching on message text.
 """
 
 from importlib import metadata as _metadata
 from typing import Protocol
 
 from ._ddxdb import (  # noqa: F401  (re-exported)
-    AmbiguousColumn,
     DdxError,
     InvalidColumn,
-    InvalidMarker,
-    ProjectionBoundary,
     NotScalar,
-    SqlParseError,
     UnknownColumn,
     UnsupportedExpression,
-    differentiate_sql,
-    rewrite_sql,
     supported_functions,
 )
 from ._ddxdb import (  # noqa: F401  (re-exported)
@@ -96,15 +87,9 @@ __version__ = _metadata.version("ddxdb")
 # name (`from ddxdb import Context` goes through __getattr__ just the same) and
 # stays listed in __dir__ below, so only the wildcard skips it.
 __all__ = [
-    "rewrite_sql",
-    "differentiate_sql",
     "supported_functions",
     "DdxError",
     "UnsupportedExpression",
-    "InvalidMarker",
-    "AmbiguousColumn",
-    "ProjectionBoundary",
-    "SqlParseError",
     "NotScalar",
     "UnknownColumn",
     "InvalidColumn",
@@ -130,8 +115,8 @@ def __getattr__(name):
     """Re-export :class:`ddxdb.datafusion.Context` without importing DataFusion.
 
     ``Context`` subclasses ``datafusion.SessionContext``, so its module cannot
-    be imported without an engine — and ``rewrite_sql``, which needs no engine
-    at all, lives here. Module-level ``__getattr__`` (PEP 562) defers the
+    be imported without an engine — and the programs, which run on any
+    :class:`Backend`, live here. Module-level ``__getattr__`` (PEP 562) defers the
     submodule import to the first attribute access, so ``ddxdb.Context`` reads
     as one namespace while costing nothing to anyone who never touches it.
     """

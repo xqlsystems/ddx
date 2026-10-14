@@ -14,8 +14,8 @@ worth an issue or PR.
 it is designed on paper before it is written in code. Two documents are the
 source of truth — read the parts relevant to your change before you start:
 
-- [`docs/design.md`](docs/design.md) — the full design: what `ddx` is, the v1
-  (scalar) and v2 (query-level) layers, the differentiation surface, the
+- [`docs/design.md`](docs/design.md) — the full design: what `ddx` is, the
+  query-level layer and the scalar rules under it, the differentiation surface, the
   per-engine integration story, and the milestone plan. It ends with a decision
   log (`F#`/`G#`/`R#`/`S#`/`Q#`) recording *why* each choice was made.
 - [`docs/spikes/`](docs/spikes/) — small runnable programs that back every
@@ -75,19 +75,19 @@ this guide then work unchanged. CI does not use Nix; this is a dev shell only.
 
 ```
 crates/
-  ddx-core/          # the v1 engine — sqlparser only. Start here.
-  ddx-datafusion/    # DataFusion adapter: AnalyzerRule (bare grad) + ddx_sql
-  ddx-ad/            # v2: query-level reverse-mode AD over Substrait
-python/ddxdb/        # PyO3/maturin wheel: rewrite_sql + a DataFusion Context
-tests/               # cross-engine numeric-agreement suites (vs JAX)
+  ddx-ad/            # query-level AD over Substrait. Start here.
+  ddx-core/          # the scalar derivative rules ddx-ad uses — sqlparser only
+  ddx-datafusion/    # DataFusion adapter: ad
+python/ddxdb/        # PyO3/maturin wheel: a DataFusion Context + ad
+tests/               # numeric-agreement suites (vs JAX)
 docs/design.md       # the design (source of truth)
 docs/spikes/         # runnable evidence behind the design
 .github/workflows/   # CI (PR gates) + the nightly property-fuzz soak
 ```
 
-`ddx-core` is where most work happens; everything else is a thin layer over it.
-`ddx-ad` is v2. Its integration tests live in `ddx-datafusion/tests/`, where
-there is an engine to run the plans it emits.
+`ddx-ad` is where most work happens; the adapters are thin layers over it. Its
+integration tests live in `ddx-datafusion/tests/`, where there is an engine to
+run the plans it emits.
 
 ## Working on the Python code
 
@@ -95,8 +95,8 @@ There are two Python surfaces, and they are separate environments on purpose.
 
 | | what it is | where |
 |---|---|---|
-| **`ddxdb`** | the wheel published to PyPI — a thin PyO3 binding over `ddx-core` | `python/ddxdb` |
-| **the oracle suite** | ddx's derivatives checked against `jax.grad` on real engines | `tests/` |
+| **`ddxdb`** | the wheel published to PyPI — a thin PyO3 binding over `ddx-ad` | `python/ddxdb` |
+| **the oracle suite** | ddx's derivatives checked against `jax.grad` on DataFusion | `tests/` |
 
 Both need [`uv`](https://docs.astral.sh/uv/) and a Rust toolchain, because both
 build the extension module from this repo's own crates.
@@ -107,7 +107,7 @@ build the extension module from this repo's own crates.
 cd python/ddxdb
 uv venv --python 3.12
 uv pip install maturin '.[test]'
-uv run maturin develop --uv        # compiles ddx-core + the binding into the venv
+uv run maturin develop --uv        # compiles ddx-ad + the binding into the venv
 uv run pytest tests/ -q
 ```
 
@@ -130,17 +130,12 @@ virtualenv.
 
 > **`--reinstall-package ddxdb` is necessary, not defensive.** A plain
 > `uv sync` sees `ddxdb` already installed and audits it in milliseconds —
-> *including after you have edited `crates/ddx-core`*, because uv watches the
+> *including after you have edited `crates/`*, because uv watches the
 > Python package and the Rust source is not in it. Leave it off and the suite
 > passes against the engine you had **before** your change, which is the most
-> expensive kind of green. Measured, not hypothetical:
->
-> ```
-> $ uv sync                             # after editing the cos rule
-> Audited 17 packages in 2ms
-> >>> ddxdb.rewrite_sql("SELECT grad(cos(x), x) ...")
-> 'SELECT (-sin(x)) AS d FROM t'        # the OLD rule
-> ```
+> expensive kind of green. Measured, not hypothetical: after editing the `cos`
+> rule, `uv sync` reported "Audited 17 packages in 2ms" and the suite still
+> ran the old rule.
 
 `tests/uv.lock` is committed, so CI resolves the environment the repo describes.
 That also means a JAX release cannot change the oracle underneath a green build:
@@ -179,9 +174,11 @@ The differentiation cores are deliberately minimal so any engine can drive them:
   …), which quarantine them.
 - `sqlparser` is **pinned exactly** (`=0.62.0`) and re-exported as
   `ddx_core::sqlparser`. A `sqlparser` bump is a breaking change to `ddx-core`
-  and needs its own discussion (see design.md §6, `G2`).
-- **`ddx-ad` depends on `substrait` and `ddx-core`** — the scalar engine is
-  the elementwise rule of v2 (design.md §4.3). `substrait` is pinned exactly to
+  and needs its own discussion, since every crate that passes `sqlparser`
+  types across must move with it.
+- **`ddx-ad` depends on `substrait` and `ddx-core`** — for each expression in
+  a query, such as a projection's `x * y`, `ddx-ad` gets the partial
+  derivatives from `ddx-core`'s rules. `substrait` is pinned exactly to
   the version `datafusion-substrait` uses, for the same reason `sqlparser` is:
   the adapter hands `ddx-ad` the engine's own plan type, and two versions would
   be two unrelated Rust types.
@@ -191,8 +188,7 @@ The differentiation cores are deliberately minimal so any engine can drive them:
   `tests/pyproject.toml`. `ddx-datafusion`'s API is DataFusion's own types, so a
   caller must link the version ddx was built and tested against. A bump is one
   deliberate change: the workspace `Cargo.toml`, both `pyproject.toml` files and
-  their lockfiles together (`sqlparser_pin.rs` and `substrait_pin.rs` check the
-  Rust side).
+  their lockfiles together (`substrait_pin.rs` checks the Rust side).
 
 ## Development workflow
 
@@ -231,8 +227,7 @@ cargo test --workspace
 > clean state:
 > `cargo clean -p ddx-core && cargo clippy --workspace --all-targets -- -D warnings`.
 
-If you touched the **engine** (`ddx-core`'s differentiation or rewrite logic),
-also give the property-fuzz soak a spin — it explores far past the bounded seeds
+If you touched the **scalar rules** (`ddx-core`), also give the property-fuzz soak a spin — it explores far past the bounded seeds
 and is where several real bugs were first found:
 
 ```bash
@@ -301,11 +296,6 @@ Differentiation is a numerical-correctness feature, so tests are layered
 
 - **`rules.rs`** — per-rule math and the errors the engine *refuses* (each
   unsupported case asserts a typed error, not a wrong number).
-- **`rewrite.rs`** — the end-to-end marker path: span splicing (UTF-8/multibyte,
-  multiple/nested markers), the ambiguity and projection-boundary guards,
-  identifier folding, and `explain`.
-- **`roundtrip.rs`** — the §5 property invariant: a constructed derivative,
-  rendered and re-parsed, is the same AST modulo parentheses.
 - **`simulation.rs`** — dependency-free, seed-reproducible property/fuzz tests: a
   finite-difference oracle for numeric agreement, render fidelity, and
   self-consumption (the engine must re-parse and re-differentiate its own

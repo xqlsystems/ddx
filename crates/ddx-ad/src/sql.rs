@@ -30,8 +30,7 @@
 //! vector-Jacobian product is [`crate::vjp`].
 //!
 //! No engine could run that call: a table function receives values, and
-//! `f` is a query. So, like v1's `grad` (design.md §3.3, Path A), it is
-//! rewritten before the engine sees the statement. [`GradCalls::find`] finds
+//! `f` is a query. So it is rewritten before the engine sees the statement. [`GradCalls::find`] finds
 //! the calls and the objectives they need; the engine adapter runs each
 //! objective's [`crate::grad`] program; [`GradCalls::rewrite`] splices a relation
 //! holding each gradient in place of each call, by source span, leaving the
@@ -47,10 +46,6 @@
 //! This is the one part of `ddx-ad` about SQL text rather than Substrait, so
 //! its API names `sqlparser` (a [`Dialect`]), through the `ddx-core` this
 //! crate re-exports; the rest of the crate needs only `substrait`.
-//!
-//! The scalar `grad(expr, column)` of v1 is an expression, in a select list;
-//! this one is a relation, in a `FROM` clause. The rewriter tells them apart by
-//! where they appear.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;

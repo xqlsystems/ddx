@@ -7,8 +7,8 @@
 Importing this module requires DataFusion. That is why it is a module and not
 part of ``ddxdb/__init__.py``: ``Context`` subclasses ``SessionContext``, and a
 subclass needs its base class at definition time, so defining it beside
-:func:`ddxdb.rewrite_sql` would make ``import ddxdb`` require an engine that
-``rewrite_sql`` does not need. Python already has a mechanism for "costs nothing
+:func:`ddxdb.grad_plan` would make ``import ddxdb`` require an engine that the
+programs do not need. Python already has a mechanism for "costs nothing
 until you ask for it" — a submodule — and ``ddxdb.Context`` re-exports this one
 lazily.
 """
@@ -18,11 +18,10 @@ try:
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError(
         "ddxdb.Context needs DataFusion: pip install 'ddxdb[datafusion]'. "
-        "For any other engine use ddxdb.rewrite_sql(sql, dialect) and hand "
-        "the result to that engine yourself."
+        "For any other engine, run ddxdb.grad_plan's programs on a ddxdb.Backend."
     ) from e
 
-from ._ddxdb import _Statements, rewrite_sql
+from ._ddxdb import _Statements
 
 __all__ = ["Context"]
 
@@ -36,14 +35,11 @@ class Context(SessionContext):
         from ddxdb import Context
 
         ctx = Context()
-        ctx.sql("CREATE TABLE t AS VALUES (1.0), (2.0), (3.0)").collect()
-        ctx.sql("SELECT grad(column1 * column1, column1) AS d FROM t").collect()
-
-    Only ``sql()`` is intercepted, and that is the whole reachable surface: the
-    DataFrame API builds expressions directly rather than going through SQL
-    text, so a marker cannot arrive that way. Native Rust users get that case
-    covered by the in-engine analyzer rule in the ``ddx-datafusion`` crate;
-    `datafusion-python` exposes no hook to install one.
+        ctx.sql("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
+        ctx.sql(
+            "WITH loss AS (SELECT SUM(val * val) AS l FROM w) "
+            "SELECT * FROM grad(loss, w.val)"
+        ).collect()
     """
 
     def __init__(self, *args, dialect: str = "datafusion", **kwargs):
@@ -53,20 +49,14 @@ class Context(SessionContext):
         object.__setattr__(self, "_ddx_dialect", dialect)
 
     def sql(self, query: str, *args, **kwargs):
-        """Rewrite `grad` in `query`, then plan it as usual.
+        """Run `grad` in `query`, then plan it as usual.
 
-        Two kinds of `grad` are understood. In a select list, `grad(expr,
-        column)` is a derivative column (v1). In a `FROM` clause, `grad(loss,
-        table.column)` is the gradient of the loss a CTE computes, as a relation
-        shaped like the table (see :mod:`ddxdb.ad`).
-
-        A statement with neither is passed through byte-identical and is never
-        parsed by ddx, so routing every query through here is free.
+        In a `FROM` clause, `grad(loss, table.column)` is the gradient of the
+        loss a CTE computes, as a relation shaped like the table (see
+        :mod:`ddxdb.ad`). A statement with no `grad` is planned as it is.
         """
         if not args and not kwargs and _Statements([query], self._ddx_dialect).jobs():
             from . import ad
 
-            # ad.sql runs the loss's program, then plans the rewritten
-            # statement through this method again, for any v1 `grad`.
             return ad.sql(self, query, dialect=self._ddx_dialect)
-        return super().sql(rewrite_sql(query, self._ddx_dialect), *args, **kwargs)
+        return super().sql(query, *args, **kwargs)
