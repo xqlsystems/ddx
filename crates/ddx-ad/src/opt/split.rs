@@ -20,7 +20,7 @@ use substrait::proto::{Plan, Rel};
 
 use crate::emit::read_step;
 use crate::forward::{rel_inputs, rel_inputs_mut, root_of, step_columns, width};
-use crate::program::Step;
+use crate::program::{Step, Unbound};
 
 /// The most relations deep a step may be: 64 levels of protobuf nesting,
 /// leaving 36 of datafusion-python's 100 for the plan's frame and the
@@ -33,7 +33,7 @@ pub(crate) fn split_steps(steps: &mut Vec<Step>) {
     let mut out = Vec::with_capacity(steps.len());
     for mut step in steps.drain(..) {
         let mut parts = Vec::new();
-        split_plan(&mut step.plan, &step.name, &mut parts);
+        split_plan(&mut step.plan.0, &step.name, &mut parts);
         out.extend(parts);
         out.push(step);
     }
@@ -58,7 +58,7 @@ fn split_plan(plan: &mut Plan, name: &str, parts: &mut Vec<Step>) {
     for (part, rel, width) in cut {
         parts.push(Step {
             name: part,
-            plan: Plan {
+            plan: Unbound(Plan {
                 relations: vec![substrait::proto::PlanRel {
                     rel_type: Some(substrait::proto::plan_rel::RelType::Root(
                         substrait::proto::RelRoot {
@@ -68,7 +68,7 @@ fn split_plan(plan: &mut Plan, name: &str, parts: &mut Vec<Step>) {
                     )),
                 }],
                 ..plan.clone()
-            },
+            }),
         });
     }
     for r in plan.relations.iter_mut() {
@@ -170,7 +170,7 @@ mod tests {
         }
         let mut steps = vec![Step {
             name: "__ddx_t_value".into(),
-            plan: plan(rel, vec!["a".into()], &ext),
+            plan: Unbound(plan(rel, vec!["a".into()], &ext)),
         }];
         split_steps(&mut steps);
         let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
@@ -192,13 +192,7 @@ mod tests {
             assert_eq!(s.plan.extensions, steps[0].plan.extensions);
         }
         // Each part reads the one before it, and the step the last.
-        assert_eq!(
-            crate::unbound_reads(&steps[1].plan),
-            vec!["__ddx_t_value_part_0"]
-        );
-        assert_eq!(
-            crate::unbound_reads(&steps[2].plan),
-            vec!["__ddx_t_value_part_1"]
-        );
+        assert_eq!(steps[1].plan.reads(), vec!["__ddx_t_value_part_0"]);
+        assert_eq!(steps[2].plan.reads(), vec!["__ddx_t_value_part_1"]);
     }
 }

@@ -2,16 +2,30 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ddx_ad::Backend`, the four primitives a synchronous engine supplies, on
-//! DataFusion run synchronously: the same gradient as `ad::run`, and the same
-//! refusal and cleanup.
+//! `ddx_ad::Backend` implemented by a synchronous engine, as a Python one
+//! is: each method does its work and returns a future already done, and the
+//! run is driven without an async runtime. The same gradient as `ad::run`,
+//! and the same refusal and cleanup.
+
+use std::future::{ready, Future};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
-use ddx_ad::substrait::proto::{NamedStruct, Plan};
-use ddx_ad::{Backend, RunError};
+use ddx_ad::substrait::proto::NamedStruct;
+use ddx_ad::{Backend, Bound, RunError};
 use ddx_datafusion::ad::{self, ColumnRef};
 use tokio::runtime::Runtime;
+
+/// Run a future whose every await is already done: a synchronous engine's
+/// whole run, since each of its methods returns a finished future.
+fn now<F: Future>(f: F) -> F::Output {
+    match pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("a synchronous backend's future is never pending"),
+    }
+}
 
 struct Sync {
     ctx: SessionContext,
@@ -23,25 +37,46 @@ struct Sync {
 impl Backend for Sync {
     type Error = DataFusionError;
 
-    fn table_schema(&mut self, name: &str) -> Result<NamedStruct, Self::Error> {
+    fn table_schema(
+        &mut self,
+        name: &str,
+    ) -> impl Future<Output = Result<NamedStruct, Self::Error>> + Send {
         self.log.push(format!("schema {name}"));
-        self.rt
-            .block_on(ddx_datafusion::engine::table_schema(&self.ctx, name))
+        ready(
+            self.rt
+                .block_on(ddx_datafusion::engine::table_schema(&self.ctx, name)),
+        )
     }
 
-    fn returns_rows(&mut self, plan: &Plan) -> Result<bool, Self::Error> {
-        self.rt
-            .block_on(ddx_datafusion::engine::returns_rows(&self.ctx, plan))
+    fn returns_rows(
+        &mut self,
+        plans: &[Bound],
+    ) -> impl Future<Output = Result<Vec<bool>, Self::Error>> + Send {
+        ready(
+            plans
+                .iter()
+                .map(|plan| {
+                    self.rt
+                        .block_on(ddx_datafusion::engine::returns_rows(&self.ctx, plan))
+                })
+                .collect(),
+        )
     }
 
-    fn materialize(&mut self, name: &str, plan: &Plan) -> Result<(), Self::Error> {
+    fn materialize(
+        &mut self,
+        name: &str,
+        plan: &Bound,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.log.push(format!("write {name}"));
-        self.rt
-            .block_on(ddx_datafusion::engine::materialize(&self.ctx, name, plan))
+        ready(
+            self.rt
+                .block_on(ddx_datafusion::engine::materialize(&self.ctx, name, plan)),
+        )
     }
 
-    fn drop_table(&mut self, name: &str) -> Result<(), Self::Error> {
-        self.ctx.deregister_table(name).map(|_| ())
+    fn drop_table(&mut self, name: &str) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        ready(self.ctx.deregister_table(name).map(|_| ()))
     }
 }
 
@@ -88,7 +123,7 @@ fn a_synchronous_backend_gets_the_gradient_and_drops_the_intermediates() {
     let program =
         b.rt.block_on(ad::grad(&b.ctx, loss, &[ColumnRef::new("w", "val")]))
             .unwrap();
-    ddx_ad::run(&mut b, &program).unwrap();
+    now(ddx_ad::run(&mut b, &program)).unwrap();
     assert_eq!(
         gradient(&b, &program.gradients[0].step),
         vec![(0, 1.0), (1, 2.0)]
@@ -123,7 +158,7 @@ fn a_synchronous_backend_refuses_rows_that_share_their_dims() {
             &[ColumnRef::new("w", "val")],
         ))
         .unwrap();
-    let err = ddx_ad::run(&mut b, &program).unwrap_err();
+    let err = now(ddx_ad::run(&mut b, &program)).unwrap_err();
     assert!(
         matches!(err, RunError::Refused(ddx_ad::AdError::InvalidWrt(_))),
         "{err}"

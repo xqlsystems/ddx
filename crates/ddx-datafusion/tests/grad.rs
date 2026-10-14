@@ -683,8 +683,12 @@ async fn a_fixed_namespace_makes_the_program_the_same_every_time() {
     let options = Options::new().namespace("__ddx_golden_");
     let bytes = |p: &ddx_ad::BackwardProgram| -> Vec<(String, Vec<u8>)> {
         p.steps()
-            .map(|s| (s.name.clone(), s.plan_bytes()))
-            .chain(p.checks.iter().map(|c| (c.message.clone(), c.plan_bytes())))
+            .map(|s| (s.name.clone(), s.plan.to_bytes()))
+            .chain(
+                p.checks
+                    .iter()
+                    .map(|c| (c.message.clone(), c.plan.to_bytes())),
+            )
             .collect()
     };
     let (a, b) = (
@@ -724,7 +728,10 @@ async fn a_host_can_hand_over_plans_as_bytes() {
     )
     .unwrap();
     for step in program.steps() {
-        assert_eq!(ddx_ad::decode_plan(&step.plan_bytes()).unwrap(), step.plan);
+        assert_eq!(
+            ddx_ad::decode_plan(&step.plan.to_bytes()).unwrap(),
+            *step.plan
+        );
     }
     run(&ctx, &program).await;
     let got = rows(

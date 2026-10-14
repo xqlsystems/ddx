@@ -27,60 +27,65 @@ use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, ProjectRel, Rel};
-use ddx_ad::{bind_reads, unbound_reads, Action, AdError, Program, RunError, Step};
+use ddx_ad::{AdError, Bound, Program, RunError, Step};
 
 pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
 /// Run `program`'s checks, then its steps, registering each step's result
-/// on `ctx` under its name. Its input tables must be registered. The value and the
-/// gradients stay registered until [`release`]; the intermediate tables are
-/// dropped.
+/// on `ctx` under its name ([`ddx_ad::run`] on [`DataFusion`]). Its input
+/// tables must be registered. The value and the gradients stay registered
+/// until [`release`]; the intermediate tables are dropped.
 pub async fn execute<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
-    // The order, and what is dropped when, are ddx_ad::Runner's. The checks
-    // read no step and none reads another, so they run at once, each a task
-    // of its own (polled together on one task, they ran one after another),
-    // and the runner is told how each went in its own order: on a large wrt
-    // table they are most of a run (the dims of a table, then of its
-    // tangent, each a grouped scan).
-    let mut runner = ddx_ad::Runner::new(program);
-    let mut checked: Vec<Option<Result<bool>>> = program.checks().iter().map(|_| None).collect();
-    let tasks: Vec<_> = program
-        .checks()
-        .iter()
-        .enumerate()
-        .map(|(i, check)| {
-            let (ctx, plan) = (ctx.clone(), check.plan.clone());
-            (
-                i,
-                tokio::spawn(async move { returns_rows(&ctx, &plan).await }),
-            )
+    ddx_ad::run(&mut DataFusion(ctx.clone()), program)
+        .await
+        .map_err(|e| match e {
+            RunError::Refused(e) => to_df_err(e),
+            RunError::Engine(e) => e,
+            other => DataFusionError::Internal(other.to_string()),
         })
-        .collect();
-    for (i, task) in tasks {
-        checked[i] = Some(
-            task.await
-                .unwrap_or_else(|e| Err(DataFusionError::External(Box::new(e)))),
-        );
+}
+
+/// A DataFusion context as a [`ddx_ad::Backend`].
+pub struct DataFusion(pub SessionContext);
+
+impl ddx_ad::Backend for DataFusion {
+    type Error = DataFusionError;
+
+    async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
+        table_schema(&self.0, name).await
     }
-    while let Some(action) = runner.next() {
-        match &action {
-            Action::Check(i) => runner.checked(
-                checked[*i]
-                    .take()
-                    .expect("the runner asks for each check it runs once"),
-            ),
-            Action::Materialize(i) => runner.done(run_step(ctx, program.step(*i)).await),
-            Action::Drop(name) => runner.done(ctx.deregister_table(name.as_str()).map(|_| ())),
+
+    async fn returns_rows(&mut self, plans: &[Bound]) -> Result<Vec<bool>> {
+        // The checks read no step and none reads another, so they run at
+        // once, each a task of its own (polled together on one task, they
+        // ran one after another): on a large wrt table they are most of a
+        // run, each a grouped scan.
+        let tasks: Vec<_> = plans
+            .iter()
+            .map(|plan| {
+                let (ctx, plan) = (self.0.clone(), (**plan).clone());
+                tokio::spawn(async move { returns_rows(&ctx, &plan).await })
+            })
+            .collect();
+        let mut rows = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            rows.push(
+                task.await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+            );
         }
+        Ok(rows)
     }
-    runner.finish().map_err(|e| match e {
-        RunError::Refused(e) => to_df_err(e),
-        RunError::Engine(e) => e,
-        other => DataFusionError::Internal(other.to_string()),
-    })?;
-    Ok(())
+
+    async fn materialize(&mut self, name: &str, plan: &Bound) -> Result<()> {
+        materialize(&self.0, name, plan).await
+    }
+
+    async fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.0.deregister_table(name).map(|_| ())
+    }
 }
 
 /// Register `df`'s rows as the table `name`, materialized.
@@ -155,13 +160,16 @@ pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Resul
 /// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
 /// names mean nothing to ddx, whose plans refer to columns by position.
 pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
-    let mut plan = plan.clone();
+    let unbound = ddx_ad::Unbound::from_plan(plan.clone());
     let mut schemas = HashMap::new();
-    for name in unbound_reads(&plan) {
+    for name in unbound.reads() {
         let schema = table_schema(ctx, &name).await?;
         schemas.insert(name, schema);
     }
-    bind_reads(&mut plan, &mut |name| schemas.get(name).cloned()).map_err(to_df_err)?;
+    let plan = unbound
+        .bind(&mut |name| schemas.get(name).cloned())
+        .map_err(to_df_err)?
+        .into_plan();
     let state = ctx.state();
     let extensions = Extensions::try_from(&plan.extensions)?;
     let consumer = ShortNames {

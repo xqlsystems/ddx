@@ -743,11 +743,14 @@ alongside Ibis's producer) learned each of these the hard way:
 
 A host that holds plans as protobuf bytes, as most of the Substrait ecosystem
 does, needs no `substrait` crate of its own: `decode_plan` takes the bytes and
-each step and check gives its plan back as bytes. Running a program is a
-protocol written once, in `ddx-ad` (`Runner`, without I/O, or `Backend` for a
-synchronous engine); an engine supplies four primitives: whether a plan
-returns rows, materialize a plan as a table, drop a table, and a table's
-schema in its own producer's terms.
+each step and check gives its plan back as bytes. Running a program is
+written once, in `ddx-ad`'s `run`; an engine implements `Backend`, four
+primitives: whether plans return rows, materialize a plan as a table, drop a
+table, and a table's schema in its own producer's terms. Each returns a
+future, so an asynchronous engine (DataFusion) implements it directly and a
+synchronous one (a Python object) returns futures already done. A step's plan
+is `Unbound` until `run` binds its reads to the engine's tables, and the
+engine is only ever handed a `Bound` one (`S17`).
 
 `ddx-ad`'s dependencies stay symmetric with v1's: `substrait`, plus `ddx-core`
 for the elementwise rule, and no `datafusion` or `duckdb`. `substrait` is pinned
@@ -960,8 +963,8 @@ adapter's `run(ctx, &program, &inputs)` takes the inputs as relations, one
 per `InputTable` in order, and returns the value and the gradients as
 relations that hold their rows, tangents named `{column}_tangent` as in SQL
 (`OutputTable::query`); none of the program's tables stays on the engine
-(`S11`). The step-by-step run underneath (`Runner`, and the adapter's own
-engine module) is what `run` and SQL are built on, not the API.
+(`S11`). The step-by-step run underneath (`ddx_ad::run`, and the adapter's
+own engine module) is what `run` and SQL are built on, not the API.
 
 **Each step is a plain Substrait `Plan`,** handed to the engine's own consumer
 (`from_substrait`, `datafusion-substrait`) rather than converted to SQL text by
@@ -2005,7 +2008,7 @@ on DuckDB, found that what is neither calculus nor engine had been written
 once per adapter: the run protocol (checks first, steps in order, drop the
 intermediates on success and failure) and `sql_all`'s planning (one program
 per loss query, each call's dims and value columns). Both now live in
-`ddx-ad` (`Runner` and `Backend`; `sql::Statements`), and the DataFusion and
+`ddx-ad` (`run` and `Backend`; `sql::Statements`), and the DataFusion and
 Python adapters drive them. The spike also found two producer gaps, now
 closed (a `ReferenceRel` was not followed; a cast of a literal was opaque, so
 `x ** 2` from an unoptimized plan was refused), and that emitted plans
@@ -2040,6 +2043,20 @@ gave rows that share keys their summed gradient with no error: the one place
 the API traded correctness for speed. It was removed, from Rust and Python. A
 faster check, or a cache keyed on something an engine can vouch for, can come
 back as an internal detail. → §4.4.
+
+**S17 — One run, written once; engines implement `Backend`.** Running a
+program took two shapes: `Runner`, a state machine an adapter drove step by
+step (so an asynchronous engine could run it), and a synchronous `Backend`.
+Each adapter wrote a loop over `Runner`'s actions, and the SQL layer grew a
+second state machine of its own. The standard shape, as MADlib's driver
+functions and every database client have it, is a trait of engine
+operations with the library owning the driver: `Backend`'s methods return
+futures, so DataFusion implements it directly and a Python engine returns
+futures already done, and `ddx_ad::run` is the only loop. `Runner` and its
+actions left the API. Two invariants moved into types: a program's plans are
+`Unbound` (their reads of tables it writes name no column types) and an
+engine receives only `Bound` plans, which only `Unbound::bind` makes; and
+`Program` is `Sync`, so a run can be spawned. → §4.2.
 
 ## References
 
