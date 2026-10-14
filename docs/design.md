@@ -1518,8 +1518,11 @@ breadth, not de-risking.
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
-  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9). Still to come: `jvp(…)` in SQL, the Python API, and agreement with
-  `jax.jvp` on the spikes' fixtures.
+  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); the Python
+  API (`ddxdb` 0.3: `jvp`, `jvp_plan`, `ForwardProgram`, composition),
+  checked against `jax.jvp` and, both ways, `jax.jvp(jax.grad(f))` on the
+  MLP fixture. Still to come: `jvp(…)` in SQL, a soak oracle for `jvp`, and
+  `Verified` from Python.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,

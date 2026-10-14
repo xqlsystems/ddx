@@ -318,6 +318,11 @@ pub(crate) fn readable(table: &[String]) -> String {
 /// column; of a program, of its one output table, which must too (see
 /// [`Differentiable`]).
 ///
+/// As in JAX, this is [`vjp`] with the cotangent 1, and ddx builds it that
+/// way: one code path for both, with the 1 written into the plan rather than
+/// read from an input table, so a `grad` program has no input to register
+/// and none to check.
+///
 /// Each [`ColumnRef`] names a table as [`ColumnRef::table`] describes, and a
 /// column of it, case-insensitively.
 pub fn grad<D: Differentiable + ?Sized>(of: &D, wrt: &[ColumnRef]) -> Result<BackwardProgram> {

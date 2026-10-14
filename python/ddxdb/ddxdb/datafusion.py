@@ -55,7 +55,8 @@ class Context(SessionContext):
         loss a CTE computes, as a relation shaped like the table (see
         :mod:`ddxdb.ad`). A statement with no `grad` is planned as it is.
         """
-        if not args and not kwargs and _Statements([query], self._ddx_dialect).jobs():
+        planned = None if args or kwargs else _Statements([query], self._ddx_dialect)
+        if planned is not None and planned.jobs():
             from . import ad
 
             return ad.sql(self, query, dialect=self._ddx_dialect)
