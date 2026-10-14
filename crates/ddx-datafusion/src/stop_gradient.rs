@@ -8,7 +8,7 @@
 //! Unlike `grad`, it runs: it is the identity, so a forward query using it
 //! returns the same numbers as one without it. `ddx-ad` finds it in the
 //! query's Substrait plan and treats its argument as a constant, as JAX treats
-//! `lax.stop_gradient` (design.md §4.3).
+//! `lax.stop_gradient`.
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result};

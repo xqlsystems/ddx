@@ -2,16 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Simulation / property tests for query-level AD (v2): `grad`, `vjp`, `run`
+//! Simulation / property tests for query-level AD: `grad`, `vjp`, `run`
 //! and `grad(loss, table.column)` in SQL, on generated loss queries.
 //!
-//! The hand-written v2 tests check a gradient on a fixture somebody thought
-//! of. This file generates the queries: random compositions of the relational
-//! primitives design.md §4.3 gives a rule each (map, select, broadcast,
-//! reduce), over small random tables, written the way a user writes SQL — CTEs,
-//! joins on shared dims, grouped SUM/AVG/MAX/MIN, filters, semi-joins, a rank
-//! filter, a softmax with and without its shift stopped. Each is then held to
-//! two kinds of property.
+//! The hand-written tests check a gradient on a fixture somebody thought of.
+//! This file generates the queries: random compositions of the relational
+//! primitives ddx has a differentiation rule for each of (map, select,
+//! broadcast, reduce), over small random tables, written the way a user writes
+//! SQL — CTEs, joins on shared dims, grouped SUM/AVG/MAX/MIN, filters,
+//! semi-joins, a rank filter, a softmax with and without its shift stopped.
+//! Each is then held to two kinds of property.
 //!
 //! # The oracle: a finite difference the engine computes
 //!
@@ -62,18 +62,18 @@
 //!
 //! # Soak mode
 //!
-//! [`soak_v2_query_ad`] is an `#[ignore]`d variant that runs every property on
+//! [`soak_query_ad`] is an `#[ignore]`d variant that runs every property on
 //! fresh seeds for a wall-clock budget, with the same knobs and log format as
 //! ddx-core's soak, so `.github/scripts/report_fuzz_findings.sh` triages both:
 //!
 //! ```text
 //! DDX_SOAK_SECS=300  DDX_SOAK_BASE=0  DDX_SOAK_LOG=/path/to/soak.log \
 //!   cargo test -p ddx-datafusion --test ad_simulation --release \
-//!   -- --ignored --nocapture soak_v2_query_ad
+//!   -- --ignored --nocapture soak_query_ad
 //! ```
 //!
 //! Every failure is reported with its seed; `DDX_SOAK_BASE=<seed>` replays it
-//! as iteration 0, and `DDX_V2_SEED=<seed>` with `replay_one_seed` prints the
+//! as iteration 0, and `DDX_AD_SEED=<seed>` with `replay_one_seed` prints the
 //! generated SQL and runs only that case.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -303,11 +303,11 @@ fn gen_table(
     }
 }
 
-/// Percent of parameter values generated NULL (`DDX_V2_NULL_PCT`, default
+/// Percent of parameter values generated NULL (`DDX_AD_NULL_PCT`, default
 /// 4). Setting it to 0 replays a case minus its NULLs, which is how a
 /// failure is attributed to them.
 fn null_pct() -> u64 {
-    env_u64("DDX_V2_NULL_PCT", 4)
+    env_u64("DDX_AD_NULL_PCT", 4)
 }
 
 /// Values with few significant digits, so a failure report is readable and
@@ -344,7 +344,7 @@ enum Extreme {
 
 /// A case's modes. Each is drawn from its own generator seeded by the case's
 /// seed and applied after the case is generated, so a seed with no mode
-/// replays as it did before modes existed. `DDX_V2_MODES=ties,nulls,
+/// replays as it did before modes existed. `DDX_AD_MODES=ties,nulls,
 /// extreme,big` forces the listed modes on every case instead.
 #[derive(Clone, Copy, Debug, Default)]
 struct Modes {
@@ -373,7 +373,7 @@ impl Modes {
                 Extreme::InfData,
             ])
         };
-        let modes = match std::env::var("DDX_V2_MODES") {
+        let modes = match std::env::var("DDX_AD_MODES") {
             Ok(names) => {
                 let on = |n: &str| names.split(',').any(|x| x.trim() == n);
                 Modes {
@@ -899,7 +899,7 @@ impl Gen<'_> {
     fn map(&mut self, depth: u32) -> usize {
         let c = self.node(depth - 1);
         let (f, t) = match self.rng.below(100) {
-            // Occasionally, ddx-core's own generator: the whole v1 grammar,
+            // Occasionally, ddx-core's own generator: its whole scalar grammar,
             // domain edges and all. A NaN loss is skipped, not compared. Its
             // tangent is ddx-core's jvp, the one rule the oracle borrows.
             0..=9 => {
@@ -1562,10 +1562,10 @@ fn gen_case(rng: &mut Rng, modes: Modes, mrng: &mut Rng) -> Case {
             wrt.push(rng.pick(&reads).clone());
         }
         shuffle(rng, &mut wrt);
-        // `DDX_V2_WRT_ALL`: differentiate every parameter table the loss
+        // `DDX_AD_WRT_ALL`: differentiate every parameter table the loss
         // reads, so none is constant data (for a soak that must not meet the
         // known near-tie finding over constant tables in ad_findings.rs).
-        if std::env::var("DDX_V2_WRT_ALL").is_ok() {
+        if std::env::var("DDX_AD_WRT_ALL").is_ok() {
             wrt = reads.clone();
         }
         let head = rng.pick(HEADS).to_string();
@@ -4316,7 +4316,7 @@ async fn contract_checks(
 
     // Two programs on one context at once, as `ad::sql` from two tasks would
     // run them: each has its own prefix, so neither may see the other's
-    // tables (S11). Spawned, so they really do interleave on the runtime.
+    // tables. Spawned, so they really do interleave on the runtime.
     {
         let ctx = Arc::new(setup(case, 4).await?);
         let spell = [
@@ -4714,7 +4714,7 @@ fn bounded(label: &str, salt: u64, n: u64, props: Props, min_accepted: u64) {
 /// Seeds per bounded property group. Each case runs a dozen or more programs,
 /// so this stays small for `cargo test`; the soak is where the volume is.
 fn seeds() -> u64 {
-    env_u64("DDX_V2_SEEDS", 24)
+    env_u64("DDX_AD_SEEDS", 24)
 }
 
 const NONE: Props = Props {
@@ -5009,15 +5009,15 @@ async fn debug_steps(case: &Case) {
 }
 
 /// Print one seed's case and run every property on it:
-/// `DDX_V2_SEED=<seed> cargo test … -- --ignored --nocapture replay_one_seed`.
+/// `DDX_AD_SEED=<seed> cargo test … -- --ignored --nocapture replay_one_seed`.
 #[test]
 #[ignore]
 fn replay_one_seed() {
-    let seed = env_u64("DDX_V2_SEED", 0);
+    let seed = env_u64("DDX_AD_SEED", 0);
     let (case, _) = case_for(seed);
     eprintln!("seed {seed}:\n{}", case.describe());
     eprintln!("inline = {}", case.inline_sql());
-    if std::env::var("DDX_V2_DEBUG").is_ok() {
+    if std::env::var("DDX_AD_DEBUG").is_ok() {
         runtime().block_on(debug_steps(&case));
     }
     let o = run_one(&runtime(), seed, soak_props());
@@ -5031,10 +5031,10 @@ fn replay_one_seed() {
 }
 
 /// The property groups a soak runs: all of them, or the comma-separated
-/// names in `DDX_V2_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
+/// names in `DDX_AD_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
 /// shapes,names,train,exact,cost,jvp`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
-    let Ok(names) = std::env::var("DDX_V2_PROPS") else {
+    let Ok(names) = std::env::var("DDX_AD_PROPS") else {
         return ALL;
     };
     let on = |n: &str| names.split(',').any(|x| x.trim() == n);
@@ -5058,7 +5058,7 @@ fn soak_props() -> Props {
 /// budget. Same knobs and log lines as ddx-core's soak.
 #[test]
 #[ignore]
-fn soak_v2_query_ad() {
+fn soak_query_ad() {
     use std::time::Instant;
 
     let budget = env_u64("DDX_SOAK_SECS", 30);
@@ -5092,12 +5092,12 @@ fn soak_v2_query_ad() {
     ));
     logline(
         "REPRO DDX_SOAK_SECS=15 DDX_SOAK_BASE={seed} cargo test -p ddx-datafusion \
-         --test ad_simulation --release -- --ignored --nocapture soak_v2_query_ad",
+         --test ad_simulation --release -- --ignored --nocapture soak_query_ad",
     );
-    // Seeds known to fail without any change (`DDX_V2_SKIP_SEEDS`, a file
+    // Seeds known to fail without any change (`DDX_AD_SKIP_SEEDS`, a file
     // of one seed per line): mutation testing's baseline, so a failure it
     // counts is the mutant's.
-    let skip: BTreeSet<u64> = std::env::var("DDX_V2_SKIP_SEEDS")
+    let skip: BTreeSet<u64> = std::env::var("DDX_AD_SKIP_SEEDS")
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
@@ -5136,7 +5136,7 @@ fn soak_v2_query_ad() {
     ));
     assert_eq!(
         tally.failures, 0,
-        "the v2 soak found {} failure(s); see FAILURE lines",
+        "the soak in ad_simulation.rs found {} failure(s); see FAILURE lines",
         tally.failures
     );
 }

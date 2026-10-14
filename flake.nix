@@ -32,7 +32,7 @@
             python312
             # pyo3 and the crates' build scripts need a C compiler and pkg-config.
             pkg-config
-            # The `substrait` crate (ddx-ad, v2) generates its Rust types from
+            # The `substrait` crate (ddx-ad) generates its Rust types from
             # .proto files at build time, which needs protoc.
             protobuf
             # The ddxdb wheel builds protoc from source instead (substrait's

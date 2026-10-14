@@ -1,7 +1,7 @@
 [package]
 name = "ddx-ad"
-description = "Query-level reverse-mode AD for ddx (v2): vjp over Substrait plans."
-# Versioned independently, like ddx-core. First published with M4, when
+description = "Query-level AD for ddx: grad, vjp and jvp of Substrait plans."
+# Versioned independently, like ddx-core. First published when
 # ddx-datafusion started depending on it.
 version = "0.1.0"
 readme = "README.md"
@@ -13,8 +13,8 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# v2 differentiates Substrait plans (design.md §4.2), and uses ddx-core's scalar
-# engine as its elementwise rule (§4.3). No engine crate: an adapter produces
+# ddx-ad differentiates Substrait plans, and gets each expression's partial
+# derivatives from ddx-core. No engine crate: an adapter produces
 # the plan and runs what comes back. Building `substrait` needs `protoc`.
 [dependencies]
 ddx-core = { workspace = true }

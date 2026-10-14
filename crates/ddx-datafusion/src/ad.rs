@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Query-level reverse-mode AD (ddx v2) on DataFusion.
+//! Query-level AD on DataFusion.
 //!
 //! The simplest way in is SQL itself. [`sql`] runs a statement in which,
 //! in a `SELECT` over a table, `grad(f, column)` is the gradient at each row

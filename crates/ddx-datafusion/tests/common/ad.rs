@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Running a v2 backward program on DataFusion, and checking its gradients
+//! Running a backward program on DataFusion, and checking its gradients
 //! against finite differences computed by the same engine.
 
 use std::collections::HashMap;

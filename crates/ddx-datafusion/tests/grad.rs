@@ -275,8 +275,8 @@ async fn a_table_whose_dims_repeat_is_not_given_summed_gradients() {
 async fn a_null_rows_gradient_does_not_depend_on_how_the_loss_is_written() {
     // A NULL value's gradient is 1 under SUM(val), 0 under SUM(val * val)
     // (the NULL derivative is coalesced to 0 by the dense gradient step), and
-    // 0.5 under AVG(val) once #76 lands. v1 pins NULL for a NULL row (#60) and
-    // design.md §5 asks for NULL conventions to be pinned, not emergent.
+    // 0.5 under AVG(val) once #76 lands. A NULL row's gradient should be one
+    // pinned convention, NULL (#60), not whatever the loss's form makes it.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -302,7 +302,7 @@ async fn a_null_rows_gradient_does_not_depend_on_how_the_loss_is_written() {
     assert!(
         same,
         "the gradient at a NULL row is {} for SUM(val) and {} for SUM(val * val); \
-         pin one convention (v1's is NULL)",
+         pin one convention (NULL)",
         at_null[0], at_null[1]
     );
 }
@@ -396,9 +396,9 @@ async fn a_gradient_has_its_values_type() {
 
 #[tokio::test]
 async fn a_row_an_aggregate_skips_as_null_sends_no_gradient() {
-    // From the v2 soak (#89). SUM skips row 1, whose term p + q is NULL, so
-    // the loss is p(0) + 5 and ∂/∂p(1) is 0, not the group's cotangent.
-    // Likewise with the NULL in constant data: d - p.
+    // Found by the soak in ad_simulation.rs (#89). SUM skips row 1, whose term
+    // p + q is NULL, so the loss is p(0) + 5 and ∂/∂p(1) is 0, not the group's
+    // cotangent. Likewise with the NULL in constant data: d - p.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -437,8 +437,9 @@ async fn a_row_an_aggregate_skips_as_null_sends_no_gradient() {
 
 #[tokio::test]
 async fn a_table_with_capitals_gets_a_step_its_engine_can_name() {
-    // From the v2 soak (#92): a step named `…_grad_0_W` was folded to lower
-    // case when registered, then not found under its own name.
+    // Found by the soak in ad_simulation.rs (#92): a step named `…_grad_0_W`
+    // was folded to lower case when registered, then not found under its own
+    // name.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -456,8 +457,8 @@ async fn a_table_with_capitals_gets_a_step_its_engine_can_name() {
 
 #[tokio::test]
 async fn a_program_runs_without_the_simplifier() {
-    // From the v2 soak (#90): DataFusion 54 runs coalesce only once its
-    // simplifier has rewritten it, and the gradient step used it.
+    // Found by the soak in ad_simulation.rs (#90): DataFusion 54 runs coalesce
+    // only once its simplifier has rewritten it, and the gradient step used it.
     use datafusion::execution::SessionStateBuilder;
     let ctx = SessionContext::new_with_state(
         SessionStateBuilder::new()
@@ -488,10 +489,10 @@ async fn a_program_runs_without_the_simplifier() {
 
 #[tokio::test]
 async fn vjp_sends_no_gradient_through_an_output_row_that_is_null() {
-    // From the v2 soak (seed 200886). Row 1's value, NULL + SUM(val), is NULL
-    // whatever the sum is, so its cotangent moves nothing: it must not
-    // reach the SUM, as grad(SUM(s · c)), which skips the row, agrees. Row
-    // 0 gets 3 directly and 3 more through the SUM.
+    // Found by the soak in ad_simulation.rs (seed 200886). Row 1's value, NULL
+    // + SUM(val), is NULL whatever the sum is, so its cotangent moves nothing:
+    // it must not reach the SUM, as grad(SUM(s · c)), which skips the row,
+    // agrees. Row 0 gets 3 directly and 3 more through the SUM.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -564,9 +565,9 @@ async fn a_row_one_aggregate_skips_still_gets_another_aggregates_gradient() {
 
 #[tokio::test]
 async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
-    // From the v2 soak (#98): a wrt table whose dims repeat is refused, and
-    // a cotangent whose keys repeat was joined as it is, doubling that row's
-    // gradient without a word.
+    // Found by the soak in ad_simulation.rs (#98): a wrt table whose dims
+    // repeat is refused, and a cotangent whose keys repeat was joined as it is,
+    // doubling that row's gradient without a word.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -588,10 +589,10 @@ async fn vjp_refuses_a_cotangent_whose_keys_repeat() {
 
 #[tokio::test]
 async fn a_value_many_columns_read_has_a_small_backward_step() {
-    // From the v2 soak (#98): a value read by N columns gets N cotangent
-    // terms, which were folded by nesting the running sum; DataFusion names
-    // a column by its expression, so the step's names tripled per reader
-    // (117 MB at ten). They are one flat sum now.
+    // Found by the soak in ad_simulation.rs (#98): a value read by N columns
+    // gets N cotangent terms, which were folded by nesting the running sum;
+    // DataFusion names a column by its expression, so the step's names tripled
+    // per reader (117 MB at ten). They are one flat sum now.
     let ctx = SessionContext::new();
     exec(
         &ctx,
@@ -637,10 +638,10 @@ async fn a_value_many_columns_read_has_a_small_backward_step() {
 
 #[tokio::test]
 async fn grad_fits_a_worker_threads_stack() {
-    // From the v2 soak (#98): a CTE read twice per layer, nine layers. The
-    // backward step appended one projection per column, hundreds deep, and
-    // cloning it overflowed a 2 MB stack (a tokio worker's), aborting the
-    // process. Cotangents are projected in batches now.
+    // Found by the soak in ad_simulation.rs (#98): a CTE read twice per layer,
+    // nine layers. The backward step appended one projection per column,
+    // hundreds deep, and cloning it overflowed a 2 MB stack (a tokio worker's),
+    // aborting the process. Cotangents are projected in batches now.
     let ctx = SessionContext::new();
     exec(
         &ctx,

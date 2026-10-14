@@ -30,7 +30,7 @@ is a failure. The dangerous direction is closed off by construction.
 **What this costs.** A jaxpr is already lowered, so ddx rules JAX does not keep
 as primitives are unreachable from here: `jnp.log2` traces to `log(x)/log(2)` and
 `jnp.log10` to `log(x)*0.4342…`, so no amount of generation will emit SQL's
-`log2`/`log10`. Every other v1 rule survives tracing one-to-one. Those two are
+`log2`/`log10`. Every other scalar rule survives tracing one-to-one. Those two are
 covered by name in `test_rules.py` instead of being quietly missing.
 """
 

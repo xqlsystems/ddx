@@ -107,7 +107,7 @@ impl Var {
 }
 
 // ---------------------------------------------------------------------------
-// Random expression generator over the *derivable* v1 grammar.
+// Random expression generator over the *derivable* scalar grammar.
 // ---------------------------------------------------------------------------
 //
 // Everything produced here is inside the engine's supported surface, so

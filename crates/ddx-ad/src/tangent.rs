@@ -9,8 +9,7 @@
 //! directional derivative along the caller's tangent of the `wrt` columns.
 //! The dual keeps every column where the relation had it and appends the
 //! tangents after them, so an expression over the relation's columns reads
-//! the same columns of its dual. Each operator carries tangents its own way
-//! (design.md §8, M4.5):
+//! the same columns of its dual. Each operator carries tangents its own way:
 //!
 //! | Primitive | Tangent |
 //! |---|---|
@@ -1243,8 +1242,7 @@ enum WindowTan {
 
 /// `rel` with only the columns `emit` picks: as its own emit if it is a
 /// projection without one, else through a projection over it. An emit
-/// only on a projection: DuckDB's consumer ignores one on anything else
-/// (design.md §4.2).
+/// only on a projection: DuckDB's consumer ignores one on anything else.
 fn with_emit(rel: Rel, emit: Vec<usize>) -> Rel {
     match rel.rel_type {
         Some(RelType::Project(p)) if p.common.is_none() => {

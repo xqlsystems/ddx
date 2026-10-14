@@ -6,7 +6,7 @@
 composition, typed refusals.
 
 The comparison with jax.grad on real models lives in the repo's oracle suite
-(tests/test_v2_jax.py); these check the binding.
+(tests/test_query_jax.py); these check the binding.
 """
 
 import pyarrow as pa
@@ -253,8 +253,9 @@ def test_tables_whose_names_join_alike_keep_their_own_gradients(ad):
 
 
 def test_grad_in_sql_of_a_table_with_capitals(ad):
-    # From the v2 soak (#92): a gradient step named with the table's capitals
-    # was registered under a folded name and not found again.
+    # Found by the soak in ad_simulation.rs (#92): a gradient step named with
+    # the table's capitals was registered under a folded name and not found
+    # again.
     import datafusion
 
     ctx = datafusion.SessionContext()
@@ -264,7 +265,8 @@ def test_grad_in_sql_of_a_table_with_capitals(ad):
 
 
 def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
-    # From the v2 soak (#89): SUM skips row 1, whose term w + q is NULL.
+    # Found by the soak in ad_simulation.rs (#89): SUM skips row 1, whose
+    # term w + q is NULL.
     ctx.register_record_batches("q", [table([0, 1, 2], [5.0, None, 1.0]).to_batches()])
     df = ad.sql(
         ctx,
@@ -274,7 +276,8 @@ def test_no_gradient_through_a_row_an_aggregate_skips(ad, ctx):
 
 
 def test_vjp_refuses_a_cotangent_whose_keys_repeat(ad, ctx):
-    # From the v2 soak (#98): a repeated key added its rows' cotangents.
+    # Found by the soak in ad_simulation.rs (#98): a repeated key added its
+    # rows' cotangents.
     program = ad.vjp(ctx, "SELECT i, val * val AS s FROM w", "w.val")
     c = pa.table({"i": pa.array([0, 0, 1, 2], pa.int64()), "s": [1.0, 1.0, 1.0, 1.0]})
     with pytest.raises(ddxdb.InvalidColumn, match="share their keys"):

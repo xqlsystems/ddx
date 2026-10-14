@@ -17,12 +17,12 @@ source of truth — read the parts relevant to your change before you start:
 - [`docs/design.md`](docs/design.md) — the full design: what `ddx` is, the
   query-level layer and the scalar rules under it, the differentiation surface, the
   per-engine integration story, and the milestone plan. It ends with a decision
-  log (`F#`/`G#`/`R#`/`S#`/`Q#`) recording *why* each choice was made.
+  log recording *why* each choice was made.
 - [`docs/spikes/`](docs/spikes/) — small runnable programs that back every
-  deciding claim in the design (each cited by tag). New direction-changing claims
+  deciding claim in the design. New direction-changing claims
   should come with a spike.
 
-The guiding principles (design.md §2) shape almost every review comment:
+The guiding principles shape almost every review comment:
 
 1. **Fail loud, never silently wrong.** An unsupported construct is a *typed
    error*, never an approximate or silently-zero derivative. A wrong number in
@@ -236,19 +236,20 @@ DDX_SOAK_SECS=120 cargo test -p ddx-core --test simulation --release \
 ```
 
 If you touched **query-level AD** (`ddx-ad`, or `ddx-datafusion`'s `ad` module),
-the v2 soak is its counterpart. It generates loss queries and checks their
-gradients against finite differences of the query, and against ddx itself:
+the soak in `crates/ddx-datafusion/tests/ad_simulation.rs` is its counterpart.
+It generates loss queries and checks their gradients against finite
+differences of the query, and against ddx itself:
 
 ```bash
 DDX_SOAK_SECS=120 cargo test -p ddx-datafusion --test ad_simulation --release \
-  -- --ignored --nocapture soak_v2_query_ad
+  -- --ignored --nocapture soak_query_ad
 ```
 
-A failure prints its seed; `DDX_V2_SEED=<seed>` with the ignored
+A failure prints its seed; `DDX_AD_SEED=<seed>` with the ignored
 `replay_one_seed` test prints that case's SQL and tables and reruns only it.
-`DDX_V2_PROPS=shapes,names,train` spends a soak on some property groups only, and
-`DDX_V2_NULL_PCT=0` turns off generated NULLs. `DDX_V2_MODES=ties,nulls,
-extreme,big` forces those data modes on every case, and `DDX_V2_DEBUG=1` with
+`DDX_AD_PROPS=shapes,names,train` spends a soak on some property groups only, and
+`DDX_AD_NULL_PCT=0` turns off generated NULLs. `DDX_AD_MODES=ties,nulls,
+extreme,big` forces those data modes on every case, and `DDX_AD_DEBUG=1` with
 `replay_one_seed` prints each step's table and flags any relation that is not
 bit-reproducible from run to run.
 
@@ -269,12 +270,12 @@ and the kernel then kills more than the test.
 ```bash
 systemd-run --user --scope -p MemoryMax=8G \
   cargo test -p ddx-datafusion --test ad_simulation --release \
-  -- --ignored --nocapture soak_v2_query_ad
+  -- --ignored --nocapture soak_query_ad
 ```
 
-To see how much a clean v2 soak proves, `.github/scripts/mutation_test.py`
-seeds one deliberate bug at a time into `ddx-ad` and the DataFusion adapter
-and measures how long the soak takes to catch it (it also runs weekly, in
+To see how much a clean run of that soak proves,
+`.github/scripts/mutation_test.py` seeds one deliberate bug at a time into
+`ddx-ad` and the DataFusion adapter and measures how long the soak takes to catch it (it also runs weekly, in
 `.github/workflows/mutation.yml`). A mutant that survives is a blind spot;
 when you change a rule, add a mutant for it.
 
@@ -291,8 +292,9 @@ Maintainers merge; you don't need to (and can't) push to protected branches.
 
 ## Testing conventions
 
-Differentiation is a numerical-correctness feature, so tests are layered
-(design.md §5). In `crates/ddx-core/tests/`:
+Differentiation is a numerical-correctness feature, so tests are layered:
+exact rules, then generated properties, then agreement with JAX. In
+`crates/ddx-core/tests/`:
 
 - **`rules.rs`** — per-rule math and the errors the engine *refuses* (each
   unsupported case asserts a typed error, not a wrong number).

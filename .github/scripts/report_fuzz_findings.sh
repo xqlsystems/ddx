@@ -150,9 +150,10 @@ body_file=$(mktemp)
   echo "> cancellation (magnitude cap) and truncation/aliasing (Richardson"
   echo "> self-consistency), so a surviving \`[finite-diff]\` disagreement should be"
   echo "> a real rule bug — but confirm by reproducing before assuming. \`[render]\`"
-  echo "> and \`[self-consumption]\` failures are always real. In the v2 soak, a"
-  echo "> \`[finite-diff]\` survived a kink screen and Richardson agreement; every other"
-  echo "> tag compares ddx with itself or checks a stated contract."
+  echo "> and \`[self-consumption]\` failures are always real. In the query-AD soak"
+  echo "> (ad_simulation.rs), a \`[finite-diff]\` survived a kink screen and"
+  echo "> Richardson agreement; every other tag compares ddx with itself or checks"
+  echo "> a stated contract."
   echo
   echo "<!-- fuzz-run: ${GITHUB_RUN_ID:-local} -->"
 } > "$body_file"
