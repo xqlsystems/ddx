@@ -123,8 +123,17 @@ class Rewritten:
     def __enter__(self) -> "Rewritten":
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.release()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is None:
+            self.release()
+            return
+        # The error that ended the block is the one to see: a failed drop
+        # is noted on it, not raised in its place.
+        try:
+            self.release()
+        except Exception as e:  # noqa: BLE001 - noted on the error in flight
+            if hasattr(exc, "add_note"):  # Python 3.11+
+                exc.add_note(f"Dropping the rewritten statements' tables failed too: {e!r}")
 
 
 def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "datafusion") -> Rewritten:

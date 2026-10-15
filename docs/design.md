@@ -1243,7 +1243,8 @@ differentiate. Each is rewritten before the engine sees the statement
 A gradient has its table's rows, so `grad` and `vjp` sit in a `SELECT` over
 the table, anywhere an expression can, and an SGD step is one expression,
 `SELECT i, val - lr * grad(loss, val) AS val FROM w`, where the relational
-form needed a join on every dim. A tangent has `e`'s rows, so `jvp` is a
+form needed a join on every dim. A call that is a column of its own, with no
+alias, is named `{c}_grad`. A tangent has `e`'s rows, so `jvp` is a
 column of its own of the `SELECT` computing `e` (the statement's or a
 CTE's), named by its alias or, for a column `e`, `{e}_tangent`. One
 `SELECT`'s `jvp` columns share a tangent; tangents along two tables are two
@@ -1279,8 +1280,22 @@ planned it. A table `grad` or
 `vjp` reads becomes a relation over its rows, under its alias, that also
 holds each call's gradient, left-joined on the table's dims; each call
 reads its own. A `SELECT` with `jvp` columns becomes a read of its
-program's value, each tangent in its call's place; its `ORDER BY` and
-`LIMIT` stay.
+program's value, each tangent in its call's place; its `LIMIT` stays, and
+so does its `ORDER BY`, which may name only the `SELECT`'s output, by name
+or position, since the tables it read are gone.
+
+When a statement's `WHERE` compares a column of a table `grad` reads with a
+literal (`layer = 1`), the program computes only those rows' gradients:
+the comparison rejects NULL, so no other row reaches the result whatever
+the joins. A comparison of a column the program differentiates, because
+another call on the table names it, is not pushed. And the engine plans the
+restriction itself, so its optimizer may give a plan the program cannot
+take (a filter folded away, or moved into the scan); then the program
+computes every row, which is always right.
+
+A query or seed that reads, through the CTEs it reads, a call of itself
+(`loss` reading a CTE that holds `grad(loss, …)`) is refused: no order runs
+either first.
 
 **Calls nest**, as JAX's transformations do. A call's `f`, `e`'s `SELECT`,
 or its cotangent or tangent may read another call, whose job comes first:
@@ -1308,7 +1323,9 @@ Rust does. Reverse over reverse is refused as it is elsewhere.
 *Verified* (`tests/sql_grad.rs`, `tests/sql_jvp.rs`, `tests/sql_vjp.rs`,
 `tests/sql_nesting.rs`): against the closed forms, against the programs row
 by row, two `jvp` `SELECT`s against one program along both tangents, `vjp` along 1 against `grad`, a
-`vjp`'s `WHERE` restricting its rows, `H·v` in SQL against `jvp` of the
+`vjp`'s `WHERE` restricting its rows, a filter on another call's column and
+one the engine plans away, a quoted table's name kept as written, `H·v` in
+SQL against `jvp` of the
 `grad` program, `grad` of a `jvp` and a query over a call, a tangent that is
 another call, and nothing left behind.
 

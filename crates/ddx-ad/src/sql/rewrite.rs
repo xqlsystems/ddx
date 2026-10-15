@@ -56,7 +56,12 @@ impl Calls {
             let mut columns = Vec::new();
             let mut joins: Vec<(&str, Vec<&str>)> = Vec::new();
             for (i, call) in self.calls.iter().enumerate() {
-                let Site::Column { at, read: of } = call.site else {
+                let Site::Column {
+                    at,
+                    read: of,
+                    ref name,
+                } = call.site
+                else {
                     continue;
                 };
                 if of != r {
@@ -87,6 +92,9 @@ impl Calls {
                         Ident::with_quote('"', hidden(i)),
                     ]),
                 );
+                if let Some(name) = name {
+                    rewriter.names.insert(at, Ident::with_quote('"', name));
+                }
             }
             let mut from = format!("{TABLE} AS __ddx_t");
             for (g, (step, dims)) in joins.iter().enumerate() {
@@ -241,6 +249,9 @@ struct Rewriter {
     reads: HashMap<Location, TableFactor>,
     /// A `grad` or `vjp` call's replacement, by where its name starts.
     calls: HashMap<Location, Expr>,
+    /// The name of a `grad` or `vjp` call that is a column of its own with
+    /// no alias, by where its name starts.
+    names: HashMap<Location, Ident>,
 }
 
 impl VisitorMut for Rewriter {
@@ -255,6 +266,21 @@ impl VisitorMut for Rewriter {
             return ControlFlow::Continue(());
         }
         for item in &mut select.projection {
+            if let SelectItem::UnnamedExpr(expr) = item {
+                let alias = match &*expr {
+                    Expr::Function(f) => self.names.remove(&f.name.span().start),
+                    _ => None,
+                };
+                if let Some(alias) = alias {
+                    // Its contents are visited after this, so the call
+                    // under the alias is still replaced.
+                    *item = SelectItem::ExprWithAlias {
+                        expr: expr.clone(),
+                        alias,
+                    };
+                }
+                continue;
+            }
             let (SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options)) = item
             else {
                 continue;

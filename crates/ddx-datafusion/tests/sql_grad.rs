@@ -490,3 +490,98 @@ async fn a_star_beside_a_gradient_returns_the_table_s_columns_and_it() {
     let g = batches[0].column(2).as_primitive::<Float64Type>();
     assert_eq!(g.values().to_vec(), vec![2.0, -4.0, 1.0]);
 }
+
+async fn exec(ctx: &SessionContext, sql: &str) {
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_filter_on_a_column_another_call_differentiates_still_runs() {
+    // Both calls share one program along a and b, so `a > 0` reads a column
+    // it differentiates: only `i < 10` is pushed into it, and the statement
+    // filters the rest.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE ab (i BIGINT, a DOUBLE, b DOUBLE) AS VALUES \
+         (0, 1.0, 2.0), (1, -1.0, 3.0), (2, 0.5, -4.0)",
+    )
+    .await;
+    let loss = "WITH loss AS (SELECT SUM(a * b) AS l FROM ab)";
+    let ga = pairs(
+        &ctx,
+        &format!(
+            "{loss} SELECT i, grad(loss, a) AS ga, grad(loss, b) AS gb FROM ab \
+             WHERE a > 0 AND i < 10"
+        ),
+    )
+    .await;
+    assert_eq!(ga, vec![(0, 2.0), (2, -4.0)]);
+    let gb = pairs(
+        &ctx,
+        &format!(
+            "{loss} SELECT i, grad(loss, b) AS gb, grad(loss, a) AS ga FROM ab \
+             WHERE a > 0 AND i < 10"
+        ),
+    )
+    .await;
+    assert_eq!(gb, vec![(0, 1.0), (2, 0.5)]);
+}
+
+#[tokio::test]
+async fn a_filter_the_engine_plans_away_computes_every_row_instead() {
+    // DataFusion folds `i = NULL` to no rows at all, so its plan of the
+    // restriction has no filter for the program to take: the program
+    // computes every row, and the statement still keeps none.
+    let ctx = ctx().await;
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT i, grad(loss, val) FROM w WHERE i = NULL",
+    )
+    .await;
+    assert_eq!(got, vec![]);
+}
+
+#[tokio::test]
+async fn a_quoted_tables_rows_are_restricted_by_its_own_name() {
+    // `"W"` and `w` are two tables to DataFusion; the restriction of `"W"`
+    // must be planned over `"W"`.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (5, 9.0)",
+    )
+    .await;
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM \"W\") \
+         SELECT i, grad(loss, val) FROM \"W\" WHERE i < 1",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 2.0)]);
+}
+
+#[tokio::test]
+async fn an_unnamed_gradient_column_is_named_for_its_column() {
+    let ctx = ctx().await;
+    let df = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT i, grad(loss, val) FROM w",
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = df
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(names, vec!["i", "val_grad"]);
+}

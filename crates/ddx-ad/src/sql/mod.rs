@@ -16,7 +16,8 @@
 //!
 //! A gradient has its table's rows, so `grad` and `vjp` sit in a `SELECT`
 //! over the table (`c`, or `t.c` for the table the `SELECT` calls `t` when it
-//! reads more than one), anywhere an expression can:
+//! reads more than one), anywhere an expression can. A call that is a column
+//! of its own, with no alias, is named `{c}_grad`:
 //!
 //! ```sql
 //! WITH f AS (SELECT SUM(val * val) AS l FROM w)
@@ -34,8 +35,10 @@
 //! ```
 //!
 //! Several `jvp` columns of one `SELECT` push forward along the same columns
-//! and tangent; along others, write a `SELECT` each. A row a cotangent or
-//! tangent table lacks counts as 0.
+//! and tangent; along others, write a `SELECT` each. The `SELECT` becomes a
+//! read of what its program computed, so its `ORDER BY` may name only its
+//! output, by name or position. A row a cotangent or tangent table lacks
+//! counts as 0.
 //!
 //! A gradient is what an optimizer steps along, so a step,
 //! `params - lr * grad(f)(params)`, is one expression, whatever `f` scores:
@@ -74,11 +77,17 @@
 //! names, so statements that update different tables from one objective pay
 //! for one backward pass; a `jvp` program pushes one `SELECT` forward along
 //! one tangent. A program comes after any whose result its query reads, and
-//! differentiates through it. Each is run on the engine as [`crate::run`]
-//! runs one. Then each statement's tree is rewritten: a table `grad` reads
-//! becomes its rows joined with their gradients, and a `SELECT` with `jvp`
-//! columns becomes a read of its program's value. It is written out as SQL
-//! again; a statement with no call comes back as it was.
+//! differentiates through it; a query that reads, through its CTEs, a call
+//! of itself is refused, since no order runs either first. Each is run on
+//! the engine as [`crate::run`] runs one. When a statement's `WHERE` keeps
+//! some of a table's rows by comparing its columns with literals
+//! (`layer = 1`), the program computes only those rows' gradients, if the
+//! engine's plan of that restriction is one the program can take; otherwise
+//! it computes every row, which is always right. Then each statement's tree
+//! is rewritten: a table `grad` reads becomes its rows joined with their
+//! gradients, and a `SELECT` with `jvp` columns becomes a read of its
+//! program's value. It is written out as SQL again; a statement with no
+//! call comes back as it was.
 //!
 //! The names `grad`, `vjp` and `jvp` are ddx's: a function of that name in a
 //! statement is one of these calls, and a misused one is refused with its
@@ -94,6 +103,7 @@ use std::future::Future;
 
 use ddx_core::sqlparser::dialect::Dialect;
 
+use crate::error::AdError;
 use crate::program::{Options, Unbound};
 use crate::run::{Backend, RunError};
 
@@ -169,21 +179,30 @@ async fn run_all<B: Backend>(
 ) -> Result<Vec<String>, RunError<B::Error>> {
     while let Some(job) = planned.next().map_err(RunError::Refused)? {
         // Only the gradient rows the statements read, where the engine can
-        // plan the restriction; otherwise every row, which is always right.
+        // plan the restriction and the program can take it; otherwise every
+        // row, which is always right.
         let mut options = Options::new();
-        for (table, predicate) in &job.pushdown {
-            let sql = format!("SELECT * FROM {table} WHERE {predicate}");
-            if let Ok(plan) = backend.plan_sql(&sql).await {
-                options = options.restrict(table.clone(), plan);
+        for r in &job.pushdown {
+            if let Ok(plan) = backend.plan_sql(&r.query).await {
+                options = options.restrict(r.table.clone(), plan);
             }
         }
         let plan = backend
             .plan_sql(&job.query)
             .await
             .map_err(RunError::Engine)?;
-        planned
-            .build(&job, &plan, &options)
-            .map_err(RunError::Refused)?;
+        let built = planned.build(&job, &plan, &options).map(|_| ());
+        match built {
+            // An engine's plan of the restriction need not have the shape a
+            // program takes one in (its optimizer may fold the filter away,
+            // or push it into the scan): compute every row instead.
+            Err(AdError::InvalidOptions(_)) if !job.pushdown.is_empty() => {
+                planned
+                    .build(&job, &plan, &Options::new())
+                    .map_err(RunError::Refused)?;
+            }
+            other => other.map_err(RunError::Refused)?,
+        }
         for (name, query) in planned.seeds(&job).map_err(RunError::Refused)? {
             let plan = backend.plan_sql(&query).await.map_err(RunError::Engine)?;
             // The engine's own plan of the query: every read already typed.

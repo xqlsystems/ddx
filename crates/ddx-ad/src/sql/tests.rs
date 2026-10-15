@@ -22,7 +22,14 @@ fn find(sql: &str) -> Calls {
 }
 
 fn filter_of(sql: &str) -> Option<String> {
-    find(sql).calls[0].pushdown.clone()
+    let conjuncts = &find(sql).calls[0].pushdown;
+    (!conjuncts.is_empty()).then(|| {
+        conjuncts
+            .iter()
+            .map(|c| c.sql.as_str())
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    })
 }
 
 /// `calls` rewritten as if each gradient were `g_{table}`, with dims
@@ -230,13 +237,16 @@ fn a_job_restricts_a_table_only_when_every_call_on_it_does() {
             .unwrap()
             .pushdown
     };
-    assert_eq!(
-        plan(&[" WHERE layer = 0"]),
-        vec![("w".to_string(), "layer = 0".to_string())]
-    );
+    let restricted = |predicate: &str| {
+        vec![Restriction {
+            table: "w".into(),
+            query: format!("SELECT * FROM w WHERE {predicate}"),
+        }]
+    };
+    assert_eq!(plan(&[" WHERE layer = 0"]), restricted("layer = 0"));
     assert_eq!(
         plan(&[" WHERE layer = 0", " WHERE layer = 1"]),
-        vec![("w".to_string(), "(layer = 0) OR (layer = 1)".to_string())]
+        restricted("(layer = 0) OR (layer = 1)")
     );
     assert_eq!(plan(&[" WHERE layer = 0", ""]), vec![]);
 }
@@ -514,11 +524,17 @@ fn a_number_is_a_tangent_the_same_at_every_row() {
         panic!("{:?}", found.calls[0].derivative)
     };
     assert_eq!(wrt, &vec![ColumnRef::new("t", "x")]);
-    assert_eq!(tangent, &Tangent::Literal(1.0));
+    assert_eq!(
+        tangent,
+        &Tangent::Literal {
+            value: 1.0,
+            table: "t".into()
+        }
+    );
     let negative = find("SELECT jvp(sin(x), t.x, -0.5) AS dx FROM t");
     assert!(matches!(
         &negative.calls[0].derivative,
-        Derivative::Jvp { tangent: Tangent::Literal(v), .. } if *v == -0.5
+        Derivative::Jvp { tangent: Tangent::Literal { value: v, .. }, .. } if *v == -0.5
     ));
     // Its tangent table is the table's own dims, with the number under the
     // column's name.
@@ -548,4 +564,101 @@ fn a_number_is_a_tangent_the_same_at_every_row() {
     )
     .unwrap_err();
     assert!(e.to_string().contains("name of its cotangent"), "{e}");
+}
+
+#[test]
+fn an_unnamed_gradient_column_is_named_for_its_column() {
+    // As a jvp column is `{e}_tangent`: not a name of ddx's, nor one that
+    // moves when another call comes first.
+    let out = rewritten(&find(
+        "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+         SELECT i, grad(loss, val), 2 * grad(loss, val) AS twice FROM w",
+    ));
+    assert!(
+        out.contains("SELECT i, w.\"__ddx_d0\" AS \"val_grad\", 2 * w.\"__ddx_d1\" AS twice"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_filter_on_a_column_a_merged_program_differentiates_is_not_pushed() {
+    // Each call alone may push the other's column, a dim of its table;
+    // merged into one program along both, it is no dim, and only `i < 10`
+    // holds for both.
+    let sql = "WITH loss AS (SELECT SUM(a * b) AS l FROM w) \
+               SELECT i, grad(loss, a) AS ga, grad(loss, b) AS gb FROM w \
+               WHERE a > 0 AND i < 10";
+    let planned = Derivatives::plan(&[sql], &GenericDialect {}).unwrap();
+    let job = planned.next().unwrap().unwrap();
+    assert_eq!(
+        job.pushdown,
+        vec![Restriction {
+            table: "w".into(),
+            query: "SELECT * FROM w WHERE i < 10".into(),
+        }]
+    );
+}
+
+#[test]
+fn sql_ddx_writes_over_a_table_names_it_as_the_statement_does() {
+    // A quoted name keeps its quotes, and an unquoted one stays unquoted,
+    // for the engine to fold as it folds the statement's.
+    let found = find("SELECT i, jvp(val * val, \"W\".val, 1) AS d FROM \"W\"");
+    assert!(matches!(
+        &found.calls[0].derivative,
+        Derivative::Jvp { tangent: Tangent::Literal { table, .. }, .. } if table == "\"W\""
+    ));
+    let sql = "WITH loss AS (SELECT SUM(val) AS l FROM \"W\") \
+               SELECT i, grad(loss, val) AS g FROM \"W\" WHERE i < 2";
+    let planned = Derivatives::plan(&[sql], &GenericDialect {}).unwrap();
+    assert_eq!(
+        planned.next().unwrap().unwrap().pushdown[0].query,
+        "SELECT * FROM \"W\" WHERE i < 2"
+    );
+}
+
+#[test]
+fn a_function_that_reads_its_own_derivative_is_refused() {
+    // `loss` reads `g`, which is grad of `loss`: no order runs one first.
+    // So does a loss that holds grad of itself, or a tangent that is its own
+    // jvp's SELECT.
+    for sql in [
+        "WITH g AS (SELECT i, grad(loss, val) AS gv FROM w), \
+              loss AS (SELECT SUM(gv * gv) AS l FROM g) \
+         SELECT * FROM g",
+        "WITH loss AS (SELECT SUM(val * val) AS l, grad(loss, val) AS g FROM w) \
+         SELECT * FROM loss",
+        // The tangent of `jvp` is the SELECT it is a column of.
+        "WITH v AS (SELECT i, jvp(val, w.val, v) AS val FROM w) SELECT * FROM v",
+    ] {
+        let e = Derivatives::plan(&[sql], &GenericDialect {})
+            .err()
+            .unwrap_or_else(|| panic!("planned {sql}"));
+        assert!(
+            matches!(&e, AdError::InvalidPlan(m) if m.contains("cannot be part of what it differentiates")),
+            "{sql}: {e}"
+        );
+    }
+}
+
+#[test]
+fn a_jvp_select_orders_by_its_output_only() {
+    let base = "SELECT x, jvp(sin(x), t.x, 1) AS dx FROM t ORDER BY ";
+    for ok in ["x", "dx DESC", "2", "x, dx"] {
+        Calls::find(&format!("{base}{ok}"), &GenericDialect {})
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for refused in ["t.x", "y", "x + 1"] {
+        let e = Calls::find(&format!("{base}{refused}"), &GenericDialect {}).unwrap_err();
+        assert!(
+            matches!(&e, AdError::NotImplemented(m) if m.contains("order by a column of the SELECT's output")),
+            "{refused}: {e}"
+        );
+    }
+    // With a *, any bare column of the table is in the output.
+    Calls::find(
+        "SELECT *, jvp(sin(x), t.x, 1) AS dx FROM t ORDER BY y",
+        &GenericDialect {},
+    )
+    .unwrap();
 }

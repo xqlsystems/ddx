@@ -38,7 +38,7 @@ class Context(SessionContext):
         ctx.sql(
             "WITH loss AS (SELECT SUM(val * val) AS l FROM w) "
             "SELECT i, grad(loss, val) FROM w"
-        ).collect()
+        ).collect()  # columns i and val_grad
     """
 
     def __init__(self, *args, dialect: str = "datafusion", **kwargs):

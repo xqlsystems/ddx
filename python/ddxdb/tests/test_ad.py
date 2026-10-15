@@ -148,6 +148,33 @@ def test_rewrite_releases_its_tables_when_the_block_ends(ad, ctx):
     assert set(ctx.catalog().schema().names()) == before
 
 
+def test_an_error_in_the_block_is_not_hidden_by_a_failed_drop(ad, ctx):
+    class FailingDrops(ad.DataFusionBackend):
+        # Drops succeed while the programs run, and fail once the block has
+        # begun.
+        failing = False
+
+        def drop_table(self, name):
+            super().drop_table(name)
+            if self.failing:
+                raise RuntimeError("drop failed")
+
+    sql = "WITH f AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(f, val) AS g FROM w"
+    with pytest.raises(ValueError, match="in the block"):
+        with ddxdb.rewrite(FailingDrops(ctx), [sql]) as rewritten:
+            rewritten.backend.failing = True
+            raise ValueError("in the block")
+    # With nothing in flight, the drop's own error is raised.
+    with pytest.raises(RuntimeError, match="drop failed"):
+        with ddxdb.rewrite(FailingDrops(ctx), [sql]) as rewritten:
+            rewritten.backend.failing = True
+
+
+def test_an_unnamed_gradient_column_is_named_for_its_column(ad, ctx):
+    df = ad.sql(ctx, "WITH f AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(f, val) FROM w")
+    assert df.schema().names == ["i", "val_grad"]
+
+
 def test_refusals_are_typed(ad, ctx):
     with pytest.raises(ddxdb.NotScalar):
         ad.grad(ctx, "SELECT i, val FROM w", "w.val")

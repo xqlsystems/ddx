@@ -8,7 +8,7 @@
 use ddx_core::sqlparser::dialect::Dialect;
 use substrait::proto::Plan;
 
-use super::find::{same_column, same_columns, Call, Calls, Derivative, Tangent, Transform};
+use super::find::{same_column, same_columns, Call, Calls, Derivative, Site, Tangent, Transform};
 use super::rewrite::{quote, Answer};
 use crate::compose::{After, Differentiable, Subject};
 use crate::error::{AdError, Result};
@@ -19,8 +19,19 @@ use crate::Program;
 
 /// A built program of either kind, as planning holds it: run as a
 /// [`Program`], and composed into a later one as a [`Differentiable`].
-pub(super) trait Built: Program + Differentiable + Send {}
-impl<T: Program + Differentiable + Send> Built for T {}
+pub(super) trait Built: Program + Differentiable + Send {
+    /// It, as a [`Differentiable`], made from the concrete type. Not
+    /// `self as &dyn Differentiable`, an upcast of one trait object to
+    /// another (stable since Rust 1.86): built with Rust 1.88, the oldest
+    /// ddx supports, a program composed from the upcast object read invalid
+    /// memory, and newer compilers did not.
+    fn differentiable(&self) -> &dyn Differentiable;
+}
+impl<T: Program + Differentiable + Send> Built for T {
+    fn differentiable(&self) -> &dyn Differentiable {
+        self
+    }
+}
 
 /// One program to build: a derivative, merged across every call that needs
 /// it, with what its query and seed read.
@@ -29,8 +40,8 @@ struct Planned {
     /// names, each once, case aside; for `jvp`, one call's columns.
     derivative: Derivative,
     /// Rows of a `wrt` table's gradient the calls read, where they all say
-    /// (see [`Call::pushdown`]): the table, and a predicate over its columns.
-    pushdown: Vec<(String, String)>,
+    /// (see [`Call::pushdown`]).
+    pushdown: Vec<Restriction>,
     /// The query, with the calls it holds itself.
     query: Text,
     /// The cotangent or tangent query, with the calls it holds itself.
@@ -52,7 +63,18 @@ struct Text {
 pub(super) struct Job {
     pub index: usize,
     pub query: String,
-    pub pushdown: Vec<(String, String)>,
+    pub pushdown: Vec<Restriction>,
+}
+
+/// The rows of a `wrt` table whose gradient a program computes, at most
+/// ([`crate::Options::restrict`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Restriction {
+    /// The table, its name parts joined by `.`, as its `wrt` columns name it.
+    pub table: String,
+    /// `SELECT * FROM` the table, as the statement writes it, `WHERE` the
+    /// rows: for the engine to plan.
+    pub query: String,
 }
 
 /// Every derivative a batch of statements needs, in the order to build
@@ -72,10 +94,10 @@ impl Derivatives {
         let mut planned = Vec::new();
         let mut texts = Vec::with_capacity(statements.len());
         for sql in statements {
-            texts.push(Text::of(sql, dialect, &mut planned)?);
+            texts.push(Text::of(sql, dialect, &mut planned, &mut Vec::new())?);
         }
         for (j, p) in planned.iter_mut().enumerate() {
-            p.pushdown = pushdown(&texts, j);
+            p.pushdown = pushdown(&texts, j, p.derivative.wrt());
         }
         Ok(Derivatives {
             statements: texts,
@@ -113,7 +135,7 @@ impl Derivatives {
         let needs = p.query.needs();
         let inner: Vec<&dyn Differentiable> = needs
             .iter()
-            .map(|&j| &*self.built[j] as &dyn Differentiable)
+            .map(|&j| self.built[j].differentiable())
             .collect();
         let program = if inner.is_empty() {
             build(&p.derivative, plan, options)?
@@ -140,24 +162,26 @@ impl Derivatives {
             .flat_map(|j| self.built[j].inputs())
             .map(|i| i.name.as_str())
             .collect();
+        let seed = match &p.seed {
+            Some(text) => Some(text.rewrite(&self.planned, &self.built)?),
+            None => None,
+        };
         let mut out = Vec::new();
         for input in program.inputs() {
             if carried.contains(&input.name.as_str()) {
                 continue;
             }
             let columns: Vec<String> = input.columns.iter().map(|c| quote(c)).collect();
-            let query = match (&p.derivative, &p.seed) {
-                (_, Some(text)) => format!(
-                    "SELECT {} FROM ({}) AS __ddx_seed",
-                    columns.join(", "),
-                    text.rewrite(&self.planned, &self.built)?
-                ),
+            let query = match (&p.derivative, &seed) {
+                (_, Some(seed)) => {
+                    format!("SELECT {} FROM ({seed}) AS __ddx_seed", columns.join(", "))
+                }
                 // The same number at every row of the table: the table's own
                 // dims, and the number under each wrt column's name.
                 (
                     Derivative::Jvp {
                         wrt,
-                        tangent: Tangent::Literal(v),
+                        tangent: Tangent::Literal { value, table },
                         ..
                     },
                     None,
@@ -167,13 +191,13 @@ impl Derivatives {
                         .iter()
                         .map(|c| {
                             if wrt.iter().any(|w| w.column.eq_ignore_ascii_case(c)) {
-                                format!("CAST({v:?} AS DOUBLE) AS {}", quote(c))
+                                format!("CAST({value:?} AS DOUBLE) AS {}", quote(c))
                             } else {
                                 quote(c)
                             }
                         })
                         .collect();
-                    format!("SELECT {} FROM {}", picked.join(", "), wrt[0].table)
+                    format!("SELECT {} FROM {table}", picked.join(", "))
                 }
                 _ => {
                     return Err(AdError::Internal(format!(
@@ -252,13 +276,21 @@ impl Planned {
     /// `wrt`; planned now if none is, after the derivatives its query and
     /// seed read, so a derivative comes after every one whose program it
     /// reads.
-    fn of(call: &Call, dialect: &dyn Dialect, planned: &mut Vec<Planned>) -> Result<usize> {
+    ///
+    /// `open` holds the texts being planned, outermost first: a query or
+    /// seed that reads, through its CTEs, a call of itself is refused.
+    fn of(
+        call: &Call,
+        dialect: &dyn Dialect,
+        planned: &mut Vec<Planned>,
+        open: &mut Vec<String>,
+    ) -> Result<usize> {
         let j = match planned.iter().position(|p| p.takes(&call.derivative)) {
             Some(j) => j,
             None => {
-                let query = Text::of(call.derivative.of(), dialect, planned)?;
+                let query = Text::of(call.derivative.of(), dialect, planned, open)?;
                 let seed = match call.derivative.seed_query() {
-                    Some(sql) => Some(Text::of(sql, dialect, planned)?),
+                    Some(sql) => Some(Text::of(sql, dialect, planned, open)?),
                     None => None,
                 };
                 let mut derivative = call.derivative.clone();
@@ -319,26 +351,51 @@ impl Planned {
 
 /// The rows of each table's gradient that derivative `j`'s calls read,
 /// where every call on that table says which (see [`Call::pushdown`]).
-fn pushdown(texts: &[Text], j: usize) -> Vec<(String, String)> {
-    let mut by_table: Vec<(String, Vec<Option<String>>)> = Vec::new();
+///
+/// A call's conjuncts compare columns of its table other than its own. One
+/// that compares a column `j` differentiates is dropped, since its program
+/// has no such dim: what is left still holds every row the call reads.
+fn pushdown(texts: &[Text], j: usize, wrt: &[ColumnRef]) -> Vec<Restriction> {
+    // Per table: its name as `wrt` has it and as the statement writes it,
+    // then each call's predicate, `None` for every row.
+    let mut by_table: Vec<(String, String, Vec<Option<String>>)> = Vec::new();
     for text in texts {
         let Some(calls) = &text.calls else { continue };
         for (call, &k) in calls.calls.iter().zip(&text.needs) {
-            if k != j || call.derivative.transform() == Transform::Jvp {
+            let Site::Column { read, .. } = call.site else {
+                continue;
+            };
+            if k != j {
                 continue;
             }
             let table = &call.derivative.wrt()[0].table;
+            let kept: Vec<&str> = call
+                .pushdown
+                .iter()
+                .filter(|c| {
+                    !wrt.iter().any(|w| {
+                        w.table.eq_ignore_ascii_case(table)
+                            && w.column.eq_ignore_ascii_case(&c.column)
+                    })
+                })
+                .map(|c| c.sql.as_str())
+                .collect();
+            let predicate = (!kept.is_empty()).then(|| kept.join(" AND "));
             match by_table
                 .iter_mut()
-                .find(|(t, _)| t.eq_ignore_ascii_case(table))
+                .find(|(t, _, _)| t.eq_ignore_ascii_case(table))
             {
-                Some((_, filters)) => filters.push(call.pushdown.clone()),
-                None => by_table.push((table.clone(), vec![call.pushdown.clone()])),
+                Some((_, _, filters)) => filters.push(predicate),
+                None => by_table.push((
+                    table.clone(),
+                    calls.reads[read].name.to_string(),
+                    vec![predicate],
+                )),
             }
         }
     }
     let mut out = Vec::new();
-    for (table, filters) in by_table {
+    for (table, written, filters) in by_table {
         let Some(filters) = filters.into_iter().collect::<Option<Vec<_>>>() else {
             continue;
         };
@@ -357,20 +414,38 @@ fn pushdown(texts: &[Text], j: usize) -> Vec<(String, String)> {
                 .collect::<Vec<_>>()
                 .join(" OR ")
         };
-        out.push((table, predicate));
+        out.push(Restriction {
+            table,
+            query: format!("SELECT * FROM {written} WHERE {predicate}"),
+        });
     }
     out
 }
 
 impl Text {
     /// `sql`, with its calls, each matched to the one of `planned` it needs,
-    /// planned there first if none is.
-    fn of(sql: &str, dialect: &dyn Dialect, planned: &mut Vec<Planned>) -> Result<Text> {
+    /// planned there first if none is. `open` is as [`Planned::of`] takes
+    /// it.
+    fn of(
+        sql: &str,
+        dialect: &dyn Dialect,
+        planned: &mut Vec<Planned>,
+        open: &mut Vec<String>,
+    ) -> Result<Text> {
+        if open.iter().any(|o| o == sql) {
+            return Err(AdError::InvalidPlan(
+                "a call whose function, cotangent or tangent reads that same call, through \
+                 the CTEs it reads: a derivative cannot be part of what it differentiates"
+                    .into(),
+            ));
+        }
         let calls = Calls::find(sql, dialect)?;
+        open.push(sql.to_string());
         let mut needs = Vec::new();
         for call in calls.iter().flat_map(|c| &c.calls) {
-            needs.push(Planned::of(call, dialect, planned)?);
+            needs.push(Planned::of(call, dialect, planned, open)?);
         }
+        open.pop();
         Ok(Text {
             sql: sql.to_string(),
             calls,

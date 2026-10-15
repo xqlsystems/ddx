@@ -9,8 +9,8 @@ use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
     Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned,
-    Statement, TableFactor, Visit, Visitor,
+    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
 };
 use ddx_core::sqlparser::dialect::Dialect;
 use ddx_core::sqlparser::parser::Parser;
@@ -90,8 +90,10 @@ pub(crate) enum Tangent {
     /// the `wrt` table, its dims then a tangent under each column's name.
     Query(String),
     /// The same number at every row: `jvp(sin(x), t.x, 1)` is the derivative
-    /// of `sin(x)` with respect to `x`, row by row.
-    Literal(f64),
+    /// of `sin(x)` with respect to `x`, row by row. `table` is the `wrt`
+    /// table as the statement writes it, quotes included, so that SQL ddx
+    /// writes over its rows names the table the statement means.
+    Literal { value: f64, table: String },
 }
 
 /// The derivative a call asks for: a transformation applied to a function
@@ -174,13 +176,23 @@ pub(crate) struct Call {
     /// What it differentiates.
     pub derivative: Derivative,
     /// For `grad` and `vjp`, the rows of the table the `SELECT` reads at
-    /// most, when its `WHERE` says: the conjuncts that compare one of the
-    /// table's dims with a literal, written over its column names (`layer =
-    /// 0 AND i < 10`). Such a comparison rejects NULL, so computing only
-    /// those rows' gradients leaves the statement's result as it was,
-    /// whatever the joins. Planning pushes it into the program.
-    pub pushdown: Option<String>,
+    /// most, when its `WHERE` says: the conjuncts that compare a column of
+    /// the table other than the call's own with a literal (`layer = 0`, `i <
+    /// 10`); empty if none does, which is every row. Such a comparison
+    /// rejects NULL, so computing only those rows' gradients leaves the
+    /// statement's result as it was, whatever the joins. Planning pushes
+    /// the conjuncts that compare one of the table's dims into the program.
+    pub pushdown: Vec<Conjunct>,
     pub(super) site: Site,
+}
+
+/// One conjunct of a `WHERE` that [`Call::pushdown`] can carry.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Conjunct {
+    /// The column of the table it compares.
+    pub column: String,
+    /// The comparison, over bare column names (`layer IN (0, 2)`).
+    pub sql: String,
 }
 
 /// Where a call sits, for [`Calls::rewrite`].
@@ -189,9 +201,15 @@ pub(crate) struct Call {
 /// other node starts there, and the name survives cloning the statement.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Site {
-    /// A `grad` or `vjp` call: where its name starts, and which of
-    /// [`Calls`]'s `reads` is the table whose rows it is a column of.
-    Column { at: Location, read: usize },
+    /// A `grad` or `vjp` call: where its name starts, which of [`Calls`]'s
+    /// `reads` is the table whose rows it is a column of, and, when the call
+    /// is a column of its own with no alias, the column's name:
+    /// `{column}_grad`, as a `jvp`'s is `{e}_tangent`.
+    Column {
+        at: Location,
+        read: usize,
+        name: Option<String>,
+    },
     /// A `jvp` call: which of [`Calls`]'s `selects` it is a column of, the
     /// name `f` gives its expression there, and the column's name.
     Tangent {
@@ -316,9 +334,13 @@ impl Found<'_> {
                 self.column_call(kind, function, select, args[0], columns, Some(cotangent))
             }
             Transform::Jvp => {
-                let tangent = match literal(args[args.len() - 1]) {
-                    Some(v) => Tangent::Literal(v),
-                    None => Tangent::Query(self.relation(kind, args[args.len() - 1])?),
+                let last = args[args.len() - 1];
+                let tangent = match literal(last) {
+                    Some(value) => Tangent::Literal {
+                        value,
+                        table: String::new(),
+                    },
+                    None => Tangent::Query(self.relation(kind, last)?),
                 };
                 self.tangent_call(function, select, columns, tangent)
             }
@@ -393,6 +415,7 @@ impl Found<'_> {
             site: Site::Column {
                 at: start_of(function.name.span())?,
                 read,
+                name: unnamed_column(select, function).then(|| format!("{name}_grad")),
             },
         })
     }
@@ -432,9 +455,12 @@ impl Found<'_> {
         function: &Function,
         select: &Select,
         columns: &[&Expr],
-        tangent: Tangent,
+        mut tangent: Tangent,
     ) -> Result<Call> {
-        let (table, names) = one_tables_columns(Transform::Jvp, columns)?;
+        let (table, written, names) = one_tables_columns(Transform::Jvp, columns)?;
+        if let Tangent::Literal { table, .. } = &mut tangent {
+            *table = written;
+        }
         let at = select_at(select)?;
         let index = match self.selects.iter().position(|&s| s == at) {
             Some(i) => i,
@@ -457,7 +483,7 @@ impl Found<'_> {
                     .collect(),
                 tangent,
             },
-            pushdown: None,
+            pushdown: Vec::new(),
             site: Site::Tangent {
                 select: index,
                 hidden: format!("__ddx_jvp_{earlier}"),
@@ -489,6 +515,9 @@ impl Found<'_> {
                 return Err(AdError::NotImplemented(
                     "jvp(…) in a statement with a WITH RECURSIVE clause".into(),
                 ));
+            }
+            if let Some(order_by) = owner(self.query, at).and_then(|q| q.order_by.as_ref()) {
+                orders_by_output(order_by, select)?;
             }
             let mut f = select.clone();
             let mut k = 0;
@@ -870,10 +899,11 @@ fn table_name(name: &ObjectName) -> String {
         .join(".")
 }
 
-/// A `jvp` call's columns, all of one table: the table and their names.
-fn one_tables_columns(kind: Transform, columns: &[&Expr]) -> Result<(String, Vec<String>)> {
+/// A `jvp` call's columns, all of one table: the table, its parts joined by
+/// `.` unquoted and as the call writes it, and the columns' names.
+fn one_tables_columns(kind: Transform, columns: &[&Expr]) -> Result<(String, String, Vec<String>)> {
     let usage = kind.usage();
-    let mut table: Option<String> = None;
+    let mut table: Option<(String, String)> = None;
     let mut names = Vec::with_capacity(columns.len());
     for e in columns {
         let Expr::CompoundIdentifier(parts) = e else {
@@ -892,7 +922,7 @@ fn one_tables_columns(kind: Transform, columns: &[&Expr]) -> Result<(String, Vec
             .collect::<Vec<_>>()
             .join(".");
         match &table {
-            Some(first) if !first.eq_ignore_ascii_case(&t) => {
+            Some((first, _)) if !first.eq_ignore_ascii_case(&t) => {
                 return Err(AdError::NotImplemented(format!(
                     "{}(…) takes columns of one table, so its tangent is shaped like that \
                      table; call it once per table",
@@ -900,11 +930,15 @@ fn one_tables_columns(kind: Transform, columns: &[&Expr]) -> Result<(String, Vec
                 )))
             }
             Some(_) => {}
-            None => table = Some(t),
+            None => {
+                let written = ObjectName::from(prefix.to_vec()).to_string();
+                table = Some((t, written));
+            }
         }
         names.push(column.value.clone());
     }
-    Ok((table.expect("one column at least"), names))
+    let (table, written) = table.expect("one column at least");
+    Ok((table, written, names))
 }
 
 /// The select item a `jvp` call is: the call, maybe under an alias.
@@ -926,6 +960,14 @@ fn select_item<'s>(select: &'s Select, function: &Function) -> Result<&'s Select
                 Transform::Jvp.usage()
             ))
         })
+}
+
+/// Is `function` a column of `select` of its own, with no alias?
+fn unnamed_column(select: &Select, function: &Function) -> bool {
+    select.projection.iter().any(|item| {
+        matches!(item, SelectItem::UnnamedExpr(Expr::Function(f))
+            if f.name.span() == function.name.span())
+    })
 }
 
 /// The name of a `jvp` call's column: its alias, or `{e}_tangent` when
@@ -959,18 +1001,76 @@ fn visible_ctes(query: &Query, at: Location) -> Option<usize> {
         .position(|c| c.query.with.is_none() && starts(&c.query.body))
 }
 
-/// The conjuncts of `select`'s `WHERE` that compare one of the dims of the
-/// table it calls `alias` (or that it reads alone, if `bare`) with a
-/// literal, over bare column names; `None` if there are none. `value` is
-/// the column the call names, never pushed.
-fn filter_of(select: &Select, alias: &str, bare: bool, value: &str) -> Option<String> {
-    let mut kept = Vec::new();
-    for c in conjuncts(select.selection.as_ref()?) {
-        if let Some(text) = pushable(c, alias, bare, value) {
-            kept.push(text);
+/// The query whose body is the `SELECT` starting `at`: the statement, or
+/// one of its CTEs ([`visible_ctes`]).
+fn owner(query: &Query, at: Location) -> Option<&Query> {
+    let starts =
+        |body: &SetExpr| matches!(body, SetExpr::Select(s) if select_at(s).ok() == Some(at));
+    if starts(&query.body) {
+        return Some(query);
+    }
+    let ctes = query.with.as_ref().map_or(&[][..], |w| &w.cte_tables[..]);
+    ctes.iter()
+        .map(|c| &*c.query)
+        .find(|q| q.with.is_none() && starts(&q.body))
+}
+
+/// Refuse an `ORDER BY` of a `SELECT` with `jvp` columns that names
+/// anything but the `SELECT`'s output, by name or position. The `SELECT`
+/// becomes a read of its program's value, which holds only that output:
+/// the tables it read are gone.
+fn orders_by_output(order_by: &OrderBy, select: &Select) -> Result<()> {
+    let mut names = Vec::new();
+    let mut star = false;
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { alias, .. } => names.push(alias.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(c)) => names.push(c.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                names.extend(parts.last().map(|p| p.value.clone()));
+            }
+            SelectItem::UnnamedExpr(Expr::Function(f)) => {
+                if let Ok(name) = tangent_name(select, f) {
+                    names.push(name);
+                }
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => star = true,
+            _ => {}
         }
     }
-    (!kept.is_empty()).then(|| kept.join(" AND "))
+    let refuse = |what: &dyn std::fmt::Display| {
+        AdError::NotImplemented(format!(
+            "ORDER BY {what} in a SELECT with jvp(…) columns: order by a column of the \
+             SELECT's output, by name or position, or in a query over it"
+        ))
+    };
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return Err(refuse(&"ALL"));
+    };
+    for e in exprs {
+        let ok = match &e.expr {
+            Expr::Identifier(c) => star || names.iter().any(|n| n.eq_ignore_ascii_case(&c.value)),
+            other => literal(other).is_some(),
+        };
+        if !ok {
+            return Err(refuse(&e.expr));
+        }
+    }
+    Ok(())
+}
+
+/// The conjuncts of `select`'s `WHERE` that compare a column of the table
+/// it calls `alias` (or that it reads alone, if `bare`) with a literal,
+/// over bare column names. `value` is the column the call names, never
+/// pushed.
+fn filter_of(select: &Select, alias: &str, bare: bool, value: &str) -> Vec<Conjunct> {
+    let Some(selection) = select.selection.as_ref() else {
+        return Vec::new();
+    };
+    conjuncts(selection)
+        .into_iter()
+        .filter_map(|c| pushable(c, alias, bare, value))
+        .collect()
 }
 
 /// The `AND`-ed parts of `e`.
@@ -991,10 +1091,31 @@ fn conjuncts(e: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// `c` over bare column names, if it compares a dim of the table called
-/// `alias` (or read alone, if `bare`) with a literal: `=`, `<>`, `<`, `<=`,
-/// `>`, `>=`, `IN (…)` or `BETWEEN`, none negated. Each rejects NULL.
-fn pushable(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<String> {
+/// `c` over bare column names, if it compares a column of the table called
+/// `alias` (or read alone, if `bare`), other than `value`, with a literal:
+/// `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN (…)` or `BETWEEN`, none negated.
+/// Each rejects NULL.
+fn pushable(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<Conjunct> {
+    let sql = compared(c, alias, bare, value)?;
+    let column = match &sql {
+        Expr::BinaryOp { left, right, .. } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Identifier(c), _) | (_, Expr::Identifier(c)) => c,
+            _ => return None,
+        },
+        Expr::InList { expr, .. } | Expr::Between { expr, .. } => match expr.as_ref() {
+            Expr::Identifier(c) => c,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(Conjunct {
+        column: column.value.clone(),
+        sql: sql.to_string(),
+    })
+}
+
+/// [`pushable`]'s comparison, over the bare column name.
+fn compared(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<Expr> {
     use ddx_core::sqlparser::ast::BinaryOperator;
     let dim = |e: &Expr| -> Option<Expr> {
         let column = match e {
@@ -1025,24 +1146,18 @@ fn pushable(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<String> {
             ) =>
         {
             if let (Some(d), true) = (dim(left), literal(right)) {
-                return Some(
-                    Expr::BinaryOp {
-                        left: Box::new(d),
-                        op: op.clone(),
-                        right: right.clone(),
-                    }
-                    .to_string(),
-                );
+                return Some(Expr::BinaryOp {
+                    left: Box::new(d),
+                    op: op.clone(),
+                    right: right.clone(),
+                });
             }
             if let (true, Some(d)) = (literal(left), dim(right)) {
-                return Some(
-                    Expr::BinaryOp {
-                        left: left.clone(),
-                        op: op.clone(),
-                        right: Box::new(d),
-                    }
-                    .to_string(),
-                );
+                return Some(Expr::BinaryOp {
+                    left: left.clone(),
+                    op: op.clone(),
+                    right: Box::new(d),
+                });
             }
             None
         }
@@ -1050,27 +1165,21 @@ fn pushable(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<String> {
             expr,
             list,
             negated: false,
-        } if list.iter().all(literal) => dim(expr).map(|d| {
-            Expr::InList {
-                expr: Box::new(d),
-                list: list.clone(),
-                negated: false,
-            }
-            .to_string()
+        } if list.iter().all(literal) => dim(expr).map(|d| Expr::InList {
+            expr: Box::new(d),
+            list: list.clone(),
+            negated: false,
         }),
         Expr::Between {
             expr,
             negated: false,
             low,
             high,
-        } if literal(low) && literal(high) => dim(expr).map(|d| {
-            Expr::Between {
-                expr: Box::new(d),
-                negated: false,
-                low: low.clone(),
-                high: high.clone(),
-            }
-            .to_string()
+        } if literal(low) && literal(high) => dim(expr).map(|d| Expr::Between {
+            expr: Box::new(d),
+            negated: false,
+            low: low.clone(),
+            high: high.clone(),
         }),
         _ => None,
     }

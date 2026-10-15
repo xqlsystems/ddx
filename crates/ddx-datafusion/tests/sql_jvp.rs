@@ -287,3 +287,27 @@ async fn along_a_number_jvp_is_the_derivative_of_an_expression_row_by_row() {
         assert!(close(row["e"], -0.5 * 2.0 * row["val"]), "{row:?}");
     }
 }
+
+#[tokio::test]
+async fn a_number_tangent_of_a_quoted_table_has_that_tables_rows() {
+    // `"W"` and `w` are two tables to DataFusion. A tangent built from `w`'s
+    // rows would be missing row 1, whose tangent would then count as 0.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 9.0)",
+    )
+    .await;
+    let got = sql_rows(
+        &ctx,
+        "SELECT i, jvp(val * val, \"W\".val, 1) AS d FROM \"W\" ORDER BY i",
+    )
+    .await;
+    let d: Vec<f64> = got.iter().map(|r| r["d"]).collect();
+    assert_eq!(d, vec![2.0, 4.0]);
+}
