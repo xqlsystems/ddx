@@ -145,7 +145,8 @@ def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "dataf
     This is ``ddx_ad::rewrite``, ddx-ad's own Rust: it plans one program per
     distinct derivative, runs each on the backend, and rewrites the
     statements' parsed trees. Raises a :class:`DdxError` subclass when ddx
-    cannot differentiate a call, or what the backend raised.
+    cannot differentiate a call, or what the backend raised; either way,
+    it first tries to drop every table it wrote.
     """
     out, tables = _rewrite(backend, list(statements), dialect)
     return Rewritten(out, tables, backend)

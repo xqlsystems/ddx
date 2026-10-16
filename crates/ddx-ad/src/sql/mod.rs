@@ -149,6 +149,12 @@ impl Rewritten {
 /// Every program's tables but its results are dropped as it runs. What the
 /// statements read stays until [`Rewritten::release`]; if anything fails,
 /// nothing does.
+///
+/// Dropping the future before it completes (a timeout, a cancelled task)
+/// skips that cleanup, as dropping any future skips the code after its
+/// await: the tables written so far stay on the backend. Every one is named
+/// under a namespace of ddx's, starting `__ddx_`, so they can be found and
+/// dropped.
 pub fn rewrite<'a, B: Backend>(
     backend: &'a mut B,
     statements: &[&str],
