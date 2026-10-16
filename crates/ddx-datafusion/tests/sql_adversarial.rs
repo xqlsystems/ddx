@@ -384,19 +384,22 @@ async fn grad_over_what_is_not_the_table_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "#132 findings: calls in GROUP BY and ORDER BY, and a schema-qualified table"]
 async fn grad_in_group_by_order_by_and_under_a_schema() {
     // Each is valid SQL ddx documents as supported ("anywhere an expression
-    // can"), and fails: the same call in the SELECT and its GROUP BY gets two
-    // hidden columns, so the SELECT's no longer matches its key (DataFusion:
-    // "must appear in the GROUP BY clause"); an ORDER BY call is refused as
-    // outside a SELECT's columns; `public.w.val` over `FROM public.w` is
-    // refused as not in the FROM.
+    // can"), and each failed when found by fuzzing: the same call in the
+    // SELECT and its GROUP BY got two hidden columns, so the SELECT's no
+    // longer matched its key; an ORDER BY call was refused as outside a
+    // SELECT's columns; `public.w.val` over `FROM public.w` was refused as
+    // not in the FROM.
     let g = "grad(loss, val)";
+    // The loss names the table as the statement does: ddx matches tables by
+    // name, and cannot know that the engine's default schema makes `w` and
+    // `public.w` one table.
+    let public = LOSS.replace("FROM w JOIN", "FROM public.w JOIN");
     let cases: Vec<(&str, String, String)> = vec![
         (
             "schema-qualified table",
-            format!("{LOSS} SELECT i, grad(loss, public.w.val) AS g FROM public.w"),
+            format!("{public} SELECT i, grad(loss, public.w.val) AS g FROM public.w"),
             "SELECT w.i, gw.val AS g FROM w JOIN gw ON w.i = gw.i".into(),
         ),
         (
@@ -417,4 +420,15 @@ async fn grad_in_group_by_order_by_and_under_a_schema() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    // Spelled two ways, it is refused, saying which name the loss reads.
+    let ctx = ctx();
+    setup(&ctx).await;
+    let e = ad::sql(
+        &ctx,
+        &format!("{LOSS} SELECT i, grad(loss, public.w.val) AS g FROM public.w"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("name it `w`"), "{e}");
 }
