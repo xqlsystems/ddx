@@ -5,6 +5,7 @@
 //! Finding `grad`, `vjp` and `jvp` calls in a statement: what each call
 //! differentiates, and where in the statement it sits.
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
@@ -722,15 +723,45 @@ fn find_none(statements: &[Statement]) -> Result<Option<Calls>> {
 struct Finder {
     found: Vec<(Transform, Function, Option<Select>)>,
     relations: Vec<Transform>,
-    /// The `SELECT`s around the node being visited, innermost last.
-    open: Vec<Select>,
+    /// The `SELECT`s around the node being visited, innermost last; `None`
+    /// for a query, so that a call in a query's own clauses outside its
+    /// body (`LIMIT`, or a set operation's `ORDER BY`) is in no `SELECT`,
+    /// never in the one around the query.
+    open: Vec<Option<Select>>,
+    /// The calls in a query's `ORDER BY`, by where their names start, each
+    /// with the query's body: a `SELECT` orders its own rows, so a call
+    /// there is a column of them as one in its select list is.
+    ordering: HashMap<Location, Select>,
 }
 
 impl Visitor for Finder {
     type Break = ();
 
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let (Some(order_by), SetExpr::Select(select)) = (&query.order_by, &*query.body) {
+            if let OrderByKind::Expressions(exprs) = &order_by.kind {
+                for e in exprs {
+                    let _ = e.expr.visit(&mut OurCalls {
+                        found: |f: &Function| {
+                            self.ordering
+                                .insert(f.name.span().start, (**select).clone());
+                        },
+                        depth: 0,
+                    });
+                }
+            }
+        }
+        self.open.push(None);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+        self.open.pop();
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
-        self.open.push(select.clone());
+        self.open.push(Some(select.clone()));
         ControlFlow::Continue(())
     }
 
@@ -743,8 +774,11 @@ impl Visitor for Finder {
         if let Expr::Function(f) = expr {
             if let [ObjectNamePart::Identifier(id)] = f.name.0.as_slice() {
                 if let Some(kind) = Transform::of(&id.value) {
-                    self.found
-                        .push((kind, f.clone(), self.open.last().cloned()));
+                    let select = match self.ordering.remove(&f.name.span().start) {
+                        Some(select) => Some(select),
+                        None => self.open.last().cloned().flatten(),
+                    };
+                    self.found.push((kind, f.clone(), select));
                 }
             }
         }
@@ -761,6 +795,40 @@ impl Visitor for Finder {
             if let [ObjectNamePart::Identifier(id)] = name.0.as_slice() {
                 if let Some(kind) = Transform::of(&id.value) {
                     self.relations.push(kind);
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Calls `found` on each function call in what it visits whose name is one
+/// of ours, outside any query nested in it: a call in a subquery is a
+/// column of that subquery's rows.
+struct OurCalls<F> {
+    found: F,
+    /// How many queries deep the node being visited is.
+    depth: usize,
+}
+
+impl<F: FnMut(&Function)> Visitor for OurCalls<F> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let (Expr::Function(f), 0) = (expr, self.depth) {
+            if let [ObjectNamePart::Identifier(id)] = f.name.0.as_slice() {
+                if Transform::of(&id.value).is_some() {
+                    (self.found)(f);
                 }
             }
         }
@@ -816,8 +884,8 @@ fn read_of<'s>(
     let usage = kind.usage();
     let (qualifier, name) = match column {
         Expr::Identifier(c) => (None, c.value.clone()),
-        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-            [t, c] => (Some(t), c.value.clone()),
+        Expr::CompoundIdentifier(parts) => match parts.split_last() {
+            Some((c, t)) if !t.is_empty() => (Some(t), c.value.clone()),
             _ => {
                 return Err(AdError::InvalidPlan(format!(
                     "`{column}` is not a column of a table in the SELECT's FROM; {usage}"
@@ -839,10 +907,20 @@ fn read_of<'s>(
             None => name.0.last()?.as_ident()?.value.clone(),
         })
     };
+    // A table is named by what the SELECT calls it or, when it has no
+    // alias, by its whole name (`public.w.val` over `FROM public.w`).
+    let whole = |f: &TableFactor, parts: &[Ident]| {
+        matches!(f, TableFactor::Table { name, alias: None, .. }
+        if name.0.len() == parts.len()
+            && name.0.iter().zip(parts).all(|(n, p)| {
+                n.as_ident().is_some_and(|n| n.value.eq_ignore_ascii_case(&p.value))
+            }))
+    };
     let found: Vec<&TableFactor> = match qualifier {
-        Some(t) => tables(select)
+        Some([t]) => tables(select)
             .filter(|f| called(f).is_some_and(|n| n.eq_ignore_ascii_case(&t.value)))
             .collect(),
+        Some(parts) => tables(select).filter(|f| whole(f, parts)).collect(),
         None if one_table(select) => tables(select).collect(),
         None => {
             return Err(AdError::InvalidPlan(format!(

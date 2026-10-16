@@ -1241,7 +1241,10 @@ differentiate. Each is rewritten before the engine sees the statement
 | `jvp(e, t.c, …, tangent)` | any rows: `e` is an expression of the `SELECT` | the tangent of `e` along `tangent` (shaped like `t`: its dims, then each column's tangent) |
 
 A gradient has its table's rows, so `grad` and `vjp` sit in a `SELECT` over
-the table, anywhere an expression can, and an SGD step is one expression,
+the table, anywhere an expression can (its select list, `WHERE`, `GROUP BY`,
+`HAVING`, a join's `ON`, or the `ORDER BY` of the query whose `SELECT` it
+is; a call written twice reads one gradient column, so a `SELECT` and its
+`GROUP BY` still agree), and an SGD step is one expression,
 `SELECT i, val - lr * grad(loss, val) AS val FROM w`, where the relational
 form needed a join on every dim. A call that is a column of its own, with no
 alias, is named `{c}_grad`. A tangent has `e`'s rows, so `jvp` is a

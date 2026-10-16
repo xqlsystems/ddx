@@ -52,9 +52,14 @@ impl Calls {
     /// statement is rewritten as a tree, then written out as SQL.
     pub fn rewrite<'a>(&self, answer: &dyn Fn(usize) -> Result<Answer<'a>>) -> Result<String> {
         let mut rewriter = Rewriter::default();
+        // Each `grad` or `vjp` call's gradient column. Calls on one read
+        // that read the same gradient share one, so that a call written
+        // twice (in a SELECT and its GROUP BY) is the same expression twice.
+        let mut hiddens: Vec<Option<String>> = vec![None; self.calls.len()];
         for (r, read) in self.reads.iter().enumerate() {
             let mut columns = Vec::new();
             let mut joins: Vec<(&str, Vec<&str>)> = Vec::new();
+            let mut named: Vec<(&str, &str, String)> = Vec::new();
             for (i, call) in self.calls.iter().enumerate() {
                 let Site::Column {
                     at,
@@ -80,18 +85,23 @@ impl Calls {
                         joins.len() - 1
                     }
                 };
-                columns.push(format!(
-                    "__ddx_g{g}.{} AS {}",
-                    quote(column),
-                    quote(&hidden(i))
-                ));
+                let h = match named.iter().find(|(s, c, _)| *s == step && *c == column) {
+                    Some((_, _, h)) => h.clone(),
+                    None => {
+                        let h = hidden(i);
+                        columns.push(format!("__ddx_g{g}.{} AS {}", quote(column), quote(&h)));
+                        named.push((step, column, h.clone()));
+                        h
+                    }
+                };
                 rewriter.calls.insert(
                     at,
                     Expr::CompoundIdentifier(vec![
                         read.alias.clone(),
-                        Ident::with_quote('"', hidden(i)),
+                        Ident::with_quote('"', h.clone()),
                     ]),
                 );
+                hiddens[i] = Some(h);
                 if let Some(name) = name {
                     rewriter.names.insert(at, Ident::with_quote('"', name));
                 }
@@ -126,14 +136,17 @@ impl Calls {
             rewriter.reads.insert(read.at, factor);
         }
         for (end, covered) in &self.stars {
-            let excluded = self
-                .calls
-                .iter()
-                .enumerate()
-                .filter(
-                    |(_, c)| matches!(c.site, Site::Column { read, .. } if covered.contains(&read)),
-                )
-                .map(|(i, _)| ObjectName::from(vec![Ident::with_quote('"', hidden(i))]))
+            let mut names: Vec<&str> = Vec::new();
+            for (call, h) in self.calls.iter().zip(&hiddens) {
+                if let (Site::Column { read, .. }, Some(h)) = (&call.site, h) {
+                    if covered.contains(read) && !names.contains(&h.as_str()) {
+                        names.push(h);
+                    }
+                }
+            }
+            let excluded = names
+                .into_iter()
+                .map(|h| ObjectName::from(vec![Ident::with_quote('"', h)]))
                 .collect();
             rewriter
                 .stars

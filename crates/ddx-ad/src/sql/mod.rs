@@ -15,9 +15,14 @@
 //! | `jvp(e, t.c, …, tangent)` | anything: `e` is an expression of the `SELECT` | the tangent of `e`, pushed forward along `tangent`: a CTE or table shaped like `t` (its dims, then a tangent under each column's name), or a number, the same at every row |
 //!
 //! A gradient has its table's rows, so `grad` and `vjp` sit in a `SELECT`
-//! over the table (`c`, or `t.c` for the table the `SELECT` calls `t` when it
-//! reads more than one), anywhere an expression can. A call that is a column
-//! of its own, with no alias, is named `{c}_grad`:
+//! over the table (`c`; `t.c` for the table the `SELECT` calls `t` when it
+//! reads more than one; or `s.t.c`, its whole name, when it has no alias,
+//! spelled as `f` spells it: ddx matches tables by name, so it cannot know
+//! that an engine's default schema makes `t` and `s.t` one table),
+//! anywhere an expression can: its select list, `WHERE`, `GROUP BY`,
+//! `HAVING`, a join's `ON`, or the `ORDER BY` of the query whose `SELECT` it
+//! is. A call that is a column of its own, with no alias, is named
+//! `{c}_grad`:
 //!
 //! ```sql
 //! WITH f AS (SELECT SUM(val * val) AS l FROM w)

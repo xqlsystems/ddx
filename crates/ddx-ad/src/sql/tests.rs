@@ -32,9 +32,10 @@ fn filter_of(sql: &str) -> Option<String> {
     })
 }
 
-/// `calls` rewritten as if each gradient were `g_{table}`, with dims
-/// `i`, and each value `v`: `l` and two jvps' expressions, of which
-/// `l` and the first have tangents.
+/// `calls` rewritten as if each gradient were `g_{table}` (`g_{table}_{k}`
+/// for the `k`th other query differentiated), with dims `i`, and each value
+/// `v`: `l` and two jvps' expressions, of which `l` and the first have
+/// tangents.
 fn rewritten(calls: &Calls) -> String {
     let value = OutputTable {
         step: "v".into(),
@@ -57,10 +58,24 @@ fn rewritten(calls: &Calls) -> String {
             },
         ],
     };
+    let mut queries: Vec<&str> = Vec::new();
     let steps: Vec<String> = calls
         .calls
         .iter()
-        .map(|c| format!("g_{}", c.derivative.wrt()[0].table))
+        .map(|c| {
+            let k = queries
+                .iter()
+                .position(|q| *q == c.derivative.of())
+                .unwrap_or_else(|| {
+                    queries.push(c.derivative.of());
+                    queries.len() - 1
+                });
+            let table = &c.derivative.wrt()[0].table;
+            match k {
+                0 => format!("g_{table}"),
+                k => format!("g_{table}_{k}"),
+            }
+        })
         .collect();
     calls
         .rewrite(&|i| {
@@ -575,7 +590,7 @@ fn an_unnamed_gradient_column_is_named_for_its_column() {
          SELECT i, grad(loss, val), 2 * grad(loss, val) AS twice FROM w",
     ));
     assert!(
-        out.contains("SELECT i, w.\"__ddx_d0\" AS \"val_grad\", 2 * w.\"__ddx_d1\" AS twice"),
+        out.contains("SELECT i, w.\"__ddx_d0\" AS \"val_grad\", 2 * w.\"__ddx_d0\" AS twice"),
         "{out}"
     );
 }
@@ -661,4 +676,84 @@ fn a_jvp_select_orders_by_its_output_only() {
         &GenericDialect {},
     )
     .unwrap();
+}
+
+#[test]
+fn a_call_written_twice_reads_one_gradient_column() {
+    // A SELECT and its GROUP BY must say the same thing after the rewrite,
+    // and a * excludes the one column once.
+    let out = rewritten(&find(
+        "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+         SELECT grad(loss, val) > 0 AS up, COUNT(*) AS n FROM w GROUP BY grad(loss, val) > 0",
+    ));
+    assert!(
+        out.contains("SELECT w.\"__ddx_d0\" > 0 AS up, COUNT(*) AS n FROM")
+            && out.ends_with("GROUP BY w.\"__ddx_d0\" > 0"),
+        "{out}"
+    );
+    let out = rewritten(&find(
+        "WITH loss AS (SELECT SUM(val) AS l FROM w) \
+         SELECT *, grad(loss, val) AS a, grad(loss, val) AS b FROM w",
+    ));
+    assert!(out.contains("SELECT * EXCLUDE (\"__ddx_d0\"),"), "{out}");
+}
+
+#[test]
+fn a_call_in_an_order_by_is_a_column_of_that_query_s_rows() {
+    let loss = "WITH loss AS (SELECT SUM(val) AS l FROM w) ";
+    let out = rewritten(&find(&format!(
+        "{loss}SELECT i FROM w ORDER BY grad(loss, val) DESC LIMIT 2"
+    )));
+    assert!(
+        out.contains("ORDER BY w.\"__ddx_d0\" DESC LIMIT 2"),
+        "{out}"
+    );
+    // A subquery's ORDER BY orders the subquery's rows: its call is a column
+    // of x's, never of the outer SELECT's w.
+    let found = find(&format!(
+        "{loss}SELECT w.i FROM w WHERE w.i IN (SELECT i FROM x ORDER BY grad(loss, val) LIMIT 1)"
+    ));
+    assert_eq!(
+        found.calls[0].derivative.wrt(),
+        &[ColumnRef::new("x", "val")]
+    );
+    // So is a call in a subquery within the outer ORDER BY.
+    let found = find(&format!(
+        "{loss}SELECT i FROM w ORDER BY (SELECT grad(loss, val) FROM x LIMIT 1)"
+    ));
+    assert_eq!(
+        found.calls[0].derivative.wrt(),
+        &[ColumnRef::new("x", "val")]
+    );
+    // Anywhere else outside a SELECT's body, a call is in no SELECT.
+    for sql in [
+        format!("{loss}SELECT i FROM w LIMIT grad(loss, val)"),
+        format!("{loss}SELECT i FROM w UNION ALL SELECT i FROM w ORDER BY grad(loss, val)"),
+    ] {
+        let e = Calls::find(&sql, &GenericDialect {}).unwrap_err();
+        assert!(
+            matches!(&e, AdError::InvalidPlan(m) if m.contains("outside a SELECT's columns")),
+            "{sql}: {e}"
+        );
+    }
+}
+
+#[test]
+fn a_column_may_name_its_table_in_full() {
+    let found = find(
+        "WITH loss AS (SELECT SUM(val) AS l FROM public.w) \
+         SELECT i, grad(loss, public.w.val) AS g FROM public.w",
+    );
+    assert_eq!(
+        found.calls[0].derivative.wrt(),
+        &[ColumnRef::new("public.w", "val")]
+    );
+    // An alias hides the table's name, as it does in SQL.
+    let e = Calls::find(
+        "WITH loss AS (SELECT SUM(val) AS l FROM public.w) \
+         SELECT i, grad(loss, public.w.val) AS g FROM public.w AS p",
+        &GenericDialect {},
+    )
+    .unwrap_err();
+    assert!(matches!(e, AdError::InvalidPlan(_)), "{e}");
 }

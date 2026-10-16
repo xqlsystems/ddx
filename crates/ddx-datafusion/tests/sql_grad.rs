@@ -585,3 +585,58 @@ async fn an_unnamed_gradient_column_is_named_for_its_column() {
         .collect();
     assert_eq!(names, vec!["i", "val_grad"]);
 }
+
+#[tokio::test]
+async fn a_call_in_a_select_and_its_group_by_is_one_expression() {
+    // ∂/∂val Σ val² = 2·val: 2.0, -4.0, 1.0, two of them positive.
+    let ctx = ctx().await;
+    let batches: Vec<RecordBatch> = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT grad(loss, val) > 0 AS up, COUNT(*) AS n FROM w \
+         GROUP BY grad(loss, val) > 0 ORDER BY up",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let n: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| b.column(1).as_primitive::<Int64Type>().values().to_vec())
+        .collect();
+    assert_eq!(n, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn a_select_can_order_by_a_call() {
+    // Gradients 2.0, -4.0, 1.0: rows 0 then 2.
+    let ctx = ctx().await;
+    let batches: Vec<RecordBatch> = ad::sql(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+         SELECT i FROM w ORDER BY grad(loss, val) DESC LIMIT 2",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let i: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+        .collect();
+    assert_eq!(i, vec![0, 2]);
+}
+
+#[tokio::test]
+async fn a_column_may_name_its_table_with_its_schema() {
+    let ctx = ctx().await;
+    let got = pairs(
+        &ctx,
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM public.w) \
+         SELECT i, grad(loss, public.w.val) AS g FROM public.w",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 2.0), (1, -4.0), (2, 1.0)]);
+}

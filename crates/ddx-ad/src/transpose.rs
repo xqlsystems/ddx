@@ -106,7 +106,9 @@ impl<'a> Transposer<'a> {
             let Output::Value(m) = saved.outputs[col] else {
                 return Err(AdError::NotImplemented(
                     "gradient through a GROUP BY key: the aggregate groups by a value that \
-                     depends on a wrt column, and that value is then used in the loss"
+                     depends on a wrt column, and that value is then used in the loss (a SELECT \
+                     DISTINCT groups by every column it returns, so one over such a column \
+                     is the same)"
                         .into(),
                 ));
             };

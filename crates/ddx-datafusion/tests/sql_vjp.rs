@@ -134,4 +134,7 @@ async fn vjps_along_one_cotangent_share_a_backward_pass_across_tables() {
     let mut w = out[0].clone();
     w.sort_by(f64::total_cmp);
     assert_eq!(w, vec![3.0, 4.0, 5.0]);
+    let mut b = out[1].clone();
+    b.sort_by(f64::total_cmp);
+    assert_eq!(b, vec![-1.0, 0.5, 2.0]);
 }
