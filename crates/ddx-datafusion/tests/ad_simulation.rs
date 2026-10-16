@@ -105,6 +105,9 @@ mod mutate;
 #[path = "ad_simulation/jvp.rs"]
 mod jvp;
 
+#[path = "ad_simulation/sql.rs"]
+mod sql;
+
 // ---------------------------------------------------------------------------
 // Tables.
 // ---------------------------------------------------------------------------
@@ -2421,6 +2424,7 @@ struct Props {
     exact: bool,
     cost: bool,
     jvp: bool,
+    sql: bool,
 }
 
 const ALL: Props = Props {
@@ -2436,6 +2440,7 @@ const ALL: Props = Props {
     exact: true,
     cost: true,
     jvp: true,
+    sql: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -2863,6 +2868,10 @@ async fn check_case_inner(
 
     if props.jvp {
         jvp::jvp_checks(rng, &ctx, case, &sql, &wrt, l0, &grads, &program, out).await?;
+    }
+
+    if props.sql {
+        sql::sql_checks(rng, &ctx, case, l0, &grads, out).await?;
     }
     Ok(())
 }
@@ -4730,6 +4739,7 @@ const NONE: Props = Props {
     exact: false,
     cost: false,
     jvp: false,
+    sql: false,
 };
 
 #[test]
@@ -4753,6 +4763,17 @@ fn gradients_obey_the_calculus() {
             calculus: true,
             ..NONE
         },
+        seeds() / 3,
+    );
+}
+
+#[test]
+fn sql_calls_are_their_programs() {
+    bounded(
+        "sql",
+        13_000,
+        seeds(),
+        Props { sql: true, ..NONE },
         seeds() / 3,
     );
 }
@@ -5031,7 +5052,7 @@ fn replay_one_seed() {
 }
 
 /// The property groups a soak runs: all of them, or the comma-separated
-/// names in `DDX_AD_PROPS` (`fd,calculus,vjp,invariance,contract,surface,
+/// names in `DDX_AD_PROPS` (`fd,calculus,vjp,invariance,contract,surface,sql,
 /// shapes,names,train,exact,cost,jvp`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
     let Ok(names) = std::env::var("DDX_AD_PROPS") else {
@@ -5051,6 +5072,7 @@ fn soak_props() -> Props {
         exact: on("exact"),
         cost: on("cost"),
         jvp: on("jvp"),
+        sql: on("sql"),
     }
 }
 
