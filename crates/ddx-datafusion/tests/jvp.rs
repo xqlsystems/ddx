@@ -542,9 +542,15 @@ async fn an_aggregate_with_no_rule_is_refused() {
 }
 
 #[tokio::test]
-async fn an_output_that_does_not_move_is_refused() {
-    let e = refusal("SELECT COUNT(*) AS c FROM w", &[w()], &[wrt("w", "val")]).await;
-    assert!(matches!(e, AdError::NotScalar(_)), "{e}");
+async fn an_output_that_does_not_move_has_no_tangent_column() {
+    // Its tangent is 0, as jax.jvp of a constant function gives; grad of it
+    // gives zeros the same way.
+    let ctx = ctx();
+    w().create(&ctx).await;
+    let plan = substrait_of(&ctx, "SELECT COUNT(*) AS c FROM w", true).await;
+    let program = ddx_ad::jvp(&plan, &[wrt("w", "val")]).unwrap();
+    assert!(program.value.tangents.is_empty());
+    assert_eq!(program.value.columns, vec!["c".to_string()]);
 }
 
 #[tokio::test]

@@ -109,12 +109,9 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
     let mut dp = dual_plan(plan, &ddx, &functions, ext, &mut sources)?;
     sources.check_every_wrt_was_read()?;
     let name = format!("{namespace}jvp");
+    // An output no wrt column moves has no tangent column: its tangent is
+    // 0, as `jax.jvp` of a constant function returns a zero tangent.
     let value = output_of(&name, Of::Output, &dp)?;
-    if value.tangents.is_empty() {
-        return Err(AdError::NotScalar(
-            "no output column depends on a wrt column".into(),
-        ));
-    }
     let (inputs, checks) = sources.inputs(&mut dp.ext, Vec::new());
     let mut steps = vec![Step {
         name,
