@@ -175,7 +175,7 @@ jobs:
           import ddxdb
           assert 'tanh' in ddxdb.supported_functions()
           try:
-              ddxdb.grad_plan(b'', [('t', 'x')])
+              ddxdb.grad_plan(b'', ['t.x'])
               raise SystemExit('a plan with no root must raise')
           except ddxdb.DdxError:
               pass
