@@ -148,6 +148,10 @@ def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "dataf
     cannot differentiate a call, or what the backend raised; either way,
     it first tries to drop every table it wrote.
     """
+    # A str is a sequence of strs: without this, each character would be a
+    # statement, and the calls would never be found.
+    if isinstance(statements, str):
+        raise TypeError("statements is a list of SQL statements; to rewrite one, pass [statement]")
     out, tables = _rewrite(backend, list(statements), dialect)
     return Rewritten(out, tables, backend)
 

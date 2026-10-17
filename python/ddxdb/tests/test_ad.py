@@ -148,6 +148,14 @@ def test_rewrite_releases_its_tables_when_the_block_ends(ad, ctx):
     assert set(ctx.catalog().schema().names()) == before
 
 
+def test_rewrite_refuses_one_statement_not_in_a_list(ad, ctx):
+    sql = "WITH f AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(f, val) AS g FROM w"
+    with pytest.raises(TypeError, match=r"\[statement\]"):
+        ddxdb.rewrite(ad.DataFusionBackend(ctx), sql)
+    with pytest.raises(TypeError, match=r"\[statement\]"):
+        ad.sql_all(ctx, sql)
+
+
 def test_an_error_in_the_block_is_not_hidden_by_a_failed_drop(ad, ctx):
     class FailingDrops(ad.DataFusionBackend):
         # Drops succeed while the programs run, and fail once the block has
