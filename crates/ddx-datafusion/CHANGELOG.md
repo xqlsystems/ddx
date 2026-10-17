@@ -15,12 +15,11 @@ Entries below the first release are maintained automatically by
 
 - [**breaking**] grad, vjp and jvp in SQL are columns of a SELECT, and nest ([#132](https://github.com/xqlsystems/ddx/pull/132))
 - [**breaking**] engines implement an async Backend; ddx-ad owns the only run loop ([#136](https://github.com/xqlsystems/ddx/pull/136))
-- [**breaking**] every run checks its tables; Verified is gone ([#135](https://github.com/xqlsystems/ddx/pull/135))
+- [**breaking**] every run checks its tables ([#135](https://github.com/xqlsystems/ddx/pull/135))
 - [**breaking**] run returns values, as a JAX function does ([#129](https://github.com/xqlsystems/ddx/pull/129))
 - [**breaking**] remove v1's SQL surface; ddx-core is the scalar rules ddx-ad uses ([#133](https://github.com/xqlsystems/ddx/pull/133))
-- skip a check whose fact a caller already holds (Verified) ([#120](https://github.com/xqlsystems/ddx/pull/120))
 - *(ddx-ad)* [**breaking**] grad, vjp and jvp compose with each other ([#121](https://github.com/xqlsystems/ddx/pull/121))
-- *(ddx-ad)* jvp of a query and of a program; Hessian-vector products (M4.5 1) ([#113](https://github.com/xqlsystems/ddx/pull/113))
+- *(ddx-ad)* jvp of a query and of a program; Hessian-vector products ([#113](https://github.com/xqlsystems/ddx/pull/113))
 
 ### Fixed
 
