@@ -247,9 +247,6 @@ pub(crate) struct Calls {
     pub(super) stars: Vec<(Location, Vec<usize>)>,
     /// The statement.
     pub(super) query: Query,
-    /// How many lines the statement spans: what [`Calls::rewrite`] writes
-    /// is placed after them.
-    pub(super) lines: usize,
 }
 
 impl Calls {
@@ -308,7 +305,6 @@ impl Calls {
             selects: found.selects,
             stars,
             query: (**query).clone(),
-            lines: sql.lines().count() + 1,
         }))
     }
 }

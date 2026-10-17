@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    ExcludeSelectItem, Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr,
-    Spanned, TableFactor, VisitMut, VisitorMut,
+    BinaryOperator, CastKind, DataType, ExactNumberInfo, ExcludeSelectItem, Expr, Ident, Join,
+    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, TableAlias, TableFactor, TableWithJoins,
+    Value, VisitMut, VisitorMut, WildcardAdditionalOptions,
 };
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
@@ -49,7 +51,8 @@ impl Calls {
     ///   call's place, under its name.
     ///
     /// A call inside a `jvp`'s `SELECT` is its program's to read. The
-    /// statement is rewritten as a tree, then written out as SQL.
+    /// statement is rewritten as a tree, every replacement built as nodes,
+    /// then written out as SQL.
     pub fn rewrite<'a>(&self, answer: &dyn Fn(usize) -> Result<Answer<'a>>) -> Result<String> {
         let mut rewriter = Rewriter::default();
         // Each `grad` or `vjp` call's gradient column. Calls on one read
@@ -89,51 +92,36 @@ impl Calls {
                     Some((_, _, h)) => h.clone(),
                     None => {
                         let h = hidden(i);
-                        columns.push(format!("__ddx_g{g}.{} AS {}", quote(column), quote(&h)));
+                        columns.push(SelectItem::ExprWithAlias {
+                            expr: field(&joined(g), column),
+                            alias: quoted(&h),
+                        });
                         named.push((step, column, h.clone()));
                         h
                     }
                 };
                 rewriter.calls.insert(
                     at,
-                    Expr::CompoundIdentifier(vec![
-                        read.alias.clone(),
-                        Ident::with_quote('"', h.clone()),
-                    ]),
+                    Expr::CompoundIdentifier(vec![read.alias.clone(), quoted(&h)]),
                 );
                 hiddens[i] = Some(h);
                 if let Some(name) = name {
-                    rewriter.names.insert(at, Ident::with_quote('"', name));
+                    rewriter.names.insert(at, quoted(name));
                 }
             }
-            let mut from = format!("{TABLE} AS __ddx_t");
-            for (g, (step, dims)) in joins.iter().enumerate() {
-                let on: Vec<String> = dims
-                    .iter()
-                    .map(|d| {
-                        format!(
-                            "(__ddx_t.{d} IS NOT DISTINCT FROM __ddx_g{g}.{d})",
-                            d = quote(d)
-                        )
-                    })
-                    .collect();
-                let on = if on.is_empty() {
-                    "TRUE".to_string()
-                } else {
-                    on.join(" AND ")
-                };
-                from.push_str(&format!(" LEFT JOIN {} AS __ddx_g{g} ON {on}", quote(step)));
-            }
-            let sql = format!(
-                "SELECT * FROM (SELECT __ddx_t.*, {} FROM {from}) AS __ddx_alias",
-                columns.join(", ")
+            let joins = joins
+                .into_iter()
+                .enumerate()
+                .map(|(g, (step, dims))| gradient_join(g, step, &dims))
+                .collect();
+            rewriter.reads.insert(
+                read.at,
+                Gradients {
+                    alias: read.alias.clone(),
+                    columns,
+                    joins,
+                },
             );
-            let mut factor = first_table(generated(&sql, self.lines)?)?;
-            let _ = VisitMut::visit(&mut factor, &mut Named(&read.name));
-            if let TableFactor::Derived { alias: Some(a), .. } = &mut factor {
-                a.name = read.alias.clone();
-            }
-            rewriter.reads.insert(read.at, factor);
         }
         for (end, covered) in &self.stars {
             let mut names: Vec<&str> = Vec::new();
@@ -146,7 +134,7 @@ impl Calls {
             }
             let excluded = names
                 .into_iter()
-                .map(|h| ObjectName::from(vec![Ident::with_quote('"', h)]))
+                .map(|h| ObjectName::from(vec![quoted(h)]))
                 .collect();
             rewriter
                 .stars
@@ -172,23 +160,26 @@ impl Calls {
                 ));
             };
             let own = &value.columns[..value.columns.len() - value.tangents.len()];
-            let picked: Vec<String> = own
+            let projection = own
                 .iter()
                 .map(|c| match mine.iter().find(|(_, h, _)| h == c) {
-                    Some((_, _, name)) => {
-                        let tangent = value
+                    Some((_, _, name)) => SelectItem::ExprWithAlias {
+                        expr: value
                             .tangents
                             .iter()
                             .find(|t| &t.column == c)
-                            .map_or("CAST(0 AS DOUBLE)".to_string(), |t| quote(&t.tangent));
-                        format!("{tangent} AS {}", quote(name))
-                    }
-                    None => quote(c),
+                            .map_or_else(zero, |t| Expr::Identifier(quoted(&t.tangent))),
+                        alias: quoted(name),
+                    },
+                    None => SelectItem::UnnamedExpr(Expr::Identifier(quoted(c))),
                 })
                 .collect();
-            let sql = format!("SELECT {} FROM {}", picked.join(", "), quote(&value.step));
-            let SetExpr::Select(select) = *generated(&sql, self.lines)?.body else {
-                return Err(AdError::Internal(format!("`{sql}` is not a SELECT")));
+            let from = TableWithJoins {
+                relation: table(ObjectName::from(vec![quoted(&value.step)]), None),
+                joins: Vec::new(),
+            };
+            let SetExpr::Select(select) = *select_from(projection, from).body else {
+                unreachable!("select_from writes a SELECT");
             };
             rewriter.selects.insert(at, *select);
         }
@@ -204,62 +195,153 @@ fn hidden(i: usize) -> String {
     format!("__ddx_d{i}")
 }
 
-/// The placeholder for a table's name in the relation that replaces it.
-const TABLE: &str = "__ddx_table";
-
-/// `sql`, which ddx wrote, as a query placed after the statement's `lines`
-/// lines, so that none of its nodes starts where one of the statement's
-/// does. Every name in it is ddx's or quoted; a table's own name goes in
-/// afterwards ([`Named`]), so the user's dialect never meets this parser.
-fn generated(sql: &str, lines: usize) -> Result<Query> {
-    let text = format!("{}{sql}", "\n".repeat(lines));
-    Parser::new(&GenericDialect {})
-        .try_with_sql(&text)
-        .and_then(|mut p| p.parse_query())
-        .map(|q| *q)
-        .map_err(|e| AdError::Internal(format!("ddx wrote SQL it cannot parse, `{sql}`: {e}")))
+/// What replaces a table `grad` or `vjp` calls are columns of: its rows,
+/// under `alias`, with `columns` (each a gradient, from one of `joins`).
+struct Gradients {
+    alias: Ident,
+    columns: Vec<SelectItem>,
+    joins: Vec<Join>,
 }
 
-/// The first relation in `query`'s `FROM`.
-fn first_table(query: Query) -> Result<TableFactor> {
-    let SetExpr::Select(select) = *query.body else {
-        return Err(AdError::Internal(
-            "a query of ddx's that is not a SELECT".into(),
-        ));
-    };
-    select
-        .from
-        .into_iter()
-        .next()
-        .map(|t| t.relation)
-        .ok_or_else(|| AdError::Internal("a query of ddx's with no FROM".into()))
-}
-
-/// Puts a table's name where [`TABLE`] stands.
-struct Named<'a>(&'a ObjectName);
-
-impl VisitorMut for Named<'_> {
-    type Break = ();
-
-    fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<()> {
-        if matches!(name.0.as_slice(), [ObjectNamePart::Identifier(id)] if id.value == TABLE) {
-            *name = self.0.clone();
+impl Gradients {
+    /// `(SELECT __ddx_t.*, <columns> FROM <table> AS __ddx_t <joins>) AS
+    /// <alias>`, over the statement's own `table`.
+    fn over(self, mut table: TableFactor) -> TableFactor {
+        if let TableFactor::Table { alias, .. } = &mut table {
+            *alias = named(Ident::new(ROWS));
         }
-        ControlFlow::Continue(())
+        let mut projection = vec![SelectItem::QualifiedWildcard(
+            SelectItemQualifiedWildcardKind::ObjectName(ObjectName::from(vec![Ident::new(ROWS)])),
+            WildcardAdditionalOptions::default(),
+        )];
+        projection.extend(self.columns);
+        let from = TableWithJoins {
+            relation: table,
+            joins: self.joins,
+        };
+        TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(select_from(projection, from)),
+            alias: named(self.alias),
+            sample: None,
+        }
     }
 }
 
+/// The alias of a table's own rows in the relation that replaces it.
+const ROWS: &str = "__ddx_t";
+
+/// The alias of the `g`th gradient table joined to a table's rows.
+fn joined(g: usize) -> String {
+    format!("__ddx_g{g}")
+}
+
+/// `LEFT JOIN <step> AS __ddx_g<g> ON` each of `dims` matching, NULLs
+/// included (`TRUE` for a table with no dims).
+fn gradient_join(g: usize, step: &str, dims: &[&str]) -> Join {
+    let on = dims
+        .iter()
+        .map(|d| {
+            Expr::Nested(Box::new(Expr::IsNotDistinctFrom(
+                Box::new(field(ROWS, d)),
+                Box::new(field(&joined(g), d)),
+            )))
+        })
+        .reduce(|a, b| Expr::BinaryOp {
+            left: Box::new(a),
+            op: BinaryOperator::And,
+            right: Box::new(b),
+        })
+        .unwrap_or_else(|| Expr::Value(Value::Boolean(true).with_empty_span()));
+    Join {
+        relation: table(
+            ObjectName::from(vec![quoted(step)]),
+            named(Ident::new(joined(g))),
+        ),
+        global: false,
+        join_operator: JoinOperator::Left(JoinConstraint::On(on)),
+    }
+}
+
+/// `<table>."<column>"`.
+fn field(table: &str, column: &str) -> Expr {
+    Expr::CompoundIdentifier(vec![Ident::new(table), quoted(column)])
+}
+
+/// `CAST(0 AS DOUBLE)`: the tangent of a column that does not move.
+fn zero() -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(Expr::Value(
+            Value::Number("0".into(), false).with_empty_span(),
+        )),
+        data_type: DataType::Double(ExactNumberInfo::None),
+        array: false,
+        format: None,
+    }
+}
+
+/// `AS <name>`.
+fn named(name: Ident) -> Option<TableAlias> {
+    Some(TableAlias {
+        explicit: true,
+        name,
+        columns: Vec::new(),
+        at: None,
+    })
+}
+
+/// The table `name`, read as it is.
+fn table(name: ObjectName, alias: Option<TableAlias>) -> TableFactor {
+    TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    }
+}
+
+/// `SELECT <projection> FROM <from>`. sqlparser's `Query` and `Select`
+/// have dozens of fields and no `Default`, so it starts from a constant
+/// query, which holds no name or value of the statement's, and sets those
+/// two.
+fn select_from(projection: Vec<SelectItem>, from: TableWithJoins) -> Query {
+    let mut query = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT 1")
+        .and_then(|mut p| p.parse_query())
+        .expect("a constant query parses");
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        unreachable!("SELECT 1 is a SELECT");
+    };
+    select.projection = projection;
+    select.from = vec![from];
+    *query
+}
+
+/// `name` as a quoted identifier.
+fn quoted(name: &str) -> Ident {
+    Ident::with_quote('"', name)
+}
+
 /// Replaces nodes of a statement, each named by where it starts
-/// ([`Site`]): `selects` before their contents are visited, so whatever a
-/// replaced `SELECT` held goes with it.
+/// ([`Site`]). A table or a `SELECT` is replaced after its contents are
+/// visited, so a replacement is never visited itself: its nodes, which ddx
+/// built, are never taken for the statement's, and whatever a replaced
+/// `SELECT` held goes with it.
 #[derive(Default)]
 struct Rewriter {
     /// A `jvp` `SELECT`'s replacement.
     selects: HashMap<Location, Select>,
     /// What a `*` excludes.
     stars: HashMap<Location, ExcludeSelectItem>,
-    /// A table's replacement, by where its name starts.
-    reads: HashMap<Location, TableFactor>,
+    /// What replaces a table, by where its name starts.
+    reads: HashMap<Location, Gradients>,
     /// A `grad` or `vjp` call's replacement, by where its name starts.
     calls: HashMap<Location, Expr>,
     /// The name of a `grad` or `vjp` call that is a column of its own with
@@ -271,13 +353,6 @@ impl VisitorMut for Rewriter {
     type Break = ();
 
     fn pre_visit_select(&mut self, select: &mut Select) -> ControlFlow<()> {
-        if let Some(new) = select_at(select)
-            .ok()
-            .and_then(|at| self.selects.remove(&at))
-        {
-            *select = new;
-            return ControlFlow::Continue(());
-        }
         for item in &mut select.projection {
             if let SelectItem::UnnamedExpr(expr) = item {
                 let alias = match &*expr {
@@ -305,11 +380,22 @@ impl VisitorMut for Rewriter {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
-        if let TableFactor::Table { name, .. } = factor {
-            if let Some(new) = self.reads.remove(&name.span().start) {
-                *factor = new;
-            }
+    fn post_visit_select(&mut self, select: &mut Select) -> ControlFlow<()> {
+        if let Some(new) = select_at(select)
+            .ok()
+            .and_then(|at| self.selects.remove(&at))
+        {
+            *select = new;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        let TableFactor::Table { name, .. } = factor else {
+            return ControlFlow::Continue(());
+        };
+        if let Some(gradients) = self.reads.remove(&name.span().start) {
+            *factor = gradients.over(factor.clone());
         }
         ControlFlow::Continue(())
     }

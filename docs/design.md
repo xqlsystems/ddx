@@ -2171,9 +2171,10 @@ expression's span can stop short of its `)`, and rules for edits inside other
 edits; two bugs came from those. The statement must parse for its calls to be
 found anyway, so the rewrite now replaces nodes of the parsed tree,
 each named by where its first token starts (`sqlparser`'s `VisitorMut`), and
-writes the tree out. What ddx writes is parsed as if it came after the
-statement's last line, so none of its nodes is mistaken for one of the
-statement's. The cost: comments and spacing are not kept, and the engine sees
+writes the tree out. Each replacement is built as nodes (the relation
+that replaces a table wraps the statement's own table node) and swapped in
+only after the visitor has passed it, so the visitor never walks into
+what ddx built and never mistakes it for the statement's. The cost: comments and spacing are not kept, and the engine sees
 `sqlparser`'s rendering of the statement; `tests/ad_sql_text.rs` and every
 SQL test run through it. → §4.8.
 
