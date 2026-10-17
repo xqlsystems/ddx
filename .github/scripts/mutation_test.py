@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Mutation testing for the v2 simulation soak: how fast does it catch a bug?
+"""Mutation testing for the query-AD soak (`soak_query_ad` in
+crates/ddx-datafusion/tests/ad_simulation.rs, which generates loss queries
+and checks their gradients): how fast does it catch a bug?
 
 A clean soak proves only as much as the soak can see. This seeds one
 deliberate bug at a time into ddx-ad (or the DataFusion adapter), runs the
-v2 soak until its first failure or a time budget, and restores the source.
+soak until its first failure or a time budget, and restores the source.
 A mutant the soak does not kill within the budget marks a blind spot in the
 generator or the properties, which is the point of running this.
 
@@ -68,7 +70,7 @@ MUTANTS = [
     ("partial-is-one", f"{AD}/transpose.rs",
      "if as_number(&d) == Some(1.0) {",
      "if as_number(&d).is_some() {",
-     "the map rule treats any constant partial as 1"),
+     "the projection rule treats any constant partial derivative as 1"),
     ("fan-in-first", f"{AD}/program.rs",
      "let mut aligned: Vec<Rel> = contribs\n        .into_iter()",
      "let mut aligned: Vec<Rel> = contribs\n        .into_iter()\n        .take(1)",
@@ -122,9 +124,9 @@ def run(budget, base, log, skip=None, stop=True):
     if stop:
         env["DDX_SOAK_STOP_ON_FAIL"] = "1"
     if skip:
-        env["DDX_V2_SKIP_SEEDS"] = skip
+        env["DDX_AD_SKIP_SEEDS"] = skip
     cmd = ["cargo", "test", "-q", "-p", "ddx-datafusion", "--test", "ad_simulation",
-           "--release", "--", "--ignored", "--nocapture", "soak_v2_query_ad"]
+           "--release", "--", "--ignored", "--nocapture", "soak_query_ad"]
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
 
 

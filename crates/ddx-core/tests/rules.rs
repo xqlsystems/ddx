@@ -2,13 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The prototype's rule unit tests, ported to `ddx-core` (design.md §3.2, M0:
-//! "port the prototype's 15 rule tests — they pin the math unchanged").
+//! The rule unit tests of ddx's prototype, the autograd in xarray-sql#192's
+//! `src/autograd.rs`, ported to `ddx-core` so they pin the math unchanged.
 //!
-//! The *math* is identical to xarray-sql#192's `src/autograd.rs`; the rendered
-//! output differs in two documented, deliberate ways introduced by the design:
-//! `div()` casts its numerator to `DOUBLE` (F4), and composite operands are
-//! `Nested`-wrapped for precedence safety (G1). Both are asserted here.
+//! The *math* is identical; the rendered output differs in two deliberate
+//! ways: `div()` casts its numerator to `DOUBLE`, and composite operands are
+//! `Nested`-wrapped for precedence safety. Both are asserted here.
 
 use ddx_core::sqlparser::ast::Expr;
 use ddx_core::sqlparser::dialect::GenericDialect;
@@ -63,7 +62,7 @@ fn product_rule() {
 #[test]
 fn quotient_rule() {
     // d/dx (x / y) = 1 / y: a denominator constant in x divides the tangent,
-    // the numerator cast to DOUBLE (design.md §3.8).
+    // the numerator cast to DOUBLE.
     assert_eq!(d("x / y", "x"), "CAST(1.0 AS DOUBLE) / y");
     // d/dy (x / y) = (0 - (x/y)*1)/y: the full rule, divided by y once
     // through the quotient.
@@ -76,9 +75,9 @@ fn quotient_rule() {
 #[test]
 fn a_quotients_derivative_holds_when_its_denominator_is_infinite_or_tiny() {
     // (du·v - u·dv)/v² is ∞/∞ = NaN at v = ∞, where the limit is 0: a value in
-    // the data can be infinite (found by the v2 soak). (du - (u/v)·dv)/v is
-    // finite there, whether or not v depends on the variable, and never
-    // squares v, which underflows at 1e-163.
+    // the data can be infinite (found by the soak in ad_simulation.rs). (du -
+    // (u/v)·dv)/v is finite there, whether or not v depends on the variable,
+    // and never squares v, which underflows at 1e-163.
     use ddx_core::test_utils::{eval, parse_expr};
     let constant = parse_expr(&d("x * x / y", "x"));
     assert_eq!(eval(&constant, 1.5, f64::INFINITY), Some(0.0));
@@ -86,9 +85,9 @@ fn a_quotients_derivative_holds_when_its_denominator_is_infinite_or_tiny() {
     let varied = parse_expr(&d("x / (x + y)", "x"));
     assert_eq!(eval(&varied, 1.5, f64::INFINITY), Some(0.0));
     assert_eq!(eval(&varied, 1.0, 1.0), Some(0.25));
-    // x / sinh(x) is 1 - x²/6 + …, so its derivative at a tiny x is about
-    // -x/3, not the ±1e159 two cancelling 1/x terms leave (v2 soak, tiny
-    // values).
+    // x / sinh(x) is 1 - x²/6 + …, so its derivative at a tiny x is about -x/3,
+    // not the ±1e159 two cancelling 1/x terms leave (found by the soak in
+    // ad_simulation.rs, tiny values).
     let tiny = parse_expr(&d("x / sinh(x)", "x"));
     let at = eval(&tiny, 1e-163, 1.0).unwrap();
     assert!(at.abs() < 1e-150, "{at:e}");
@@ -132,9 +131,9 @@ fn unsupported_function_errors() {
 
 #[test]
 fn power_negative_constant_exponent() {
-    // d/dx power(x, -2) = -2 * power(x, -3), written -2 / power(x, 3); a
-    // negative constant exponent is inside the stated v1 surface and must not
-    // be rejected (review #46).
+    // d/dx power(x, -2) = -2 * power(x, -3), written -2 / power(x, 3). A
+    // negative exponent is still a constant one, which is supported, and
+    // must not be rejected (review #46).
     assert_eq!(
         d("power(x, -2)", "x"),
         "CAST(-2.0 AS DOUBLE) / power(x, 3.0)"
@@ -168,7 +167,8 @@ fn power_fractional_exponent_output_is_reconsumable() {
 fn a_negative_power_is_a_division_so_a_zero_base_gives_infinity() {
     // DataFusion refuses power(0, c) for c < 0 ("zero raised to a negative
     // power is undefined"), failing the query; written as c / power(u, 1 - c)
-    // the derivative at 0 is c / 0, an infinity, as it is (v2 soak).
+    // the derivative at 0 is c / 0, an infinity, as it is (found by the soak in
+    // ad_simulation.rs).
     use ddx_core::test_utils::{eval, parse_expr};
     for (sql, want) in [
         ("power(x, 0.5)", f64::INFINITY),
@@ -211,7 +211,7 @@ fn non_finite_exponent_still_differentiates_to_zero_when_base_is_constant_in_wrt
     // The non-finite constant only blocks emission *when actually emitted*. If
     // the base doesn't depend on the differentiation variable, the derivative is
     // 0 and no non-finite literal is ever built — so this must return 0, not
-    // error (review #49/F1: the finiteness check must follow the zero
+    // error (review #49: the finiteness check must follow the zero
     // short-circuit, matching the constant-base branch).
     assert_eq!(d("power(x, 1e400)", "y"), "0.0");
 }

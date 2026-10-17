@@ -25,8 +25,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ddx-core = { path = "../../crates/ddx-core" }
-# v2. Plans cross the FFI boundary as Substrait protobuf bytes, which prost
-# decodes and encodes.
+# Query-level AD. Plans cross the FFI boundary as Substrait protobuf bytes,
+# which prost decodes and encodes.
 ddx-ad = { path = "../../crates/ddx-ad" }
 # Without protobuf's default limit of 100 nested messages: a plan is two per
 # relation, so a query about 48 relations deep could not be differentiated

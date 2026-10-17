@@ -6,7 +6,7 @@
 //!
 //! JAX differentiates functions of arrays, and a gradient has the shape of
 //! what it is taken with respect to. ddx differentiates queries over
-//! relations, and plays the same game with the XQL data model (design.md §1): a
+//! relations, and plays the same game with the XQL data model: a
 //! relation is an N-dimensional array stored long, one row per coordinate
 //! tuple. Its columns are of two kinds.
 //!

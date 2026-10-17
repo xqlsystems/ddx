@@ -226,8 +226,9 @@ async fn tables_whose_names_join_alike_keep_their_own_gradients() {
 
 #[tokio::test]
 async fn grad_in_sql_of_a_table_with_capitals() {
-    // From the v2 soak (#92): the gradient step was registered under a name
-    // DataFusion lowercased, then read back quoted, case and all.
+    // Found by the soak in ad_simulation.rs (#92): the gradient step was
+    // registered under a name DataFusion lowercased, then read back quoted,
+    // case and all.
     let ctx = SessionContext::new();
     ctx.sql("CREATE TABLE \"W\" (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
         .await
@@ -246,9 +247,10 @@ async fn grad_in_sql_of_a_table_with_capitals() {
 
 #[tokio::test]
 async fn grad_in_sql_reads_comments_as_comments() {
-    // From the v2 soak (#98): the call's end was found by counting
-    // parentheses in the text, so one inside a comment cut the call short
-    // or never closed it, and a comment between `grad` and `(` hid the call.
+    // Found by the soak in ad_simulation.rs (#98): the call's end was found by
+    // counting parentheses in the text, so one inside a comment cut the call
+    // short or never closed it, and a comment between `grad` and `(` hid the
+    // call.
     let ctx = SessionContext::new();
     for sql in [
         "CREATE TABLE cp (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",

@@ -1,6 +1,6 @@
 # ddx-ad
 
-Query-level reverse-mode automatic differentiation for SQL: the v2 engine of
+Query-level automatic differentiation for SQL: the engine of
 [ddx](https://github.com/xqlsystems/ddx).
 
 `ddx-core` differentiates one scalar expression. `ddx-ad` differentiates a whole
@@ -36,9 +36,7 @@ For DataFusion that adapter is
 [`ddx-datafusion`](https://docs.rs/ddx-datafusion)'s `ad` module.
 
 An unsupported construct on the path from a `wrt` column to the loss is a typed
-error, never a wrong or silently zero gradient. See
-[`docs/design.md`](https://github.com/xqlsystems/ddx/blob/main/docs/design.md)
-§4 for the design.
+error, never a wrong or silently zero gradient.
 
 `substrait` is pinned exactly and re-exported as `ddx_ad::substrait`: an adapter
 must pass the same `substrait::proto::Plan` type its engine's producer uses.

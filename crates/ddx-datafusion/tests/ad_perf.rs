@@ -5,7 +5,7 @@
 //! How a program's cost scales, against its query's.
 //!
 //! Reverse mode should cost a small constant multiple of the forward pass, as
-//! it does in JAX; ddx adds recomputation (design.md §4.4), a region rebuilt
+//! it does in JAX; ddx adds recomputation, a region rebuilt
 //! in each backward step, so a larger constant is expected, but not a worse
 //! exponent. These measure, per family and size: the forward query alone,
 //! building the program, running it, and each step, plus the sizes of ddx's

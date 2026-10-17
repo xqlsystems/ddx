@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gradients of whole queries on DataFusion (ddx v2).
+"""Gradients of whole queries on DataFusion.
 
 Write a model's forward pass and loss as SQL, and take its gradient in SQL::
 

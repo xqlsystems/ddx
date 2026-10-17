@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `substrait` single-version guard, the v2 twin of `sqlparser_pin.rs`.
+//! The `substrait` single-version guard.
 //!
 //! The adapter hands `ddx-ad` the `substrait::proto::Plan` that
 //! `datafusion-substrait` produced. That type-checks only while both crates

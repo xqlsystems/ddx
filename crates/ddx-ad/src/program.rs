@@ -14,7 +14,7 @@
 //!   row and one column, as `jax.grad` requires a scalar.
 //!
 //! Either way the result is a [`BackwardProgram`]: steps the engine runs in
-//! order, materializing each under its name (design.md §4.4).
+//! order, materializing each under its name.
 //!
 //! 1. **Forward**: one step per saved aggregate, `…saved_{n}`, then the
 //!    query's own result, [`BackwardProgram::value`], so a program is
@@ -880,7 +880,7 @@ fn combine(
 ///
 /// Two conventions are pinned here, whatever the loss:
 /// - a row no gradient reached gets `0`;
-/// - a row whose value is NULL gets NULL, as v1 does (#60): a missing value
+/// - a row whose value is NULL gets NULL (#60): a missing value
 ///   has no gradient, not a zero one.
 fn dense_gradient(
     t: &mut Transposer,

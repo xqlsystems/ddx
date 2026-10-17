@@ -306,10 +306,10 @@ async fn grad_in_sql_of_a_table_with_capitals() {
 
 #[tokio::test]
 async fn a_power_under_one_at_zero_has_an_infinite_derivative_not_a_failed_query() {
-    // Found by the soak after the fixes above (seed 811): the map rule's
-    // partial of power(v, 0.5) was 0.5 * power(v, -0.5), and DataFusion
-    // refuses power(0, c) for c < 0 ("zero raised to a negative power is
-    // undefined"), so a program ddx accepted failed to run where v = 0.
+    // Found by the soak after the fixes above (seed 811): the partial
+    // derivative ddx wrote for power(v, 0.5) was 0.5 * power(v, -0.5), and
+    // DataFusion refuses power(0, c) for c < 0 ("zero raised to a negative
+    // power is undefined"), so a program ddx accepted failed to run at v = 0.
     // *Fixed in ddx-core:* a negative power is written as a division, so the
     // partial there is 0.5 / 0 = inf, as it is.
     let ctx = SessionContext::new();

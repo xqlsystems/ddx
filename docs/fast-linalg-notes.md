@@ -159,7 +159,7 @@ Two notes from ddx's emitted plans:
 2. Correctness: the rule on and off give the same results (to rounding)
    over ddx's soak generator, which already produces random contractions,
    NULLs and ties; and ddx's gradients still match `jax.grad`
-   (`tests/test_v2_jax.py`).
+   (`tests/test_query_jax.py`).
 3. Speed: ddx's `matmul` and `attn` benchmark families (`ad_perf.rs`),
    forward and backward, rule on against rule off.
 

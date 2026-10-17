@@ -262,8 +262,8 @@ async fn an_integer_wrt_column_is_refused() {
     // requires real- or complex-valued inputs"), and ddx should too: the
     // engine evaluates `val / 2` as integer division, which is piecewise
     // constant (derivative 0), while ddx-core differentiates real division
-    // (derivative 0.5), a silently wrong gradient (#87). Unlike v1, v2 can
-    // see this: the read's base schema carries the column's type.
+    // (derivative 0.5), a silently wrong gradient (#87). ddx can see this:
+    // the read's base schema carries the column's type.
     let ctx = ctx().await;
     ctx.sql("CREATE TABLE wi (i BIGINT, val BIGINT) AS VALUES (0, 3), (1, 5)")
         .await

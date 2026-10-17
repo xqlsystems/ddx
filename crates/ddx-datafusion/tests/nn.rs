@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! M4's acceptance fixture: nn.py's MLP, trained with gradients from `grad` in
-//! SQL rather than written by hand.
+//! nn.py's MLP, a neural network written in SQL in xarray-sql, trained with
+//! gradients from `grad` in SQL rather than written by hand.
 //!
 //! The first test runs nn.py's own hand-written backward pass (its `delta*`
 //! and `g*` queries, copied from xarray-sql#196 with the train/test split

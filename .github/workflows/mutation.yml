@@ -1,8 +1,10 @@
-name: Mutation test (v2 soak)
+name: Mutation test (query-AD soak)
 
-# How much does a clean v2 soak prove? This seeds one deliberate bug at a time
+# How much does a clean run of the query-AD soak (ad_simulation.rs, which
+# generates loss queries and checks their gradients) prove? This seeds one
+# deliberate bug at a time
 # into ddx-ad and the DataFusion adapter (.github/scripts/mutation_test.py),
-# runs the v2 simulation soak until its first failure or a time budget, and
+# runs the soak until its first failure or a time budget, and
 # reports how long each took to kill. A mutant that survives marks a blind
 # spot in the soak's generator or properties.
 #

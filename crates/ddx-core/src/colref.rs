@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Column identity read off the AST, compared with per-dialect identifier
-//! folding rather than raw-string equality (design.md §3.2, F1).
+//! folding rather than raw-string equality.
 
 use sqlparser::ast::{Expr, Ident};
 
@@ -11,7 +11,7 @@ use sqlparser::ast::{Expr, Ident};
 ///
 /// SQL unquoted identifiers are case-insensitive, so `grad(Temp*Temp, temp)`
 /// must match — otherwise it silently differentiates to `0`. The exact rule is
-/// per-dialect (F1):
+/// per-dialect:
 ///
 /// * [`IdentCasing::FoldUnquoted`] — unquoted identifiers fold to lowercase;
 ///   quoted identifiers keep their case. (DataFusion, Postgres, the generic
@@ -88,7 +88,7 @@ pub enum Match {
     Not,
     /// The occurrence's base name matches `wrt` but its qualification can't be
     /// pinned syntactically — a bare occurrence when `wrt` is qualified, or a
-    /// qualified occurrence when `wrt` is bare. Hard error (F2).
+    /// qualified occurrence when `wrt` is bare. Hard error.
     Ambiguous,
 }
 
@@ -127,7 +127,7 @@ impl ColRef {
     }
 
     /// Classify an occurrence `self` against the differentiation variable
-    /// `wrt` under a folding policy — the whole of the ambiguity guard (F2).
+    /// `wrt` under a folding policy — the whole of the ambiguity guard.
     ///
     /// The guard fires (returns [`Match::Ambiguous`]) *only* on an uncertain
     /// occurrence of the `wrt` base name; a non-matching name is always

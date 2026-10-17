@@ -371,8 +371,8 @@ async fn gradient_of(ctx: &SessionContext, loss: &str, table: &str) -> Vec<Vec<f
 
 #[tokio::test]
 async fn avg_max_and_min_send_no_gradient_through_a_row_they_skip() {
-    // From the v2 soak (#89): each skips row 1, whose argument p + q is NULL,
-    // so p(1) cannot move the loss.
+    // Found by the soak in ad_simulation.rs (#89): each skips row 1, whose
+    // argument p + q is NULL, so p(1) cannot move the loss.
     let ctx = ctx();
     exec(
         &ctx,
@@ -398,8 +398,9 @@ async fn avg_max_and_min_send_no_gradient_through_a_row_they_skip() {
 
 #[tokio::test]
 async fn a_rank_filter_over_a_rank_filter_runs() {
-    // From the v2 soak (#89): the rebuilt region held two identically named
-    // window columns. Top two by val, then the top one of those: row 1.
+    // Found by the soak in ad_simulation.rs (#89): the rebuilt region held two
+    // identically named window columns. Top two by val, then the top one of
+    // those: row 1.
     let ctx = ctx();
     exec(
         &ctx,
@@ -421,11 +422,11 @@ async fn a_rank_filter_over_a_rank_filter_runs() {
 
 #[tokio::test]
 async fn max_finds_its_row_when_the_recomputed_values_jitter() {
-    // From the v2 soak (#91). The region beneath the MAX is recomputed, and
-    // a grouped SUM over several partitions adds in arrival order, so the
-    // recomputed values need not equal the forward pass's to the bit. The
-    // MAX rule compared them with the saved maximum, and about half these
-    // runs sent no gradient at all.
+    // Found by the soak in ad_simulation.rs (#91). The region beneath the MAX
+    // is recomputed, and a grouped SUM over several partitions adds in arrival
+    // order, so the recomputed values need not equal the forward pass's to the
+    // bit. The MAX rule compared them with the saved maximum, and about half
+    // these runs sent no gradient at all.
     use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -650,9 +651,10 @@ async fn a_volatile_function_in_a_recomputed_region_is_refused() {
 
 #[tokio::test]
 async fn an_infinite_row_that_does_not_attain_the_min_sends_no_nan() {
-    // From the v2 soak (seed 100534). The row with d = inf has v = inf,
-    // which the MIN skips over; its seed was 0, and 0 times the partial of
-    // sqrt(v·v + 1), ∞/∞ there, is NaN, which then summed into p's gradient.
+    // Found by the soak in ad_simulation.rs (seed 100534). The row with d = inf
+    // has v = inf, which the MIN skips over; its seed was 0, and 0 times the
+    // partial of sqrt(v·v + 1), ∞/∞ there, is NaN, which then summed into p's
+    // gradient.
     let ctx = ctx();
     exec(
         &ctx,
@@ -680,9 +682,10 @@ async fn an_infinite_row_that_does_not_attain_the_min_sends_no_nan() {
 
 #[tokio::test]
 async fn a_grouped_max_over_nan_data_finds_its_row() {
-    // From the v2 soak (seed 600845). DataFusion's grouped MAX skips a NaN,
-    // but a window MAX returns it, so the rows attaining the saved maximum
-    // were compared with NaN and none matched: a silent zero gradient.
+    // Found by the soak in ad_simulation.rs (seed 600845). DataFusion's grouped
+    // MAX skips a NaN, but a window MAX returns it, so the rows attaining the
+    // saved maximum were compared with NaN and none matched: a silent zero
+    // gradient.
     let ctx = ctx();
     exec(
         &ctx,
@@ -709,11 +712,11 @@ async fn a_grouped_max_over_nan_data_finds_its_row() {
 
 #[tokio::test]
 async fn a_max_tie_that_rounding_breaks_is_still_shared() {
-    // From the v2 soak (seed 2101304): two groups that tie in exact
-    // arithmetic can differ in the last bit, and which one rounds higher can
-    // change from run to run (a sum over partitions), so the MAX gave its
-    // whole cotangent to either. Within a few ulps it is shared, as a tie:
-    // p + (0.1 + 0.2) and p + 0.3 differ by one ulp, and the sums are an
+    // Found by the soak in ad_simulation.rs (seed 2101304): two groups that tie
+    // in exact arithmetic can differ in the last bit, and which one rounds
+    // higher can change from run to run (a sum over partitions), so the MAX
+    // gave its whole cotangent to either. Within a few ulps it is shared, as a
+    // tie: p + (0.1 + 0.2) and p + 0.3 differ by one ulp, and the sums are an
     // aggregate's output.
     let ctx = ctx();
     exec(
@@ -738,10 +741,11 @@ async fn a_max_tie_that_rounding_breaks_is_still_shared() {
 
 #[tokio::test]
 async fn a_near_tie_of_constant_table_values_goes_to_the_larger() {
-    // From the v2 soak (#102): the tolerance keyed on "reads a table that is
-    // not differentiated", so p's gradient depended on whether d was in
-    // `wrt`. A table's values are the same every run, differentiated or not:
-    // MAX(p * d) with d = (1, 1 + 2 ulps) sends its cotangent to the larger.
+    // Found by the soak in ad_simulation.rs (#102): the tolerance keyed on
+    // "reads a table that is not differentiated", so p's gradient depended on
+    // whether d was in `wrt`. A table's values are the same every run,
+    // differentiated or not: MAX(p * d) with d = (1, 1 + 2 ulps) sends its
+    // cotangent to the larger.
     let ctx = ctx();
     let b = f64::from_bits(1.0f64.to_bits() + 2);
     exec(
@@ -767,10 +771,11 @@ async fn a_near_tie_of_constant_table_values_goes_to_the_larger() {
 
 #[tokio::test]
 async fn max_at_a_near_tie_of_table_values_sends_its_cotangent_to_the_larger() {
-    // From the v2 soak (#98): MAX(1, 1 + 2 ulps) is differentiable, with
-    // gradient (0, 1) as jax.grad gives. The tolerance that shares a tie
-    // rounding breaks applies only to values that can jitter (computed from
-    // a recomputed aggregate); table values are the same every run.
+    // Found by the soak in ad_simulation.rs (#98): MAX(1, 1 + 2 ulps) is
+    // differentiable, with gradient (0, 1) as jax.grad gives. The tolerance
+    // that shares a tie rounding breaks applies only to values that can jitter
+    // (computed from a recomputed aggregate); table values are the same every
+    // run.
     let ctx = ctx();
     let b = f64::from_bits(1.0f64.to_bits() + 2);
     exec(
@@ -786,9 +791,10 @@ async fn max_at_a_near_tie_of_table_values_sends_its_cotangent_to_the_larger() {
 
 #[tokio::test]
 async fn a_near_tie_scaled_by_a_maximum_goes_to_the_larger() {
-    // From the v2 soak (seed 3501343): a MAX never rounds, so values scaled
-    // by `(SELECT MAX(..))` are as repeatable as the table's, and 2 ulps
-    // apart they do not tie. Only an aggregate that rounds (a sum) jitters.
+    // Found by the soak in ad_simulation.rs (seed 3501343): a MAX never
+    // rounds, so values scaled by `(SELECT MAX(..))` are as repeatable as the
+    // table's, and 2 ulps apart they do not tie. Only an aggregate that
+    // rounds (a sum) jitters.
     let ctx = ctx();
     let b = f64::from_bits(1.0f64.to_bits() + 2);
     exec(

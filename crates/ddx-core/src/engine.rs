@@ -9,8 +9,8 @@
 //! node has a differentiation rule and the chain rule composes them as the tree
 //! is walked. Because each row of a relational table is an independent
 //! evaluation point, differentiating a column expression and letting the engine
-//! evaluate it per row is the relational equivalent of `jax.vmap(jax.grad(f))`
-//! (design.md §1). Both [`differentiate`] (one partial derivative) and [`jvp`]
+//! evaluate it per row is the relational equivalent of `jax.vmap(jax.grad(f))`.
+//! Both [`differentiate`] (one partial derivative) and [`jvp`]
 //! (a directional derivative) are thin wrappers over [`linearize`] that differ
 //! only in their *leaf rule* — the tangent assigned to each column.
 
@@ -39,13 +39,13 @@ constant base or exponent, casts to a numeric type, and column/literal leaves";
 /// A differentiation rule for a unary primitive `f(u)`: given the argument
 /// expression `u`, it returns the *outer* derivative `f'(u)`. The engine
 /// multiplies by `du` (the chain rule) itself, so a user rule supplies only
-/// the local factor (design.md §3.2).
+/// the local factor.
 pub type Rule = Arc<dyn Fn(&Expr) -> Result<Expr> + Send + Sync>;
 
 /// A registry of differentiation rules, keyed by (lower-cased) function name.
 ///
-/// Built-ins populate it; users extend it with [`RuleRegistry::register`]
-/// (design.md §3.2 — the "extensible rule registry" decision).
+/// Built-ins populate it; users extend it with [`RuleRegistry::register`], so
+/// a function ddx has no rule for can be given one without changing ddx.
 #[derive(Clone)]
 pub struct RuleRegistry {
     unary: HashMap<String, Rule>,
@@ -65,7 +65,7 @@ fn rule(f: impl Fn(&Expr) -> Expr + Send + Sync + 'static) -> Rule {
 impl RuleRegistry {
     /// A registry populated with the built-in rule set: `+ - * /`, the unary
     /// chain rule for the trig / inverse-trig / exp / log / hyperbolic set plus
-    /// `abs`, and `power` with a constant base or exponent (design.md §3.6).
+    /// `abs`, and `power` with a constant base or exponent.
     pub fn new() -> Self {
         let mut unary: HashMap<String, Rule> = HashMap::new();
 
@@ -112,7 +112,7 @@ impl RuleRegistry {
             rule(|u| sub(one(), square(func1("tanh", u.clone())))),
         );
         // Piecewise-linear: d/du |u| = sign(u), emitted as a portable CASE that
-        // pins abs'(0) = 0 on every engine (design.md §5, F12). It deliberately
+        // pins abs'(0) = 0 on every engine. It deliberately
         // does NOT emit signum()/sign(): DuckDB has no signum (only sign),
         // DataFusion has no sign (only signum), and signum(0) = 1 — so a bare
         // builtin would be non-portable AND violate the pinned convention. Note
@@ -147,7 +147,8 @@ impl RuleRegistry {
 
 /// A *leaf rule*: the tangent seed for a column occurrence. Returns an error
 /// when the occurrence's identity against the differentiation variable can't be
-/// pinned syntactically (the ambiguity guard, F2).
+/// pinned syntactically: the ambiguity guard, which refuses rather than
+/// guesses which column an identifier names.
 type Leaf<'a> = dyn Fn(&ColRef) -> Result<Expr> + 'a;
 
 /// Differentiate `expr` with respect to the column `wrt`.
@@ -176,7 +177,7 @@ pub fn differentiate(
 /// (`seeds`) for each seeded input column; unseeded columns are constant.
 ///
 /// The marker form `jvp(expr, column, tangent)` seeds a single column; a
-/// multi-input directional derivative is a sum of `jvp` terms (design.md §3.6).
+/// multi-input directional derivative is a sum of `jvp` terms.
 pub fn jvp(
     expr: &Expr,
     seeds: &[(ColRef, Expr)],
@@ -365,7 +366,7 @@ fn linearize_function(f: &Function, leaf: &Leaf, reg: &RuleRegistry) -> Result<E
     Ok(mul(outer, du))
 }
 
-/// Linearize `power(base, exponent)` (design.md §3.6).
+/// Linearize `power(base, exponent)`.
 ///
 /// * Constant exponent `c`: `c * base^(c-1) * d(base)`, written
 ///   `c / base^(1-c) * d(base)` when `c < 1`.
@@ -389,7 +390,7 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
             // `finite_num` fails loud on a non-finite constant (e.g. an
             // out-of-range literal `1e400` → inf), but *only here at emission* —
             // after the zero short-circuit above — so a wrt-independent base
-            // still differentiates to `0` rather than erroring (#49/F1, #33).
+            // still differentiates to `0` rather than erroring (#49, #33).
             if c == 0.0 {
                 return Ok(zero());
             }
@@ -397,7 +398,7 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
             // derivative is infinite, and `c / power(u, 1 - c)` says so
             // (`c / 0`), where DataFusion refuses `power(0, c - 1)` outright
             // ("zero raised to a negative power is undefined"), failing the
-            // whole query instead (found by the v2 soak).
+            // whole query instead (found by the soak in ad_simulation.rs).
             let outer = if c < 1.0 {
                 div(
                     finite_num(c)?,
@@ -426,7 +427,7 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
             );
             Ok(mul(outer, dexp))
         }
-        // General u^v — deferred (design.md §3.6 roadmap).
+        // General u^v: not supported yet; the message says how to rewrite it.
         (None, None) => Err(DiffError::NotImplemented(
             "cannot differentiate `power(base, exponent)` when both the base and the exponent \
              depend on the differentiation variable; ddx handles it only when one side is a \
@@ -439,7 +440,7 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
 
 /// The lower-cased name of a function call — but only for an **unqualified**
 /// call (a single-identifier name), mirroring the marker path's strict
-/// `len() == 1` (F8). A schema-qualified call like `myschema.sin(x)` may be an
+/// `len() == 1`. A schema-qualified call like `myschema.sin(x)` may be an
 /// unrelated user function, so it must not silently match the built-in `sin`
 /// rule ("tag explicitly, never infer" — principle 3; round-3 review #47).
 fn simple_func_name(f: &Function) -> Option<String> {
@@ -491,7 +492,7 @@ pub(crate) fn is_float_type(dt: &DataType) -> bool {
 /// True if `dt` is a numeric type — the only kind of cast that can be
 /// differentiated (see [`is_float_type`] for which are linear). The list is exhaustive for the pinned
 /// `sqlparser` version; a `sqlparser` bump is already a breaking release of
-/// `ddx-core` (design.md §6, G2), at which point this is re-checked.
+/// `ddx-core`, at which point this is re-checked.
 pub(crate) fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
         dt,

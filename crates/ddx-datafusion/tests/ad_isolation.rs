@@ -162,10 +162,10 @@ async fn run_leaves_the_value_and_gradients_and_release_drops_them() {
 
 #[tokio::test]
 async fn an_unoptimized_case_over_integer_data_runs() {
-    // From the v2 soak (#89, #90). grad takes any LogicalPlan, a
-    // DataFrame's included. In this unanalyzed one a CASE picks between a
-    // BIGINT and a DOUBLE branch on a condition that depends on b.val, so
-    // its type is settled only by type coercion; the step's declared
+    // Found by the soak in ad_simulation.rs (#89, #90). grad takes any
+    // LogicalPlan, a DataFrame's included. In this unanalyzed one a CASE picks
+    // between a BIGINT and a DOUBLE branch on a condition that depends on
+    // b.val, so its type is settled only by type coercion; the step's declared
     // schema disagreed with the batches it produced.
     let ctx = SessionContext::new();
     exec(
@@ -194,10 +194,10 @@ async fn an_unoptimized_case_over_integer_data_runs() {
 
 #[tokio::test]
 async fn a_deep_chain_of_maps_plans_to_a_small_plan() {
-    // From the v2 soak (#98): each layer `sin(v) + 0.1 * v` reads v twice,
-    // and DataFusion's Substrait consumer names a computed column by its
-    // expression, so every layer doubled the names: 60 MB of plan at 14
-    // layers, and 20 exhausted 13 GB. ad::run consumes a step with short
+    // Found by the soak in ad_simulation.rs (#98): each layer
+    // `sin(v) + 0.1 * v` reads v twice, and DataFusion's Substrait consumer names a computed
+    // column by its expression, so every layer doubled the names: 60 MB of plan
+    // at 14 layers, and 20 exhausted 13 GB. ad::run consumes a step with short
     // names instead.
     let ctx = SessionContext::new();
     exec(

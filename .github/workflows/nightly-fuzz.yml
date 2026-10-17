@@ -7,7 +7,7 @@ name: Nightly fuzz (scalar-rule and query-AD simulation soaks)
 # - scalar rules: crates/ddx-core/tests/simulation.rs ::
 #   soak_continuous_property_fuzz (finite-difference numeric agreement, render
 #   fidelity, higher-order self-consumption of scalar derivatives).
-# - query AD: crates/ddx-datafusion/tests/ad_simulation.rs :: soak_v2_query_ad
+# - query AD: crates/ddx-datafusion/tests/ad_simulation.rs :: soak_query_ad
 #   (generated loss queries: gradients against finite differences of the
 #   query, the calculus and vjp identities, invariance, the program contract,
 #   and grad(loss, table.column) in SQL).
@@ -95,8 +95,8 @@ jobs:
           path: soak-region-${{ matrix.region }}.log
           if-no-files-found: warn
 
-  soak-v2:
-    name: v2 soak region ${{ matrix.region }}
+  soak-ad:
+    name: query-AD soak region ${{ matrix.region }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -121,19 +121,20 @@ jobs:
           OVERRIDE='${{ github.event.inputs.base_override }}'
           REGION='${{ matrix.region }}'
           # A case is a few hundred milliseconds, not microseconds, so a region
-          # explores thousands of seeds, far inside the 1e7-wide windows the v1
-          # soak uses; the same windows keep the arithmetic in one place.
+          # explores thousands of seeds, far inside the 1e7-wide windows the
+          # scalar-rule soak uses; the same windows keep the arithmetic in one
+          # place.
           if [ -n "$OVERRIDE" ]; then
             BASE=$(( OVERRIDE + REGION * 10000000 ))
           else
             BASE=$(( GITHUB_RUN_NUMBER * 100000000 + REGION * 10000000 ))
           fi
-          LOG="$PWD/soak-v2-region-${REGION}.log"
+          LOG="$PWD/soak-ad-region-${REGION}.log"
           echo "ENV rustc=$(rustc --version) os=${RUNNER_OS} sha=${GITHUB_SHA}" > "$LOG"
           set +e
           DDX_SOAK_SECS="$SECS" DDX_SOAK_BASE="$BASE" DDX_SOAK_LOG="$LOG" \
             cargo test -p ddx-datafusion --test ad_simulation --release \
-            -- --ignored --nocapture soak_v2_query_ad
+            -- --ignored --nocapture soak_query_ad
           echo "soak exit code: $?"
           set -e
           tail -n 12 "$LOG" || true
@@ -142,13 +143,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-v2-log-${{ matrix.region }}
-          path: soak-v2-region-${{ matrix.region }}.log
+          name: soak-ad-log-${{ matrix.region }}
+          path: soak-ad-region-${{ matrix.region }}.log
           if-no-files-found: warn
 
   report:
     name: triage & file issue
-    needs: [soak, soak-v2]
+    needs: [soak, soak-ad]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

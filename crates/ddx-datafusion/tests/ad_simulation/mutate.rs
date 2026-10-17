@@ -4,10 +4,10 @@
 
 //! Equivalence-preserving rewrites of a Substrait plan.
 //!
-//! `ddx-ad` reads plans by hand (design.md §4.4): emits, field references,
+//! `ddx-ad` reads plans by hand: emits, field references,
 //! projections that append, joins whose columns are both sides'. It has only
 //! ever been fed what DataFusion's producer happens to emit, and another
-//! producer (DuckDB's, in M5) will not emit the same shapes. So these rewrite a
+//! producer (DuckDB's, say) will not emit the same shapes. So these rewrite a
 //! plan into one that computes the same relation by a different shape, at
 //! random nodes, and the caller insists the gradient does not move.
 //!

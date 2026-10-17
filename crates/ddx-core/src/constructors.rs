@@ -4,22 +4,21 @@
 
 //! Smart constructors for building derivative `sqlparser::ast::Expr` trees.
 //!
-//! These own three correctness properties, not just algebraic tidiness
-//! (design.md §3.2):
+//! These own three correctness properties, not just algebraic tidiness:
 //!
 //! 1. **0/1-folding** — the JAX-`Zero`-tangent equivalent. Structurally-zero
 //!    terms are dropped and dead product branches short-circuit, keeping output
 //!    compact. This is a *stated* NULL-semantics convention (folding
-//!    `0 * (NULL-valued expr)` to `0`), documented and tested, not silent (F11).
+//!    `0 * (NULL-valued expr)` to `0`), documented and tested, not silent.
 //! 2. **Numeric-type policy** — [`div`] forces floating-point division by
 //!    casting its numerator to `DOUBLE`, so `grad(x/y, y)` on integer columns
 //!    does not silently truncate (integer `/` differs across engines). Literals
-//!    are emitted with an explicit decimal point (F4).
+//!    are emitted with an explicit decimal point.
 //! 3. **Precedence-safe construction** — composite operands are wrapped in
 //!    `Expr::Nested` exactly when the operator precedence requires it, because
 //!    `sqlparser`'s `Display` for a binary op emits no precedence parentheses.
 //!    Without this, a *constructed* `mul(add(a,b), c)` displays as `a + b * c`
-//!    and reparses as the wrong expression — a wrong number in valid SQL (G1).
+//!    and reparses as the wrong expression — a wrong number in valid SQL.
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
@@ -60,11 +59,11 @@ fn raw_num(v: f64) -> Expr {
 /// `0.6931471805599453`).
 ///
 /// A negative value is emitted as a *unary minus* applied to the magnitude
-/// (`-1.0` ⇒ `UnaryOp{Minus, 1.0}`) — exactly the AST shape `sqlparser` produces
-/// when it parses `-1.0`. This is what makes the §5 round-trip invariant
-/// (`reparse(render(d)) == d` modulo `Nested`) hold for negative literals too;
-/// emitting a `Value("-1.0")` would reparse to a `UnaryOp` and break it
-/// (round-3 review #46).
+/// (`-1.0` ⇒ `UnaryOp{Minus, 1.0}`) — exactly the AST shape `sqlparser`
+/// produces when it parses `-1.0`. This is what makes the round-trip property
+/// the tests check (`reparse(render(d)) == d` modulo `Nested`) hold for
+/// negative literals too; emitting a `Value("-1.0")` would reparse to a
+/// `UnaryOp` and break it (round-3 review #46).
 ///
 /// `v` must be finite. For a *compile-time-known* finite constant (`0`, `1`,
 /// `2`, `ln 2`, …) call `num` directly. For any value *computed from user input*
@@ -170,7 +169,7 @@ pub fn is_one(e: &Expr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Precedence-safe assembly (G1)
+// Precedence-safe assembly
 // ---------------------------------------------------------------------------
 
 /// Binding-precedence of an expression's *top* operator, higher = binds tighter.
@@ -298,7 +297,7 @@ pub fn mul(a: Expr, b: Expr) -> Expr {
 /// When a real division is emitted, the numerator is cast to `DOUBLE` so the
 /// division is floating-point on every engine — SQL integer division truncates
 /// on some and not others, which would make `grad(x/y, y)` on a `BIGINT`
-/// column silently wrong (F4). Casting one operand promotes the whole division;
+/// column silently wrong. Casting one operand promotes the whole division;
 /// casting the *numerator* (not the result) is essential — `CAST(a/b AS DOUBLE)`
 /// would truncate before the cast.
 pub fn div(a: Expr, b: Expr) -> Expr {
@@ -509,7 +508,7 @@ mod tests {
 
     #[test]
     fn precedence_wrapping_is_semantic_not_cosmetic() {
-        // (a+b)*c must keep its parentheses under Display (G1). Without the
+        // (a+b)*c must keep its parentheses under Display. Without the
         // Nested wrap this would render "a + b * c" and reparse wrongly.
         let a = Expr::Identifier(Ident::new("a"));
         let b = Expr::Identifier(Ident::new("b"));
@@ -531,7 +530,7 @@ mod tests {
     fn div_casts_numerator_to_double() {
         let x = Expr::Identifier(Ident::new("x"));
         let y = Expr::Identifier(Ident::new("y"));
-        // Forces float division; integer x/y would otherwise truncate (F4).
+        // Forces float division; integer x/y would otherwise truncate.
         assert_eq!(div(x, y).to_string(), "CAST(x AS DOUBLE) / y");
     }
 

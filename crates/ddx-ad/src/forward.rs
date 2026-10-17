@@ -938,12 +938,11 @@ impl Builder<'_> {
     /// A query that reads a CTE twice gets the CTE's plan twice: Substrait
     /// plans are trees, and producers inline. Two identical aggregates are one
     /// saved relation, computed and stored once, and both readers' cotangents
-    /// are added into one (design.md §4.4's fan-in). Treating them as two
-    /// would also be correct, by linearity, but would do the work twice. This
-    /// is the other half of the save-or-recompute policy the module docs
-    /// describe.
-    /// Save aggregate `a`, once: lowered over `below`, its input's region,
-    /// if [`Builder::lower`] walked down to it.
+    /// are added into one, as the cotangents of any value read twice are.
+    /// Treating them as two would also be correct, by linearity, but would do
+    /// the work twice. This is the other half of the save-or-recompute policy
+    /// the module docs describe. Save aggregate `a`, once: lowered over
+    /// `below`, its input's region, if [`Builder::lower`] walked down to it.
     fn read_saved(&mut self, a: &AggregateRel, below: Option<Region>) -> Result<usize> {
         let encoding = match self.encodings.remove(&std::ptr::from_ref(a)) {
             Some(e) => e,

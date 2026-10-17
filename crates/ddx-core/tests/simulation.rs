@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Simulation / property-based tests for the scalar differentiation engine
-//! (design.md §5: "numeric agreement" + "round-trip property tests").
+//! Simulation / property-based tests for the scalar differentiation engine:
+//! numeric agreement with finite differences, and round trips through SQL
+//! text.
 //!
 //! These are adversarial: instead of hand-picked expressions, they generate
 //! random derivable SQL scalar expressions and hold the engine to three
@@ -18,10 +19,10 @@
 //!    outlier. Proven to have teeth by mutation testing (a corrupted `cos` rule
 //!    fails with 8/8-points-disagree).
 //! 2. **Render fidelity.** `reparse(render(d))` must be *value-equal* to `d`.
-//!    This is the correctness-relevant form of the §5 round-trip invariant: a
+//!    This is the correctness-relevant form of the round-trip property: a
 //!    purely structural "== d modulo Nested" check is imprecise for `*`/`/`
-//!    associativity (issue #50), but a value comparison still catches the G1
-//!    precedence bug (`(a+b)*c` losing its parens → `a+b*c`).
+//!    associativity (issue #50), but a value comparison still catches a lost
+//!    parenthesis (`(a+b)*c` losing its parens → `a+b*c`).
 //! 3. **Self-consumption / higher-order stability.** The engine must re-parse
 //!    and re-differentiate its *own* text output repeatedly without panicking,
 //!    erroring, or emitting unparseable SQL (e.g. a `--` line comment).
@@ -116,7 +117,7 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
         let x0 = rng.range(0.2, 1.8);
         let y0 = rng.range(0.2, 1.8);
         // Domain-edge gate: skip if the primal is near a restricted-domain
-        // boundary anywhere in the finite-difference window (design.md §5).
+        // boundary anywhere in the finite-difference window.
         let near_edge = [
             (x0, y0),
             (x0 + H, y0),

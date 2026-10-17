@@ -4,10 +4,11 @@
 
 //! Writing the plans of a backward program.
 //!
-//! Every step ddx emits is an ordinary, unmarked Substrait plan (design.md
-//! §4.3), built from six relations: read, project, filter, join, aggregate and
-//! union. The builders here produce them in the shapes DataFusion's own
-//! producer does, since that is the consumer they are tested against.
+//! Every step ddx emits is an ordinary Substrait plan, with nothing in it only
+//! ddx understands, built from six relations: read, project, filter, join,
+//! aggregate and union. The builders here produce them in the shapes
+//! DataFusion's own producer does, since that is the consumer they are tested
+//! against.
 //!
 //! # Reading an earlier step
 //!

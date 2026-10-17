@@ -11,8 +11,8 @@ use ddx_core::DiffError;
 /// Why `ddx-ad` refused a plan.
 ///
 /// Every refusal is one of these, never a gradient that is silently wrong or
-/// silently zero (design.md §2, principle 5). New kinds of refusal will be
-/// added, so a `match` on it needs a wildcard arm.
+/// silently zero: ddx fails loud rather than silently wrong. New kinds of
+/// refusal will be added, so a `match` on it needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AdError {

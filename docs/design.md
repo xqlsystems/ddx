@@ -1604,7 +1604,7 @@ breadth, not de-risking.
   DataFusion. `ddx-datafusion/examples/nn` trains nn.py's MLP with one SQL
   statement per parameter table; its gradients equal nn.py's hand-written
   backward queries to 1e-12, and the spikes' MLP, attention and max-pool
-  gradients, taken in SQL, equal `jax.grad` to 1e-12 (`tests/test_v2_jax.py`),
+  gradients, taken in SQL, equal `jax.grad` to 1e-12 (`tests/test_query_jax.py`),
   as do the gradients of nn.py's own network and SQL. Not built: a loss
   defined in a `WITH RECURSIVE` clause is refused by the SQL surface, so a
   whole training loop is not yet one recursive statement (§5). That refusal

@@ -19,9 +19,8 @@
 //!
 //! A matrix product, `SUM(a.v * b.v) … GROUP BY` over a join, is not a
 //! primitive: it is broadcast, map and reduce, and its transpose is theirs
-//! composed, which gives `Ā = Σ_out C̄·B` and `B̄ = Σ_batch A·C̄` (design.md
-//! §4.3). A `COUNT` does not change when its argument does, so its transpose is
-//! zero.
+//! composed, which gives `Ā = Σ_out C̄·B` and `B̄ = Σ_batch A·C̄`. A `COUNT`
+//! does not change when its argument does, so its transpose is zero.
 //!
 //! # How the rules are applied
 //!
@@ -425,7 +424,7 @@ impl<'a> Transposer<'a> {
         // dims and cotangents, are materialized once, and every contribution
         // reads them. With two (a contraction of two varied operands) the
         // region is rebuilt twice instead, which costs at most twice and
-        // never writes a contraction's join (N x D x H rows) out (S6).
+        // never writes a contraction's join (N x D x H rows) out.
         if at_inputs.len() > 2 {
             let mut needed = std::collections::BTreeSet::new();
             for (&slot, cols) in &at_inputs {
@@ -575,7 +574,8 @@ impl<'a> Transposer<'a> {
         Ok(())
     }
 
-    /// The map rule: `y = f(x₁, …)` with cotangent in column `cotangent`
+    /// The transpose of a map, a projection computing each row from one input
+    /// row: `y = f(x₁, …)` with cotangent in column `cotangent`
     /// gives each varied `xᵢ` the term `ȳ · ∂f/∂xᵢ`.
     fn map(
         &mut self,
