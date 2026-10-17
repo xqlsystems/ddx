@@ -3,7 +3,7 @@ name = "ddx-ad"
 description = "Query-level AD for ddx: grad, vjp and jvp of Substrait plans."
 # Versioned independently, like ddx-core. First published when
 # ddx-datafusion started depending on it.
-version = "0.1.0"
+version = "0.2.0"
 readme = "README.md"
 keywords = ["sql", "autograd", "differentiation", "substrait", "backpropagation"]
 categories = ["mathematics", "database"]

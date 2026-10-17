@@ -9,6 +9,34 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.1.1...ddx-datafusion-v0.2.0) - 2026-10-17
+
+### Added
+
+- [**breaking**] grad, vjp and jvp in SQL are columns of a SELECT, and nest ([#132](https://github.com/xqlsystems/ddx/pull/132))
+- [**breaking**] engines implement an async Backend; ddx-ad owns the only run loop ([#136](https://github.com/xqlsystems/ddx/pull/136))
+- [**breaking**] every run checks its tables ([#135](https://github.com/xqlsystems/ddx/pull/135))
+- [**breaking**] run returns values, as a JAX function does ([#129](https://github.com/xqlsystems/ddx/pull/129))
+- [**breaking**] remove v1's SQL surface; ddx-core is the scalar rules ddx-ad uses ([#133](https://github.com/xqlsystems/ddx/pull/133))
+- *(ddx-ad)* [**breaking**] grad, vjp and jvp compose with each other ([#121](https://github.com/xqlsystems/ddx/pull/121))
+- *(ddx-ad)* jvp of a query and of a program; Hessian-vector products ([#113](https://github.com/xqlsystems/ddx/pull/113))
+
+### Fixed
+
+- *(ddx-ad)* an ungrouped aggregate keeps its row; jvp of a constant is 0 ([#138](https://github.com/xqlsystems/ddx/pull/138))
+- *(ddx-ad)* a MAX of a grouped MAX is exact at a near tie ([#116](https://github.com/xqlsystems/ddx/pull/116))
+- *(ddx-ad)* write an emit only on a projection ([#117](https://github.com/xqlsystems/ddx/pull/117))
+- *(ddx-ad)* an ordering by an expression breaks no ties; two smaller findings ([#114](https://github.com/xqlsystems/ddx/pull/114))
+
+### Other
+
+- fuzz grad, vjp and jvp as SQL columns ([#137](https://github.com/xqlsystems/ddx/pull/137))
+- every doc and docstring stands on its own ([#134](https://github.com/xqlsystems/ddx/pull/134))
+- a soak oracle for jvp, against reverse mode ([#130](https://github.com/xqlsystems/ddx/pull/130))
+- *(ddx-ad)* an opt module that fuses projections and splits deep steps ([#123](https://github.com/xqlsystems/ddx/pull/123))
+- tangents by forward mode over each expression; the plan walked once; checks at once ([#119](https://github.com/xqlsystems/ddx/pull/119))
+- *(ddx-ad)* [**breaking**] one vocabulary of input and output tables for every program ([#118](https://github.com/xqlsystems/ddx/pull/118))
+
 ## [0.1.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.1.0...ddx-datafusion-v0.1.1) - 2026-10-04
 
 ### Added
