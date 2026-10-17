@@ -76,7 +76,8 @@ pub struct OutputTable {
     /// tangents, if any, come after them.
     pub columns: Vec<String>,
     /// For a [`jvp`](crate::jvp) program, each column that has a tangent and
-    /// where it is; empty otherwise.
+    /// where it is; empty otherwise. A column no `wrt` column moves has none:
+    /// its tangent is 0.
     pub tangents: Vec<Tangent>,
 }
 

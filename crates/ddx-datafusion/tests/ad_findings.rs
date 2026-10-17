@@ -1024,3 +1024,39 @@ async fn a_max_of_a_grouped_max_is_exact_at_a_near_tie() {
     .await;
     assert_eq!(got, vec![(0, Some(0.5)), (1, Some(0.5)), (2, Some(0.0))]);
 }
+
+#[tokio::test]
+async fn a_case_choosing_a_constant_aggregate_under_a_softmax_runs() {
+    // From the SQL soak (seed 13203301), shrunk. `r5` is a scalar aggregate
+    // of data no wrt table feeds, chosen per row by a CASE on `u`, so it is
+    // piecewise constant in `u`; a grouped softmax and an AVG follow. grad
+    // accepts the loss, then one of its cotangent steps is an aggregate with
+    // no grouping and no measure, which DataFusion refuses to plan
+    // ("Aggregate requires at least one grouping or aggregate expression").
+    // With a literal in place of the aggregate, it ran. An ungrouped
+    // aggregate is one row, so pruning now keeps one of its measures though
+    // nothing reads it. `u` reaches the loss only through the CASE's
+    // condition, so its gradient is 0 at every row.
+    let ctx = SessionContext::new();
+    exec(
+        &ctx,
+        "CREATE TABLE x (s BIGINT, i BIGINT, val DOUBLE) AS VALUES (0, 0, 0.5), (0, 1, -0.3), (1, 0, 0.2)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE u (i BIGINT, val DOUBLE) AS VALUES (0, 0.4), (1, -0.6), (2, 0.9)",
+    )
+    .await;
+    let loss = "WITH r1 AS (SELECT SUM(val) / COUNT(*) AS v FROM x), \
+                r4 AS (SELECT i, i % 2 AS j, val AS v FROM u), \
+                r5 AS (SELECT b.i, b.j, CASE WHEN b.v > 0 THEN a.v ELSE 0.5 * a.v END AS v \
+                       FROM r1 a CROSS JOIN r4 b), \
+                r6 AS (SELECT j, MAX(v) AS v FROM r5 GROUP BY j), \
+                r7 AS (SELECT a.i, a.j, exp(a.v - b.v) AS v FROM r5 a JOIN r6 b ON a.j = b.j), \
+                r8 AS (SELECT j, SUM(v) AS v FROM r7 GROUP BY j), \
+                r9 AS (SELECT a.i, a.j, a.v / b.v AS v FROM r7 a JOIN r8 b ON a.j = b.j) \
+                SELECT AVG(v) AS loss FROM r9";
+    let got = grad(&ctx, loss, "u").await;
+    assert_eq!(got, vec![(0, Some(0.0)), (1, Some(0.0)), (2, Some(0.0))]);
+}

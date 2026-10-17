@@ -358,19 +358,20 @@ pub(super) async fn jvp_checks(
 ) -> Result<(), String> {
     let jp = match ad::jvp(ctx, sql, wrt).await {
         Ok(p) => p,
-        // A loss that reads wrt only through conditions (a CASE's test, a
-        // LIMIT's ordering) is piecewise constant: grad gives zeros, jvp
-        // refuses. Tallied, not failed (seed 12046).
-        Err(e) if e.to_string().contains("no output column depends") && scale_of(grads) == 0.0 => {
-            out.engine
-                .push("jvp: NotScalar where grad is all zeros (piecewise constant loss)".into());
-            return Ok(());
-        }
         Err(e) => {
             refused("jvp", e, out);
             return Ok(());
         }
     };
+    // A loss that reads wrt only through conditions (a CASE's test, a
+    // LIMIT's ordering) is piecewise constant (seed 12046): its tangent is 0,
+    // which a program writes as no tangent column, and grad gives zeros.
+    if jp.value.tangents.is_empty() {
+        if scale_of(grads) != 0.0 {
+            out.fail("[jvp-zero] no tangent column, but grad is not all zeros");
+        }
+        return Ok(());
+    }
     // One tangent table per wrt table the loss reads, its dims then val.
     for tt in &jp.inputs {
         let name = tt

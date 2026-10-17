@@ -501,9 +501,15 @@ fn prune_aggregate(mut a: Box<AggregateRel>, need: &BTreeSet<usize>) -> Pruned {
         ) {
             child_need.extend(fields_of(e)?);
         }
-        let kept: Vec<usize> = (0..a.measures.len())
+        let mut kept: Vec<usize> = (0..a.measures.len())
             .filter(|m| need.contains(&(ng + m)))
             .collect();
+        // With no grouping, an aggregate is one row whatever its input,
+        // and a join above may need that row though no column of it: keep
+        // one measure, since an aggregate of nothing is not a relation.
+        if ng == 0 && kept.is_empty() && !a.measures.is_empty() {
+            kept.push(0);
+        }
         for &m in &kept {
             child_need.extend(measure_fields(&a.measures[m])?);
         }
