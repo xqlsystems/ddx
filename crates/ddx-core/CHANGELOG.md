@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.2...ddx-core-v0.3.0) - 2026-10-17
+
+### Added
+
+- [**breaking**] remove v1's SQL surface; ddx-core is the scalar rules ddx-ad uses ([#133](https://github.com/xqlsystems/ddx/pull/133))
+
+### Other
+
+- every doc and docstring stands on its own ([#134](https://github.com/xqlsystems/ddx/pull/134))
+
 ## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.1...ddx-core-v0.2.2) - 2026-10-04
 
 ### Added
