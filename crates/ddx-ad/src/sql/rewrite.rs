@@ -10,14 +10,12 @@ use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
     BinaryOperator, CastKind, DataType, ExactNumberInfo, ExcludeSelectItem, Expr, Ident, Join,
-    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, TableAlias, TableFactor, TableWithJoins,
-    Value, VisitMut, VisitorMut, WildcardAdditionalOptions,
+    JoinConstraint, JoinOperator, ObjectName, Select, SelectItem, SelectItemQualifiedWildcardKind,
+    Spanned, TableFactor, TableWithJoins, Value, VisitMut, VisitorMut, WildcardAdditionalOptions,
 };
-use ddx_core::sqlparser::dialect::GenericDialect;
-use ddx_core::sqlparser::parser::Parser;
 use ddx_core::sqlparser::tokenizer::Location;
 
+use super::build::{self, named, quoted, table};
 use super::find::{select_at, Calls, Site};
 use crate::error::{AdError, Result};
 use crate::tables::OutputTable;
@@ -178,10 +176,7 @@ impl Calls {
                 relation: table(ObjectName::from(vec![quoted(&value.step)]), None),
                 joins: Vec::new(),
             };
-            let SetExpr::Select(select) = *select_from(projection, from).body else {
-                unreachable!("select_from writes a SELECT");
-            };
-            rewriter.selects.insert(at, *select);
+            rewriter.selects.insert(at, build::select(projection, from));
         }
         let mut query = self.query.clone();
         let _ = VisitMut::visit(&mut query, &mut rewriter);
@@ -221,7 +216,7 @@ impl Gradients {
         };
         TableFactor::Derived {
             lateral: false,
-            subquery: Box::new(select_from(projection, from)),
+            subquery: Box::new(build::query(None, build::select(projection, from))),
             alias: named(self.alias),
             sample: None,
         }
@@ -279,54 +274,6 @@ fn zero() -> Expr {
         array: false,
         format: None,
     }
-}
-
-/// `AS <name>`.
-fn named(name: Ident) -> Option<TableAlias> {
-    Some(TableAlias {
-        explicit: true,
-        name,
-        columns: Vec::new(),
-        at: None,
-    })
-}
-
-/// The table `name`, read as it is.
-fn table(name: ObjectName, alias: Option<TableAlias>) -> TableFactor {
-    TableFactor::Table {
-        name,
-        alias,
-        args: None,
-        with_hints: Vec::new(),
-        version: None,
-        with_ordinality: false,
-        partitions: Vec::new(),
-        json_path: None,
-        sample: None,
-        index_hints: Vec::new(),
-    }
-}
-
-/// `SELECT <projection> FROM <from>`. sqlparser's `Query` and `Select`
-/// have dozens of fields and no `Default`, so it starts from a constant
-/// query, which holds no name or value of the statement's, and sets those
-/// two.
-fn select_from(projection: Vec<SelectItem>, from: TableWithJoins) -> Query {
-    let mut query = Parser::new(&GenericDialect {})
-        .try_with_sql("SELECT 1")
-        .and_then(|mut p| p.parse_query())
-        .expect("a constant query parses");
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        unreachable!("SELECT 1 is a SELECT");
-    };
-    select.projection = projection;
-    select.from = vec![from];
-    *query
-}
-
-/// `name` as a quoted identifier.
-fn quoted(name: &str) -> Ident {
-    Ident::with_quote('"', name)
 }
 
 /// Replaces nodes of a statement, each named by where it starts

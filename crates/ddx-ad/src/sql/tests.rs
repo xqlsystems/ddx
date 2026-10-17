@@ -58,7 +58,7 @@ fn rewritten(calls: &Calls) -> String {
             },
         ],
     };
-    let mut queries: Vec<&str> = Vec::new();
+    let mut queries: Vec<&ddx_core::sqlparser::ast::Query> = Vec::new();
     let steps: Vec<String> = calls
         .calls
         .iter()
@@ -103,6 +103,7 @@ fn a_call_is_found_with_its_objective_query() {
     let Derivative::Grad { of, wrt } = &call.derivative else {
         panic!("{:?}", call.derivative)
     };
+    let of = of.to_string();
     assert!(
         of.starts_with("WITH d AS (SELECT * FROM x), loss AS ("),
         "{of}"
@@ -354,7 +355,7 @@ fn a_tangent_is_a_column_of_its_select_s_rows() {
     // f is the SELECT with each jvp written as its expression, after
     // the CTEs it reads.
     assert_eq!(a.derivative.of(), b.derivative.of());
-    let f = a.derivative.of();
+    let f = a.derivative.of().to_string();
     assert!(f.starts_with("WITH h AS ("), "{f}");
     assert!(
         f.ends_with(
@@ -363,7 +364,7 @@ fn a_tangent_is_a_column_of_its_select_s_rows() {
         ),
         "{f}"
     );
-    let dw = a.derivative.seed_query().unwrap();
+    let dw = a.derivative.seed_query().unwrap().to_string();
     assert!(dw.ends_with("SELECT * FROM dw"), "{dw}");
     assert_eq!(a.derivative.wrt(), vec![ColumnRef::new("w", "val")]);
     // The SELECT becomes a read of the value: the tangent in the call's
@@ -386,7 +387,7 @@ fn a_query_carries_only_the_ctes_it_reads() {
                k AS (SELECT jvp(l, w.b, u) AS t FROM f) \
                SELECT * FROM j CROSS JOIN k";
     let found = find(sql);
-    let k = found.calls[1].derivative.of();
+    let k = found.calls[1].derivative.of().to_string();
     assert!(k.starts_with("WITH f AS ("), "{k}");
     assert!(!k.contains("j AS"), "{k}");
     let planned = Derivatives::plan(&[sql], &GenericDialect {}).unwrap();
@@ -396,6 +397,7 @@ fn a_query_carries_only_the_ctes_it_reads() {
         .derivative
         .seed_query()
         .unwrap()
+        .to_string()
         .starts_with("WITH v AS ("));
 }
 

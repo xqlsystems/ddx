@@ -12,11 +12,13 @@ use ddx_core::sqlparser::ast::{
     Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
     ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
+    With,
 };
 use ddx_core::sqlparser::dialect::Dialect;
 use ddx_core::sqlparser::parser::Parser;
 use ddx_core::sqlparser::tokenizer::{Location, Span};
 
+use super::build;
 use crate::error::{AdError, Result};
 use crate::relation::ColumnRef;
 
@@ -89,7 +91,7 @@ impl Transform {
 pub(crate) enum Tangent {
     /// A query computing it, a CTE's or `SELECT * FROM` a table: shaped like
     /// the `wrt` table, its dims then a tangent under each column's name.
-    Query(String),
+    Query(Box<Query>),
     /// The same number at every row: `jvp(sin(x), t.x, 1)` is the derivative
     /// of `sin(x)` with respect to `x`, row by row. `table` is the `wrt`
     /// table as the statement writes it, quotes included, so that SQL ddx
@@ -104,19 +106,19 @@ pub(crate) enum Tangent {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Derivative {
     /// `grad(f, c)`: [`crate::grad`] of `of`, the CTE `f`'s query.
-    Grad { of: String, wrt: Vec<ColumnRef> },
+    Grad { of: Box<Query>, wrt: Vec<ColumnRef> },
     /// `vjp(f, c, cotangent)`: [`crate::vjp`] of `of`, pulled back along a
     /// query computing the cotangent, a CTE's or `SELECT * FROM` a table.
     Vjp {
-        of: String,
+        of: Box<Query>,
         wrt: Vec<ColumnRef>,
-        cotangent: String,
+        cotangent: Box<Query>,
     },
     /// `jvp(e, t.c, …, tangent)`: [`crate::jvp`] of `of`, the `SELECT` the
     /// call is a column of, after the CTEs it reads, with each `jvp(e, …)`
     /// in it written `e` under a name of ddx's ([`Site::Tangent`]).
     Jvp {
-        of: String,
+        of: Box<Query>,
         wrt: Vec<ColumnRef>,
         tangent: Tangent,
     },
@@ -133,7 +135,7 @@ impl Derivative {
     }
 
     /// The query it differentiates.
-    pub(crate) fn of(&self) -> &str {
+    pub(crate) fn of(&self) -> &Query {
         match self {
             Derivative::Grad { of, .. }
             | Derivative::Vjp { of, .. }
@@ -159,7 +161,7 @@ impl Derivative {
     }
 
     /// A query computing its cotangent or tangent, if one does.
-    pub(crate) fn seed_query(&self) -> Option<&str> {
+    pub(crate) fn seed_query(&self) -> Option<&Query> {
         match self {
             Derivative::Vjp { cotangent, .. } => Some(cotangent),
             Derivative::Jvp {
@@ -267,6 +269,13 @@ impl Calls {
         let [Statement::Query(query)] = statements.as_slice() else {
             return find_none(&statements);
         };
+        Calls::in_query(query)
+    }
+
+    /// Find the calls in `query`, or `None` if it has none: a statement's,
+    /// or a query ddx built from one's nodes (a derivative's query or
+    /// seed), whose calls are the nodes the statement placed there.
+    pub fn in_query(query: &Query) -> Result<Option<Calls>> {
         let mut finder = Finder::default();
         let _ = query.visit(&mut finder);
         if let Some(kind) = finder.relations.first() {
@@ -304,7 +313,7 @@ impl Calls {
             reads: found.reads,
             selects: found.selects,
             stars,
-            query: (**query).clone(),
+            query: query.clone(),
         }))
     }
 }
@@ -327,7 +336,7 @@ impl Found<'_> {
         match kind {
             Transform::Grad => self.column_call(kind, function, select, args[0], columns, None),
             Transform::Vjp => {
-                let cotangent = self.relation(kind, args[args.len() - 1])?;
+                let cotangent = Box::new(self.relation(kind, args[args.len() - 1])?);
                 self.column_call(kind, function, select, args[0], columns, Some(cotangent))
             }
             Transform::Jvp => {
@@ -337,7 +346,7 @@ impl Found<'_> {
                         value,
                         table: String::new(),
                     },
-                    None => Tangent::Query(self.relation(kind, last)?),
+                    None => Tangent::Query(Box::new(self.relation(kind, last)?)),
                 };
                 self.tangent_call(function, select, columns, tangent)
             }
@@ -346,11 +355,13 @@ impl Found<'_> {
 
     /// A query computing `arg`, a call's last argument, the name of a CTE
     /// or a table: its cotangent or tangent.
-    fn relation(&self, kind: Transform, arg: &Expr) -> Result<String> {
+    fn relation(&self, kind: Transform, arg: &Expr) -> Result<Query> {
         let what = kind.seed().unwrap_or("relation");
         match arg {
             Expr::Identifier(s) => Ok(cte_query(self.query, &s.value, kind.name())?
-                .unwrap_or_else(|| format!("SELECT * FROM {s}"))),
+                .unwrap_or_else(|| {
+                    build::query(None, build::select_star(vec![build::unplaced(s)].into()))
+                })),
             _ => Err(AdError::InvalidPlan(format!(
                 "{}'s last argument is the name of its {what}; {}",
                 kind.name(),
@@ -368,7 +379,7 @@ impl Found<'_> {
         select: &Select,
         f: &Expr,
         columns: &[&Expr],
-        cotangent: Option<String>,
+        cotangent: Option<Box<Query>>,
     ) -> Result<Call> {
         let [column] = columns else {
             return Err(AdError::InvalidPlan(format!(
@@ -401,9 +412,12 @@ impl Found<'_> {
         )];
         Ok(Call {
             derivative: match cotangent {
-                None => Derivative::Grad { of: query, wrt },
+                None => Derivative::Grad {
+                    of: Box::new(query),
+                    wrt,
+                },
                 Some(cotangent) => Derivative::Vjp {
-                    of: query,
+                    of: Box::new(query),
                     wrt,
                     cotangent,
                 },
@@ -473,7 +487,8 @@ impl Found<'_> {
             .count();
         Ok(Call {
             derivative: Derivative::Jvp {
-                of: String::new(),
+                // Written once every call is found (`write_jvp_queries`).
+                of: Box::new(build::query(None, select.clone())),
                 wrt: names
                     .into_iter()
                     .map(|c| ColumnRef::new(table.clone(), c))
@@ -527,7 +542,10 @@ impl Found<'_> {
                     k += 1;
                 }
             }
-            let f = format!("{}{f}", with_clause(self.ctes, visible, &reads_of(select)));
+            let f = Box::new(build::query(
+                with_of(self.ctes, visible, &reads_of(select)),
+                f,
+            ));
             let mut along: Option<Derivative> = None;
             for call in self.calls.iter_mut() {
                 if !matches!(call.site, Site::Tangent { select, .. } if select == index) {
@@ -1262,7 +1280,7 @@ fn compared(c: &Expr, alias: &str, bare: bool, value: &str) -> Option<Expr> {
 /// A query computing the CTE `name` of `query`, for a call of `call`: the
 /// CTEs it reads, then it, then `SELECT * FROM` it; `None` if no CTE has
 /// that name.
-fn cte_query(query: &Query, name: &str, call: &str) -> Result<Option<String>> {
+fn cte_query(query: &Query, name: &str, call: &str) -> Result<Option<Query>> {
     let Some(with) = query.with.as_ref() else {
         return Ok(None);
     };
@@ -1278,10 +1296,10 @@ fn cte_query(query: &Query, name: &str, call: &str) -> Result<Option<String>> {
             "{call} of a CTE defined in a WITH RECURSIVE clause"
         )));
     }
-    let quoted = &with.cte_tables[idx].alias.name;
-    Ok(Some(format!(
-        "{}SELECT * FROM {quoted}",
-        with_clause(&with.cte_tables, idx + 1, &[name.to_string()])
+    let cte = build::unplaced(&with.cte_tables[idx].alias.name);
+    Ok(Some(build::query(
+        with_of(&with.cte_tables, idx + 1, &[name.to_string()]),
+        build::select_star(vec![cte].into()),
     )))
 }
 
@@ -1310,11 +1328,11 @@ fn reads_of<V: Visit>(node: &V) -> Vec<String> {
     names.0
 }
 
-/// A `WITH` clause, then a space, of the first `upto` of `ctes` that the
-/// relations named `roots` read, directly or through each other, in their
-/// order; empty if none. A CTE nothing reads is left out: one holding a
-/// call would make the query read that call's program.
-fn with_clause(ctes: &[Cte], upto: usize, roots: &[String]) -> String {
+/// A `WITH` clause of the first `upto` of `ctes` that the relations named
+/// `roots` read, directly or through each other, in their order; `None` if
+/// none. A CTE nothing reads is left out: one holding a call would make the
+/// query read that call's program.
+fn with_of(ctes: &[Cte], upto: usize, roots: &[String]) -> Option<With> {
     let mut wanted: Vec<String> = roots.to_vec();
     let mut kept = vec![false; upto];
     for k in (0..upto).rev() {
@@ -1324,13 +1342,10 @@ fn with_clause(ctes: &[Cte], upto: usize, roots: &[String]) -> String {
             wanted.extend(reads_of(&*ctes[k].query));
         }
     }
-    let kept: Vec<String> = (0..upto)
-        .filter(|&k| kept[k])
-        .map(|k| ctes[k].to_string())
-        .collect();
-    if kept.is_empty() {
-        String::new()
-    } else {
-        format!("WITH {} ", kept.join(", "))
-    }
+    build::with(
+        (0..upto)
+            .filter(|&k| kept[k])
+            .map(|k| ctes[k].clone())
+            .collect(),
+    )
 }

@@ -5,6 +5,7 @@
 //! Planning the programs a batch of statements' calls need: one per distinct
 //! derivative, each after the derivatives its query or seed reads.
 
+use ddx_core::sqlparser::ast::Query;
 use ddx_core::sqlparser::dialect::Dialect;
 use substrait::proto::Plan;
 
@@ -51,6 +52,8 @@ struct Planned {
 /// SQL that may hold calls (a statement, or a derivative's query or seed),
 /// with the derivative each call needs.
 struct Text {
+    /// As a statement was written, or a query ddx built, written out: what
+    /// runs when it holds no call.
     sql: String,
     calls: Option<Calls>,
     /// Which of the planned derivatives each call needs, in order.
@@ -94,7 +97,7 @@ impl Derivatives {
         let mut planned = Vec::new();
         let mut texts = Vec::with_capacity(statements.len());
         for sql in statements {
-            texts.push(Text::of(sql, dialect, &mut planned, &mut Vec::new())?);
+            texts.push(Text::statement(sql, dialect, &mut planned)?);
         }
         for (j, p) in planned.iter_mut().enumerate() {
             p.pushdown = pushdown(&texts, j, p.derivative.wrt());
@@ -277,20 +280,15 @@ impl Planned {
     /// seed read, so a derivative comes after every one whose program it
     /// reads.
     ///
-    /// `open` holds the texts being planned, outermost first: a query or
+    /// `open` holds the queries being planned, outermost first: a query or
     /// seed that reads, through its CTEs, a call of itself is refused.
-    fn of(
-        call: &Call,
-        dialect: &dyn Dialect,
-        planned: &mut Vec<Planned>,
-        open: &mut Vec<String>,
-    ) -> Result<usize> {
+    fn of(call: &Call, planned: &mut Vec<Planned>, open: &mut Vec<Query>) -> Result<usize> {
         let j = match planned.iter().position(|p| p.takes(&call.derivative)) {
             Some(j) => j,
             None => {
-                let query = Text::of(call.derivative.of(), dialect, planned, open)?;
+                let query = Text::query(call.derivative.of(), planned, open)?;
                 let seed = match call.derivative.seed_query() {
-                    Some(sql) => Some(Text::of(sql, dialect, planned, open)?),
+                    Some(seed) => Some(Text::query(seed, planned, open)?),
                     None => None,
                 };
                 let mut derivative = call.derivative.clone();
@@ -423,34 +421,44 @@ fn pushdown(texts: &[Text], j: usize, wrt: &[ColumnRef]) -> Vec<Restriction> {
 }
 
 impl Text {
-    /// `sql`, with its calls, each matched to the one of `planned` it needs,
-    /// planned there first if none is. `open` is as [`Planned::of`] takes
-    /// it.
-    fn of(
-        sql: &str,
-        dialect: &dyn Dialect,
-        planned: &mut Vec<Planned>,
-        open: &mut Vec<String>,
-    ) -> Result<Text> {
-        if open.iter().any(|o| o == sql) {
+    /// A statement, as written in `dialect`. One with no call is not
+    /// parsed, or not understood ([`Calls::find`]), and comes back as it
+    /// was.
+    fn statement(sql: &str, dialect: &dyn Dialect, planned: &mut Vec<Planned>) -> Result<Text> {
+        let calls = Calls::find(sql, dialect)?;
+        Text::of(sql.to_string(), calls, planned, &mut Vec::new())
+    }
+
+    /// A derivative's query or seed, which ddx built from a statement's
+    /// nodes, so the calls in it are the statement's.
+    fn query(query: &Query, planned: &mut Vec<Planned>, open: &mut Vec<Query>) -> Result<Text> {
+        if open.contains(query) {
             return Err(AdError::InvalidPlan(
                 "a call whose function, cotangent or tangent reads that same call, through \
                  the CTEs it reads: a derivative cannot be part of what it differentiates"
                     .into(),
             ));
         }
-        let calls = Calls::find(sql, dialect)?;
-        open.push(sql.to_string());
+        let calls = Calls::in_query(query)?;
+        Text::of(query.to_string(), calls, planned, open)
+    }
+
+    /// `sql`, holding `calls`, each planned.
+    fn of(
+        sql: String,
+        calls: Option<Calls>,
+        planned: &mut Vec<Planned>,
+        open: &mut Vec<Query>,
+    ) -> Result<Text> {
         let mut needs = Vec::new();
-        for call in calls.iter().flat_map(|c| &c.calls) {
-            needs.push(Planned::of(call, dialect, planned, open)?);
+        if let Some(calls) = &calls {
+            open.push(calls.query.clone());
+            for call in &calls.calls {
+                needs.push(Planned::of(call, planned, open)?);
+            }
+            open.pop();
         }
-        open.pop();
-        Ok(Text {
-            sql: sql.to_string(),
-            calls,
-            needs,
-        })
+        Ok(Text { sql, calls, needs })
     }
 
     /// The derivatives whose programs it reads, each once.

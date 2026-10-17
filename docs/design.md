@@ -2174,7 +2174,11 @@ each named by where its first token starts (`sqlparser`'s `VisitorMut`), and
 writes the tree out. Each replacement is built as nodes (the relation
 that replaces a table wraps the statement's own table node) and swapped in
 only after the visitor has passed it, so the visitor never walks into
-what ddx built and never mistakes it for the statement's. The cost: comments and spacing are not kept, and the engine sees
+what ddx built and never mistakes it for the statement's. The query a
+derivative differentiates (a CTE's query after the CTEs it reads, or a
+`jvp`'s `SELECT`) is built from the statement's nodes the same way, and
+its own calls are found in those nodes rather than in a reparse of its
+text. The cost: comments and spacing are not kept, and the engine sees
 `sqlparser`'s rendering of the statement; `tests/ad_sql_text.rs` and every
 SQL test run through it. → §4.8.
 

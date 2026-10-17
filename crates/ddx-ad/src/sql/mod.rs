@@ -98,6 +98,7 @@
 //! statement is one of these calls, and a misused one is refused with its
 //! usage.
 
+mod build;
 mod find;
 mod plan;
 mod rewrite;
