@@ -114,7 +114,7 @@ def test_grad_runs_end_to_end(ctx):
     got = col(
         ctx,
         "WITH loss AS (SELECT SUM(x * x) AS l FROM t) "
-        "SELECT x FROM grad(loss, t.x) ORDER BY i",
+        "SELECT grad(loss, x) FROM t ORDER BY i",
     )
     assert got == [2.0, 4.0, 6.0]
 

@@ -8,17 +8,18 @@ differentiates the plan, and DataFusion runs the plans it returns.
 
 ## Gradients of whole queries: `ad`
 
-In SQL,
-`grad(loss, table.column)` in a `FROM` clause is the gradient of the loss a CTE
-computes, as a relation shaped like the table:
+In SQL, `grad(loss, val)` in a `SELECT` over a table is, at each row, the
+gradient of the number the CTE `loss` computes; `vjp(f, val, cotangent)` the
+same for any CTE `f` along a cotangent; and `jvp(e, w.val, tangent)`, a column
+of the `SELECT` computing `e`, its tangent at each row, along a tangent table
+or a number (`jvp(sin(x), t.x, 1)` is `cos(x)`):
 
 ```rust
 use ddx_datafusion::ad;
 
 let step = ad::sql(&ctx, "
     WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-    SELECT w.i, w.val - 0.1 * g.val AS val
-    FROM w JOIN grad(loss, w.val) g ON w.i = g.i").await?;
+    SELECT i, val - 0.1 * grad(loss, val) AS val FROM w").await?;
 ```
 
 Nothing in the loss is labelled; the one function ddx claims is

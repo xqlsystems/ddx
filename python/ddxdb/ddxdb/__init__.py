@@ -12,8 +12,7 @@ Write a model's forward pass and loss as SQL, and take its gradient in SQL::
     ctx = Context()
     ctx.sql('''
         WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-        SELECT w.i, w.val - 0.1 * g.val AS val
-        FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+        SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
     ''')
 
 :class:`Context` is a DataFusion ``SessionContext`` whose ``.sql()``
@@ -27,8 +26,9 @@ you wrote, ``InvalidColumn`` that a column cannot be differentiated. Catch the
 one you can act on rather than matching on message text.
 """
 
+from dataclasses import dataclass
 from importlib import metadata as _metadata
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from ._ddxdb import (  # noqa: F401  (re-exported)
     DdxError,
@@ -51,13 +51,16 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     run,
     vjp_plan,
 )
+from ._ddxdb import _rewrite
 
 
 class Backend(Protocol):
-    """An engine :func:`run` can run a program on: the four primitives of
-    ``ddx_ad::Backend``. Plans cross as serialized Substrait, with their reads
-    of earlier steps already bound. :class:`ddxdb.ad.DataFusionBackend` is
-    one; any object with these methods is another."""
+    """An engine ddx runs on: the primitives of ``ddx_ad::Backend``.
+    :func:`run` needs the first four to run a program; rewriting SQL that
+    calls ``grad``, ``vjp`` or ``jvp`` also needs :meth:`plan_sql`. Plans
+    cross as serialized Substrait, with their reads of earlier steps already
+    bound. :class:`ddxdb.ad.DataFusionBackend` is one; any object with these
+    methods is another."""
 
     def select_all(self, name: str) -> bytes:
         """The engine's own serialized Substrait plan of ``SELECT * FROM
@@ -76,6 +79,81 @@ class Backend(Protocol):
     def drop_table(self, name: str) -> None:
         """Drop the table ``name`` if it exists."""
         ...
+
+    def plan_sql(self, sql: str) -> bytes:
+        """The engine's serialized Substrait plan of the SQL query ``sql``.
+        Only :func:`ddxdb.ad.sql`'s rewrite asks for one, to differentiate a
+        query a statement names; a backend that only runs programs may
+        leave it out."""
+        ...
+
+
+@dataclass(frozen=True)
+class Rewritten:
+    """SQL statements rewritten by :func:`rewrite`, and the tables they read.
+
+    Use it as a context manager: the tables are dropped from the backend when
+    the block ends, once the statements have been planned or run::
+
+        with ddxdb.rewrite(backend, statements) as rewritten:
+            for sql in rewritten.statements:
+                con.sql(sql)
+    """
+
+    #: Each statement, its ``grad``, ``vjp`` and ``jvp`` calls replaced by
+    #: reads of what their programs computed; one with no call, as it was.
+    statements: list
+    #: The tables the statements read: the programs' values and gradients,
+    #: and the cotangents and tangents registered for them.
+    tables: list
+    backend: "Backend"
+
+    def release(self) -> None:
+        """Drop :attr:`tables` from the backend, every one even after a failed
+        drop; the first failure is raised."""
+        first = None
+        for table in self.tables:
+            try:
+                self.backend.drop_table(table)
+            except Exception as e:  # noqa: BLE001 - re-raised below
+                first = first or e
+        if first is not None:
+            raise first
+
+    def __enter__(self) -> "Rewritten":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is None:
+            self.release()
+            return
+        # The error that ended the block is the one to see: a failed drop
+        # is noted on it, not raised in its place.
+        try:
+            self.release()
+        except Exception as e:  # noqa: BLE001 - noted on the error in flight
+            if hasattr(exc, "add_note"):  # Python 3.11+
+                exc.add_note(f"Dropping the rewritten statements' tables failed too: {e!r}")
+
+
+def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "datafusion") -> Rewritten:
+    """Compute what the ``grad``, ``vjp`` and ``jvp`` calls in ``statements``
+    read, on ``backend`` (any :class:`Backend` with :meth:`Backend.plan_sql`),
+    and rewrite each statement to read it. ``dialect`` is how the statements
+    are written: a dialect name ``sqlparser`` knows, or ``"datafusion"``.
+
+    This is ``ddx_ad::rewrite``, ddx-ad's own Rust: it plans one program per
+    distinct derivative, runs each on the backend, and rewrites the
+    statements' parsed trees. Raises a :class:`DdxError` subclass when ddx
+    cannot differentiate a call, or what the backend raised; either way,
+    it first tries to drop every table it wrote.
+    """
+    # A str is a sequence of strs: without this, each character would be a
+    # statement, and the calls would never be found.
+    if isinstance(statements, str):
+        raise TypeError("statements is a list of SQL statements; to rewrite one, pass [statement]")
+    out, tables = _rewrite(backend, list(statements), dialect)
+    return Rewritten(out, tables, backend)
 
 
 # Single-sourced from the installed distribution metadata, which maturin fills
@@ -98,6 +176,8 @@ __all__ = [
     "UnknownColumn",
     "InvalidColumn",
     "Backend",
+    "Rewritten",
+    "rewrite",
     "BackwardProgram",
     "Check",
     "ForwardProgram",

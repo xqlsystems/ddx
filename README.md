@@ -12,13 +12,15 @@ engine computes it alongside everything else:
 
 ```sql
 WITH f AS (SELECT SUM(val * val) AS l FROM w)
-SELECT w.i, g.val AS df_dval
-FROM w JOIN grad(f, w.val) g ON w.i = g.i     -- 2·val, row by row
+SELECT i, val, grad(f, val) AS df_dval FROM w     -- 2·val, row by row
 ```
 
-The query being differentiated is ordinary SQL: joins, sums, averages, max and
-min, window rankings. The engine plans it and writes it as Substrait; ddx
-differentiates the plan and hands back Substrait plans for the engine to run.
+A derivative is a column. `grad(f, val)` is, at each row of `w`, the
+derivative of the number the CTE `f` computes with respect to that row's
+`val`. The query being differentiated is ordinary SQL: joins, sums, averages,
+max and min, window rankings. The engine plans it and writes it as Substrait;
+ddx differentiates the plan and hands back Substrait plans for the engine to
+run.
 
 ## Try it
 
@@ -33,7 +35,7 @@ ctx = Context()
 ctx.sql("CREATE TABLE w (i BIGINT, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)")
 ctx.sql("""
     WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-    SELECT i, val FROM grad(loss, w.val) ORDER BY i
+    SELECT i, grad(loss, val) AS g FROM w ORDER BY i
 """).collect()   # 2.0, 4.0
 ```
 
@@ -43,8 +45,9 @@ From Rust, `ddx_datafusion::ad::sql(&ctx, statement)` does the same.
 
 A gradient is what an optimizer steps along, so anything a query can score, a
 query can optimize: a model's loss, a curve's misfit, a physical system's
-energy. A step, `params - lr * grad(f)(params)`, is a join of the parameter
-table with its gradient. Training a neural network is one such case:
+energy. In a `SELECT` over the parameter table, a step,
+`params - lr * grad(f)(params)`, is one expression. Training a neural network
+is one such case:
 
 ```sql
 WITH h AS (
@@ -53,9 +56,15 @@ WITH h AS (
 loss AS (
   SELECT SUM(power(h.val - y.val, 2)) AS l
   FROM h JOIN y ON h.sample = y.sample AND h.out = y.out)
-SELECT w.inp, w.out, w.val - 0.1 * g.val AS val
-FROM w JOIN grad(loss, w.val) g ON w.inp = g.inp AND w.out = g.out
+SELECT inp, out, val - 0.1 * grad(loss, val) AS val FROM w
 ```
+
+Forward mode is `jvp`, a column of the `SELECT` that computes what it
+differentiates: `jvp(e, w.val, v)` is the tangent of `e` at each row along a
+tangent table `v` shaped like `w`, or along a number: `SELECT x, jvp(sin(x),
+t.x, 1) AS dx FROM t` is `cos(x)`, row by row. `vjp(f, val, cotangent)` pulls a cotangent
+of any CTE back to `w`'s rows. Calls nest, as JAX's transformations do: a
+`jvp` of a CTE of gradients is a Hessian-vector product.
 
 That runs as written through `ddxdb.Context` in Python and
 `ddx_datafusion::ad::sql` in Rust. ddx differentiates the loss the way

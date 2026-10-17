@@ -7,7 +7,7 @@
 //!
 //! The first test runs nn.py's own hand-written backward pass (its `delta*`
 //! and `g*` queries, copied from xarray-sql#196 with the train/test split
-//! removed) next to `grad(loss, weight.val)` and `grad(loss, bias.val)` for
+//! removed) next to `grad(loss, val)` over `weight` and over `bias` for
 //! nn.py's own loss, and requires the two to agree on every weight and bias.
 //! The second trains the model.
 
@@ -230,12 +230,12 @@ async fn tagged(ctx: &SessionContext, tables: &[(i64, &str)]) -> HashMap<Vec<i64
     out
 }
 
-/// `grad(loss, weight.val)` and `grad(loss, bias.val)` of nn.py's loss, from
+/// `grad(loss, val)` over `weight` and over `bias` of nn.py's loss, from
 /// one run of its program.
 async fn sql_gradients(ctx: &SessionContext) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let with_loss = model::with_loss();
-    let weight = format!("{with_loss} SELECT layer, inp, out, val FROM grad(loss, weight.val)");
-    let bias = format!("{with_loss} SELECT layer, out, val FROM grad(loss, bias.val)");
+    let weight = format!("{with_loss} SELECT layer, inp, out, grad(loss, val) FROM weight");
+    let bias = format!("{with_loss} SELECT layer, out, grad(loss, val) FROM bias");
     let frames = ad::sql_all(ctx, &[&weight, &bias]).await.unwrap();
     let mut out = Vec::new();
     for df in frames {

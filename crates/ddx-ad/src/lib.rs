@@ -59,8 +59,10 @@
 //! along, is refused as [`AdError::NotImplemented`]. Off that path (constant
 //! data, or a subtree no gradient reaches) it is copied as it is.
 //!
-//! [`sql`] finds `grad(loss, table.column)` in a SQL statement, for
-//! adapters that let users write `grad` in SQL.
+//! [`rewrite`] runs `grad(f, column)`, `vjp(f, column, cotangent)` and
+//! `jvp(e, table.column, tangent)`, columns of a `SELECT`, in SQL statements
+//! on any [`Backend`] that can also plan SQL, and rewrites each statement to
+//! read what they computed: SQL calculus for any engine, in one call.
 //!
 //! # `substrait` version policy
 //!
@@ -90,7 +92,7 @@ mod jvp;
 mod opt;
 mod program;
 mod run;
-pub mod sql;
+mod sql;
 mod tables;
 mod tangent;
 mod transpose;
@@ -111,7 +113,7 @@ pub use program::{
 };
 pub use relation::ColumnRef;
 pub use run::{run, Backend, Program, RunError};
-pub use sql::{GradCall, GradCalls, Job, Objective, Statements};
+pub use sql::{rewrite, Rewritten};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]
 #[doc(hidden)]

@@ -40,11 +40,17 @@ pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
 pub async fn execute<P: Program + ?Sized>(ctx: &SessionContext, program: &P) -> Result<()> {
     ddx_ad::run(&mut DataFusion(ctx.clone()), program)
         .await
-        .map_err(|e| match e {
-            RunError::Refused(e) => to_df_err(e),
-            RunError::Engine(e) => e,
-            other => DataFusionError::Internal(other.to_string()),
-        })
+        .map_err(from_run_error)
+}
+
+/// A run's failure as DataFusion's error: a refusal boxed as an
+/// [`AdError`], the engine's own as it was.
+pub(crate) fn from_run_error(e: RunError<DataFusionError>) -> DataFusionError {
+    match e {
+        RunError::Refused(e) => to_df_err(e),
+        RunError::Engine(e) => e,
+        other => DataFusionError::Internal(other.to_string()),
+    }
 }
 
 /// A DataFusion context as a [`ddx_ad::Backend`].
@@ -85,6 +91,11 @@ impl ddx_ad::Backend for DataFusion {
 
     async fn drop_table(&mut self, name: &str) -> Result<()> {
         self.0.deregister_table(name).map(|_| ())
+    }
+
+    async fn plan_sql(&mut self, sql: &str) -> Result<Plan> {
+        let lp = self.0.sql(sql).await?.into_optimized_plan()?;
+        crate::ad::substrait_of(&self.0, &lp).map(|p| *p)
     }
 }
 

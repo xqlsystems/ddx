@@ -9,14 +9,12 @@
 //! called nn.py in the comments here). That demo writes its backward pass by
 //! hand: a query per layer for the error, and one per weight and bias
 //! gradient. Here the backward pass is one expression per parameter table,
-//! `grad(loss, weight.val)`, where `loss` is the demo's own loss query, and a
-//! training step is the SGD update written as a join:
+//! `grad(loss, val)` in a SELECT over it, where `loss` is the demo's own loss
+//! query, and a training step is the SGD update, row by row:
 //!
 //! ```sql
 //! WITH ..., loss AS (SELECT -AVG(ln(e.e / s.s)) AS loss FROM ...)
-//! SELECT w.layer, w.inp, w.out, w.val - 0.5 * g.val AS val
-//! FROM weight w JOIN grad(loss, weight.val) g
-//!   ON w.layer = g.layer AND w.inp = g.inp AND w.out = g.out
+//! SELECT layer, inp, out, val - 0.5 * grad(loss, val) AS val FROM weight
 //! ```
 //!
 //! ```sh

@@ -11,8 +11,7 @@
 //!
 //! ```sql
 //! WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-//! SELECT w.i, w.val - 0.1 * g.val AS val
-//! FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+//! SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
 //! ```
 //!
 //! DataFusion plans and optimizes the query and writes it as Substrait;

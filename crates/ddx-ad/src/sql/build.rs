@@ -1,0 +1,125 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Nodes ddx builds into the queries it differentiates and the statements
+//! it rewrites, rather than writing SQL text and parsing it.
+//!
+//! Every node built here has no place in any statement: its tokens and
+//! names are unplaced ([`Span::empty`]). The statement's nodes are named by
+//! where they start ([`super::find::Site`]), and an unplaced node never is,
+//! so one ddx built is never taken for one of the statement's, wherever it
+//! ends up.
+
+use ddx_core::sqlparser::ast::helpers::attached_token::AttachedToken;
+use ddx_core::sqlparser::ast::{
+    Cte, GroupByExpr, Ident, ObjectName, Query, Select, SelectFlavor, SelectItem, SetExpr,
+    TableAlias, TableFactor, TableWithJoins, WildcardAdditionalOptions, With,
+};
+use ddx_core::sqlparser::tokenizer::Span;
+
+/// `SELECT <projection> FROM <from>`.
+pub(super) fn select(projection: Vec<SelectItem>, from: TableWithJoins) -> Select {
+    Select {
+        select_token: AttachedToken::empty(),
+        optimizer_hints: Vec::new(),
+        distinct: None,
+        select_modifiers: None,
+        top: None,
+        top_before_distinct: false,
+        projection,
+        exclude: None,
+        into: None,
+        from: vec![from],
+        lateral_views: Vec::new(),
+        prewhere: None,
+        selection: None,
+        connect_by: Vec::new(),
+        group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+        cluster_by: Vec::new(),
+        distribute_by: Vec::new(),
+        sort_by: Vec::new(),
+        having: None,
+        named_window: Vec::new(),
+        qualify: None,
+        window_before_qualify: false,
+        value_table_mode: None,
+        flavor: SelectFlavor::Standard,
+    }
+}
+
+/// `SELECT * FROM <table>`.
+pub(super) fn select_star(table: ObjectName) -> Select {
+    select(
+        vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+        TableWithJoins {
+            relation: self::table(table, None),
+            joins: Vec::new(),
+        },
+    )
+}
+
+/// `<with> <select>`: a query with nothing after its `SELECT`.
+pub(super) fn query(with: Option<With>, select: Select) -> Query {
+    Query {
+        with,
+        body: Box::new(SetExpr::Select(Box::new(select))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }
+}
+
+/// `WITH <ctes>`, or `None` for no CTEs.
+pub(super) fn with(ctes: Vec<Cte>) -> Option<With> {
+    (!ctes.is_empty()).then(|| With {
+        with_token: AttachedToken::empty(),
+        recursive: false,
+        cte_tables: ctes,
+    })
+}
+
+/// The table `name`, read as it is.
+pub(super) fn table(name: ObjectName, alias: Option<TableAlias>) -> TableFactor {
+    TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    }
+}
+
+/// `AS <name>`.
+pub(super) fn named(name: Ident) -> Option<TableAlias> {
+    Some(TableAlias {
+        explicit: true,
+        name,
+        columns: Vec::new(),
+        at: None,
+    })
+}
+
+/// `name` as a quoted identifier.
+pub(super) fn quoted(name: &str) -> Ident {
+    Ident::with_quote('"', name)
+}
+
+/// `ident`, unplaced: as the statement writes it, quotes included, but
+/// with no place in it.
+pub(super) fn unplaced(ident: &Ident) -> Ident {
+    Ident {
+        span: Span::empty(),
+        ..ident.clone()
+    }
+}

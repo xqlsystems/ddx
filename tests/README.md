@@ -73,8 +73,10 @@ traces to `log(x)/log(2)`, so no generated expression will ever render SQL's
 - **`engines.py`** — takes the gradient of `SUM(f)` over a table `t(i, x, y)`
   on DataFusion and returns it row by row, which is `jax.vmap(jax.grad(f))`.
   Rows arrive as Arrow, not as a `VALUES` literal, so every column is float64.
-- **`test_jax_agreement.py`** — generated: `grad` vs `jax.vmap(jax.grad)`, and
-  central differences as an independent cross-check. JAX and ddx share a structure, so a misconception
+- **`test_jax_agreement.py`** — generated: `grad` vs `jax.vmap(jax.grad)`,
+  `jvp` in SQL vs `jax.jvp`, second derivatives (`jvp` of a `SELECT` over
+  `grad`, the calls nested) vs nested `jax.grad`, and central differences as an
+  independent cross-check. JAX and ddx share a structure, so a misconception
   common to both would be invisible between them; a finite difference shares
   nothing with either, because it only ever evaluates the primal.
 - **`test_rules.py`** — every scalar rule by name, so a failure names the rule rather

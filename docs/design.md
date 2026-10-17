@@ -14,11 +14,10 @@ and loss as SQL, and take its gradient in SQL,
 
 ```sql
 WITH loss AS (SELECT SUM(val * val) AS l FROM w)
-SELECT w.i, w.val - 0.1 * g.val AS val
-FROM w JOIN grad(loss, w.val) g ON w.i = g.i
+SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
 ```
 
-and the gradient comes back as a relation shaped like the table, computed by
+and the gradient comes back as a column beside each row's value, computed by
 the engine as a sequence of plans. The destination is training ML models in
 SQL — a [differentiable](https://www.youtube.com/watch?v=LNNU33TmBFk) [database](https://www.youtube.com/watch?v=jUe3rvTmv7Q). It ships as one engine-neutral Rust core with
 thin per-engine adapters, into DataFusion (via a Python package, `ddxdb`, into
@@ -1230,6 +1229,109 @@ direction; `jvp` of a loss against `⟨∇L, t⟩` from `grad`, and of a relatio
 against `vjp` by the dot-product test `⟨J t, c⟩ = ⟨t, Jᵀ c⟩`, to rounding;
 and `H·v` against a finite difference of `grad`'s gradient.
 
+**In SQL.** `grad`, `vjp` and `jvp` are each a column of a `SELECT`, with
+the rows its derivative has, as JAX's results have the shapes of what they
+differentiate. Each is rewritten before the engine sees the statement
+(§4.4):
+
+| call | in a `SELECT` over | is, row by row |
+|---|---|---|
+| `grad(f, c)` | the table whose column `c` is | the gradient at that row's `c` of the number the CTE `f` computes |
+| `vjp(f, c, cotangent)` | the table whose column `c` is | the same for any `f`, pulled back along `cotangent` (a CTE or table shaped like `f`'s output: its keys, then its values) |
+| `jvp(e, t.c, …, tangent)` | any rows: `e` is an expression of the `SELECT` | the tangent of `e` along `tangent` (shaped like `t`: its dims, then each column's tangent) |
+
+A gradient has its table's rows, so `grad` and `vjp` sit in a `SELECT` over
+the table, anywhere an expression can (its select list, `WHERE`, `GROUP BY`,
+`HAVING`, a join's `ON`, or the `ORDER BY` of the query whose `SELECT` it
+is; a call written twice reads one gradient column, so a `SELECT` and its
+`GROUP BY` still agree), and an SGD step is one expression,
+`SELECT i, val - lr * grad(loss, val) AS val FROM w`, where the relational
+form needed a join on every dim. A call that is a column of its own, with no
+alias, is named `{c}_grad`. A tangent has `e`'s rows, so `jvp` is a
+column of its own of the `SELECT` computing `e` (the statement's or a
+CTE's), named by its alias or, for a column `e`, `{e}_tangent`. One
+`SELECT`'s `jvp` columns share a tangent; tangents along two tables are two
+`SELECT`s, and add:
+
+```sql
+WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.val)) AS y
+           FROM x JOIN w ON x.i = w.i JOIN b ON w.o = b.o GROUP BY x.n, w.o),
+     dw AS (SELECT i, o, 0.01 AS val FROM w),
+     j AS (SELECT n, o, y, jvp(y, w.val, dw) AS t FROM h),
+     k AS (SELECT n, o, jvp(y, b.val, db) AS t FROM h)          -- db: a table
+SELECT j.n, j.o, j.y, j.t + k.t AS dy FROM j JOIN k ON j.n = k.n AND j.o = k.o
+```
+
+A `jvp`'s tangent may be a number, the same at every row:
+`SELECT x, jvp(sin(x), t.x, 1) AS dx FROM t` is `cos(x)`, the derivative of
+an expression row by row, ddx writing the tangent table itself (the table's
+dims, the number under the column's name).
+
+`ddx_ad::rewrite(&mut backend, statements, dialect)` is the whole of it, on
+any `Backend` that can also plan SQL (`plan_sql`). It finds the calls of
+several statements, each a `Derivative`: `Grad`, `Vjp` with its cotangent,
+or `Jvp` with its tangent, a query or a number. It plans one program per
+distinct derivative: per objective for `grad`, per objective and cotangent
+for `vjp` (so statements updating different tables pay for one backward
+pass), per `SELECT`, columns and tangent for `jvp`, whose `f` is the
+`SELECT` with each `jvp(e, …)` written `e`. For each in turn it plans the
+query on the engine, builds the program, registers its cotangent or tangent
+as the program's input table and runs it; then it rewrites each statement's
+tree to read what the calls need, and writes it out as SQL again (`S18`),
+returning it with the tables it reads, for the caller to drop once it has
+planned it. A table `grad` or
+`vjp` reads becomes a relation over its rows, under its alias, that also
+holds each call's gradient, left-joined on the table's dims; each call
+reads its own. A `SELECT` with `jvp` columns becomes a read of its
+program's value, each tangent in its call's place; its `LIMIT` stays, and
+so does its `ORDER BY`, which may name only the `SELECT`'s output, by name
+or position, since the tables it read are gone.
+
+When a statement's `WHERE` compares a column of a table `grad` reads with a
+literal (`layer = 1`), the program computes only those rows' gradients:
+the comparison rejects NULL, so no other row reaches the result whatever
+the joins. A comparison of a column the program differentiates, because
+another call on the table names it, is not pushed. And the engine plans the
+restriction itself, so its optimizer may give a plan the program cannot
+take (a filter folded away, or moved into the scan); then the program
+computes every row, which is always right.
+
+A query or seed that reads, through the CTEs it reads, a call of itself
+(`loss` reading a CTE that holds `grad(loss, …)`) is refused: no order runs
+either first.
+
+**Calls nest**, as JAX's transformations do. A call's `f`, `e`'s `SELECT`,
+or its cotangent or tangent may read another call, whose job comes first:
+
+```sql
+WITH loss AS (SELECT SUM(val * val * val) AS l FROM w),
+     g AS (SELECT i, grad(loss, val) AS val FROM w),
+     v AS (SELECT i, 1.0 AS val FROM w)
+SELECT i, jvp(val, w.val, v) AS hv FROM g                      -- H·v
+```
+
+The outer job's query is written over the inner programs' tables, and the
+engine plans it as any query. Its program is built from that plan *after*
+the inner programs (`compose::After`): their steps, renamed into one
+namespace, then the plan as the step that writes the value. The engine's
+reads of their tables become reads of those steps, and every plan is
+declared from one set of functions, since the engine numbers them its own
+way. `grad`, `vjp` and `jvp` of that program then differentiate through the
+inner ones as of any program (§4.9): forward over reverse, reverse over
+forward, forward over forward. A cotangent or tangent that reads a call is
+only computed, never differentiated. Every job also runs on its own, so a
+nested call costs its inner program once more than a composed program from
+Rust does. Reverse over reverse is refused as it is elsewhere.
+
+*Verified* (`tests/sql_grad.rs`, `tests/sql_jvp.rs`, `tests/sql_vjp.rs`,
+`tests/sql_nesting.rs`): against the closed forms, against the programs row
+by row, two `jvp` `SELECT`s against one program along both tangents, `vjp` along 1 against `grad`, a
+`vjp`'s `WHERE` restricting its rows, a filter on another call's column and
+one the engine plans away, a quoted table's name kept as written, `H·v` in
+SQL against `jvp` of the
+`grad` program, `grad` of a `jvp` and a query over a call, a tangent that is
+another call, and nothing left behind.
+
 ### 4.9 Composition
 
 `grad`, `vjp` and `jvp` each take a query's plan or a program of either
@@ -1345,7 +1447,7 @@ layered:
   with 1, `vjp(R, c)` = `grad(Σ R·c)`, and invariance to CTE inlining, the
   unoptimized plan, row order, partition count, dim storage type, the `wrt`
   list, reuse of a program on new values, and concurrent programs. It also
-  checks that `grad(loss, t.col)` in SQL matches the program. The plan ddx
+  checks that `grad(loss, col)` in SQL matches the program. The plan ddx
   reads is varied too, because §4.2's coverage risk is about plan shapes. The
   query is re-planned with optimizer rules removed or reordered, and the
   Substrait plan is rewritten into equivalent shapes another producer might
@@ -1356,9 +1458,10 @@ layered:
   the loss need not be differentiable, and any subgradient is a convention);
   dense NULLs and NULL keys; huge, tiny, `-0.0`, NaN and infinite values; and
   thousand-row tables in several partitions. Near a kink, ⟨∇L, d⟩ must lie
-  between the one-sided derivatives. `grad(loss, t.col)` in SQL is held to
+  between the one-sided derivatives. `grad(loss, col)` in SQL is held to
   the program's gradient under schema-qualified and quoted names with a decoy
-  of the old name, a shadowing CTE, the call in a subquery or a later CTE, and
+  of the old name, a shadowing CTE (refused: a `SELECT` over it reads the
+  CTE's rows), the call in a subquery or a later CTE, and
   two losses in one statement; three SGD steps written in SQL must each be
   θ − lr·∇L and lower the loss. It runs nightly beside v1's soak, and a
   weekly mutation test seeds bugs into each rule to measure how fast the soak
@@ -1491,12 +1594,12 @@ breadth, not de-risking.
 - **M4 — `grad` over queries, phase 2: the ML headline.** `grad(plan, wrt)`
   and `vjp(plan, wrt)` take a Substrait `Plan` and emit the backward
   program — a sequence of named, materializable `Plan`s (the tape) — exposed
-  in the engines' own terms, down to `grad(loss, table.column)` in SQL. Stays
+  in the engines' own terms, down to `grad(loss, column)` in SQL. Stays
   pure-logical; performance is a separate, physical concern (the
   fused-contraction operator, still to spike). Runs first on DataFusion.
   *Exit:* train the `nn.py` MLP with gradients *emitted by* `ddx`'s `grad`, not
   hand-written, matching the demo and JAX. **Built:** `grad(loss,
-  table.column)` in SQL, from Rust (`ddx_datafusion::ad::sql`) and Python
+  column)` in SQL, from Rust (`ddx_datafusion::ad::sql`) and Python
   (`ddxdb.Context.sql`, `ddxdb.ad`), over `grad`/`vjp` programs run on
   DataFusion. `ddx-datafusion/examples/nn` trains nn.py's MLP with one SQL
   statement per parameter table; its gradients equal nn.py's hand-written
@@ -1513,22 +1616,23 @@ breadth, not de-risking.
   no tape: tangents travel beside values through the same operators (map via
   `ddx-core`'s scalar `jvp`; sum, mean and join linear in the tangent; `MAX`
   and `MIN` taking the attaining row's tangent, averaged over ties), so a `jvp`
-  is one rewritten query rather than a program. Surfaces as `jvp(query,
-  table.column, tangent)` in a `FROM` clause, from Rust and Python. *Exit:*
+  is one rewritten query rather than a program. Surfaces as `jvp(e,
+  table.column, tangent)`, a column of a `SELECT`, from Rust and Python. *Exit:*
   matches `jax.jvp` on the spikes' fixtures, passes the dot-product test
   ⟨J t, c⟩ = ⟨t, Jᵀ c⟩ against `vjp`, and gives a Hessian-vector product on
   the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
   far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
-  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); the Python
-  API (`ddxdb` 0.3: `jvp`, `jvp_plan`, `ForwardProgram`, composition),
+  `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); `vjp(…)`
+  and `jvp(…)` in SQL, nesting (§4.8); the Python API (`ddxdb` 0.3: `jvp`,
+  `jvp_plan`, `ForwardProgram`, composition, `vjp(…)` and `jvp(…)` in SQL),
   checked against `jax.jvp` and, both ways, `jax.jvp(jax.grad(f))` on the
   MLP fixture; `run` returning values. The soak checks `jvp` on its random
   queries against reverse mode, exactly (`tests/ad_simulation/jvp.rs`:
   ⟨∇L, t⟩, linearity, a missing tangent row as 0, the dot-product test
   against `vjp`, `H·t`'s symmetry and its value, a repeated tangent key
   refused); 332 cases and 3,350 comparisons in a five-minute run, none
-  failing. Still to come: `jvp(…)` in SQL.
+  failing.
 - **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
   its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
   Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
@@ -2008,7 +2112,7 @@ on DuckDB, found that what is neither calculus nor engine had been written
 once per adapter: the run protocol (checks first, steps in order, drop the
 intermediates on success and failure) and `sql_all`'s planning (one program
 per loss query, each call's dims and value columns). Both now live in
-`ddx-ad` (`run` and `Backend`; `sql::Statements`), and the DataFusion and
+`ddx-ad` (`run` and `Backend`; `rewrite`), and the DataFusion and
 Python adapters drive them. The spike also found two producer gaps, now
 closed (a `ReferenceRel` was not followed; a cast of a literal was opaque, so
 `x ** 2` from an unoptimized plan was refused), and that emitted plans
@@ -2057,6 +2161,26 @@ actions left the API. Two invariants moved into types: a program's plans are
 `Unbound` (their reads of tables it writes name no column types) and an
 engine receives only `Bound` plans, which only `Unbound::bind` makes; and
 `Program` is `Sync`, so a run can be spawned. → §4.2.
+
+**S18 — Calls in SQL are rewritten as a tree, not spliced as text.** v1
+spliced each derivative into the statement by source span and kept every
+other byte (§3.2), so a statement could go to any engine exactly as written.
+Once calls became columns of a `SELECT`, splicing meant byte offsets for
+calls, tables, `*`s and `SELECT`s, a parenthesis count in tokens because an
+expression's span can stop short of its `)`, and rules for edits inside other
+edits; two bugs came from those. The statement must parse for its calls to be
+found anyway, so the rewrite now replaces nodes of the parsed tree,
+each named by where its first token starts (`sqlparser`'s `VisitorMut`), and
+writes the tree out. Each replacement is built as nodes (the relation
+that replaces a table wraps the statement's own table node) and swapped in
+only after the visitor has passed it, so the visitor never walks into
+what ddx built and never mistakes it for the statement's. The query a
+derivative differentiates (a CTE's query after the CTEs it reads, or a
+`jvp`'s `SELECT`) is built from the statement's nodes the same way, and
+its own calls are found in those nodes rather than in a reparse of its
+text. The cost: comments and spacing are not kept, and the engine sees
+`sqlparser`'s rendering of the statement; `tests/ad_sql_text.rs` and every
+SQL test run through it. → §4.8.
 
 ## References
 

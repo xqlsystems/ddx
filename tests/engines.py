@@ -71,7 +71,7 @@ def grad_sql(body: str, wrt: str) -> str:
     """The statement whose column is `∂body/∂wrt` at each row of `t`."""
     return (
         f"WITH loss AS (SELECT SUM({body}) AS l FROM t) "
-        f"SELECT i, {wrt} FROM grad(loss, t.{wrt}) ORDER BY i"
+        f"SELECT i, grad(loss, {wrt}) AS d FROM t ORDER BY i"
     )
 
 
@@ -82,7 +82,7 @@ def grad_values(body: str, wrt: str, xs, ys) -> list:
 
     ctx = context(xs, ys)
     table = ad.sql(ctx, grad_sql(body, wrt)).to_arrow_table()
-    return table.column(wrt).to_pylist()
+    return table.column("d").to_pylist()
 
 
 def grad_column(body: str, wrt: str, xs, ys) -> np.ndarray:
@@ -95,6 +95,46 @@ def grad_column(body: str, wrt: str, xs, ys) -> np.ndarray:
     return np.array(
         [np.nan if v is None else float(v) for v in grad_values(body, wrt, xs, ys)]
     )
+
+
+def _dims(wrt: str) -> str:
+    """The columns of `t` other than `wrt`: its dims, when `wrt` is
+    differentiated along."""
+    return "i, y" if wrt == "x" else "i, x"
+
+
+def jvp_sql(body: str, wrt: str) -> str:
+    """The statement whose column is the tangent of `body` at each row of `t`,
+    along a tangent of `wrt` that is the other column's value there."""
+    other = "y" if wrt == "x" else "x"
+    return (
+        f"WITH tangent AS (SELECT {_dims(wrt)}, {other} AS {wrt} FROM t) "
+        f"SELECT i, jvp({body}, t.{wrt}, tangent) AS d FROM t ORDER BY i"
+    )
+
+
+def second_sql(body: str, wrt: str) -> str:
+    """The statement whose column is `∂²body/∂wrt²` at each row of `t`: the
+    tangent of the gradient along a tangent of 1, a Hessian-vector product
+    whose Hessian is diagonal, since each row's `body` reads that row alone.
+    `jvp` of a `SELECT` over `grad`, calls nested as JAX's transformations
+    are."""
+    return (
+        f"WITH loss AS (SELECT SUM({body}) AS l FROM t), "
+        f"g AS (SELECT i, grad(loss, {wrt}) AS g FROM t), "
+        f"ones AS (SELECT {_dims(wrt)}, 1.0 AS {wrt} FROM t) "
+        f"SELECT i, jvp(g, t.{wrt}, ones) AS d FROM g ORDER BY i"
+    )
+
+
+def column(sql: str, xs, ys) -> np.ndarray:
+    """The column `d` of `sql`, run by ddx over `t`, as float64 with NULL as
+    NaN."""
+    from ddxdb import ad
+
+    ctx = context(xs, ys)
+    got = ad.sql(ctx, sql).to_arrow_table().column("d").to_pylist()
+    return np.array([np.nan if v is None else float(v) for v in got])
 
 
 def values(sql: str, xs, ys) -> list:

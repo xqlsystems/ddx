@@ -78,6 +78,17 @@ impl Backend for Sync {
     fn drop_table(&mut self, name: &str) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(self.ctx.deregister_table(name).map(|_| ()))
     }
+
+    fn plan_sql(
+        &mut self,
+        sql: &str,
+    ) -> impl Future<Output = Result<ddx_ad::substrait::proto::Plan, Self::Error>> + Send {
+        let mut engine = ddx_datafusion::engine::DataFusion(self.ctx.clone());
+        ready(
+            self.rt
+                .block_on(ddx_ad::Backend::plan_sql(&mut engine, sql)),
+        )
+    }
 }
 
 fn backend(rows: &str) -> Sync {

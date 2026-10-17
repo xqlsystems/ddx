@@ -970,7 +970,9 @@ impl<'a> Dualizer<'a> {
             tans.push(if depends(self.functions, k, &varied)? {
                 Tan::Refused(AdError::NotImplemented(
                     "a tangent through a GROUP BY key: the aggregate groups by a value that \
-                     depends on a wrt column, and that value is then used as a number"
+                     depends on a wrt column, and that value is then used as a number (a SELECT \
+                     DISTINCT groups by every column it returns, so one over such a column \
+                     is the same)"
                         .into(),
                 ))
             } else {
