@@ -116,50 +116,51 @@ fn failed(label: &str, sql: &str, e: &str, out: &mut Outcome) {
     }
 }
 
-/// `grad` spelled as a user might: any case, qualified or not, with a
-/// comment (multibyte, holding parentheses) before it on its line.
-fn grad_call(rng: &mut Rng, t: &str) -> String {
+/// `grad` spelled as a user might: any case, `val` bare or qualified by
+/// `qualify` (`w.`, an alias's `p.`, or none), with a comment (multibyte,
+/// holding parentheses) before it on its line.
+fn grad_call(rng: &mut Rng, qualify: &str) -> String {
     let name = *rng.pick(&["grad", "GRAD", "Grad"]);
     let col = if rng.below(2) == 0 {
         "val".to_string()
     } else {
-        format!("{t}.val")
+        format!("{qualify}val")
     };
     let pre = *rng.pick(&["", "", " /* ☕ é (x) */ ", "/*ü*/"]);
     let inner = *rng.pick(&["", " ", "\t"]);
     format!("{pre}{name}({inner}loss,{inner}{col})")
 }
 
-/// An expression of the gradient `g` and the value `v` at a row, as SQL
-/// over `G` (the call) and its value.
+/// An expression of the gradient `g` and the value `v` at a row: as SQL
+/// over a call and `val`, and as what it computes.
 struct Template {
-    sql: &'static str,
+    sql: fn(&str) -> String,
     f: fn(Option<f64>, Option<f64>) -> Option<f64>,
 }
 
 const TEMPLATES: &[Template] = &[
     Template {
-        sql: "G",
+        sql: |g| g.to_string(),
         f: |g, _| g,
     },
     Template {
-        sql: "val - 0.25 * G",
+        sql: |g| format!("val - 0.25 * {g}"),
         f: |g, v| Some(v? - 0.25 * g?),
     },
     Template {
-        sql: "CASE WHEN G >= 0 THEN G ELSE -1.0 * G END",
+        sql: |g| format!("CASE WHEN {g} >= 0 THEN {g} ELSE -1.0 * {g} END"),
         f: |g, _| g.map(f64::abs),
     },
     Template {
-        sql: "G * G + 1.0",
+        sql: |g| format!("{g} * {g} + 1.0"),
         f: |g, _| g.map(|g| g * g + 1.0),
     },
     Template {
-        sql: "COALESCE(G, -7.0)",
+        sql: |g| format!("COALESCE({g}, -7.0)"),
         f: |g, _| Some(g.unwrap_or(-7.0)),
     },
     Template {
-        sql: "G + G",
+        sql: |g| format!("{g} + {g}"),
         f: |g, _| g.map(|g| 2.0 * g),
     },
 ];
@@ -297,8 +298,8 @@ pub(super) async fn sql_checks(
         // Placement: an expression of the gradient, beside the loss read
         // through the re-rendered CTEs.
         let tpl = rng.pick(TEMPLATES);
-        let call = grad_call(rng, t);
-        let expr = tpl.sql.replace('G', &call);
+        let call = grad_call(rng, &format!("{t}."));
+        let expr = (tpl.sql)(&call);
         let sql =
             format!("{lp} SELECT {lead_dims}{expr} AS g, (SELECT loss FROM loss) AS lv FROM {t}");
         match query_sql(ctx, &sql).await {
@@ -326,7 +327,7 @@ pub(super) async fn sql_checks(
                             out.fail(format!(
                                 "[sql-placement] {t}{key:?}: `{}` is {:?}, the program's \
                                  gradient {:?} gives {want:?}\n  {sql}",
-                                tpl.sql,
+                                (tpl.sql)("G"),
                                 row[k],
                                 g.get(key)
                             ));
@@ -346,7 +347,7 @@ pub(super) async fn sql_checks(
         }
 
         // An aggregate of the gradient, and the rows a WHERE on it keeps.
-        let call = grad_call(rng, t);
+        let call = grad_call(rng, &format!("{t}."));
         let sql = format!("{lp} SELECT SUM({call} * val) AS s, COUNT({call}) AS n FROM {t}");
         let (mut s, mut sa, mut n) = (0.0, 0.0, 0.0);
         for (key, v) in tb.keys.iter().zip(&tb.vals) {
@@ -377,7 +378,7 @@ pub(super) async fn sql_checks(
             }
         }
         if k > 0 {
-            let call = grad_call(rng, t);
+            let call = grad_call(rng, &format!("{t}."));
             let sql = format!("{lp} SELECT {} FROM {t} WHERE {call} > 0", dims.join(", "));
             // A gradient within rounding of 0 (a softmax's, about 1e-17 of
             // residue) may land on either side of it in another program.
@@ -407,7 +408,7 @@ pub(super) async fn sql_checks(
                 }
             }
             // Under GROUP BY the first dim.
-            let call = grad_call(rng, t);
+            let call = grad_call(rng, &format!("{t}."));
             let d0 = &tb.dims[0];
             let sql = format!("{lp} SELECT {d0}, SUM({call}) AS s FROM {t} GROUP BY {d0}");
             let mut want: BTreeMap<i64, (Option<f64>, f64)> = BTreeMap::new();
@@ -461,7 +462,7 @@ pub(super) async fn sql_checks(
             let kept: BTreeSet<Vec<i64>> = keep.rows.iter().map(|x| key_of(x, k)).collect();
             statements.push(format!(
                 "{lp} SELECT {lead_dims}{} AS g FROM {t}{alias} WHERE {p}",
-                grad_call(rng, t).replace(&format!("{t}.val"), &format!("{q}val"))
+                grad_call(rng, &q)
             ));
             wants.push(kept);
         }
