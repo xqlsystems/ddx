@@ -17,13 +17,13 @@
 //! | select (filter, join condition, semi-join, `LIMIT`, sort) | the kept rows keep their tangents |
 //! | join, cross join | each side's tangents come along with its values |
 //! | `SUM`, `AVG` (aggregate or window) | the same function over the tangents |
-//! | `MAX`, `MIN` | the mean tangent of the rows attaining it (`jax.jvp` of `jnp.max`) |
+//! | `MAX`, `MIN` (aggregate, or window over a whole partition) | the mean tangent of the rows attaining it (`jax.jvp` of `jnp.max`) |
 //! | `COUNT` | none |
 //! | `UNION ALL` | each input's tangents, zero where an input has none |
 //! | `ddx_stop_gradient(x)` | none |
 //!
-//! Which aggregates have a rule, and which, is [`crate::reduce`]'s, which
-//! reverse mode reads too.
+//! The reductions' rules are one linear form each, [`crate::reduce`]'s,
+//! which reverse mode transposes.
 //!
 //! A `wrt` table is read joined to its tangent table on its dims; a row the
 //! tangent table lacks has tangent 0. An earlier step of a program (forward
@@ -49,8 +49,6 @@
 
 use substrait::proto::aggregate_function::AggregationInvocation;
 use substrait::proto::aggregate_rel::Measure;
-use substrait::proto::expression::window_function::bound::Kind as BoundKind;
-use substrait::proto::expression::window_function::Bound;
 use substrait::proto::expression::{RexType, WindowFunction};
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
@@ -74,7 +72,7 @@ use crate::forward::{
     rel_inputs, rel_name, width,
 };
 use crate::functions::{Extensions, Function, Functions};
-use crate::reduce::{no_rule, reduce_rule, Reduce, Rule};
+use crate::reduce::{no_rule, reduce_rule, whole_partition, Linear, Reduce};
 use crate::relation::Table;
 
 /// A column's tangent.
@@ -787,38 +785,52 @@ impl<'a> Dualizer<'a> {
         let Some(t) = self.tangent_of(&arg, tans)? else {
             return Ok(WindowTan::Zero);
         };
-        match rule {
-            Rule::Sum | Rule::Mean => {
-                let mut tw = wf.clone();
-                tw.arguments = vec![value_arg(self.masked(arg, t))];
-                tw.output_type = None;
-                Ok(WindowTan::Now(Expression {
-                    rex_type: Some(RexType::WindowFunction(tw)),
-                }))
-            }
-            Rule::Extreme(_) => {
-                let whole = wf.sorts.is_empty()
-                    && unbounded(wf.lower_bound.as_ref())
-                    && unbounded(wf.upper_bound.as_ref());
-                if !whole {
-                    return refuse(&format!("a running {name} over an ordered frame"));
-                }
-                // The rows attaining the extreme (the window's own column),
-                // and the mean of their tangents, over the same partition.
-                let equal = self.ext.anchor(Function::Equal);
-                let avg = self.ext.anchor(Function::Avg);
-                let masked = self.masked(arg.clone(), t);
-                let attaining = if_then(
-                    vec![(call(equal, vec![arg, field(at)]), masked)],
-                    null_f64(),
-                );
-                Ok(WindowTan::Later(crate::expr::window(
-                    avg,
-                    vec![attaining],
-                    wf.partitions.clone(),
-                )))
-            }
+        let masked = self.masked(arg.clone(), t);
+        if rule.extreme.is_none() {
+            // Every row counts: the same window over the tangents.
+            let mut tw = wf.clone();
+            tw.arguments = vec![value_arg(masked)];
+            tw.output_type = None;
+            return Ok(WindowTan::Now(Expression {
+                rex_type: Some(RexType::WindowFunction(tw)),
+            }));
         }
+        if !whole_partition(wf) {
+            return refuse(&format!("a running {name} over an ordered frame"));
+        }
+        // The rows attaining the extreme (the window's own column) share
+        // the tangent, over the same partition.
+        let (f, counted) = self.counted(rule, arg, masked, field(at));
+        Ok(WindowTan::Later(crate::expr::window(
+            f,
+            vec![counted],
+            wf.partitions.clone(),
+        )))
+    }
+
+    /// The function and argument of the aggregate that renders `rule`'s
+    /// linear form: the tangents of the rows that count (`masked`, NULL on
+    /// the others), summed, or averaged when they share it.
+    fn counted(
+        &mut self,
+        rule: Linear,
+        arg: Expression,
+        masked: Expression,
+        extreme: Expression,
+    ) -> (u32, Expression) {
+        let counted = match rule.extreme {
+            None => masked,
+            Some(_) => {
+                let equal = self.ext.anchor(Function::Equal);
+                if_then(vec![(call(equal, vec![arg, extreme]), masked)], null_f64())
+            }
+        };
+        let f = self.ext.anchor(if rule.shared {
+            Function::Avg
+        } else {
+            Function::Sum
+        });
+        (f, counted)
     }
 
     fn filter(&mut self, f: &FilterRel, d: Dual) -> Result<Dual> {
@@ -1039,7 +1051,13 @@ impl<'a> Dualizer<'a> {
                 m.invocation,
                 &m.arguments,
             );
-            if let Ok(Some(Reduce::Of(Rule::Extreme(_), _))) = rule {
+            if let Ok(Some(Reduce::Of(
+                Linear {
+                    extreme: Some(_), ..
+                },
+                _,
+            ))) = rule
+            {
                 m.sorts.clear();
             }
         }
@@ -1119,31 +1137,14 @@ impl<'a> Dualizer<'a> {
         let Some(t) = self.tangent_of(&arg, tans)? else {
             return Ok(None);
         };
-        let tangent = |function_reference: u32, arg: Expression| Measure {
-            measure: Some(AggregateFunction {
-                function_reference,
-                arguments: vec![value_arg(arg)],
-                invocation: AggregationInvocation::All as i32,
-                phase: f.phase,
-                ..Default::default()
-            }),
-            filter: None,
-        };
-        match rule {
-            // Linear: the same function over the tangents.
-            Rule::Sum | Rule::Mean => {
-                let masked = self.masked(arg, t);
-                Ok(Some(tangent(f.function_reference, masked)))
-            }
-            // The mean tangent of the rows attaining the group's extreme,
-            // found by a window over the group, never by comparing with the
-            // aggregate. NaN is left out of the window, as DataFusion's
-            // grouped MAX leaves it out.
-            Rule::Extreme(extreme) => {
+        // An extreme's rows are found by a window over the group, never by
+        // comparing with the aggregate. NaN is left out of the window, as
+        // DataFusion's grouped MAX leaves it out.
+        let extreme = match rule.extreme {
+            None => null_f64(),
+            Some(extreme) => {
                 let isnan = self.ext.anchor(Function::IsNan);
                 let extreme = self.ext.anchor(extreme);
-                let equal = self.ext.anchor(Function::Equal);
-                let avg = self.ext.anchor(Function::Avg);
                 let skip_nan = if_then(
                     vec![(call(isnan, vec![arg.clone()]), null_f64())],
                     arg.clone(),
@@ -1153,15 +1154,21 @@ impl<'a> Dualizer<'a> {
                     vec![skip_nan],
                     groupings.to_vec(),
                 ));
-                let at = base + windows.len() - 1;
-                let masked = self.masked(arg.clone(), t);
-                let attaining = if_then(
-                    vec![(call(equal, vec![arg, field(at)]), masked)],
-                    null_f64(),
-                );
-                Ok(Some(tangent(avg, attaining)))
+                field(base + windows.len() - 1)
             }
-        }
+        };
+        let masked = self.masked(arg.clone(), t);
+        let (function_reference, counted) = self.counted(rule, arg, masked, extreme);
+        Ok(Some(Measure {
+            measure: Some(AggregateFunction {
+                function_reference,
+                arguments: vec![value_arg(counted)],
+                invocation: AggregationInvocation::All as i32,
+                phase: f.phase,
+                ..Default::default()
+            }),
+            filter: None,
+        }))
     }
 
     fn set(&mut self, s: &SetRel) -> Result<Dual> {
@@ -1262,10 +1269,6 @@ fn with_emit(rel: Rel, emit: Vec<usize>) -> Rel {
         }
         other => select(Rel { rel_type: other }, emit),
     }
-}
-
-fn unbounded(b: Option<&Bound>) -> bool {
-    b.is_none_or(|b| matches!(b.kind, None | Some(BoundKind::Unbounded(_))))
 }
 
 fn value_args(arguments: &[substrait::proto::FunctionArgument]) -> Vec<&Expression> {

@@ -129,6 +129,89 @@ async fn softmax_cross_entropy_with_the_shift_stopped() {
 }
 
 #[tokio::test]
+async fn softmax_cross_entropy_written_with_windows() {
+    // The shift and the normalizer as windows over each sample's rows:
+    // the same function as the GROUP BY form, so the same gradient.
+    let tables = logits();
+    let loss = "WITH e AS (SELECT sample, out, \
+                                  exp(val - MAX(val) OVER (PARTITION BY sample)) AS e FROM z), \
+                     p AS (SELECT sample, out, e / SUM(e) OVER (PARTITION BY sample) AS p FROM e) \
+                SELECT -AVG(ln(p.p) * y.val) * 3.0 AS loss \
+                FROM p JOIN y ON y.sample = p.sample AND y.out = p.out";
+    let grads = check_gradients(&ctx(), loss, &tables, &[ColumnRef::new("z", "val")]).await;
+    assert_close(&grads["z"], &softmax_minus_onehot(&tables[0]));
+}
+
+#[tokio::test]
+async fn a_window_over_each_whole_partition_has_its_group_by_forms_gradient() {
+    // An aggregate over each whole partition is the grouped aggregate joined
+    // back to the partition's rows, so the two spellings have one gradient:
+    // a tie shared, a NULL row skipped.
+    let ctx = ctx();
+    exec(
+        &ctx,
+        "CREATE TABLE wg (i BIGINT, g BIGINT, val DOUBLE) AS VALUES \
+         (0, 0, 1.0), (1, 0, 3.0), (2, 0, 3.0), (3, 1, 2.0), (4, 1, -0.5), (5, 1, NULL)",
+    )
+    .await;
+    let body = "SELECT SUM(exp(val - r) * val) AS l FROM m";
+    for f in ["MAX", "MIN", "SUM", "AVG"] {
+        let window =
+            format!("WITH m AS (SELECT val, {f}(val) OVER (PARTITION BY g) AS r FROM wg) {body}");
+        let grouped = format!(
+            "WITH r AS (SELECT g, {f}(val) AS r FROM wg GROUP BY g), \
+                  m AS (SELECT wg.val, r.r FROM wg JOIN r ON wg.g = r.g) {body}"
+        );
+        let (got, want) = (
+            gradient_of(&ctx, &window, "wg").await,
+            gradient_of(&ctx, &grouped, "wg").await,
+        );
+        assert_eq!(got.len(), want.len(), "{f}");
+        for (g, w) in got.iter().zip(&want) {
+            let same =
+                g[..2] == w[..2] && (g[2].is_nan() && w[2].is_nan() || (g[2] - w[2]).abs() < 1e-12);
+            assert!(same, "{f}: {got:?} vs {want:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_running_sum_or_mean_has_a_gradient_and_a_running_extreme_is_refused() {
+    // A running sum's transpose is a sum over the frame seen from the other
+    // side (k PRECEDING ↔ k FOLLOWING). A running maximum moves with a
+    // different row at each frame, and has no rule.
+    let ctx = ctx();
+    let tables = [Table {
+        name: "rw",
+        columns: vec![("i", "BIGINT"), ("g", "BIGINT"), ("val", "DOUBLE")],
+        rows: (0..8)
+            .map(|i| vec![i as f64, (i % 2) as f64, (0.7 * i as f64).sin()])
+            .collect(),
+    }];
+    for frame in [
+        "SUM(val) OVER (PARTITION BY g ORDER BY i)",
+        "AVG(val) OVER (PARTITION BY g ORDER BY i ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING)",
+        "SUM(val * val) OVER (ORDER BY i, g ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING)",
+    ] {
+        let loss = format!(
+            "WITH m AS (SELECT val, {frame} AS r FROM rw) SELECT SUM(r * r * val) AS l FROM m"
+        );
+        check_gradients(&ctx, &loss, &tables, &[ColumnRef::new("rw", "val")]).await;
+    }
+    let why = refusal(
+        &ctx,
+        "WITH m AS (SELECT val, MAX(val) OVER (PARTITION BY g ORDER BY i) AS r FROM rw) \
+         SELECT SUM(r) AS l FROM m",
+        "rw",
+    )
+    .await;
+    assert!(
+        why.as_deref().is_some_and(|m| m.contains("running `max`")),
+        "{why:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_stop_gradient_changes_the_gradient_it_stops() {
     // loss = Σ val · stop(val): the gradient is val, not the 2·val of the
     // unstopped function. Finite differences would say 2·val, so this checks
@@ -522,14 +605,14 @@ async fn a_limit_must_break_ties_by_the_dims_it_cuts() {
 }
 
 #[tokio::test]
-async fn an_exact_window_over_each_whole_partition_needs_no_ties_broken() {
+async fn a_window_over_each_whole_partition_needs_no_ties_broken() {
     // MAX(val) OVER (PARTITION BY g) is the same however a partition's rows
     // are ordered, so recomputing it for the backward pass gives the same
     // value, and it needs no ORDER BY to break ties; the window jvp writes
     // for a MAX's tangent is one, which vjp of a jvp program reads. A SUM
-    // can round differently from run to run, so it is still refused. (In a
-    // CTE: DataFusion's producer writes a window inside an aggregate's
-    // argument, which its consumer cannot plan.)
+    // is too, up to rounding, which a recomputed scalar subquery has as
+    // well. (In a CTE: DataFusion's producer writes a window inside an
+    // aggregate's argument, which its consumer cannot plan.)
     let ctx = ctx();
     exec(
         &ctx,
@@ -553,16 +636,23 @@ async fn an_exact_window_over_each_whole_partition_needs_no_ties_broken() {
             vec![3.0, 1.0, 5.0]
         ]
     );
-    let why = refusal(
+    // The SUM appears only in the condition, so the gradient is the kept
+    // rows': 3 > 4 / 2 and 2.5 > 4.5 / 2.
+    let got = gradient_of(
         &ctx,
         "WITH m AS (SELECT val, SUM(val) OVER (PARTITION BY g) AS s FROM wp) \
          SELECT SUM(CASE WHEN val > s / 2 THEN val ELSE 0 END) AS l FROM m",
         "wp",
     )
     .await;
-    assert!(
-        why.as_deref().is_some_and(|m| m.contains("ties")),
-        "{why:?}"
+    assert_eq!(
+        got,
+        vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 1.0],
+            vec![2.0, 1.0, 0.0],
+            vec![3.0, 1.0, 1.0]
+        ]
     );
 }
 

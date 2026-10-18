@@ -438,9 +438,9 @@ async fn forward_mode_agrees_with_grad() {
     );
 }
 
-/// Both modes read one rule per aggregate ([`ddx_ad`]'s `reduce`): each
-/// aggregate is differentiated by both or refused by both, and where both
-/// differentiate it they agree, ⟨∇L, t⟩ = J t.
+/// Both modes read one linear form per reduction ([`ddx_ad`]'s `reduce`):
+/// each aggregate or window function is differentiated by both or refused
+/// by both, and where both differentiate it they agree, ⟨∇L, t⟩ = J t.
 #[tokio::test]
 async fn both_modes_have_the_same_aggregate_rules() {
     // (aggregate, differentiated). DataFusion plans a DISTINCT aggregate as
@@ -461,17 +461,55 @@ async fn both_modes_have_the_same_aggregate_rules() {
         ("median(val)", false),
         ("SUM(val) FILTER (WHERE i > 0)", false),
     ];
+    // Plus a sum, so the loss always moves and jvp's own NotScalar refusal
+    // (an output that cannot move) stays out of it.
+    let mut losses: Vec<(String, bool)> = aggregates
+        .into_iter()
+        .map(|(agg, d)| (format!("SELECT {agg} + SUM(val * val) AS l FROM w"), d))
+        .collect();
+    // (window function, differentiated). A frame narrower than the
+    // partition is a running sum or mean; a running extreme is refused.
+    let windows = [
+        ("SUM(val) OVER (PARTITION BY o)", true),
+        ("AVG(val) OVER (PARTITION BY o)", true),
+        ("MAX(val) OVER (PARTITION BY o)", true),
+        ("MIN(val) OVER (PARTITION BY i)", true),
+        ("COUNT(val) OVER (PARTITION BY o)", true),
+        ("SUM(val) OVER (PARTITION BY o ORDER BY i)", true),
+        (
+            "AVG(val) OVER (PARTITION BY o ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            true,
+        ),
+        (
+            "SUM(val) OVER (ORDER BY i, o ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)",
+            true,
+        ),
+        (
+            "MAX(val) OVER (PARTITION BY o ORDER BY i \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+            true,
+        ),
+        ("ROW_NUMBER() OVER (PARTITION BY o ORDER BY i)", true),
+        ("MAX(val) OVER (PARTITION BY o ORDER BY i)", false),
+        ("ROW_NUMBER() OVER (PARTITION BY o ORDER BY val, i)", false),
+    ];
+    losses.extend(windows.into_iter().map(|(win, d)| {
+        (
+            format!(
+                "WITH m AS (SELECT i, o, val, {win} AS r FROM w) \
+                 SELECT SUM(r * val) + SUM(val * val) AS l FROM m"
+            ),
+            d,
+        )
+    }));
     let mut wrong = Vec::new();
-    for (agg, differentiated) in aggregates {
+    for (loss, differentiated) in losses {
         let ctx = ctx();
         let tables = [w()];
         let wrt = [wrt("w", "val")];
         for t in &tables {
             t.create(&ctx).await;
         }
-        // Plus a sum, so the loss always moves and jvp's own NotScalar
-        // refusal (an output that cannot move) stays out of it.
-        let loss = format!("SELECT {agg} + SUM(val * val) AS l FROM w");
         let plan = substrait_of(&ctx, &loss, true).await;
         let forward = ddx_ad::jvp(&plan, &wrt);
         let reverse = grad_dot(&ctx, &loss, &tables, &wrt).await;
@@ -480,18 +518,18 @@ async fn both_modes_have_the_same_aggregate_rules() {
                 let (_, out) = jvp_of(&self::ctx(), &loss, &tables, &wrt).await;
                 let jvp = out[0][1];
                 if (jvp - dot).abs() > 1e-12 * dot.abs().max(1.0) {
-                    wrong.push(format!("{agg}: jvp {jvp} vs ⟨∇L, t⟩ {dot}"));
+                    wrong.push(format!("{loss}: jvp {jvp} vs ⟨∇L, t⟩ {dot}"));
                 }
                 if !differentiated {
-                    wrong.push(format!("{agg}: differentiated, but should be refused"));
+                    wrong.push(format!("{loss}: differentiated, but should be refused"));
                 }
             }
             (Err(e), Err(_)) if differentiated => {
-                wrong.push(format!("{agg}: refused by both: {e}"));
+                wrong.push(format!("{loss}: refused by both: {e}"));
             }
             (Err(_), Err(_)) => {}
-            (Ok(_), Err(e)) => wrong.push(format!("{agg}: only grad refuses: {e}")),
-            (Err(e), Ok(_)) => wrong.push(format!("{agg}: only jvp refuses: {e}")),
+            (Ok(_), Err(e)) => wrong.push(format!("{loss}: only grad refuses: {e}")),
+            (Err(e), Ok(_)) => wrong.push(format!("{loss}: only jvp refuses: {e}")),
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
