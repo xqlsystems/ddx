@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.0...ddx-ad-v0.2.1) - 2026-10-18
+
+### Added
+
+- *(ddx-ad)* one linear form per reduction; window values in reverse mode ([#145](https://github.com/xqlsystems/ddx/pull/145))
+
+### Other
+
+- *(ddx-ad)* one rule per aggregate, read by forward and reverse mode ([#139](https://github.com/xqlsystems/ddx/pull/139))
+
 ## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.1.0...ddx-ad-v0.2.0) - 2026-10-17
 
 ### Added
