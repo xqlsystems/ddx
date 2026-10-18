@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.1...ddx-datafusion-v0.2.2) - 2026-10-18
+
+### Other
+
+- *(ddx-ad)* transpose a contraction without rebuilding its join ([#126](https://github.com/xqlsystems/ddx/pull/126))
+
 ## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.0...ddx-datafusion-v0.2.1) - 2026-10-18
 
 ### Added
