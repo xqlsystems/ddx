@@ -818,3 +818,30 @@ async fn causal_attention_matches_the_general_rule() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_side_that_does_not_move_is_still_checked_for_a_total_order() {
+    // w is constant here, but t recomputes it: a LIMIT inside it may keep
+    // other rows on a second run, so the contraction rule refuses it as the
+    // general rule does.
+    let ctx = SessionContext::new();
+    let mut rng = Rng::new(0x1171);
+    register(
+        &ctx,
+        "a",
+        table(&mut rng, &[("s", 3), ("k", 3)], &["val"], 0.0, None),
+    );
+    register(
+        &ctx,
+        "w",
+        table(&mut rng, &[("k", 3), ("o", 3)], &["val"], 0.0, None),
+    );
+    let loss = "WITH c AS (SELECT a.s, w.o, SUM(a.val * w.val) AS z FROM a \
+                JOIN (SELECT * FROM w LIMIT 4) w ON a.k = w.k GROUP BY a.s, w.o) \
+                SELECT SUM(z * z) AS l FROM c";
+    let refused = ad::grad(&ctx, loss, &[ColumnRef::new("a", "val")]).await;
+    let why = refused
+        .expect_err("a LIMIT in recomputed constant data")
+        .to_string();
+    assert!(why.contains("LIMIT"), "{why}");
+}

@@ -149,6 +149,10 @@ impl Transposer<'_> {
                 return Ok(false);
             }
         }
+        // Both sides are recomputed, the one that does not move too (it makes
+        // t), so their rankings must be total, as the general rule requires of
+        // the whole region.
+        self.check_rankings_are_total(&saved.input)?;
         for x in (0..2).filter(|&x| moves[x]) {
             self.side(&shape, x, cotangent, cot_col)?;
         }
