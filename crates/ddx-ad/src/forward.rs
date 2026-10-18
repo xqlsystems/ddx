@@ -39,6 +39,7 @@
 //! a refusal that is raised only if gradient actually reaches it.
 
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
 use prost::Message;
 
@@ -144,8 +145,9 @@ pub enum Def {
         /// The rows it reads: the region beneath it, as it was before the
         /// window's projection, its columns this region's from `offset` on.
         /// Its transpose runs over these, each row once, whatever filters,
-        /// joins or sparse cotangents do to them above it.
-        beneath: Box<Region>,
+        /// joins or sparse cotangents do to them above it. Shared, so a
+        /// region's copy holds its windows' regions without copying them.
+        beneath: Rc<Region>,
         /// This region's column of `beneath`'s column 0.
         offset: usize,
     },
@@ -785,7 +787,7 @@ impl Builder<'_> {
             .expressions
             .iter()
             .any(|e| matches!(e.rex_type, Some(RexType::WindowFunction(_))))
-            .then(|| Box::new(s.clone()));
+            .then(|| Rc::new(s.clone()));
         let mut exprs = Vec::with_capacity(p.expressions.len());
         let mut direct = inputs.clone();
         for e in &p.expressions {

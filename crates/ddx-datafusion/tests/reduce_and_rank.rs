@@ -268,6 +268,60 @@ async fn a_running_sum_or_mean_has_a_gradient_and_a_running_extreme_is_refused()
     );
 }
 
+/// `depth` layers, each normalizing the last with two windows:
+/// `x - AVG(x) OVER (...) / 2 + MAX(x) OVER (...) / 10`.
+fn stacked_windows(depth: usize) -> String {
+    let mut ctes = vec!["x0 AS (SELECT i, g, val AS x FROM rw)".to_string()];
+    for k in 1..=depth {
+        ctes.push(format!(
+            "x{k} AS (SELECT i, g, x - 0.5 * AVG(x) OVER (PARTITION BY g) \
+             + 0.1 * MAX(x) OVER (PARTITION BY g) AS x FROM x{})",
+            k - 1
+        ));
+    }
+    format!(
+        "WITH {} SELECT SUM(x * x) AS l FROM x{depth}",
+        ctes.join(", ")
+    )
+}
+
+#[tokio::test]
+async fn a_stack_of_windows_is_transposed_once_per_layer() {
+    // Each layer reads the last directly and through two windows. A window
+    // read along several paths is transposed once, and the transpose
+    // beneath a window reads its cotangents from a step rather than a copy
+    // of the region above: before, the program grew about 4x per layer
+    // (30 MB at depth 5), and now it grows with the square of the depth,
+    // from the region recomputed at each layer.
+    let ctx = ctx();
+    let tables = [Table {
+        name: "rw",
+        columns: vec![("i", "BIGINT"), ("g", "BIGINT"), ("val", "DOUBLE")],
+        rows: (0..6)
+            .map(|i| vec![i as f64, (i % 2) as f64, (0.9 * i as f64).cos()])
+            .collect(),
+    }];
+    check_gradients(
+        &ctx,
+        &stacked_windows(3),
+        &tables,
+        &[ColumnRef::new("rw", "val")],
+    )
+    .await;
+    let mut size = Vec::new();
+    for depth in [3, 6] {
+        let plan = substrait_of(&ctx, &stacked_windows(depth), true).await;
+        let program = grad(&plan, &[ColumnRef::new("rw", "val")]).unwrap();
+        size.push(
+            program
+                .steps()
+                .map(|s| format!("{:?}", s.plan).len())
+                .sum::<usize>(),
+        );
+    }
+    assert!(size[1] < 8 * size[0], "{size:?}");
+}
+
 #[tokio::test]
 async fn a_stop_gradient_changes_the_gradient_it_stops() {
     // loss = Σ val · stop(val): the gradient is val, not the 2·val of the

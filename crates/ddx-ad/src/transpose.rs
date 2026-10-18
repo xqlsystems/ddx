@@ -41,6 +41,7 @@
 //! the expressions that use it, so a shared subexpression is computed once.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use ddx_core::Ddx;
 use substrait::proto::aggregate_function::AggregationInvocation;
@@ -80,6 +81,17 @@ pub(crate) struct Transposer<'a> {
     /// `(name, relation, column names)`, in the order they must run.
     pub steps: Vec<(String, Rel, Vec<String>)>,
     region_steps: usize,
+    /// The windows a region transpose reached, not yet transposed.
+    windows: Vec<Gathered>,
+}
+
+/// Windows over one set of rows, and their cotangents so far.
+struct Gathered {
+    /// The rows beneath the windows.
+    beneath: Rc<Region>,
+    /// Each window function, over `beneath`'s columns, with its cotangents
+    /// summed back to those rows: one relation per place that reads it.
+    functions: Vec<(Expression, Vec<Rel>)>,
 }
 
 impl<'a> Transposer<'a> {
@@ -91,6 +103,7 @@ impl<'a> Transposer<'a> {
             contributions: BTreeMap::new(),
             steps: Vec::new(),
             region_steps: 0,
+            windows: Vec::new(),
         }
     }
 
@@ -266,26 +279,9 @@ impl<'a> Transposer<'a> {
         if_then(vec![(call(is_null, vec![field(arg)]), null_f64())], seed)
     }
 
-    /// The transpose of a region's window column, `function` over the rows
-    /// `beneath` it (whose column 0 is the region's column `offset`), with
-    /// the cotangent of each of `rel`'s rows in its column `cotangent`.
-    ///
-    /// A window is a reduction over the rows it read, so its transpose runs
-    /// over those rows, each once. Above the window, a filter may have
-    /// dropped some, a join copied others, and a sparse cotangent left out
-    /// the rest; so `rel`'s cotangents are first summed back to the window's
-    /// rows by the dims of the inputs beneath it (the broadcast rule), and
-    /// joined to the rows `beneath` it, recomputed, a row with none getting
-    /// NULL. The window's transpose is then a region transpose of its own,
-    /// whose contributions add to this region's at the inputs.
-    fn window_rows(
-        &mut self,
-        beneath: &Region,
-        offset: usize,
-        function: &Expression,
-        rel: &Rel,
-        cotangent: usize,
-    ) -> Result<()> {
+    /// The dims of the inputs beneath a window, as columns of `beneath`:
+    /// they tell its rows apart, so cotangents are summed back to them.
+    fn row_keys(&self, beneath: &Region) -> Result<Vec<usize>> {
         let mut keys = Vec::new();
         for (j, slot) in beneath.slots.iter().enumerate() {
             let Some(o) = slot.offset else { continue };
@@ -304,28 +300,107 @@ impl<'a> Transposer<'a> {
                 }
             }
         }
+        Ok(keys)
+    }
+
+    /// Gather the cotangent of a region's window column, `function` over the
+    /// rows `beneath` it (whose column 0 is the region's column `offset`),
+    /// with the cotangent of each of `rel`'s rows in its column `cotangent`.
+    ///
+    /// A window is a reduction over the rows it read, so its transpose runs
+    /// over those rows, each once. Above the window, a filter may have
+    /// dropped some, a join copied others, and a sparse cotangent left out
+    /// the rest; so `rel`'s cotangents are summed back to the window's rows
+    /// by the dims of the inputs beneath it (the broadcast rule). The
+    /// transpose itself waits for [`Self::windows`], so that a window read
+    /// along several paths is transposed once, from all of them.
+    fn gather(
+        &mut self,
+        beneath: &Rc<Region>,
+        offset: usize,
+        function: &Expression,
+        rel: &Rel,
+        cotangent: usize,
+    ) -> Result<()> {
+        let keys = self.row_keys(beneath)?;
         let sum = self.ext.anchor(Function::Sum);
         let summed = aggregate(
             rel.clone(),
             keys.iter().map(|&k| field(offset + k)).collect(),
             vec![(sum, vec![field(cotangent)])],
         );
-        let width = beneath.defs.len();
-        let positions: Vec<usize> = (0..keys.len()).collect();
-        let base = self.join_on(
-            beneath.rel.clone(),
-            summed,
-            keys.iter().map(|&k| field(k)).collect(),
-            &positions,
-            width,
-            JoinType::Left,
-        )?;
+        // Materialized, so the transpose beneath reads it rather than
+        // carrying a copy of this region's: a plan is a tree, and a copy at
+        // each of a stack of windows grew as a power of its depth.
+        let name = format!("{}window_{}", self.f.namespace, self.steps_made());
+        let names: Vec<String> = (0..=keys.len()).map(|i| format!("c{i}")).collect();
+        self.steps.push((name.clone(), summed, names.clone()));
+        let summed = crate::emit::read_step(&name, names);
         let function = map_fields(function, &mut |i| Ok(i - offset))?;
-        let mut rel = project(base, vec![function.clone()]);
-        let (cotangent, own) = (width + keys.len(), width + keys.len() + 1);
-        let mut width = own + 1;
-        let seeds = self.window(beneath, own, &function, cotangent, &mut rel, &mut width)?;
-        self.region(beneath, rel, seeds)
+        let i = match self
+            .windows
+            .iter()
+            .position(|g| Rc::ptr_eq(&g.beneath, beneath))
+        {
+            Some(i) => i,
+            None => {
+                self.windows.push(Gathered {
+                    beneath: Rc::clone(beneath),
+                    functions: Vec::new(),
+                });
+                self.windows.len() - 1
+            }
+        };
+        let functions = &mut self.windows[i].functions;
+        match functions.iter_mut().find(|(f, _)| *f == function) {
+            Some((_, summed_at)) => summed_at.push(summed),
+            None => functions.push((function, vec![summed])),
+        }
+        Ok(())
+    }
+
+    /// Transpose every gathered window, each set of rows beneath windows
+    /// once. A region that reads a window's rows holds the region beneath
+    /// it, so every place that reads a set of rows is a larger region:
+    /// taking the largest first, all of a set's cotangents are gathered
+    /// before it is transposed.
+    fn windows(&mut self) -> Result<()> {
+        while let Some(i) =
+            (0..self.windows.len()).max_by_key(|&i| self.windows[i].beneath.defs.len())
+        {
+            let Gathered { beneath, functions } = self.windows.swap_remove(i);
+            let keys = self.row_keys(&beneath)?;
+            let positions: Vec<usize> = (0..keys.len()).collect();
+            let mut rel = beneath.rel.clone();
+            let mut width = beneath.defs.len();
+            let mut seeds = Vec::new();
+            for (function, summed_at) in functions {
+                // Each place's sums, joined to the rows beneath the window,
+                // recomputed; a row with none gets NULL.
+                let mut cotangents = Vec::new();
+                for summed in summed_at {
+                    rel = self.join_on(
+                        rel,
+                        summed,
+                        keys.iter().map(|&k| field(k)).collect(),
+                        &positions,
+                        width,
+                        JoinType::Left,
+                    )?;
+                    cotangents.push(field(width + keys.len()));
+                    width += keys.len() + 1;
+                }
+                let cotangent = self.null_skipping_sum(cotangents);
+                rel = project(rel, vec![cotangent, function.clone()]);
+                let (cotangent, own) = (width, width + 1);
+                width += 2;
+                seeds.extend(
+                    self.window(&beneath, own, &function, cotangent, &mut rel, &mut width)?,
+                );
+            }
+            self.region_once(&beneath, rel, seeds)?;
+        }
+        Ok(())
     }
 
     fn window(
@@ -525,6 +600,17 @@ impl<'a> Transposer<'a> {
         base: Rel,
         seeds: Vec<(usize, Expression)>,
     ) -> Result<()> {
+        self.region_once(region, base, seeds)?;
+        self.windows()
+    }
+
+    /// [`Self::region`], leaving the windows it reaches gathered.
+    fn region_once(
+        &mut self,
+        region: &Region,
+        base: Rel,
+        seeds: Vec<(usize, Expression)>,
+    ) -> Result<()> {
         self.check_rankings_are_total(region)?;
         let mut width = width(&base)?;
         let mut rel = base;
@@ -579,7 +665,7 @@ impl<'a> Transposer<'a> {
                     // The window reads this column's cotangent.
                     width += batch.len();
                     rel = project(rel, std::mem::take(&mut batch));
-                    self.window_rows(beneath, *offset, function, &rel, here)?;
+                    self.gather(beneath, *offset, function, &rel, here)?;
                 }
                 Def::Const => {
                     return Err(AdError::Internal(format!(

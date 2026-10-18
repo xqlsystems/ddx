@@ -790,7 +790,10 @@ modes. A rank or row number has no derivative. A window's transpose runs over
 the rows it read, recomputed, each once: the cotangents of the rows above it
 are first summed back to them by the dims of the inputs beneath it, so a later
 filter, a join that copies rows, or a group with no cotangent cannot change
-its counts, its ties or its frames.
+its counts, its ties or its frames. Those sums are materialized as a step, and
+a window read along several paths is transposed once, from all of their sums:
+a stack of windows, each layer reading the last both directly and through a
+window, then costs the square of its depth rather than a power of it.
 
 **Map is the seam between v1 and v2.** A projected column is a scalar function
 of other columns of the same row, and its local derivatives are one call into
