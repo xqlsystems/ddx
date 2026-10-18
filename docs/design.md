@@ -786,7 +786,11 @@ same reduction over each row's frame. Over a whole partition it is the
 grouped reduction broadcast back to the rows. Over a running frame, a sum or
 mean's transpose sums over the frame seen from the other side. A running
 extreme moves with a different row in each frame, and is refused in both
-modes. A rank or row number has no derivative.
+modes. A rank or row number has no derivative. A window's transpose runs over
+the rows it read, recomputed, each once: the cotangents of the rows above it
+are first summed back to them by the dims of the inputs beneath it, so a later
+filter, a join that copies rows, or a group with no cotangent cannot change
+its counts, its ties or its frames.
 
 **Map is the seam between v1 and v2.** A projected column is a scalar function
 of other columns of the same row, and its local derivatives are one call into
@@ -1204,13 +1208,13 @@ recomputations repeatable.
 | join, cross join | each side's tangents come along with its values; an outer join's NULL-extended side has NULL tangents |
 | `SUM`, `AVG` (aggregate or window) | the same function over the tangents |
 | `MAX`, `MIN` (aggregate, or window over a whole partition) | the mean tangent of the rows attaining it, found by a window over the group (`jax.jvp` of `jnp.max`) |
-
-Each is the reduction's linear form, `Σ coef · ṫ` over its group, rendered as
-a tangent.
 | `COUNT` | none |
 | `UNION ALL` | each input's tangents, 0 where an input has none |
 | `ddx_stop_gradient(x)` | none |
 | a `wrt` table | its rows joined to the tangent table on its dims |
+
+The reduce rows are each the reduction's linear form, `Σ coef · ṫ` over its
+group, rendered as a tangent.
 
 A column that depends on `wrt` only through conditions (a `CASE` test, a
 comparison, a `COUNT`) has tangent 0, as `jax.jvp` gives and as `grad` gives

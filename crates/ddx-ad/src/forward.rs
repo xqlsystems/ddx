@@ -141,6 +141,13 @@ pub enum Def {
         keys: Option<Vec<usize>>,
         /// The window function.
         function: Expression,
+        /// The rows it reads: the region beneath it, as it was before the
+        /// window's projection, its columns this region's from `offset` on.
+        /// Its transpose runs over these, each row once, whatever filters,
+        /// joins or sparse cotangents do to them above it.
+        beneath: Box<Region>,
+        /// This region's column of `beneath`'s column 0.
+        offset: usize,
     },
     /// A column of a constant input.
     Const,
@@ -188,9 +195,16 @@ impl Region {
                     col,
                 },
                 Def::Expr(e) => Def::Expr(map_fields(&e, &mut |i| Ok(i + shift))?),
-                Def::Window { keys, function } => Def::Window {
+                Def::Window {
+                    keys,
+                    function,
+                    beneath,
+                    offset,
+                } => Def::Window {
                     keys: keys.map(|keys| keys.into_iter().map(|k| k + shift).collect()),
                     function: map_fields(&function, &mut |i| Ok(i + shift))?,
+                    beneath,
+                    offset: offset + shift,
                 },
                 Def::Const => Def::Const,
             });
@@ -766,6 +780,12 @@ impl Builder<'_> {
     /// A projection over `s`, its input's region.
     fn project(&mut self, mut s: Region, p: &ProjectRel) -> Result<(Region, Vec<usize>)> {
         let inputs = s.outputs.clone();
+        // The rows a window in this projection reads.
+        let beneath = p
+            .expressions
+            .iter()
+            .any(|e| matches!(e.rex_type, Some(RexType::WindowFunction(_))))
+            .then(|| Box::new(s.clone()));
         let mut exprs = Vec::with_capacity(p.expressions.len());
         let mut direct = inputs.clone();
         for e in &p.expressions {
@@ -804,6 +824,8 @@ impl Builder<'_> {
                     Def::Window {
                         keys,
                         function: e.clone(),
+                        beneath: beneath.clone().expect("cloned for a window"),
+                        offset: 0,
                     },
                     varied,
                 );

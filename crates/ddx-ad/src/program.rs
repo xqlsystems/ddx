@@ -683,6 +683,7 @@ fn seed_cotangent(t: &mut Transposer, f: &Forward) -> Result<(Vec<String>, usize
         keys,
         &positions,
         width,
+        JoinType::Inner,
     )?;
     // An output row whose value is NULL does not move with anything in it,
     // as an aggregate that skips it would say: its cotangent is NULL, so none

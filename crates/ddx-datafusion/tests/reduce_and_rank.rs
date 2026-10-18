@@ -176,6 +176,63 @@ async fn a_window_over_each_whole_partition_has_its_group_by_forms_gradient() {
 }
 
 #[tokio::test]
+async fn a_window_sees_every_row_beneath_it_whatever_happens_to_them_above() {
+    // The window's transpose runs over the rows the window read, not the rows
+    // that reach the loss: a group with no cotangent, a filter after the
+    // window, or a join that copies its rows must not change its count, its
+    // tie or its frame.
+    let tables = [
+        Table {
+            name: "wa",
+            columns: vec![("i", "BIGINT"), ("g", "BIGINT"), ("val", "DOUBLE")],
+            rows: (0..8)
+                .map(|i| {
+                    let v = if i == 2 || i == 5 {
+                        1.5
+                    } else {
+                        (0.9 * i as f64).cos()
+                    };
+                    vec![i as f64, (i % 3) as f64, v]
+                })
+                .collect(),
+        },
+        Table {
+            name: "dup",
+            columns: vec![("g", "BIGINT"), ("k", "BIGINT"), ("w", "DOUBLE")],
+            rows: vec![
+                vec![0.0, 0.0, 0.5],
+                vec![0.0, 1.0, -1.25],
+                vec![1.0, 0.0, 2.0],
+            ],
+        },
+    ];
+    let wrt = [ColumnRef::new("wa", "val")];
+    for win in [
+        "AVG(val) OVER ()",
+        "MAX(val) OVER ()",
+        "SUM(val) OVER (ORDER BY i, g ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)",
+    ] {
+        let m = format!("m AS (SELECT i, g, val, val * val - {win} AS d FROM wa)");
+        for loss in [
+            // Only group 0's aggregate has a cotangent.
+            format!(
+                "WITH {m}, a AS (SELECT g, SUM(d) AS s FROM m GROUP BY g) \
+                 SELECT SUM(s * s) AS l FROM a WHERE g = 0"
+            ),
+            // A filter after the window, in its region.
+            format!("WITH {m} SELECT SUM(d * d) AS l FROM m WHERE g <> 1"),
+            // A semi-join after the window.
+            format!("WITH {m} SELECT SUM(d * d) AS l FROM m WHERE g IN (SELECT g FROM dup)"),
+            // A join after the window that copies some rows and drops others.
+            format!("WITH {m} SELECT SUM(d * d * dup.w) AS l FROM m JOIN dup ON m.g = dup.g"),
+        ] {
+            let ctx = ctx();
+            check_gradients(&ctx, &loss, &tables, &wrt).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_running_sum_or_mean_has_a_gradient_and_a_running_extreme_is_refused() {
     // A running sum's transpose is a sum over the frame seen from the other
     // side (k PRECEDING ↔ k FOLLOWING). A running maximum moves with a

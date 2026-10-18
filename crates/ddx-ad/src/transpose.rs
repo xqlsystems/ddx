@@ -55,7 +55,9 @@ use substrait::proto::{CrossRel, Expression, FunctionArgument, Rel};
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
 use crate::error::{AdError, Result};
-use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
+use crate::expr::{
+    as_number, call, field, fields_of, if_then, lit_f64, map_fields, null_f64, window,
+};
 use crate::forward::{subquery_rounds, width, Def, Forward, Input, Output, Region};
 use crate::functions::{Extensions, Function};
 use crate::reduce::{no_rule, reduce_rule, Linear, Reduce};
@@ -157,7 +159,7 @@ impl<'a> Transposer<'a> {
         // broadcast every reduce rule starts from.
         let cotangent_at = next + dims.len();
         let key_positions: Vec<usize> = (0..dims.len()).collect();
-        let base = self.join_on(rel, cotangent, keys, &key_positions, next)?;
+        let base = self.join_on(rel, cotangent, keys, &key_positions, next, JoinType::Inner)?;
         let mut seeds = Vec::new();
         for (r, &(_, i)) in counted.iter().zip(&reductions) {
             seeds.push((r.arg, self.seed(r, field(cotangent_at + i))));
@@ -264,10 +266,68 @@ impl<'a> Transposer<'a> {
         if_then(vec![(call(is_null, vec![field(arg)]), null_f64())], seed)
     }
 
-    /// The transpose of window column `c` of `region` (`function`, a
-    /// reduction over each row's frame), whose rows' cotangents are in column
-    /// `cotangent` of `rel` (`width` columns). Returns the terms of the
-    /// columns its argument reads.
+    /// The transpose of a region's window column, `function` over the rows
+    /// `beneath` it (whose column 0 is the region's column `offset`), with
+    /// the cotangent of each of `rel`'s rows in its column `cotangent`.
+    ///
+    /// A window is a reduction over the rows it read, so its transpose runs
+    /// over those rows, each once. Above the window, a filter may have
+    /// dropped some, a join copied others, and a sparse cotangent left out
+    /// the rest; so `rel`'s cotangents are first summed back to the window's
+    /// rows by the dims of the inputs beneath it (the broadcast rule), and
+    /// joined to the rows `beneath` it, recomputed, a row with none getting
+    /// NULL. The window's transpose is then a region transpose of its own,
+    /// whose contributions add to this region's at the inputs.
+    fn window_rows(
+        &mut self,
+        beneath: &Region,
+        offset: usize,
+        function: &Expression,
+        rel: &Rel,
+        cotangent: usize,
+    ) -> Result<()> {
+        let mut keys = Vec::new();
+        for (j, slot) in beneath.slots.iter().enumerate() {
+            let Some(o) = slot.offset else { continue };
+            match slot.input {
+                Input::Const if slot.at_most_one_row => continue,
+                Input::Const => {
+                    return Err(AdError::NotImplemented(
+                        "a window function that carries gradient over rows joined to data ddx \
+                         has no dims for: ddx cannot tell its rows apart to sum their \
+                         cotangents; materialize the data as a table first"
+                            .into(),
+                    ))
+                }
+                Input::Table(_) | Input::Saved(_) => {
+                    keys.extend(self.slot_dims(beneath, j)?.into_iter().map(|d| o + d))
+                }
+            }
+        }
+        let sum = self.ext.anchor(Function::Sum);
+        let summed = aggregate(
+            rel.clone(),
+            keys.iter().map(|&k| field(offset + k)).collect(),
+            vec![(sum, vec![field(cotangent)])],
+        );
+        let width = beneath.defs.len();
+        let positions: Vec<usize> = (0..keys.len()).collect();
+        let base = self.join_on(
+            beneath.rel.clone(),
+            summed,
+            keys.iter().map(|&k| field(k)).collect(),
+            &positions,
+            width,
+            JoinType::Left,
+        )?;
+        let function = map_fields(function, &mut |i| Ok(i - offset))?;
+        let mut rel = project(base, vec![function.clone()]);
+        let (cotangent, own) = (width + keys.len(), width + keys.len() + 1);
+        let mut width = own + 1;
+        let seeds = self.window(beneath, own, &function, cotangent, &mut rel, &mut width)?;
+        self.region(beneath, rel, seeds)
+    }
+
     fn window(
         &mut self,
         region: &Region,
@@ -421,7 +481,7 @@ impl<'a> Transposer<'a> {
     }
 
     /// Join `left` (whose columns before `left_width` are a region's) to
-    /// `right` on `left_keys[k] = right column right_keys[k]`, null-safely; a
+    /// `right`, by `kind`, on `left_keys[k] = right column right_keys[k]`, null-safely; a
     /// cross join when there are no keys.
     pub fn join_on(
         &mut self,
@@ -430,6 +490,7 @@ impl<'a> Transposer<'a> {
         left_keys: Vec<Expression>,
         right_keys: &[usize],
         left_width: usize,
+        kind: JoinType,
     ) -> Result<Rel> {
         if left_keys.is_empty() {
             return Ok(Rel {
@@ -450,7 +511,7 @@ impl<'a> Transposer<'a> {
             .map(|(key, &r)| call(same, vec![key, field(left_width + r)]))
             .reduce(|a, b| call(and, vec![a, b]))
             .expect("at least one key");
-        Ok(join(left, right, cond, JoinType::Inner))
+        Ok(join(left, right, cond, kind))
     }
 
     /// The transpose of a recomputed region, from `seeds` (a column and its
@@ -509,15 +570,16 @@ impl<'a> Transposer<'a> {
                 Def::Input { slot, col } => {
                     at_inputs.entry(*slot).or_default().insert(*col, here);
                 }
-                Def::Window { function, .. } => {
+                Def::Window {
+                    function,
+                    beneath,
+                    offset,
+                    ..
+                } => {
                     // The window reads this column's cotangent.
                     width += batch.len();
                     rel = project(rel, std::mem::take(&mut batch));
-                    for (read, term) in
-                        self.window(region, c, function, here, &mut rel, &mut width)?
-                    {
-                        pending.entry(read).or_default().push(term);
-                    }
+                    self.window_rows(beneath, *offset, function, &rel, here)?;
                 }
                 Def::Const => {
                     return Err(AdError::Internal(format!(
