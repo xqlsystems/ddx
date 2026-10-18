@@ -123,10 +123,31 @@ fn a_gradient_is_a_column_of_its_table_s_rows() {
         ),
         "{out}"
     );
+    // Nothing reads the objective once its call reads `g_w`.
+    assert!(out.starts_with("SELECT w.i"), "{out}");
+}
+
+#[test]
+fn a_rewritten_statement_keeps_only_the_ctes_it_still_reads() {
+    // `loss` and `d`, which only `loss` reads, go; `kept`, which the body
+    // reads (spelled in another case), stays, and so does `base`, which
+    // only `kept` reads.
+    let sql = "WITH base AS (SELECT i, 2 AS k FROM x), kept AS (SELECT i, k FROM base), \
+               d AS (SELECT * FROM x), \
+               loss AS (SELECT SUM(w.val * d.v) AS l FROM w JOIN d ON w.i = d.i) \
+               SELECT w.i, w.val - 0.1 * grad(loss, w.val) AS val FROM w JOIN KEPT ON w.i = kept.i";
+    let out = rewritten(&find(sql));
     assert!(
-        out.starts_with("WITH d AS (SELECT * FROM x), loss AS"),
+        out.starts_with(
+            "WITH base AS (SELECT i, 2 AS k FROM x), kept AS (SELECT i, k FROM base) SELECT"
+        ),
         "{out}"
     );
+    // A CTE read only inside a subquery is read.
+    let sql = "WITH t AS (SELECT 1 AS i), loss AS (SELECT SUM(val) AS l FROM w) \
+               SELECT i, grad(loss, val) AS g FROM w WHERE i IN (SELECT i FROM t)";
+    let out = rewritten(&find(sql));
+    assert!(out.starts_with("WITH t AS (SELECT 1 AS i) SELECT"), "{out}");
 }
 
 #[test]
