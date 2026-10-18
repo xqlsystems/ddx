@@ -642,3 +642,54 @@ async fn a_column_may_name_its_table_with_its_schema() {
     .await;
     assert_eq!(got, vec![(0, 2.0), (1, -4.0), (2, 1.0)]);
 }
+
+#[tokio::test]
+async fn a_window_shift_has_the_gradient_of_its_group_by_form() {
+    // Log-sum-exp's shift, `x - MAX(x) OVER (PARTITION BY i)`, is the grouped
+    // maximum joined back to its rows, so both spellings have one gradient.
+    let ctx = SessionContext::new();
+    ctx.sql(
+        "CREATE TABLE s (i BIGINT, j BIGINT, x DOUBLE) AS \
+         VALUES (0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 5.0)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let gradient = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            let batches = ad::sql(&ctx, sql).await.unwrap().collect().await.unwrap();
+            let mut out = Vec::new();
+            for b in &batches {
+                let g = b.column(2).as_primitive::<Float64Type>();
+                out.extend((0..b.num_rows()).map(|r| g.value(r)));
+            }
+            out
+        }
+    };
+    let window = gradient(
+        "WITH m AS (SELECT i, j, x - MAX(x) OVER (PARTITION BY i) AS d FROM s), \
+              loss AS (SELECT SUM(exp(d)) AS l FROM m) \
+         SELECT i, j, grad(loss, x) AS g FROM s ORDER BY i, j",
+    )
+    .await;
+    let grouped = gradient(
+        "WITH mx AS (SELECT i, MAX(x) AS m FROM s GROUP BY i), \
+              d AS (SELECT s.i, s.j, s.x - mx.m AS d FROM s JOIN mx ON s.i = mx.i), \
+              loss AS (SELECT SUM(exp(d)) AS l FROM d) \
+         SELECT i, j, grad(loss, x) AS g FROM s ORDER BY i, j",
+    )
+    .await;
+    // Each partition's non-maximal row gets exp(x - max); the maximal row
+    // gets 1 from its own term less the sum of every term from the shift.
+    let (a, b) = ((-1.0f64).exp(), (-2.0f64).exp());
+    let want = [a, -a, b, -b];
+    for (got, name) in [(&window, "window"), (&grouped, "GROUP BY")] {
+        assert_eq!(got.len(), 4, "{name}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-12, "{name}: {got:?} vs {want:?}");
+        }
+    }
+}

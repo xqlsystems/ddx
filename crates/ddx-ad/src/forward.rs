@@ -39,11 +39,12 @@
 //! a refusal that is raised only if gradient actually reaches it.
 
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
 use prost::Message;
 
 use substrait::proto::aggregate_rel::Grouping;
-use substrait::proto::expression::{window_function, RexType, WindowFunction};
+use substrait::proto::expression::RexType;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
@@ -63,6 +64,7 @@ use crate::expr::{
     uncorrelated_scalar,
 };
 use crate::functions::Functions;
+use crate::reduce::{reduce_rule, whole_partition, Reduce};
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
 
 /// What an input of a region is.
@@ -127,14 +129,27 @@ pub enum Def {
     },
     /// A scalar expression over earlier columns: the map primitive.
     Expr(Expression),
-    /// A window function: a value computed across rows (a rank), with no
-    /// derivative. `keys` are the columns it partitions and orders by, or
-    /// `None` if its value is the same however the rows of a partition are
-    /// ordered (an exact aggregate over each whole partition: `MAX(x) OVER
-    /// (PARTITION BY g)`), so it needs no ties broken.
+    /// A window function, `function`, over earlier columns: a value
+    /// computed across rows. `keys` are the columns it partitions and orders
+    /// by, or `None` if it is an aggregate with a rule ([`crate::reduce`])
+    /// over each whole partition (`MAX(x) OVER (PARTITION BY g)`). Then it
+    /// needs no ties broken, since its value is the same however a
+    /// partition's rows are ordered, and its transpose is its reduction's.
+    /// Any other window that carries gradient (a rank, a running sum) is
+    /// refused.
     Window {
         /// The columns it partitions and orders by.
         keys: Option<Vec<usize>>,
+        /// The window function.
+        function: Expression,
+        /// The rows it reads: the region beneath it, as it was before the
+        /// window's projection, its columns this region's from `offset` on.
+        /// Its transpose runs over these, each row once, whatever filters,
+        /// joins or sparse cotangents do to them above it. Shared, so a
+        /// region's copy holds its windows' regions without copying them.
+        beneath: Rc<Region>,
+        /// This region's column of `beneath`'s column 0.
+        offset: usize,
     },
     /// A column of a constant input.
     Const,
@@ -182,8 +197,16 @@ impl Region {
                     col,
                 },
                 Def::Expr(e) => Def::Expr(map_fields(&e, &mut |i| Ok(i + shift))?),
-                Def::Window { keys } => Def::Window {
+                Def::Window {
+                    keys,
+                    function,
+                    beneath,
+                    offset,
+                } => Def::Window {
                     keys: keys.map(|keys| keys.into_iter().map(|k| k + shift).collect()),
+                    function: map_fields(&function, &mut |i| Ok(i + shift))?,
+                    beneath,
+                    offset: offset + shift,
                 },
                 Def::Const => Def::Const,
             });
@@ -230,7 +253,7 @@ impl Region {
     fn detached_cuts(&self) -> Vec<Cut> {
         let mut cuts = self.cuts.clone();
         for (c, d) in self.defs.iter().enumerate() {
-            if let Def::Window { keys: Some(keys) } = d {
+            if let Def::Window { keys: Some(keys), .. } = d {
                 cuts.push(self.cut(Some(keys.clone()), c));
             }
         }
@@ -759,6 +782,12 @@ impl Builder<'_> {
     /// A projection over `s`, its input's region.
     fn project(&mut self, mut s: Region, p: &ProjectRel) -> Result<(Region, Vec<usize>)> {
         let inputs = s.outputs.clone();
+        // The rows a window in this projection reads.
+        let beneath = p
+            .expressions
+            .iter()
+            .any(|e| matches!(e.rex_type, Some(RexType::WindowFunction(_))))
+            .then(|| Rc::new(s.clone()));
         let mut exprs = Vec::with_capacity(p.expressions.len());
         let mut direct = inputs.clone();
         for e in &p.expressions {
@@ -770,23 +799,58 @@ impl Builder<'_> {
                 continue;
             }
             let col = if let Some(RexType::WindowFunction(w)) = &e.rex_type {
-                let keys = (!self.whole_partition_exact(w)?).then(|| {
+                let rule = reduce_rule(
+                    self.functions,
+                    w.function_reference,
+                    w.invocation,
+                    &w.arguments,
+                );
+                let reduces = whole_partition(w) && matches!(rule, Ok(Some(_)));
+                let keys = (!reduces).then(|| {
                     w.partitions
                         .iter()
                         .chain(w.sorts.iter().filter_map(|s| s.expr.as_ref()))
                         .filter_map(order_key)
                         .collect()
                 });
-                let varied = fields_of(&e)?.into_iter().any(|f| s.varied[f]);
-                let col = s.push(Def::Window { keys }, varied);
-                s.refuse(
-                    col,
-                    AdError::NotImplemented(
-                        "a window function's result is used as a value that carries gradient; \
-                         a rank or row number has no derivative"
-                            .into(),
-                    ),
+                // A window moves only with its argument, by its rule: one
+                // varied only through its partitions or ordering (or a
+                // count) is piecewise constant.
+                let varied = match &rule {
+                    Ok(Some(Reduce::Of(_, arg))) => depends(self.functions, arg, &|f| s.varied[f])?,
+                    Ok(Some(Reduce::Constant)) => false,
+                    Ok(None) | Err(_) => fields_of(&e)?.into_iter().any(|f| s.varied[f]),
+                };
+                let name = self.functions.name(w.function_reference)?.to_string();
+                let col = s.push(
+                    Def::Window {
+                        keys,
+                        function: e.clone(),
+                        beneath: beneath.clone().expect("cloned for a window"),
+                        offset: 0,
+                    },
+                    varied,
                 );
+                match rule {
+                    Err(why) => s.refuse(col, why),
+                    Ok(None) => s.refuse(
+                        col,
+                        AdError::NotImplemented(format!(
+                            "the window function `{name}` is used as a value that carries \
+                             gradient, and has no derivative (ddx differentiates SUM, AVG, MAX \
+                             and MIN windows; a rank or row number has none)"
+                        )),
+                    ),
+                    Ok(Some(Reduce::Of(form, _))) if form.extreme.is_some() && !reduces => s.refuse(
+                        col,
+                        AdError::NotImplemented(format!(
+                            "a running `{name}` (a window whose frame is narrower than its \
+                             partition) is used as a value that carries gradient; ddx \
+                             differentiates a MAX or MIN window over each whole partition"
+                        )),
+                    ),
+                    Ok(Some(_)) => {}
+                }
                 col
             } else if contains(&e, &|x| {
                 matches!(x.rex_type, Some(RexType::WindowFunction(_)))
@@ -812,22 +876,6 @@ impl Builder<'_> {
             s.rel = rename_in_place(s.rel, width, &windows);
         }
         Ok((s, direct))
-    }
-
-    /// Is `w` an exact aggregate (`MAX`, `MIN`, `COUNT`) over each whole
-    /// partition, with no `ORDER BY` and no frame narrower than it? Then its
-    /// value does not depend on how a partition's rows are ordered, and a
-    /// recomputation gives the same one.
-    fn whole_partition_exact(&self, w: &WindowFunction) -> Result<bool> {
-        use substrait::proto::expression::window_function::bound::Kind;
-        let unbounded = |b: &Option<window_function::Bound>| match b {
-            None => true,
-            Some(b) => matches!(b.kind, None | Some(Kind::Unbounded(_))),
-        };
-        Ok(w.sorts.is_empty()
-            && unbounded(&w.lower_bound)
-            && unbounded(&w.upper_bound)
-            && !self.functions.rounds(w.function_reference)?)
     }
 
     fn join(&mut self, j: &JoinRel) -> Result<(Region, Vec<usize>)> {

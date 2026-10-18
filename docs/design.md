@@ -771,6 +771,29 @@ and v2 does the same:
 | | `AVG` | the same, divided by the group's count |
 | | `MAX`, `MIN` | the group's cotangent to the rows attaining it, shared evenly at a tie |
 | | `COUNT` | nothing: it does not change when its argument does |
+| | a window `SUM` or `AVG` | each row's cotangent (over its frame's count, for `AVG`), summed over the frame mirrored (`k PRECEDING` ↔ `k FOLLOWING`) |
+| | a window `MAX` or `MIN` over each whole partition | the grouped rule, from the sum of the partition's cotangents |
+
+**One linear form per reduction.** Every reduction's tangent is linear in its
+argument's: `Σ over the group's rows of coef · ṫ`, with `coef` 1 for `SUM`,
+`1/count` for `AVG`, and `1/(number attaining)` on the rows attaining a
+`MAX` or `MIN` (0 elsewhere). ddx-ad's `reduce.rs` defines that form once, as
+JAX's `deflinear` defines a linear primitive once. Forward mode renders it
+as a tangent (`SUM` of the counted tangents, or `AVG` when they share it),
+and reverse mode as its transpose (the group's cotangent times `coef`), so
+the two modes have the same rules by construction. A window function is the
+same reduction over each row's frame. Over a whole partition it is the
+grouped reduction broadcast back to the rows. Over a running frame, a sum or
+mean's transpose sums over the frame seen from the other side. A running
+extreme moves with a different row in each frame, and is refused in both
+modes. A rank or row number has no derivative. A window's transpose runs over
+the rows it read, recomputed, each once: the cotangents of the rows above it
+are first summed back to them by the dims of the inputs beneath it, so a later
+filter, a join that copies rows, or a group with no cotangent cannot change
+its counts, its ties or its frames. Those sums are materialized as a step, and
+a window read along several paths is transposed once, from all of their sums:
+a stack of windows, each layer reading the last both directly and through a
+window, then costs the square of its depth rather than a power of it.
 
 **Map is the seam between v1 and v2.** A projected column is a scalar function
 of other columns of the same row, and its local derivatives are one call into
@@ -1192,6 +1215,9 @@ recomputations repeatable.
 | `UNION ALL` | each input's tangents, 0 where an input has none |
 | `ddx_stop_gradient(x)` | none |
 | a `wrt` table | its rows joined to the tangent table on its dims |
+
+The reduce rows are each the reduction's linear form, `Σ coef · ṫ` over its
+group, rendered as a tangent.
 
 A column that depends on `wrt` only through conditions (a `CASE` test, a
 comparison, a `COUNT`) has tangent 0, as `jax.jvp` gives and as `grad` gives
