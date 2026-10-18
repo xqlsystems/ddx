@@ -85,6 +85,7 @@ macro_rules! internal {
 }
 
 mod compose;
+mod contraction;
 mod elementwise;
 mod error;
 mod functions;

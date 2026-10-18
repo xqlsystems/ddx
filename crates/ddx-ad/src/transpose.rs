@@ -74,7 +74,7 @@ pub(crate) struct Contribution {
 pub(crate) struct Transposer<'a> {
     pub f: &'a Forward,
     pub ext: Extensions,
-    ew: Elementwise<'a>,
+    pub(crate) ew: Elementwise<'a>,
     pub contributions: BTreeMap<Input, Vec<Contribution>>,
     /// Steps the transposes need materialized before the contributions that
     /// read them: a region's cotangents, when several inputs read them.
@@ -115,8 +115,7 @@ impl<'a> Transposer<'a> {
     /// per entry of `cols`.
     pub fn saved(&mut self, n: usize, cols: &[usize], cotangent: Rel) -> Result<()> {
         let saved = &self.f.saved[n];
-        let mut region = saved.input.clone();
-        let width = region.defs.len();
+        let width = saved.input.defs.len();
         let dims = saved.dims();
 
         // Each measure's argument becomes a column of the region, so the
@@ -146,6 +145,20 @@ impl<'a> Transposer<'a> {
             reductions.push((Reduction::new(arg_col, form), i));
             args.push(arg);
         }
+        // A contraction's transpose needs no rebuilt join (see
+        // `crate::contraction`).
+        if let ([(r, i)], [arg]) = (&reductions[..], &args[..]) {
+            if r.form
+                == (Linear {
+                    extreme: None,
+                    shared: false,
+                })
+                && self.contraction(n, arg, &cotangent, *i)?
+            {
+                return Ok(());
+            }
+        }
+        let mut region = saved.input.clone();
         for e in &args {
             let varied = depends(&self.f.functions, e, &|c| region.varied[c])?;
             region.defs.push(Def::Expr(e.clone()));
@@ -750,7 +763,7 @@ impl<'a> Transposer<'a> {
     /// must partition or order by each dim of the rows beneath it; otherwise
     /// the program is refused rather than risk sending gradient to rows the
     /// forward pass did not keep.
-    fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
+    pub(crate) fn check_rankings_are_total(&self, region: &Region) -> Result<()> {
         if region.volatile {
             return Err(AdError::NotImplemented(
                 "a volatile function (random(), now(), …) in rows that carry gradient: ddx \
