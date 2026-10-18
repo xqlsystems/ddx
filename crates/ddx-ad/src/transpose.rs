@@ -20,7 +20,9 @@
 //! A matrix product, `SUM(a.v * b.v) … GROUP BY` over a join, is not a
 //! primitive: it is broadcast, map and reduce, and its transpose is theirs
 //! composed, which gives `Ā = Σ_out C̄·B` and `B̄ = Σ_batch A·C̄`. A `COUNT`
-//! does not change when its argument does, so its transpose is zero.
+//! does not change when its argument does, so its transpose is zero. Which
+//! aggregates have a rule, and which, is [`crate::reduce`]'s, which forward
+//! mode reads too.
 //!
 //! # How the rules are applied
 //!
@@ -39,11 +41,9 @@
 use std::collections::BTreeMap;
 
 use ddx_core::Ddx;
-use substrait::proto::aggregate_function::AggregationInvocation;
-use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
-use substrait::proto::{AggregateFunction, CrossRel, Expression, Rel};
+use substrait::proto::{CrossRel, Expression, Rel};
 
 use crate::elementwise::{depends, Elementwise};
 use crate::emit::{aggregate, join, project};
@@ -51,6 +51,7 @@ use crate::error::{AdError, Result};
 use crate::expr::{as_number, call, field, fields_of, if_then, lit_f64, null_f64, window};
 use crate::forward::{subquery_rounds, width, Def, Forward, Input, Output, Region};
 use crate::functions::{Extensions, Function};
+use crate::reduce::{no_rule, reduce_rule, Reduce, Rule};
 
 /// An input's cotangent from one place that reads it: the input's dims, then
 /// the cotangent of each of its columns in `cols`.
@@ -111,12 +112,16 @@ impl<'a> Transposer<'a> {
                         .into(),
                 ));
             };
-            let (rule, arg) = match reduce_rule(&self.f.functions, &saved.measures[m])? {
-                Reduce::Constant => continue,
-                Reduce::Of(rule, arg) => (rule, arg),
-            };
+            let f = &saved.measures[m];
+            let functions = &self.f.functions;
+            let (rule, arg) =
+                match reduce_rule(functions, f.function_reference, f.invocation, &f.arguments)? {
+                    Some(Reduce::Constant) => continue,
+                    Some(Reduce::Of(rule, arg)) => (rule, arg.clone()),
+                    None => return Err(no_rule(functions.name(f.function_reference)?)),
+                };
             rules.push((width + args.len(), rule, i, col));
-            args.push(*arg);
+            args.push(arg);
         }
         for e in &args {
             let varied = depends(&self.f.functions, e, &|c| region.varied[c])?;
@@ -713,68 +718,5 @@ fn saved_jitters(f: &Forward, n: usize, col: usize) -> bool {
             })
         }
         None => true,
-    }
-}
-
-/// Which reduce rule a measure has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rule {
-    /// `SUM`: every row gets the group's cotangent.
-    Sum,
-    /// `AVG`: every row gets the group's cotangent over the group's count.
-    Mean,
-    /// `MAX` or `MIN` (the name): the rows attaining it share the group's
-    /// cotangent.
-    Extreme(Function),
-}
-
-/// What the reduce rules do with one measure.
-enum Reduce {
-    /// The cotangent flows into this argument by this rule.
-    Of(Rule, Box<Expression>),
-    /// Unchanged when its argument changes: no cotangent flows.
-    Constant,
-}
-
-/// The reduce rule for an aggregate function, or a refusal naming what ddx
-/// has rules for.
-fn reduce_rule(functions: &crate::functions::Functions, f: &AggregateFunction) -> Result<Reduce> {
-    let name = functions.name(f.function_reference)?;
-    let args: Vec<&Expression> = f
-        .arguments
-        .iter()
-        .filter_map(|a| match &a.arg_type {
-            Some(ArgType::Value(e)) => Some(e),
-            _ => None,
-        })
-        .collect();
-    let rule = match name {
-        "count" => return Ok(Reduce::Constant),
-        "sum" => Rule::Sum,
-        "avg" | "mean" => Rule::Mean,
-        "max" => Rule::Extreme(Function::Max),
-        "min" => Rule::Extreme(Function::Min),
-        other => {
-            return Err(AdError::NotImplemented(format!(
-                "the aggregate `{other}` over a value that carries gradient; ddx has transpose \
-                 rules for SUM, AVG, MAX, MIN and COUNT"
-            )))
-        }
-    };
-    // DISTINCT changes which rows a sum or mean counts; it makes no difference
-    // to a max or min.
-    if f.invocation == AggregationInvocation::Distinct as i32 && !matches!(rule, Rule::Extreme(_)) {
-        return Err(AdError::NotImplemented(format!(
-            "{}(DISTINCT …) over a value that carries gradient",
-            name.to_uppercase()
-        )));
-    }
-    match args.as_slice() {
-        [arg] => Ok(Reduce::Of(rule, Box::new((*arg).clone()))),
-        _ => Err(AdError::InvalidPlan(format!(
-            "{} with {} arguments",
-            name.to_uppercase(),
-            args.len()
-        ))),
     }
 }

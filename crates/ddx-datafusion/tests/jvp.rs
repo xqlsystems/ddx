@@ -386,18 +386,17 @@ async fn a_missing_tangent_row_is_zero_and_a_null_value_has_a_null_tangent() {
 }
 
 /// ⟨∇L, t⟩, from `grad`, equals the jvp of `L` along `t`.
-#[tokio::test]
-async fn forward_mode_agrees_with_grad() {
-    let ctx = ctx();
-    let loss = "WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.val)) AS y \
-                           FROM x JOIN w ON x.i = w.i JOIN b ON w.o = b.o GROUP BY x.n, w.o) \
-                SELECT SUM(y * y) / COUNT(*) + MAX(y) AS loss FROM h";
-    let tables = [x(), w(), b()];
-    let wrt = [wrt("x", "v"), wrt("w", "val"), wrt("b", "val")];
-    let (_, out) = jvp_of(&ctx, loss, &tables, &wrt).await;
-    let plan = substrait_of(&ctx, loss, true).await;
-    let program = ddx_ad::grad(&plan, &wrt).unwrap();
-    run(&ctx, &program).await;
+/// ⟨∇L, t⟩: `loss`'s gradient by reverse mode, dotted with [`direction`],
+/// or reverse mode's refusal. `tables` must already be created in `ctx`.
+async fn grad_dot(
+    ctx: &SessionContext,
+    loss: &str,
+    tables: &[Table],
+    wrt: &[ColumnRef],
+) -> Result<f64, AdError> {
+    let plan = substrait_of(ctx, loss, true).await;
+    let program = ddx_ad::grad(&plan, wrt)?;
+    run(ctx, &program).await;
     let mut dot = 0.0;
     for g in &program.gradients {
         let table = tables
@@ -409,7 +408,7 @@ async fn forward_mode_agrees_with_grad() {
             .iter()
             .position(|(_, t)| *t == "DOUBLE")
             .unwrap();
-        let grads = rows(&ctx, &format!("SELECT * FROM {}", g.step)).await;
+        let grads = rows(ctx, &format!("SELECT * FROM {}", g.step)).await;
         for (r, row) in table.rows.iter().enumerate() {
             let key: Vec<f64> = (0..table.columns.len())
                 .filter(|&c| c != val)
@@ -419,11 +418,83 @@ async fn forward_mode_agrees_with_grad() {
             dot += gr[key.len()] * direction(r, 0);
         }
     }
+    Ok(dot)
+}
+
+#[tokio::test]
+async fn forward_mode_agrees_with_grad() {
+    let ctx = ctx();
+    let loss = "WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.val)) AS y \
+                           FROM x JOIN w ON x.i = w.i JOIN b ON w.o = b.o GROUP BY x.n, w.o) \
+                SELECT SUM(y * y) / COUNT(*) + MAX(y) AS loss FROM h";
+    let tables = [x(), w(), b()];
+    let wrt = [wrt("x", "v"), wrt("w", "val"), wrt("b", "val")];
+    let (_, out) = jvp_of(&ctx, loss, &tables, &wrt).await;
+    let dot = grad_dot(&ctx, loss, &tables, &wrt).await.unwrap();
     let jvp = out[0][1];
     assert!(
         (jvp - dot).abs() <= 1e-12 * dot.abs().max(1.0),
         "jvp {jvp} vs ⟨∇L, t⟩ {dot}"
     );
+}
+
+/// Both modes read one rule per aggregate ([`ddx_ad`]'s `reduce`): each
+/// aggregate is differentiated by both or refused by both, and where both
+/// differentiate it they agree, ⟨∇L, t⟩ = J t.
+#[tokio::test]
+async fn both_modes_have_the_same_aggregate_rules() {
+    // (aggregate, differentiated). DataFusion plans a DISTINCT aggregate as
+    // a GROUP BY of its argument, so those are refused as a GROUP BY key
+    // that moves; COUNT(DISTINCT) stays an aggregate.
+    let aggregates = [
+        ("SUM(val)", true),
+        ("AVG(val)", true),
+        ("MAX(val)", true),
+        ("MIN(val)", true),
+        ("COUNT(val)", true),
+        ("COUNT(DISTINCT val)", true),
+        ("SUM(val ORDER BY i)", true),
+        ("MAX(val ORDER BY i DESC)", true),
+        ("SUM(DISTINCT val)", false),
+        ("MAX(DISTINCT val)", false),
+        ("stddev(val)", false),
+        ("median(val)", false),
+        ("SUM(val) FILTER (WHERE i > 0)", false),
+    ];
+    let mut wrong = Vec::new();
+    for (agg, differentiated) in aggregates {
+        let ctx = ctx();
+        let tables = [w()];
+        let wrt = [wrt("w", "val")];
+        for t in &tables {
+            t.create(&ctx).await;
+        }
+        // Plus a sum, so the loss always moves and jvp's own NotScalar
+        // refusal (an output that cannot move) stays out of it.
+        let loss = format!("SELECT {agg} + SUM(val * val) AS l FROM w");
+        let plan = substrait_of(&ctx, &loss, true).await;
+        let forward = ddx_ad::jvp(&plan, &wrt);
+        let reverse = grad_dot(&ctx, &loss, &tables, &wrt).await;
+        match (forward, reverse) {
+            (Ok(_), Ok(dot)) => {
+                let (_, out) = jvp_of(&self::ctx(), &loss, &tables, &wrt).await;
+                let jvp = out[0][1];
+                if (jvp - dot).abs() > 1e-12 * dot.abs().max(1.0) {
+                    wrong.push(format!("{agg}: jvp {jvp} vs ⟨∇L, t⟩ {dot}"));
+                }
+                if !differentiated {
+                    wrong.push(format!("{agg}: differentiated, but should be refused"));
+                }
+            }
+            (Err(e), Err(_)) if differentiated => {
+                wrong.push(format!("{agg}: refused by both: {e}"));
+            }
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(e)) => wrong.push(format!("{agg}: only grad refuses: {e}")),
+            (Err(e), Ok(_)) => wrong.push(format!("{agg}: only jvp refuses: {e}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// ⟨J t, c⟩ from `jvp` equals ⟨t, Jᵀ c⟩ from `vjp`, for an output with
@@ -538,7 +609,7 @@ async fn a_rank_used_as_a_number_is_refused() {
 #[tokio::test]
 async fn an_aggregate_with_no_rule_is_refused() {
     let e = refusal("SELECT stddev(val) AS l FROM w", &[w()], &[wrt("w", "val")]).await;
-    assert!(e.to_string().contains("no forward-mode rule"), "{e}");
+    assert!(e.to_string().contains("ddx has rules for"), "{e}");
 }
 
 #[tokio::test]

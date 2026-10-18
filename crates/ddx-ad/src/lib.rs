@@ -91,6 +91,7 @@ mod functions;
 mod jvp;
 mod opt;
 mod program;
+mod reduce;
 mod run;
 mod sql;
 mod tables;

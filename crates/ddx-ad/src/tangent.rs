@@ -22,6 +22,9 @@
 //! | `UNION ALL` | each input's tangents, zero where an input has none |
 //! | `ddx_stop_gradient(x)` | none |
 //!
+//! Which aggregates have a rule, and which, is [`crate::reduce`]'s, which
+//! reverse mode reads too.
+//!
 //! A `wrt` table is read joined to its tangent table on its dims; a row the
 //! tangent table lacks has tangent 0. An earlier step of a program (forward
 //! over reverse) is read from its own dual, already materialized.
@@ -71,6 +74,7 @@ use crate::forward::{
     rel_inputs, rel_name, width,
 };
 use crate::functions::{Extensions, Function, Functions};
+use crate::reduce::{no_rule, reduce_rule, Reduce, Rule};
 use crate::relation::Table;
 
 /// A column's tangent.
@@ -755,27 +759,36 @@ impl<'a> Dualizer<'a> {
             return Ok(WindowTan::Zero);
         }
         let name = self.functions.name(wf.function_reference)?.to_string();
-        let arg_varied = match args.as_slice() {
-            [a] => depends(self.functions, a, &varied)?,
-            _ => false,
-        };
         let refuse = |what: &str| -> Result<WindowTan> {
             Ok(WindowTan::Refused(AdError::NotImplemented(format!(
                 "a window function ({what}) whose result depends on a wrt column is used as a \
                  value that carries a tangent"
             ))))
         };
-        match name.as_str() {
-            "count" => Ok(WindowTan::Zero),
-            "sum" | "avg" if !arg_varied => Ok(WindowTan::Zero),
-            "sum" | "avg" => {
-                if wf.invocation == AggregationInvocation::Distinct as i32 {
-                    return refuse(&format!("{name}(DISTINCT …)"));
-                }
-                let arg = args[0].clone();
-                let Some(t) = self.tangent_of(&arg, tans)? else {
-                    return Ok(WindowTan::Zero);
-                };
+        let arg_varied = match args.as_slice() {
+            [a] => depends(self.functions, a, &varied)?,
+            _ => false,
+        };
+        let rule = reduce_rule(
+            self.functions,
+            wf.function_reference,
+            wf.invocation,
+            &wf.arguments,
+        );
+        let (rule, arg) = match rule {
+            Ok(None) => return refuse(&name),
+            Ok(Some(Reduce::Constant)) => return Ok(WindowTan::Zero),
+            // Varied only through its partitions or ordering, a sum, mean or
+            // extreme does not move, whatever its rule.
+            _ if !arg_varied => return Ok(WindowTan::Zero),
+            Ok(Some(Reduce::Of(rule, arg))) => (rule, arg.clone()),
+            Err(e) => return Ok(WindowTan::Refused(e)),
+        };
+        let Some(t) = self.tangent_of(&arg, tans)? else {
+            return Ok(WindowTan::Zero);
+        };
+        match rule {
+            Rule::Sum | Rule::Mean => {
                 let mut tw = wf.clone();
                 tw.arguments = vec![value_arg(self.masked(arg, t))];
                 tw.output_type = None;
@@ -783,18 +796,13 @@ impl<'a> Dualizer<'a> {
                     rex_type: Some(RexType::WindowFunction(tw)),
                 }))
             }
-            "max" | "min" if !arg_varied => Ok(WindowTan::Zero),
-            "max" | "min" => {
+            Rule::Extreme(_) => {
                 let whole = wf.sorts.is_empty()
                     && unbounded(wf.lower_bound.as_ref())
                     && unbounded(wf.upper_bound.as_ref());
                 if !whole {
                     return refuse(&format!("a running {name} over an ordered frame"));
                 }
-                let arg = args[0].clone();
-                let Some(t) = self.tangent_of(&arg, tans)? else {
-                    return Ok(WindowTan::Zero);
-                };
                 // The rows attaining the extreme (the window's own column),
                 // and the mean of their tangents, over the same partition.
                 let equal = self.ext.anchor(Function::Equal);
@@ -810,7 +818,6 @@ impl<'a> Dualizer<'a> {
                     wf.partitions.clone(),
                 )))
             }
-            other => refuse(other),
         }
     }
 
@@ -1020,6 +1027,22 @@ impl<'a> Dualizer<'a> {
             rel_input = project_emit(rel_input, args, None);
         }
         let mut measures = a.measures.clone();
+        // An ordering changes no extreme (see `crate::reduce`), so the dual's
+        // copy of one drops it. DataFusion fails to run an ordered MAX beside
+        // the window its tangent reads ("number of columns must match number
+        // of fields"); the same shape written as SQL runs, and the cause in
+        // the plan ddx writes is not yet found.
+        for m in measures.iter_mut().filter_map(|m| m.measure.as_mut()) {
+            let rule = reduce_rule(
+                self.functions,
+                m.function_reference,
+                m.invocation,
+                &m.arguments,
+            );
+            if let Ok(Some(Reduce::Of(Rule::Extreme(_), _))) = rule {
+                m.sorts.clear();
+            }
+        }
         measures.extend(tangent_measures);
         let template = a.clone();
         self.emitted(
@@ -1063,44 +1086,36 @@ impl<'a> Dualizer<'a> {
         if !arg_varied {
             return Ok(None);
         }
-        let name = self.functions.name(f.function_reference)?.to_string();
-        if name == "count" {
+        let rule = reduce_rule(
+            self.functions,
+            f.function_reference,
+            f.invocation,
+            &f.arguments,
+        )?;
+        let (rule, arg) = match rule {
+            Some(Reduce::Of(rule, arg)) => (rule, arg.clone()),
             // A count of varied values moves with none of them: tangent 0,
             // as grad gives it gradient 0.
-            let sum = self.ext.anchor(Function::Sum);
-            return Ok(Some(Measure {
-                measure: Some(AggregateFunction {
-                    function_reference: sum,
-                    arguments: vec![value_arg(lit_f64(0.0))],
-                    invocation: AggregationInvocation::All as i32,
-                    phase: f.phase,
-                    ..Default::default()
-                }),
-                filter: None,
-            }));
-        }
-        if f.invocation == AggregationInvocation::Distinct as i32 {
-            return Err(AdError::NotImplemented(format!(
-                "{name}(DISTINCT …) over values that depend on a wrt column"
-            )));
-        }
+            Some(Reduce::Constant) => {
+                let sum = self.ext.anchor(Function::Sum);
+                return Ok(Some(Measure {
+                    measure: Some(AggregateFunction {
+                        function_reference: sum,
+                        arguments: vec![value_arg(lit_f64(0.0))],
+                        invocation: AggregationInvocation::All as i32,
+                        phase: f.phase,
+                        ..Default::default()
+                    }),
+                    filter: None,
+                }));
+            }
+            None => return Err(no_rule(self.functions.name(f.function_reference)?)),
+        };
         if measure.filter.is_some() {
             return Err(AdError::NotImplemented(
                 "an aggregate with a FILTER clause over values that depend on a wrt column".into(),
             ));
         }
-        if !f.sorts.is_empty() {
-            return Err(AdError::NotImplemented(format!(
-                "an ordered aggregate ({name}) over values that depend on a wrt column"
-            )));
-        }
-        let [arg] = args.as_slice() else {
-            return Err(AdError::NotImplemented(format!(
-                "no forward-mode rule for the aggregate `{name}` with {} arguments",
-                args.len()
-            )));
-        };
-        let arg = (*arg).clone();
         let Some(t) = self.tangent_of(&arg, tans)? else {
             return Ok(None);
         };
@@ -1114,9 +1129,9 @@ impl<'a> Dualizer<'a> {
             }),
             filter: None,
         };
-        match name.as_str() {
+        match rule {
             // Linear: the same function over the tangents.
-            "sum" | "avg" => {
+            Rule::Sum | Rule::Mean => {
                 let masked = self.masked(arg, t);
                 Ok(Some(tangent(f.function_reference, masked)))
             }
@@ -1124,13 +1139,9 @@ impl<'a> Dualizer<'a> {
             // found by a window over the group, never by comparing with the
             // aggregate. NaN is left out of the window, as DataFusion's
             // grouped MAX leaves it out.
-            "max" | "min" => {
+            Rule::Extreme(extreme) => {
                 let isnan = self.ext.anchor(Function::IsNan);
-                let extreme = self.ext.anchor(if name == "max" {
-                    Function::Max
-                } else {
-                    Function::Min
-                });
+                let extreme = self.ext.anchor(extreme);
                 let equal = self.ext.anchor(Function::Equal);
                 let avg = self.ext.anchor(Function::Avg);
                 let skip_nan = if_then(
@@ -1150,9 +1161,6 @@ impl<'a> Dualizer<'a> {
                 );
                 Ok(Some(tangent(avg, attaining)))
             }
-            other => Err(AdError::NotImplemented(format!(
-                "no forward-mode rule for the aggregate `{other}`"
-            ))),
         }
     }
 
