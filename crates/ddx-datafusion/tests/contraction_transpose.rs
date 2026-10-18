@@ -596,3 +596,46 @@ async fn a_sum_of_a_sum_keeps_the_general_rule() {
         vec![(Some(0), Some(0), Some(0.0)), (Some(0), Some(1), Some(1.0))]
     );
 }
+
+#[tokio::test]
+async fn a_side_that_doubles_at_every_level_falls_back_in_time() {
+    // Each level reads the one below twice, so inlining the side's factor
+    // into the product would build 2^40 nodes. The contraction rule must give
+    // up on it early, and the general rule computes each level once.
+    let depth = 40;
+    let mut ctes = vec!["a0 AS (SELECT s, k, val FROM a)".to_string()];
+    for i in 1..=depth {
+        ctes.push(format!(
+            "a{i} AS (SELECT s, k, sin(val) + cos(val) AS val FROM a{})",
+            i - 1
+        ));
+    }
+    let loss = format!(
+        "WITH {}, c AS (SELECT x.s, w.o, SUM(x.val * w.val) AS z FROM a{depth} x JOIN w \
+         ON x.k = w.k GROUP BY x.s, w.o) SELECT SUM(tanh(z) * tanh(z)) AS l FROM c",
+        ctes.join(", ")
+    );
+    let ctx = SessionContext::new();
+    let mut rng = Rng(0xd0_b1e);
+    register(
+        &ctx,
+        "a",
+        table(&mut rng, &[("s", 3), ("k", 2)], &["val"], 0.0, None),
+    );
+    register(
+        &ctx,
+        "w",
+        table(&mut rng, &[("k", 2), ("o", 2)], &["val"], 0.0, None),
+    );
+    let wrt = [ColumnRef::new("w", "val"), ColumnRef::new("a", "val")];
+    let t = std::time::Instant::now();
+    let program = ad::grad(&ctx, loss.as_str(), &wrt).await.unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(30),
+        "building took {:?}",
+        t.elapsed()
+    );
+    ddx_datafusion::engine::execute(&ctx, &program)
+        .await
+        .unwrap();
+}

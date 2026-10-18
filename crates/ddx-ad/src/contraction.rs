@@ -57,6 +57,7 @@
 //! qualify), and the inlined factors stay below a size bound. Otherwise the
 //! general rule applies.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use substrait::proto::expression::RexType;
@@ -227,7 +228,7 @@ impl Transposer<'_> {
             let Output::Dim(gi) = saved.outputs[d] else {
                 return Ok(None);
             };
-            let Some(e) = inline_above(region, &saved.groupings[gi], lw + rw) else {
+            let Some(e) = inline_above(region, &saved.groupings[gi], lw + rw, &budget()) else {
                 return Ok(None);
             };
             let Some(c) = as_field(&e) else {
@@ -239,7 +240,7 @@ impl Transposer<'_> {
             groups.push(sc);
         }
         // The argument: a product of one factor from each side.
-        let Some(arg) = inline_above(region, arg, lw + rw) else {
+        let Some(arg) = inline_above(region, arg, lw + rw, &budget()) else {
             return Ok(None);
         };
         if too_big(&arg) {
@@ -321,7 +322,7 @@ impl Transposer<'_> {
         let all = |conds: Vec<Expression>| conds.into_iter().reduce(|a, b| call(and, vec![a, b]));
 
         // The factor of side x, over x's input columns, and its partials.
-        let (inputs_x, e_x) = match inline_side(region, xs, &shape.factors[x])? {
+        let (inputs_x, e_x) = match inline_side(region, xs, &shape.factors[x], &budget())? {
             Some(v) if !too_big(&v.1) => v,
             _ => return Ok(None),
         };
@@ -484,9 +485,10 @@ fn inline_side(
     region: &Region,
     s: &Side,
     e: &Expression,
+    budget: &Cell<usize>,
 ) -> Result<Option<(BTreeMap<usize, usize>, Expression)>> {
     let mut inputs = BTreeMap::new();
-    let Some(out) = inline(e, &mut |c| {
+    let Some(out) = inline(e, budget, &mut |c| {
         let rc = s.start + c;
         if region.refusals[rc].is_some() {
             return None;
@@ -498,7 +500,7 @@ fn inline_side(
             }
             Def::Expr(inner) => {
                 let local = crate::expr::map_fields(inner, &mut |f| Ok(f - s.start)).ok()?;
-                let (more, x) = inline_side(region, s, &local).ok().flatten()?;
+                let (more, x) = inline_side(region, s, &local, budget).ok().flatten()?;
                 inputs.extend(more);
                 Some(x)
             }
@@ -520,16 +522,31 @@ fn too_big(e: &Expression) -> bool {
     e.encoded_len() > 1 << 16
 }
 
+/// How many expression nodes one inlining may build. [`too_big`] measures
+/// an expression once it is built, but a chain that doubles at every level
+/// would take time and memory exponential in its depth to build first; past
+/// this many nodes, inlining gives up and the general rule applies. Every
+/// node costs at least two bytes encoded, so an expression [`too_big`]
+/// accepts never runs out.
+fn budget() -> Cell<usize> {
+    Cell::new(1 << 16)
+}
+
 /// `e` with every column at or above `above` (an expression defined above
 /// the join) replaced by its definition, recursively. `None` if one isn't an
 /// expression, or `e` holds an expression kind `inline` doesn't follow.
-fn inline_above(region: &Region, e: &Expression, above: usize) -> Option<Expression> {
-    inline(e, &mut |c| {
+fn inline_above(
+    region: &Region,
+    e: &Expression,
+    above: usize,
+    budget: &Cell<usize>,
+) -> Option<Expression> {
+    inline(e, budget, &mut |c| {
         if c < above {
             return Some(field(c));
         }
         match &region.defs[c] {
-            Def::Expr(inner) => inline_above(region, inner, above),
+            Def::Expr(inner) => inline_above(region, inner, above, budget),
             _ => None,
         }
     })
@@ -538,13 +555,19 @@ fn inline_above(region: &Region, e: &Expression, above: usize) -> Option<Express
 }
 
 /// `e` with each column reference replaced by `f(column)`; `None` if `f`
-/// declines one, or `e` holds an expression other than a literal, a column, a
-/// scalar function, a `CASE` or a cast.
+/// declines one, `e` holds an expression other than a literal, a column, a
+/// scalar function, a `CASE` or a cast, or `budget` (a count of nodes, which
+/// each node visited spends) runs out.
 fn inline(
     e: &Expression,
+    budget: &Cell<usize>,
     f: &mut dyn FnMut(usize) -> Option<Expression>,
 ) -> Result<Option<Expression>> {
     use substrait::proto::function_argument::ArgType;
+    let Some(left) = budget.get().checked_sub(1) else {
+        return Ok(None);
+    };
+    budget.set(left);
     let Some(rex) = &e.rex_type else {
         return Ok(None);
     };
@@ -565,7 +588,7 @@ fn inline(
             }
             for a in s.arguments.iter_mut() {
                 match a.arg_type.as_mut() {
-                    Some(ArgType::Value(v)) => match inline(v, f)? {
+                    Some(ArgType::Value(v)) => match inline(v, budget, f)? {
                         Some(x) => *v = x,
                         None => return Ok(None),
                     },
@@ -576,21 +599,21 @@ fn inline(
         (RexType::IfThen(_), RexType::IfThen(it)) => {
             for c in it.ifs.iter_mut() {
                 for x in [c.r#if.as_mut(), c.then.as_mut()].into_iter().flatten() {
-                    match inline(x, f)? {
+                    match inline(x, budget, f)? {
                         Some(y) => *x = y,
                         None => return Ok(None),
                     }
                 }
             }
             if let Some(x) = it.r#else.as_deref_mut() {
-                match inline(x, f)? {
+                match inline(x, budget, f)? {
                     Some(y) => *x = y,
                     None => return Ok(None),
                 }
             }
         }
         (RexType::Cast(_), RexType::Cast(c)) => match c.input.as_deref_mut() {
-            Some(x) => match inline(x, f)? {
+            Some(x) => match inline(x, budget, f)? {
                 Some(y) => *x = y,
                 None => return Ok(None),
             },
