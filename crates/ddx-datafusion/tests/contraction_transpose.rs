@@ -23,44 +23,34 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
+use ddx_core::test_utils::Rng;
 use ddx_datafusion::ad::{self, BackwardProgram, ColumnRef};
 
-/// A small deterministic generator (xorshift64*).
-struct Rng(u64);
+/// True with probability `p`.
+fn chance(rng: &mut Rng, p: f64) -> bool {
+    rng.range(0.0, 1.0) < p
+}
 
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64 <= p
-    }
-    /// NULL sometimes, NaN or ±∞ rarely, otherwise a multiple of 1/8 in
-    /// [-2, 2].
-    fn value(&mut self) -> Option<f64> {
-        if self.chance(0.12) {
-            None
-        } else if self.chance(0.03) {
-            Some(f64::NAN)
-        } else if self.chance(0.02) {
-            Some(if self.chance(0.5) {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            })
+/// NULL sometimes, NaN or ±∞ rarely, otherwise a multiple of 1/8 in
+/// [-2, 2].
+fn value(rng: &mut Rng) -> Option<f64> {
+    if chance(rng, 0.12) {
+        None
+    } else if chance(rng, 0.03) {
+        Some(f64::NAN)
+    } else if chance(rng, 0.02) {
+        Some(if chance(rng, 0.5) {
+            f64::INFINITY
         } else {
-            Some((self.below(33) as f64 - 16.0) / 8.0)
-        }
+            f64::NEG_INFINITY
+        })
+    } else {
+        Some((rng.below(33) as f64 - 16.0) / 8.0)
     }
 }
 
-/// A table of key columns and value columns.
+/// A table of key columns and value columns, any of them NULL (unlike
+/// `common::ad::Table`, whose rows are numbers).
 struct Table {
     keys: Vec<(&'static str, Vec<Option<i64>>)>,
     values: Vec<(&'static str, Vec<Option<f64>>)>,
@@ -83,19 +73,19 @@ fn table(
     };
     let total: usize = keys.iter().map(|&(_, e)| e).product();
     for cell in 0..total {
-        if !rng.chance(0.8) {
+        if !chance(rng, 0.8) {
             continue;
         }
-        for _ in 0..if rng.chance(dup) { 2 } else { 1 } {
+        for _ in 0..if chance(rng, dup) { 2 } else { 1 } {
             let mut rest = cell;
             for (i, &(name, extent)) in keys.iter().enumerate().rev() {
                 let k = (rest % extent) as i64;
                 rest /= extent;
-                let null = null_key == Some(name) && rng.chance(0.1);
+                let null = null_key == Some(name) && chance(rng, 0.1);
                 t.keys[i].1.push((!null).then_some(k));
             }
             for v in t.values.iter_mut() {
-                v.1.push(rng.value());
+                v.1.push(value(rng));
             }
         }
     }
@@ -162,43 +152,53 @@ async fn rebuilds(
     found
 }
 
-/// `(the first two key columns, a gradient)` rows.
-type Rows = Vec<(Option<i64>, Option<i64>, Option<f64>)>;
+/// `(a row's key columns, its gradient)` rows.
+type Rows = Vec<(Vec<Option<i64>>, Option<f64>)>;
 
-/// Each gradient of each `wrt` column, its rows sorted. A table's columns
-/// that no gradient is taken of are dims too; the first two are enough to
-/// tell rows apart in these tests, as rows are compared as multisets.
+/// Each gradient of each `wrt` column, its rows sorted by their keys, and
+/// rows with the same keys (repeated keys in constant data) by value, every
+/// NaN alike: two programs may give NaNs of different signs.
 async fn gradients(
     ctx: &SessionContext,
     program: &BackwardProgram,
     wrt: &[ColumnRef],
 ) -> Vec<Rows> {
+    let is_wrt = |c: &str| wrt.iter().any(|w| w.column.eq_ignore_ascii_case(c));
     let mut out = Vec::new();
     for g in &program.gradients {
-        for col in g
+        // The key columns: the tables here key on integers and hold floats.
+        let schema = ctx.table(g.step.as_str()).await.unwrap().schema().clone();
+        let dims: Vec<&String> = g
             .columns
             .iter()
-            .filter(|c| wrt.iter().any(|w| w.column.eq_ignore_ascii_case(c)))
-        {
-            let sql = format!(
-                "SELECT \"{}\", \"{}\", \"{col}\" FROM \"{}\"",
-                g.columns[0], g.columns[1], g.step
-            );
+            .filter(|c| {
+                schema
+                    .field_with_unqualified_name(c)
+                    .is_ok_and(|f| f.data_type() == &DataType::Int64)
+            })
+            .collect();
+        for col in g.columns.iter().filter(|c| is_wrt(c)) {
+            let keys: Vec<String> = dims.iter().map(|d| format!("\"{d}\"")).collect();
+            let sql = format!("SELECT {}, \"{col}\" FROM \"{}\"", keys.join(", "), g.step);
             let mut rows = Vec::new();
             for b in ctx.sql(&sql).await.unwrap().collect().await.unwrap() {
-                let k0 = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                let k1 = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-                let v = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+                let v = b
+                    .column(dims.len())
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
                 for i in 0..b.num_rows() {
-                    let get = |a: &Int64Array| (!a.is_null(i)).then(|| a.value(i));
-                    rows.push((get(k0), get(k1), (!v.is_null(i)).then(|| v.value(i))));
+                    let key: Vec<Option<i64>> = (0..dims.len())
+                        .map(|d| {
+                            let a = b.column(d).as_any().downcast_ref::<Int64Array>().unwrap();
+                            (!a.is_null(i)).then(|| a.value(i))
+                        })
+                        .collect();
+                    rows.push((key, (!v.is_null(i)).then(|| v.value(i))));
                 }
             }
-            rows.sort_by(|x, y| {
-                (x.0, x.1)
-                    .cmp(&(y.0, y.1))
-                    .then(x.2.map(f64::to_bits).cmp(&y.2.map(f64::to_bits)))
-            });
+            let bits = |v: Option<f64>| v.map(|v| if v.is_nan() { u64::MAX } else { v.to_bits() });
+            rows.sort_by(|x, y| x.0.cmp(&y.0).then(bits(x.1).cmp(&bits(y.1))));
             out.push(rows);
         }
     }
@@ -217,8 +217,8 @@ fn agree(a: &[Rows], b: &[Rows]) -> Result<(), String> {
             return Err(format!("{} rows vs {}", ga.len(), gb.len()));
         }
         for (x, y) in ga.iter().zip(gb) {
-            let ok = (x.0, x.1) == (y.0, y.1)
-                && match (x.2, y.2) {
+            let ok = x.0 == y.0
+                && match (x.1, y.1) {
                     (None, None) => true,
                     (Some(p), Some(q)) if p.is_nan() || q.is_nan() => p.is_nan() && q.is_nan(),
                     (Some(p), Some(q)) if p.is_infinite() || q.is_infinite() => p == q,
@@ -306,7 +306,7 @@ async fn matrix_products_of(
     general: &str,
     null_keys: bool,
 ) {
-    let mut rng = Rng(seed);
+    let mut rng = Rng::new(seed);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..cases {
         // In a third of the cases only w is differentiated, so a is constant
@@ -394,7 +394,7 @@ async fn a_join_on_two_keys_matches_the_general_rule() {
         )
     };
     let (fast, general) = (loss(""), loss("WHERE a.s + w.o >= 0"));
-    let mut rng = Rng(0x2ce7);
+    let mut rng = Rng::new(0x2ce7);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..60 {
         let (ns, nk, nb, no) = (
@@ -457,7 +457,7 @@ async fn a_second_layer_through_tanh_matches_the_general_rule() {
     let fast = loss("", "");
     let general = loss("WHERE x.s + w1.j >= 0", "WHERE h.s + w2.o >= 0");
     let saved = |t: &str| t.ends_with("saved_0");
-    let mut rng = Rng(0x7a17);
+    let mut rng = Rng::new(0x7a17);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..60 {
         let ctx = SessionContext::new();
@@ -516,7 +516,7 @@ async fn a_factor_of_two_columns_respects_a_null_in_either() {
         vec![ColumnRef::new("a", "val")],
         vec![ColumnRef::new("a", "val"), ColumnRef::new("a", "bias")],
     ] {
-        let mut rng = Rng(0xb1a5);
+        let mut rng = Rng::new(0xb1a5);
         let (mut compared, mut failed) = (0, Vec::new());
         for case in 0..60 {
             let (ns, nk, no) = (
@@ -593,7 +593,10 @@ async fn a_sum_of_a_sum_keeps_the_general_rule() {
     // a(0, 0) meets w(0, 0), whose value is NULL: SUM skipped the row.
     assert_eq!(
         g[0],
-        vec![(Some(0), Some(0), Some(0.0)), (Some(0), Some(1), Some(1.0))]
+        vec![
+            (vec![Some(0), Some(0)], Some(0.0)),
+            (vec![Some(0), Some(1)], Some(1.0))
+        ]
     );
 }
 
@@ -616,7 +619,7 @@ async fn a_side_that_doubles_at_every_level_falls_back_in_time() {
         ctes.join(", ")
     );
     let ctx = SessionContext::new();
-    let mut rng = Rng(0xd0_b1e);
+    let mut rng = Rng::new(0xd0_b1e);
     register(
         &ctx,
         "a",
