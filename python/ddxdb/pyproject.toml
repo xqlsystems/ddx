@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ddxdb"
-version = "0.3.1"
+version = "0.3.2"
 description = "Autograd for SQL: the gradient of a whole query, as JAX takes the gradient of a function."
 readme = "README.md"
 license = { text = "Apache-2.0" }
