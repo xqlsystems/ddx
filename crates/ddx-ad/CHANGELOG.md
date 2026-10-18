@@ -11,11 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(ddx-ad)* one linear form per reduction; window values in reverse mode ([#145](https://github.com/xqlsystems/ddx/pull/145))
+- grad and vjp of window functions: `SUM` and `AVG` over any frame, and `MAX` and `MIN` over each whole partition, so softmax written with `MAX(x) OVER` and `SUM(exp(x)) OVER` has a gradient ([#145](https://github.com/xqlsystems/ddx/pull/145))
+- jvp of an ordered aggregate (`MAX(x ORDER BY y)`) ([#139](https://github.com/xqlsystems/ddx/pull/139))
 
-### Other
+### Fixed
 
-- *(ddx-ad)* one rule per aggregate, read by forward and reverse mode ([#139](https://github.com/xqlsystems/ddx/pull/139))
+- A window's gradient no longer depends on what happens to its rows above it: a filter, semi-join, duplicating join or group with no gradient above a window cannot change its counts, ties or frames ([#145](https://github.com/xqlsystems/ddx/pull/145))
+- `ROW_NUMBER` and `FIRST_VALUE` with no `ORDER BY` are refused unless their ties are broken, since their values depend on the engine's row order ([#145](https://github.com/xqlsystems/ddx/pull/145))
+
+### Changed
+
+- One linear form per reduction, read by forward and reverse mode, so both modes have the same aggregate and window rules ([#139](https://github.com/xqlsystems/ddx/pull/139), [#145](https://github.com/xqlsystems/ddx/pull/145))
 
 ## [0.2.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.1.0...ddx-ad-v0.2.0) - 2026-10-17
 
