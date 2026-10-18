@@ -127,11 +127,13 @@ async fn rebuilds(
     right: &dyn Fn(&str) -> bool,
 ) -> bool {
     for step in program.steps() {
-        ad::run_step(ctx, step).await.unwrap();
+        ddx_datafusion::engine::run_step(ctx, step).await.unwrap();
     }
     let mut found = false;
     for step in &program.backward_steps {
-        let plan = ad::logical_plan(ctx, &step.plan).await.unwrap();
+        let plan = ddx_datafusion::engine::logical_plan(ctx, &step.plan)
+            .await
+            .unwrap();
         plan.apply(|node| {
             if let LogicalPlan::Join(j) = node {
                 let scans = |p: &LogicalPlan| {
@@ -253,14 +255,14 @@ async fn compare(
 ) -> Result<bool, String> {
     let fast = ad::grad(ctx, loss, wrt).await.unwrap();
     let slow = ad::grad(ctx, general, wrt).await.unwrap();
-    if ad::run(ctx, &fast).await.is_err() {
+    if ddx_datafusion::engine::execute(ctx, &fast).await.is_err() {
         assert!(
-            ad::run(ctx, &slow).await.is_err(),
+            ddx_datafusion::engine::execute(ctx, &slow).await.is_err(),
             "only the contraction rule's program was refused"
         );
         return Ok(false);
     }
-    ad::run(ctx, &slow).await.unwrap();
+    ddx_datafusion::engine::execute(ctx, &slow).await.unwrap();
     for &(l, r) in joins {
         assert!(
             !rebuilds(ctx, &fast, l, r).await,
@@ -292,6 +294,18 @@ fn matmul(on: &str) -> (String, String) {
 /// sometimes if `null_keys`, and asserts nearly all compared and all agreed.
 async fn matrix_products(seed: u64, cases: usize, on: &str, null_keys: bool) {
     let (loss, general) = matmul(on);
+    matrix_products_of(seed, cases, on, &loss, &general, null_keys).await;
+}
+
+/// [`matrix_products`] of a given loss and its general-rule spelling.
+async fn matrix_products_of(
+    seed: u64,
+    cases: usize,
+    on: &str,
+    loss: &str,
+    general: &str,
+    null_keys: bool,
+) {
     let mut rng = Rng(seed);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..cases {
@@ -321,7 +335,7 @@ async fn matrix_products(seed: u64, cases: usize, on: &str, null_keys: bool) {
         } else {
             vec![ColumnRef::new("w", "val")]
         };
-        match compare(&ctx, &loss, &general, &wrt, &[(&named("a"), &named("w"))]).await {
+        match compare(&ctx, loss, general, &wrt, &[(&named("a"), &named("w"))]).await {
             Ok(true) => compared += 1,
             Ok(false) => {}
             Err(e) => failed.push(format!("case {case} ({ns}×{nk}×{no}): {e}")),
@@ -342,6 +356,21 @@ async fn matrix_products(seed: u64, cases: usize, on: &str, null_keys: bool) {
 #[tokio::test]
 async fn a_matrix_product_matches_the_general_rule_on_awkward_tables() {
     matrix_products(0x5eed_c0de, 150, "a.k = w.k", false).await;
+}
+
+#[tokio::test]
+async fn a_count_beside_the_sum_matches_the_general_rule() {
+    // COUNT moves with no wrt column, so it has no cotangent, and the
+    // aggregate is still one SUM of a product for the contraction rule.
+    let loss = |filter: &str| {
+        format!(
+            "WITH c AS (SELECT a.s, w.o, SUM(a.val * w.val) AS z, COUNT(*) AS n FROM a JOIN w \
+             ON a.k = w.k {filter} GROUP BY a.s, w.o) \
+             SELECT SUM(tanh(z) * tanh(z) * n) AS l FROM c"
+        )
+    };
+    let (fast, general) = (loss(""), loss("WHERE a.s + w.o >= 0"));
+    matrix_products_of(0xc0_4e7, 90, "a.k = w.k", &fast, &general, false).await;
 }
 
 #[tokio::test]
@@ -556,7 +585,9 @@ async fn a_sum_of_a_sum_keeps_the_general_rule() {
                 ON a.k = w.k GROUP BY a.s, w.o)";
     let wrt = [ColumnRef::new("a", "val")];
     let program = ad::grad(&ctx, loss, &wrt).await.unwrap();
-    ad::run(&ctx, &program).await.unwrap();
+    ddx_datafusion::engine::execute(&ctx, &program)
+        .await
+        .unwrap();
     assert!(rebuilds(&ctx, &program, &named("a"), &named("w")).await);
     let g = gradients(&ctx, &program, &wrt).await;
     // a(0, 0) meets w(0, 0), whose value is NULL: SUM skipped the row.

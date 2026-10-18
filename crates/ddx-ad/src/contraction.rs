@@ -311,11 +311,13 @@ impl Transposer<'_> {
     ) -> Result<Option<Contribution>> {
         let y = 1 - x;
         let (xs, ys) = (&shape.sides[x], &shape.sides[y]);
-        let same = self.ext.anchor("is_not_distinct_from");
-        let and = self.ext.anchor("and");
-        let mul = self.ext.anchor("multiply");
-        let sum = self.ext.anchor("sum");
-        let is_null = self.ext.anchor("is_null");
+        let same = self
+            .ext
+            .anchor(crate::functions::Function::IsNotDistinctFrom);
+        let and = self.ext.anchor(crate::functions::Function::And);
+        let mul = self.ext.anchor(crate::functions::Function::Multiply);
+        let sum = self.ext.anchor(crate::functions::Function::Sum);
+        let is_null = self.ext.anchor(crate::functions::Function::IsNull);
         let all = |conds: Vec<Expression>| conds.into_iter().reduce(|a, b| call(and, vec![a, b]));
 
         // The factor of side x, over x's input columns, and its partials.

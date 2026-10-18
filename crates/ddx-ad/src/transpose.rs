@@ -147,8 +147,14 @@ impl<'a> Transposer<'a> {
         }
         // A contraction's transpose needs no rebuilt join (see
         // `crate::contraction`).
-        if let ([(_, Rule::Sum, i, _)], [arg]) = (&rules[..], &args[..]) {
-            if self.contraction(n, arg, &cotangent, *i)? {
+        if let ([(r, i)], [arg]) = (&reductions[..], &args[..]) {
+            if r.form
+                == (Linear {
+                    extreme: None,
+                    shared: false,
+                })
+                && self.contraction(n, arg, &cotangent, *i)?
+            {
                 return Ok(());
             }
         }
