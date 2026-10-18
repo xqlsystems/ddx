@@ -5,13 +5,15 @@
 //! Rewriting a statement to read what its calls' programs computed, on its
 //! parsed tree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use ddx_core::sqlparser::ast::visit_relations;
 use ddx_core::sqlparser::ast::{
     BinaryOperator, CastKind, DataType, ExactNumberInfo, ExcludeSelectItem, Expr, Ident, Join,
-    JoinConstraint, JoinOperator, ObjectName, Select, SelectItem, SelectItemQualifiedWildcardKind,
-    Spanned, TableFactor, TableWithJoins, Value, VisitMut, VisitorMut, WildcardAdditionalOptions,
+    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Spanned, TableFactor, TableWithJoins, Value, Visit, VisitMut,
+    VisitorMut, WildcardAdditionalOptions,
 };
 use ddx_core::sqlparser::tokenizer::Location;
 
@@ -180,7 +182,47 @@ impl Calls {
         }
         let mut query = self.query.clone();
         let _ = VisitMut::visit(&mut query, &mut rewriter);
+        drop_unread_ctes(&mut query);
         Ok(query.to_string())
+    }
+}
+
+/// Drop each CTE of `query`'s `WITH` that neither the rest of the query nor
+/// a CTE it keeps reads. Once its calls read the tables their programs
+/// computed, a statement no longer reads its objective, and an engine plans
+/// a CTE whether or not anything reads it: for a model's training step, the
+/// whole model again for each parameter table's statement. A CTE nothing
+/// reads changes no result, so dropping it is always safe. Names are
+/// compared as an engine may fold them, without case, and a read of
+/// `s.name` counts as a read of `name`, so a CTE is kept whenever a read
+/// might be its.
+fn drop_unread_ctes(query: &mut Query) {
+    let Some(mut with) = query.with.take() else {
+        return;
+    };
+    fn reads(node: &impl Visit, into: &mut HashSet<String>) {
+        let _ = visit_relations(node, |name: &ObjectName| {
+            if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
+                into.insert(last.value.to_lowercase());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    let mut read = HashSet::new();
+    reads(&*query, &mut read);
+    // A CTE reads only the CTEs before it (or, in `WITH RECURSIVE`, itself),
+    // so one pass from the last to the first finds every one that is read.
+    let mut kept = vec![false; with.cte_tables.len()];
+    for (i, cte) in with.cte_tables.iter().enumerate().rev() {
+        if read.contains(&cte.alias.name.value.to_lowercase()) {
+            kept[i] = true;
+            reads(&*cte.query, &mut read);
+        }
+    }
+    let mut kept = kept.into_iter();
+    with.cte_tables.retain(|_| kept.next().unwrap_or(true));
+    if !with.cte_tables.is_empty() {
+        query.with = Some(with);
     }
 }
 
