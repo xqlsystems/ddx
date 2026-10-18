@@ -287,7 +287,7 @@ impl<'a> Transposer<'a> {
     /// NULL, so nothing in that row moves the loss: its cotangent is NULL,
     /// not the group's, or the row's other inputs (the `p` of `SUM(p + q)`
     /// where `q` is NULL) would get gradient through it.
-    fn skips_null(&mut self, arg: usize, seed: Expression) -> Expression {
+    pub(crate) fn skips_null(&mut self, arg: usize, seed: Expression) -> Expression {
         let is_null = self.ext.anchor(Function::IsNull);
         if_then(vec![(call(is_null, vec![field(arg)]), null_f64())], seed)
     }
@@ -377,7 +377,7 @@ impl<'a> Transposer<'a> {
     /// it, so every place that reads a set of rows is a larger region:
     /// taking the largest first, all of a set's cotangents are gathered
     /// before it is transposed.
-    fn windows(&mut self) -> Result<()> {
+    pub(crate) fn windows(&mut self) -> Result<()> {
         while let Some(i) =
             (0..self.windows.len()).max_by_key(|&i| self.windows[i].beneath.defs.len())
         {
@@ -618,7 +618,7 @@ impl<'a> Transposer<'a> {
     }
 
     /// [`Self::region`], leaving the windows it reaches gathered.
-    fn region_once(
+    pub(crate) fn region_once(
         &mut self,
         region: &Region,
         base: Rel,
@@ -740,7 +740,7 @@ impl<'a> Transposer<'a> {
 
     /// How many region steps this program has made so far, counting those
     /// already handed to the program.
-    fn steps_made(&mut self) -> usize {
+    pub(crate) fn steps_made(&mut self) -> usize {
         self.region_steps += 1;
         self.region_steps - 1
     }

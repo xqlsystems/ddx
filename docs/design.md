@@ -806,10 +806,17 @@ themselves. Verified against `nn.py`'s `g2`/`g1`/`g0` and
 `relational_ad_spike.py`. The physical fused-contraction operator (§4.1) is
 where a contraction becomes a unit again, for speed, not for the math.
 Composed, the rules rebuild the join for every backward step and join it to
-the cotangent; when a saved `SUM`'s region is one inner join of two inputs
-and its argument a product of a factor from each, ddx emits each input's
-contribution as the contraction itself instead, the cotangent joined with the
-*other* input, and the join is never rebuilt (`S19`).
+the cotangent. When a saved `SUM`'s region is a tree of inner joins and its
+argument a product whose factors split the joined inputs into two sides,
+ddx instead contracts the cotangent with the *other* side and hands the
+result to each side's own rules as the cotangent of its factor, so the join
+is never rebuilt (`S19`). A side may be several inputs: attention's output,
+`SUM(w / z * v)` with the softmax's normalizer `z` joined on a grouping key,
+splits into the scores with their normalizer, and the values, so the
+division is transposed once per score, as `jax.grad` transposes `p = w / z`
+and then `p @ v`. A join condition that reads only grouping keys (a causal
+mask, `q.t >= k.t`) selects whole groups, so the transpose applies it to
+the cotangent.
 
 **Mean is a reduce rule, not a separate division.** `AVG(x)` is `SUM(x)` over
 the group's count, and its transpose is too; nn.py's `-AVG(ln p)` loss
@@ -2236,6 +2243,28 @@ NULL join keys under `=` and `IS NOT DISTINCT FROM`, two-key joins, and
 repeated keys in constant data. The soak does not yet write this shape
 (#127). `matmul`'s gradient at n = 50,000 went
 from 1.77 s to 0.83 s; `attn` at L = 256 from 0.74 s to 0.52 s. → §4.3.
+
+*Extended for causal attention (#153).* The rule above missed both of
+attention's aggregates: the scores' join carries the causal mask, a filter
+across the sides, and the output's region joins three inputs. Two
+extensions, each exact for inner joins. A conjunct that reads only grouping
+keys passes every row of a group or none, so it is applied to the
+cotangent's rows instead. And a side may hold several inputs: inner joins
+can be regrouped, so the inputs are split by which factors of the product
+read them (an input no factor reads goes with the side its conditions tie it
+to), each side is rebuilt as its own join, and each is transposed by the
+ordinary region rules (its projections, windows and inputs) from its
+factor's cotangent, the contraction `t` of the cotangent with the other
+side. This replaced inlining each side's factor down to one input's
+columns, which could not pass through a window. `t` is materialized when a
+side reads it more than once (several inputs, or a window). The output's
+sides are the scores joined to the normalizer, and the values; nothing at
+(token, token, feature) granularity is stored or rebuilt.
+`contraction_transpose.rs` adds masked products, NULL grouping keys under a
+mask, a divisor joined on a grouping key in three join orders and with a
+table no factor reads, and the full attention query, each against the
+composed rules. At 256 tokens, attention's steps went from 1.12 s to
+0.28 s.
 
 ## References
 

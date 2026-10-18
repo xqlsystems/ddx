@@ -187,7 +187,7 @@ impl Region {
     }
 
     /// Append the columns of `other` after this region's, renumbering them.
-    fn append(&mut self, other: Region) -> Result<usize> {
+    pub(crate) fn append(&mut self, other: Region) -> Result<usize> {
         let shift = self.width();
         let slot_shift = self.slots.len();
         for d in other.defs {

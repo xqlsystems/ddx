@@ -8,87 +8,116 @@
 //! `e_X` reads only `X` and `e_Y` only `Y`, is a contraction: a matrix
 //! product when `X` and `Y` are matrices. The general reduce rule rebuilds
 //! the region `X ⋈ Y` (for a matrix product, `N·D·H` rows), joins it to the
-//! cotangent, and sums by each input's dims. For an `X` row `x`, though,
+//! cotangent, and sums by each input's dims. For a row `x` of `X`, though,
 //!
 //! ```text
 //! Σ over the rows x joined to: c̄ · ∂(e_X · e_Y)/∂x  =  ∂e_X/∂x (x) · Σ_y c̄ · e_Y (y)
 //! ```
 //!
 //! and the sum on the right is a contraction of the cotangent with `Y` alone,
-//! as `jax.grad` differentiates a matrix product: `Ā = C̄·Bᵀ`. So `X`'s
-//! contribution is
+//! as `jax.grad` differentiates a matrix product: `Ā = C̄·Bᵀ`. So the
+//! cotangent of `e_X` at each row of `X` is
 //!
 //! ```sql
-//! SELECT x.dims, SUM(CASE WHEN e_X IS NULL THEN NULL ELSE t.v END * ∂e_X/∂x)
-//! FROM X x JOIN (SELECT y.b, c.g_X, SUM(c.v * e_Y) AS v
-//!                FROM Y y JOIN cotangent c ON y.g_Y IS NOT DISTINCT FROM c.g_Y
-//!                WHERE y.b IS NOT NULL
-//!                GROUP BY y.b, c.g_X) t
-//!   ON x.a IS NOT DISTINCT FROM t.b AND x.g_X IS NOT DISTINCT FROM t.g_X
-//! GROUP BY x.dims
+//! SELECT y.b, c.g_X, SUM(c.v * e_Y) AS v
+//! FROM Y y JOIN cotangent c ON y.g_Y IS NOT DISTINCT FROM c.g_Y
+//! WHERE y.b IS NOT NULL
+//! GROUP BY y.b, c.g_X                                         -- t
 //! ```
 //!
-//! which never forms `X ⋈ Y`. (For a key the query joined with `=`, `t`
-//! leaves out the NULL keys that `=` never matched, so that every key of the
-//! join with `x` can be null-safe, which DataFusion hashes; a key joined with
-//! IS NOT DISTINCT FROM keeps them.)
+//! joined to `X` on `x.a IS NOT DISTINCT FROM t.b AND x.g_X IS NOT DISTINCT
+//! FROM t.g_X`, and `X`'s own rules (its projections, windows and inputs)
+//! carry it from there, as they would carry a cotangent of a column of `X`
+//! in the general rule. `X ⋈ Y` is never formed. (For a key the query joined
+//! with `=`, `t` leaves out the NULL keys that `=` never matched, so that
+//! every key of the join with `X` can be null-safe, which DataFusion hashes;
+//! a key joined with IS NOT DISTINCT FROM keeps them.)
+//!
+//! **Sides of several inputs.** `X` and `Y` need not be single inputs. The
+//! inputs of a tree of inner joins can be joined in any order, so the
+//! inputs are split by which factors of the product read them, and each side
+//! is rebuilt as a join of its own. Attention's output, `SUM(w.w / n.z *
+//! v.x) … GROUP BY w.i, v.d` over `weights w JOIN v ON w.j = v.t JOIN norm n
+//! ON w.i = n.i`, has the factors `w.w / n.z` and `v.x`, so `X` is `weights
+//! ⋈ norm` (one row per score) and `Y` is `v`: the softmax's division is
+//! transposed per score, and never per score and feature, as `jax.grad`
+//! transposes `p = w / z` and then `p @ v`. An input no factor reads joins
+//! the side its join conditions tie it to.
+//!
+//! **A mask.** A conjunct of the join condition that reads only grouping
+//! keys, as causal attention's `q.t >= k.t` in `SUM(q.x * k.x) … GROUP BY
+//! q.t, k.t` does, selects groups rather than rows: every row of a group
+//! passes it or none does. Applied to the cotangent's rows, it leaves the
+//! groups the query kept, which is all the transpose needs (and holds even
+//! where a cotangent has a row for a group the query dropped).
 //!
 //! **NULLs.** The general rule gives a summed row no cotangent when the
 //! aggregate's argument is NULL, since `SUM` skipped it. Here the argument
 //! is `e_X · e_Y`, NULL exactly when a factor is. A NULL `e_Y` makes its
 //! term `c̄ · e_Y` NULL, which the inner `SUM` skips, as before. A NULL `e_X`
-//! makes every row of that `x` NULL, so its contribution is NULL, as before:
-//! that is the `CASE`, tested once per `x` instead of once per joined row.
-//! Duplicate rows count as before: each copy of a `Y` row adds its term to
-//! `t`, and each copy of an `X` row joins `t` and adds to its group.
+//! makes every row of that `x` NULL, so its cotangent is NULL, as before:
+//! tested once per `x` instead of once per joined row. Duplicate rows count
+//! as before: each copy of a `Y` row adds its term to `t`, and each copy of
+//! an `X` row joins `t`.
 //!
 //! **When it applies.** Exactly one measure has a cotangent, and it is a
-//! `SUM`; the region is projections over one inner join, with no filter
-//! above it, no post-join filter, no `LIMIT`, no volatile function (a
-//! ranking inside a side is checked as the general rule checks it); each
-//! side of the join reads one input; the join condition is a conjunction of
-//! `=` or `IS NOT DISTINCT FROM` between a column of each side; every
-//! grouping key is a column of one side; the argument, through the
-//! projections above the join, is a product of an expression of one side's
-//! columns and one of the other's; and, for each side that is
+//! `SUM`; the region is projections over a tree of inner joins (through
+//! projections that compute nothing), with no filter above it, no post-join
+//! filter, no `LIMIT`, no volatile function and no subquery in a join
+//! condition; the argument, through the projections above the joins, is a
+//! product whose factors split the join's inputs into two sides; each
+//! condition between the sides is `=` or `IS NOT DISTINCT FROM` between a
+//! column of each, or a mask, and there is at least one of the first; every
+//! grouping key is a column of one side; for each side that is
 //! differentiated, the *other* side holds at least one grouping key (so the
 //! cotangent joins it on a key, not as a cross join: a matrix-vector product
 //! `SUM(a.val * v.val) GROUP BY a.i`, differentiated in `a`, does not
-//! qualify), and the inlined factors stay below a size bound. Otherwise the
-//! general rule applies.
+//! qualify); and the argument stays below a size bound once inlined.
+//! Otherwise the general rule applies.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
 
 use substrait::proto::expression::RexType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
-use substrait::proto::{Expression, Rel};
+use substrait::proto::{CrossRel, Expression, Rel};
 
+use crate::elementwise::depends;
 use crate::emit::{aggregate, filter, join, project};
 use crate::error::Result;
-use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, null_f64, scalar_args};
-use crate::forward::{Def, Input, Output, Region, Saved};
-use crate::transpose::{Contribution, Transposer};
+use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, map_fields, scalar_args};
+use crate::forward::{subquery_rounds, width, Def, Output, Region, Saved, Slot};
+use crate::functions::Function;
+use crate::transpose::Transposer;
 
-/// One side of the join: the subtree that computes region columns
-/// `start..start + width`, holding one input.
-struct Side<'r> {
+/// A subtree of a region's join tree that is not itself an inner join: its
+/// relation, and its columns, `start..start + width` of the region.
+struct Leaf<'r> {
     rel: &'r Rel,
     start: usize,
     width: usize,
-    slot: usize,
+}
+
+/// One side of a contraction, rebuilt as a region of its own.
+struct Side {
+    region: Region,
+    /// Each region column's column here, if it is on this side.
+    at: Vec<Option<usize>>,
+    /// The side's factor of the product, over its own columns.
+    factor: Expression,
 }
 
 /// A contraction's shape, in each side's own column numbers.
-struct Shape<'r> {
-    sides: [Side<'r>; 2],
-    /// The join condition: `(left column, right column, is_not_distinct_from)`.
+struct Shape {
+    sides: [Side; 2],
+    /// The conditions between the sides: `(column of side 0, column of side
+    /// 1, is_not_distinct_from)`.
     keys: Vec<(usize, usize, bool)>,
     /// Each grouping key: its side and column.
     groups: Vec<(usize, usize)>,
-    /// The factors `e_X` and `e_Y`, over each side's columns.
-    factors: [Expression; 2],
+    /// The conditions that read only grouping keys, over the cotangent's
+    /// columns.
+    masks: Vec<Expression>,
 }
 
 impl Transposer<'_> {
@@ -105,249 +134,335 @@ impl Transposer<'_> {
         cotangent: &Rel,
         cot_col: usize,
     ) -> Result<bool> {
-        let f = self.f;
-        let saved = &f.saved[n];
+        let saved = &self.f.saved[n];
         let Some(shape) = self.shape(saved, arg)? else {
             return Ok(false);
         };
-        // Each side is recomputed, as the general rule recomputes the whole
-        // region, so its rankings must be total for the same reason.
-        self.check_rankings_are_total(&saved.input)?;
-        // Each varied side's contribution, from the other side's factor.
-        let mut made = Vec::new();
-        for x in 0..2 {
-            let side = &shape.sides[x];
-            let region = &saved.input;
-            if !region.varied[side.start..side.start + side.width]
-                .iter()
-                .any(|&v| v)
-            {
-                continue;
-            }
-            let Some(c) = self.side_contribution(region, &shape, x, cotangent, cot_col)? else {
+        let mut moves = [false; 2];
+        for (x, side) in shape.sides.iter().enumerate() {
+            let r = &side.region;
+            moves[x] = depends(&self.f.functions, &side.factor, &|c| r.varied[c])?;
+            // The cotangent meets the other side on its grouping keys; with
+            // none there, it would meet every row of it, a cross join, which
+            // the general rule handles instead.
+            if moves[x] && !shape.groups.iter().any(|&(s, _)| s != x) {
                 return Ok(false);
-            };
-            made.push((region.slots[side.slot].input, c));
+            }
         }
-        for (input, c) in made {
-            self.contributions.entry(input).or_default().push(c);
+        for x in (0..2).filter(|&x| moves[x]) {
+            self.side(&shape, x, cotangent, cot_col)?;
         }
+        self.windows()?;
         Ok(true)
     }
 
     /// The contraction's shape, or `None` if the region is not one.
-    fn shape<'r>(&mut self, saved: &'r Saved, arg: &Expression) -> Result<Option<Shape<'r>>> {
+    fn shape(&mut self, saved: &Saved, arg: &Expression) -> Result<Option<Shape>> {
         let region = &saved.input;
-        if region.volatile || !region.cuts.is_empty() || region.slots.len() != 2 {
+        if region.volatile
+            || !region.cuts.is_empty()
+            || region.slots.iter().any(|s| s.offset.is_none())
+        {
             return Ok(None);
         }
-        // Walk down the projections to the join.
+        // Walk down the projections to the joins.
         let mut rel = &region.rel;
-        loop {
-            match &rel.rel_type {
-                Some(RelType::Project(p)) => match p.input.as_deref() {
-                    Some(r) => rel = r,
-                    None => return Ok(None),
-                },
-                Some(RelType::Join(_)) => break,
-                _ => return Ok(None),
+        while let Some(RelType::Project(p)) = &rel.rel_type {
+            match p.input.as_deref() {
+                Some(r) => rel = r,
+                None => return Ok(None),
             }
         }
-        let Some(RelType::Join(j)) = &rel.rel_type else {
-            return Ok(None);
-        };
-        if j.r#type != JoinType::Inner as i32 || j.post_join_filter.is_some() {
-            return Ok(None);
-        }
-        let (Some(left), Some(right)) = (j.left.as_deref(), j.right.as_deref()) else {
-            return Ok(None);
-        };
-        let lw = crate::forward::width(left)?;
-        let rw = crate::forward::width(right)?;
-        // Each side must hold exactly one input, wholly inside it.
-        let slot_in = |start: usize, width: usize| -> Option<usize> {
-            let mut found = None;
-            for (i, s) in region.slots.iter().enumerate() {
-                let off = s.offset?;
-                if off >= start && off + s.width <= start + width {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(i);
-                }
-            }
-            found
-        };
-        let (Some(ls), Some(rs)) = (slot_in(0, lw), slot_in(lw, rw)) else {
-            return Ok(None);
-        };
-        if ls == rs {
-            return Ok(None);
-        }
-        let side_of = |c: usize| -> Option<(usize, usize)> {
-            if c < lw {
-                Some((0, c))
-            } else if c < lw + rw {
-                Some((1, c - lw))
-            } else {
-                None
-            }
-        };
-        // Every column above the join is an expression.
-        if region.defs[lw + rw..]
+        let below = width(rel)?;
+        // Every column above the joins is an expression.
+        if region.defs[below..]
             .iter()
             .any(|d| !matches!(d, Def::Expr(_)))
         {
             return Ok(None);
         }
-        // The join condition: equalities between the sides.
-        let Some(cond) = j.expression.as_deref() else {
+        let mut leaves = Vec::new();
+        let mut conds = Vec::new();
+        if !self.flatten(rel, 0, &mut leaves, &mut conds)? || leaves.len() < 2 {
             return Ok(None);
+        }
+        let leaf_of = |c: usize| {
+            leaves
+                .iter()
+                .position(|l| (l.start..l.start + l.width).contains(&c))
         };
-        let mut keys = Vec::new();
-        for conjunct in self.conjuncts(cond)? {
-            let Some((name, a, b)) = self.equality(&conjunct)? else {
-                return Ok(None);
-            };
-            let (Some((sa, ca)), Some((sb, cb))) = (side_of(a), side_of(b)) else {
-                return Ok(None);
-            };
-            match (sa, sb) {
-                (0, 1) => keys.push((ca, cb, name)),
-                (1, 0) => keys.push((cb, ca, name)),
-                _ => return Ok(None),
-            }
-        }
-        if keys.is_empty() {
-            return Ok(None);
-        }
         // Grouping keys, in the cotangent's order (the saved relation's dims):
-        // columns of one side, through the projections.
-        let mut groups = Vec::new();
+        // columns beneath the projections.
+        let mut group_cols = Vec::new();
         for d in saved.dims() {
             let Output::Dim(gi) = saved.outputs[d] else {
                 return Ok(None);
             };
-            let Some(e) = inline_above(region, &saved.groupings[gi], lw + rw, &budget()) else {
+            let Some(e) = inline_above(region, &saved.groupings[gi], below, &budget()) else {
                 return Ok(None);
             };
-            let Some(c) = as_field(&e) else {
-                return Ok(None);
-            };
-            let Some(sc) = side_of(c) else {
-                return Ok(None);
-            };
-            groups.push(sc);
+            match as_field(&e) {
+                Some(c) if c < below => group_cols.push(c),
+                _ => return Ok(None),
+            }
         }
-        // The argument: a product of one factor from each side.
-        let Some(arg) = inline_above(region, arg, lw + rw, &budget()) else {
+        // The argument's factors, and the inputs each reads.
+        let Some(arg) = inline_above(region, arg, below, &budget()) else {
             return Ok(None);
         };
         if too_big(&arg) {
             return Ok(None);
         }
-        let Some(RexType::ScalarFunction(f)) = &arg.rex_type else {
-            return Ok(None);
-        };
-        if self.f.functions.name(f.function_reference)? != "multiply" {
-            return Ok(None);
+        let mut factors = Vec::new();
+        self.factors(&arg, &mut factors)?;
+        // Split the leaves into the two sides: those a factor reads together
+        // are on one side, and a leaf no factor reads goes with those its
+        // conditions tie it to.
+        let mut side_of: Vec<usize> = (0..leaves.len()).collect();
+        fn root(side_of: &mut [usize], l: usize) -> usize {
+            let mut r = l;
+            while side_of[r] != r {
+                r = side_of[r];
+            }
+            side_of[l] = r;
+            r
         }
-        let [p, q] = scalar_args(f)?[..] else {
-            return Ok(None);
+        let mut read = vec![false; leaves.len()];
+        let ties = |sets: &[Vec<usize>], side_of: &mut Vec<usize>| {
+            for set in sets {
+                for w in set.windows(2) {
+                    let (a, b) = (root(side_of, w[0]), root(side_of, w[1]));
+                    side_of[a] = b;
+                }
+            }
         };
-        let side_only = |e: &Expression| -> Result<Option<usize>> {
-            let fields = fields_of(e)?;
-            let mut side = None;
-            for c in fields {
-                let Some((s, _)) = side_of(c) else {
+        let mut factor_leaves = Vec::new();
+        for f in &factors {
+            let mut ls: Vec<usize> = Vec::new();
+            for c in fields_of(f)? {
+                let Some(l) = leaf_of(c) else {
                     return Ok(None);
                 };
-                if side.is_some_and(|t| t != s) {
-                    return Ok(None);
-                }
-                side = Some(s);
+                read[l] = true;
+                ls.push(l);
             }
-            Ok(side)
-        };
-        let (Some(sp), Some(sq)) = (side_only(p)?, side_only(q)?) else {
+            factor_leaves.push(ls);
+        }
+        ties(&factor_leaves, &mut side_of);
+        let mut cond_leaves = Vec::new();
+        for c in &conds {
+            let mut subqueries = Vec::new();
+            crate::forward::collect_subqueries(c, &mut subqueries);
+            if !subqueries.is_empty() {
+                return Ok(None);
+            }
+            let mut ls = Vec::new();
+            for f in fields_of(c)? {
+                let Some(l) = leaf_of(f) else {
+                    return Ok(None);
+                };
+                ls.push(l);
+            }
+            ls.sort();
+            ls.dedup();
+            cond_leaves.push(ls);
+        }
+        let unread: Vec<Vec<usize>> = cond_leaves
+            .iter()
+            .filter(|ls| ls.iter().any(|&l| !read[l]))
+            .cloned()
+            .collect();
+        ties(&unread, &mut side_of);
+        let roots: Vec<usize> = (0..leaves.len()).map(|l| root(&mut side_of, l)).collect();
+        let first = roots[0];
+        let Some(other) = roots.iter().copied().find(|&r| r != first) else {
             return Ok(None);
         };
-        if sp == sq {
+        if roots.iter().any(|&r| r != first && r != other) {
             return Ok(None);
         }
-        let local =
-            |e: &Expression, start: usize| crate::expr::map_fields(e, &mut |c| Ok(c - start));
-        let (fl, fr) = if sp == 0 { (p, q) } else { (q, p) };
-        let factors = [local(fl, 0)?, local(fr, lw)?];
+        let side_of_leaf: Vec<usize> = roots.iter().map(|&r| usize::from(r != first)).collect();
+        let side_of_col = |c: usize| leaf_of(c).map(|l| side_of_leaf[l]);
+
+        // The conditions: within a side, between them, or a mask.
+        let mut within = [Vec::new(), Vec::new()];
+        let mut keys = Vec::new();
+        let mut masks = Vec::new();
+        for (c, ls) in conds.into_iter().zip(cond_leaves) {
+            let sides: Vec<usize> = ls.iter().map(|&l| side_of_leaf[l]).collect();
+            if sides
+                .iter()
+                .all(|&s| s == sides.first().copied().unwrap_or(0))
+            {
+                within[sides.first().copied().unwrap_or(0)].push((c, ls));
+                continue;
+            }
+            if let Some((not_distinct, a, b)) = self.equality(&c)? {
+                match (side_of_col(a), side_of_col(b)) {
+                    (Some(0), Some(1)) => {
+                        keys.push((a, b, not_distinct));
+                        continue;
+                    }
+                    (Some(1), Some(0)) => {
+                        keys.push((b, a, not_distinct));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            let mut group_only = true;
+            let mask = map_fields(&c, &mut |f| {
+                let g = group_cols.iter().position(|&gc| gc == f);
+                group_only &= g.is_some();
+                Ok(g.unwrap_or(f))
+            })?;
+            if !group_only {
+                return Ok(None);
+            }
+            masks.push(mask);
+        }
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        // Each side, rebuilt from its leaves.
+        let mut product: [Option<Expression>; 2] = [None, None];
+        let mul = self.ext.anchor(Function::Multiply);
+        for (f, ls) in factors.into_iter().zip(&factor_leaves) {
+            // A factor that reads no input is a constant; it goes with side 0.
+            let s = ls.first().map_or(0, |&l| side_of_leaf[l]);
+            product[s] = Some(match product[s].take() {
+                Some(p) => call(mul, vec![p, f]),
+                None => f,
+            });
+        }
+        let and = self.ext.anchor(Function::And);
+        let mut sides = Vec::new();
+        for (s, within) in within.into_iter().enumerate() {
+            let mine: Vec<usize> = (0..leaves.len())
+                .filter(|&l| side_of_leaf[l] == s)
+                .collect();
+            let Some(mut side) = rebuild(region, &leaves, &mine, within, and)? else {
+                return Ok(None);
+            };
+            // A side whose leaves no factor reads has the factor 1: never, as
+            // a product's factors read both sides, but kept total.
+            let Some(f) = product[s].take() else {
+                return Ok(None);
+            };
+            let at = side.at.clone();
+            side.factor = map_fields(&f, &mut |c| Ok(at[c].expect("a factor of this side")))?;
+            sides.push(side);
+        }
+        let [left, right]: [Side; 2] = sides.try_into().ok().expect("two sides");
+        let keys = keys
+            .into_iter()
+            .map(|(a, b, nd)| {
+                (
+                    left.at[a].expect("side 0"),
+                    right.at[b].expect("side 1"),
+                    nd,
+                )
+            })
+            .collect();
+        let groups = group_cols
+            .iter()
+            .map(|&c| {
+                let s = side_of_col(c).expect("a column beneath the projections");
+                (s, [&left, &right][s].at[c].expect("on its side"))
+            })
+            .collect();
         Ok(Some(Shape {
-            sides: [
-                Side {
-                    rel: left,
-                    start: 0,
-                    width: lw,
-                    slot: ls,
-                },
-                Side {
-                    rel: right,
-                    start: lw,
-                    width: rw,
-                    slot: rs,
-                },
-            ],
+            sides: [left, right],
             keys,
             groups,
-            factors,
+            masks,
         }))
     }
 
-    /// Side `x`'s contribution: see the module docs. `None` if the gradient
-    /// can't be propagated to its input this way.
-    fn side_contribution(
-        &mut self,
-        region: &Region,
-        shape: &Shape,
-        x: usize,
-        cotangent: &Rel,
-        cot_col: usize,
-    ) -> Result<Option<Contribution>> {
+    /// Collect the leaves of the inner-join tree `rel` (whose columns start
+    /// at region column `start`), and its join conditions' conjuncts in the
+    /// region's numbering. `false` if a join has a post-join filter.
+    fn flatten<'r>(
+        &self,
+        rel: &'r Rel,
+        start: usize,
+        leaves: &mut Vec<Leaf<'r>>,
+        conds: &mut Vec<Expression>,
+    ) -> Result<bool> {
+        match &rel.rel_type {
+            Some(RelType::Join(j)) if j.r#type == JoinType::Inner as i32 => {
+                if j.post_join_filter.is_some() {
+                    return Ok(false);
+                }
+                let (Some(l), Some(r)) = (j.left.as_deref(), j.right.as_deref()) else {
+                    return Ok(false);
+                };
+                if let Some(c) = j.expression.as_deref() {
+                    for conjunct in self.conjuncts(c)? {
+                        conds.push(map_fields(&conjunct, &mut |f| Ok(f + start))?);
+                    }
+                }
+                let lw = width(l)?;
+                Ok(self.flatten(l, start, leaves, conds)?
+                    && self.flatten(r, start + lw, leaves, conds)?)
+            }
+            // A projection that computes nothing keeps its input's columns.
+            Some(RelType::Project(p)) if p.expressions.is_empty() && p.common.is_none() => {
+                match p.input.as_deref() {
+                    Some(input) => self.flatten(input, start, leaves, conds),
+                    None => Ok(false),
+                }
+            }
+            _ => {
+                leaves.push(Leaf {
+                    rel,
+                    start,
+                    width: width(rel)?,
+                });
+                Ok(true)
+            }
+        }
+    }
+
+    /// The factors of a product `e`: `e` itself unless it multiplies.
+    fn factors(&self, e: &Expression, out: &mut Vec<Expression>) -> Result<()> {
+        if let Some(RexType::ScalarFunction(f)) = &e.rex_type {
+            if self.f.functions.name(f.function_reference)? == "multiply" {
+                if let [a, b] = scalar_args(f)?[..] {
+                    self.factors(a, out)?;
+                    return self.factors(b, out);
+                }
+            }
+        }
+        out.push(e.clone());
+        Ok(())
+    }
+
+    /// The transpose of side `x`: its region, with its factor appended as a
+    /// column and joined to `t` (see the module docs), transposed from the
+    /// factor's cotangent by the region rules.
+    fn side(&mut self, shape: &Shape, x: usize, cotangent: &Rel, cot_col: usize) -> Result<()> {
         let y = 1 - x;
         let (xs, ys) = (&shape.sides[x], &shape.sides[y]);
-        let same = self
-            .ext
-            .anchor(crate::functions::Function::IsNotDistinctFrom);
-        let and = self.ext.anchor(crate::functions::Function::And);
-        let mul = self.ext.anchor(crate::functions::Function::Multiply);
-        let sum = self.ext.anchor(crate::functions::Function::Sum);
-        let is_null = self.ext.anchor(crate::functions::Function::IsNull);
+        let same = self.ext.anchor(Function::IsNotDistinctFrom);
+        let and = self.ext.anchor(Function::And);
+        let mul = self.ext.anchor(Function::Multiply);
+        let sum = self.ext.anchor(Function::Sum);
+        let is_null = self.ext.anchor(Function::IsNull);
         let all = |conds: Vec<Expression>| conds.into_iter().reduce(|a, b| call(and, vec![a, b]));
-
-        // The factor of side x, over x's input columns, and its partials.
-        let (inputs_x, e_x) = match inline_side(region, xs, &shape.factors[x], &budget())? {
-            Some(v) if !too_big(&v.1) => v,
-            _ => return Ok(None),
-        };
-        let varied = |c: usize| inputs_x.get(&c).is_some_and(|&rc| region.varied[rc]);
-        let partials = self.ew.partials(&e_x, &varied, &mut self.ext)?;
-        if partials.is_empty() {
-            return Ok(None);
-        }
 
         // t: Y joined to the cotangent on Y's grouping keys, summed by Y's
         // join keys and the cotangent's X-side grouping keys.
         let ndims = shape.groups.len();
-        let ywidth = ys.width;
-        let on_y: Vec<Expression> = shape
+        let ywidth = ys.region.defs.len();
+        let on_y = shape
             .groups
             .iter()
             .enumerate()
             .filter(|(_, (s, _))| *s == y)
             .map(|(g, &(_, c))| call(same, vec![field(c), field(ywidth + g)]))
             .collect();
-        // With no grouping key on Y's side, Y would meet every cotangent row:
-        // a cross join, which the general rule handles instead.
-        let Some(on_y) = all(on_y) else {
-            return Ok(None);
-        };
+        let on_y = all(on_y).expect("checked: the other side holds a grouping key");
         let y_keys: Vec<usize> = shape
             .keys
             .iter()
@@ -372,73 +487,71 @@ impl Transposer<'_> {
             })
             .collect();
         let y_rel = match all(not_null) {
-            Some(cond) => filter(ys.rel.clone(), cond),
-            None => ys.rel.clone(),
+            Some(cond) => filter(ys.region.rel.clone(), cond),
+            None => ys.region.rel.clone(),
         };
-        let yc = join(y_rel, cotangent.clone(), on_y, JoinType::Inner);
+        let cotangent = match all(shape.masks.clone()) {
+            Some(mask) => filter(cotangent.clone(), mask),
+            None => cotangent.clone(),
+        };
+        let yc = join(y_rel, cotangent, on_y, JoinType::Inner);
         let x_groups: Vec<usize> = (0..ndims).filter(|&g| shape.groups[g].0 == x).collect();
         let mut t_keys: Vec<Expression> = y_keys.iter().map(|&c| field(c)).collect();
         t_keys.extend(x_groups.iter().map(|&g| field(ywidth + g)));
         let term = call(
             mul,
-            vec![field(ywidth + ndims + cot_col), shape.factors[y].clone()],
+            vec![field(ywidth + ndims + cot_col), ys.factor.clone()],
         );
-        let t = aggregate(yc, t_keys, vec![(sum, vec![term])]);
         let t_value = y_keys.len() + x_groups.len();
+        let mut t = aggregate(yc, t_keys, vec![(sum, vec![term])]);
+        // t is most of the work. A side of one input and no window reads it
+        // once; any other reads it once per input and once per window, so it
+        // is materialized, as a window's summed cotangent is.
+        let several = xs.region.slots.len() > 1
+            || xs
+                .region
+                .defs
+                .iter()
+                .any(|d| matches!(d, Def::Window { .. }));
+        if several {
+            let name = format!("{}contraction_{}", self.f.namespace, self.steps_made());
+            let names: Vec<String> = (0..=t_value).map(|i| format!("c{i}")).collect();
+            self.steps.push((name.clone(), t, names.clone()));
+            t = crate::emit::read_step(&name, names);
+        }
 
-        // x joined to t on the join keys and x's grouping keys.
-        let xwidth = xs.width;
+        // X, its factor a column of its own, joined to t on the join keys and
+        // X's grouping keys.
+        let mut region = xs.region.clone();
+        let factor_col = region.defs.len();
+        let varied = depends(&self.f.functions, &xs.factor, &|c| region.varied[c])?;
+        region
+            .rounds
+            .push(subquery_rounds(&self.f.functions, &xs.factor)?);
+        region.defs.push(Def::Expr(xs.factor.clone()));
+        region.varied.push(varied);
+        region.refusals.push(None);
+        let rel = project(region.rel.clone(), vec![xs.factor.clone()]);
+        let t_at = factor_col + 1;
         let mut on_x = Vec::new();
         for (k, &(l, r, _)) in shape.keys.iter().enumerate() {
             let xc = if x == 0 { l } else { r };
-            on_x.push(call(same, vec![field(xc), field(xwidth + k)]));
+            on_x.push(call(same, vec![field(xc), field(t_at + k)]));
         }
         for (i, &g) in x_groups.iter().enumerate() {
             let xc = shape.groups[g].1;
-            on_x.push(call(
-                same,
-                vec![field(xc), field(xwidth + y_keys.len() + i)],
-            ));
+            on_x.push(call(same, vec![field(xc), field(t_at + y_keys.len() + i)]));
         }
-        let xt = join(
-            xs.rel.clone(),
+        let base = join(
+            rel,
             t,
             all(on_x).expect("a contraction has a join key"),
             JoinType::Inner,
         );
         // A NULL factor of x leaves its rows nothing to pass on: the guard
         // the general rule applies to each joined row, once per row of x.
-        let guarded = if_then(
-            vec![(call(is_null, vec![e_x.clone()]), null_f64())],
-            field(xwidth + t_value),
-        );
-        let slot = &region.slots[xs.slot];
-        let offset = slot.offset.expect("a side's input is in the output") - xs.start;
-        let dims = match slot.input {
-            Input::Table(t) => self.f.tables[t].dims.clone(),
-            Input::Saved(s) => self.f.saved[s].dims(),
-            Input::Const => return Ok(None),
-        };
-        let groupings: Vec<Expression> = dims.iter().map(|d| field(offset + d)).collect();
-        // Each term is a column of its own before it is summed, as the general
-        // rule's cotangents are: two columns with the same partial (both 1 in
-        // `SUM((a.val + a.bias) * w.val)`) would otherwise be two measures of
-        // the same name, which DataFusion's consumer refuses.
-        let xt_width = xwidth + t_value + 1;
-        let mut cols = Vec::new();
-        let mut terms = Vec::new();
-        for (c, d) in partials {
-            // `c` is a column of side x holding input column `c - offset`.
-            cols.push(c - offset);
-            terms.push(call(mul, vec![guarded.clone(), d]));
-        }
-        let measures = (0..terms.len())
-            .map(|i| (sum, vec![field(xt_width + i)]))
-            .collect();
-        Ok(Some(Contribution {
-            rel: aggregate(project(xt, terms), groupings, measures),
-            cols,
-        }))
+        let seed = self.skips_null(factor_col, field(t_at + t_value));
+        self.region_once(&region, base, vec![(factor_col, seed)])
     }
 
     /// The conjuncts of `e`, flattening `and`.
@@ -476,41 +589,145 @@ impl Transposer<'_> {
     }
 }
 
-/// `e`, a factor over side `s`'s columns, rewritten over the side's input
-/// columns only (through the side's own projections), with a map from
-/// each input column it reads (in side numbering) to its region column.
-/// `None` if it reads a column that isn't an input or an expression, or
-/// one whose gradient ddx refuses.
-fn inline_side(
+/// The side made of `mine`, leaves of `region`, joined left to right, each
+/// condition in `within` (with the leaves it reads) at the first join where
+/// all its leaves are present (`and` is the anchor of `and`). `None` if a
+/// leaf's columns are not its own.
+fn rebuild(
     region: &Region,
-    s: &Side,
-    e: &Expression,
-    budget: &Cell<usize>,
-) -> Result<Option<(BTreeMap<usize, usize>, Expression)>> {
-    let mut inputs = BTreeMap::new();
-    let Some(out) = inline(e, budget, &mut |c| {
-        let rc = s.start + c;
-        if region.refusals[rc].is_some() {
-            return None;
+    leaves: &[Leaf],
+    mine: &[usize],
+    within: Vec<(Expression, Vec<usize>)>,
+    and: u32,
+) -> Result<Option<Side>> {
+    let mut at = vec![None; region.defs.len()];
+    let mut side: Option<Region> = None;
+    let mut placed = Vec::new();
+    let mut pending = within;
+    for &l in mine {
+        let leaf = &leaves[l];
+        let Some(part) = slice(region, leaf)? else {
+            return Ok(None);
+        };
+        let offset = side.as_ref().map_or(0, |s| s.defs.len());
+        for c in 0..leaf.width {
+            at[leaf.start + c] = Some(offset + c);
         }
-        match &region.defs[rc] {
-            Def::Input { slot, .. } if *slot == s.slot => {
-                inputs.insert(c, rc);
-                Some(field(c))
-            }
-            Def::Expr(inner) => {
-                let local = crate::expr::map_fields(inner, &mut |f| Ok(f - s.start)).ok()?;
-                let (more, x) = inline_side(region, s, &local, budget).ok().flatten()?;
-                inputs.extend(more);
-                Some(x)
-            }
-            _ => None,
+        placed.push(l);
+        let (ready, rest): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, ls)| ls.iter().all(|x| placed.contains(x)));
+        pending = rest;
+        let mut conds = Vec::new();
+        for (c, _) in ready {
+            conds.push(map_fields(&c, &mut |f| Ok(at[f].expect("placed")))?);
         }
-    })?
-    else {
-        return Ok(None);
+        side = Some(match side {
+            None => {
+                let mut s = part;
+                if let Some(c) = conds.into_iter().reduce(|a, b| call(and, vec![a, b])) {
+                    s.rel = filter(s.rel, c);
+                }
+                s
+            }
+            Some(mut s) => {
+                let left = std::mem::take(&mut s.rel);
+                let right = part.rel.clone();
+                s.append(part)?;
+                s.rel = match conds.into_iter().reduce(|a, b| call(and, vec![a, b])) {
+                    Some(c) => join(left, right, c, JoinType::Inner),
+                    None => Rel {
+                        rel_type: Some(RelType::Cross(Box::new(CrossRel {
+                            common: None,
+                            left: Some(Box::new(left)),
+                            right: Some(Box::new(right)),
+                            advanced_extension: None,
+                        }))),
+                    },
+                };
+                s
+            }
+        });
+    }
+    Ok(side.map(|region| Side {
+        region,
+        at,
+        factor: lit_bool(true),
+    }))
+}
+
+/// `leaf`'s columns of `region`, as a region of their own. `None` if one of
+/// them reads a column outside the leaf.
+fn slice(region: &Region, leaf: &Leaf) -> Result<Option<Region>> {
+    let range = leaf.start..leaf.start + leaf.width;
+    let local = |c: usize| {
+        range
+            .contains(&c)
+            .then(|| c - leaf.start)
+            .ok_or_else(|| crate::error::AdError::Internal("outside the leaf".into()))
     };
-    Ok(Some((inputs, out)))
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut slot_at = vec![None; region.slots.len()];
+    for (i, s) in region.slots.iter().enumerate() {
+        if let Some(o) = s.offset.filter(|o| range.contains(o)) {
+            slot_at[i] = Some(slots.len());
+            slots.push(Slot {
+                offset: Some(o - leaf.start),
+                ..s.clone()
+            });
+        }
+    }
+    let mut defs = Vec::with_capacity(leaf.width);
+    for d in &region.defs[range.clone()] {
+        let def = match d {
+            Def::Input { slot, col } => match slot_at[*slot] {
+                Some(slot) => Def::Input { slot, col: *col },
+                None => return Ok(None),
+            },
+            Def::Expr(e) => match map_fields(e, &mut |c| local(c)) {
+                Ok(e) => Def::Expr(e),
+                Err(_) => return Ok(None),
+            },
+            Def::Window {
+                keys,
+                function,
+                beneath,
+                offset,
+            } => {
+                let (Ok(function), Ok(offset)) =
+                    (map_fields(function, &mut |c| local(c)), local(*offset))
+                else {
+                    return Ok(None);
+                };
+                let keys = match keys {
+                    Some(keys) => match keys.iter().map(|&k| local(k)).collect() {
+                        Ok(keys) => Some(keys),
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
+                Def::Window {
+                    keys,
+                    function,
+                    beneath: beneath.clone(),
+                    offset,
+                }
+            }
+            Def::Const => Def::Const,
+        };
+        defs.push(def);
+    }
+    Ok(Some(Region {
+        rel: leaf.rel.clone(),
+        defs,
+        varied: region.varied[range.clone()].to_vec(),
+        refusals: region.refusals[range.clone()].to_vec(),
+        outputs: (0..leaf.width).collect(),
+        slots,
+        cuts: Vec::new(),
+        volatile: region.volatile,
+        rounds: region.rounds[range].to_vec(),
+    }))
 }
 
 /// Is `e` too large to inline? Inlining copies an expression once per use, so
