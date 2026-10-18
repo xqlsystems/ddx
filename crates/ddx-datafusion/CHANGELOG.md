@@ -9,6 +9,13 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.1...ddx-datafusion-v0.2.2) - 2026-10-18
+
+### Changed
+
+- Faster gradients of products. A `SUM` of a product of two joined inputs is now transposed as a contraction, as `jax.grad` transposes a matrix product, instead of rebuilding the forward join in every gradient step to test whether the product was NULL. `matmul`'s gradient at n = 50,000 takes 0.83 s instead of 1.79 s ([#126](https://github.com/xqlsystems/ddx/pull/126))
+- A statement rewritten for its `grad` or `vjp` calls drops the CTEs it no longer reads, which an engine would otherwise plan again for each statement: in a GPT training step of one statement per parameter table, 0.44 s of a 2.4 s step ([#160](https://github.com/xqlsystems/ddx/pull/160))
+
 ## [0.2.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.0...ddx-datafusion-v0.2.1) - 2026-10-18
 
 ### Added
