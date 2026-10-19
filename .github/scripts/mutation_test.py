@@ -70,12 +70,12 @@ MUTANTS = [
     # The two contraction mutants survive the soak until its generator writes
     # the rule's shape (#127); contraction_transpose.rs kills both.
     ("contraction-wrong-cotangent", f"{AD}/contraction.rs",
-     "vec![field(ywidth + ndims + cot_col), shape.factors[y].clone()],",
-     "vec![field(ywidth + cot_col), shape.factors[y].clone()],",
+     "vec![field(ywidth + ndims + cot_col), ys.factor.clone()],",
+     "vec![field(ywidth + cot_col), ys.factor.clone()],",
      "the contraction rule multiplies by a grouping key instead of the cotangent"),
     ("contraction-guard-off", f"{AD}/contraction.rs",
-     "vec![(call(is_null, vec![e_x.clone()]), null_f64())],",
-     "vec![(call(is_null, vec![field(0)]), null_f64())],",
+     "let seed = self.skips_null(factor_col, field(t_at + t_value));",
+     "let seed = field(t_at + t_value);",
      "the contraction rule sends gradient through a row whose own factor is NULL"),
     ("partial-is-one", f"{AD}/transpose.rs",
      "if as_number(&d) == Some(1.0) {",

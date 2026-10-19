@@ -9,8 +9,10 @@
 //! contraction of the cotangent with the other input, without rebuilding the
 //! join. Its gradient must equal the general rule's, NULLs, NaNs and
 //! infinities included. Adding a filter that reads both sides of the join,
-//! and keeps every row (the keys it reads are never NULL or negative), sends
-//! the same loss down the general rule: the two are compared on random
+//! and keeps every row (the keys it reads are never negative), sends the
+//! same loss down the general rule, as long as it reads a column that is not
+//! a grouping key (one that reads only grouping keys is a mask, which the
+//! contraction rule takes): the two are compared on random
 //! tables with NULLs, NaNs, infinities, missing rows, NULL join keys, and
 //! repeated keys in constant data. Each case also checks which rule ran, by
 //! whether a gradient step joins the two inputs.
@@ -278,6 +280,10 @@ async fn compare(
     agree(&a, &b).map(|_| true)
 }
 
+/// A filter across the sides of `a JOIN w` that keeps every row and reads a
+/// join key, so it sends a loss down the general rule.
+const GENERAL: &str = "WHERE a.k IS NULL OR a.k + w.o >= 0";
+
 /// A matrix product's loss, joined `on`, and the same loss with a filter
 /// across the sides that keeps every row.
 fn matmul(on: &str) -> (String, String) {
@@ -287,14 +293,15 @@ fn matmul(on: &str) -> (String, String) {
              GROUP BY a.s, w.o) SELECT SUM(tanh(z) * tanh(z)) AS l FROM c"
         )
     };
-    (loss(""), loss("WHERE a.s + w.o >= 0"))
+    (loss(""), loss(GENERAL))
 }
 
 /// Runs `cases` random matrix products joined `on`, with join keys NULL
 /// sometimes if `null_keys`, and asserts nearly all compared and all agreed.
 async fn matrix_products(seed: u64, cases: usize, on: &str, null_keys: bool) {
     let (loss, general) = matmul(on);
-    matrix_products_of(seed, cases, on, &loss, &general, null_keys).await;
+    let nulls = null_keys.then_some("k");
+    matrix_products_of(seed, cases, on, &loss, &general, nulls).await;
 }
 
 /// [`matrix_products`] of a given loss and its general-rule spelling.
@@ -304,7 +311,7 @@ async fn matrix_products_of(
     on: &str,
     loss: &str,
     general: &str,
-    null_keys: bool,
+    nulls: Option<&str>,
 ) {
     let mut rng = Rng::new(seed);
     let (mut compared, mut failed) = (0, Vec::new());
@@ -317,7 +324,7 @@ async fn matrix_products_of(
             1 + rng.below(4) as usize,
             1 + rng.below(4) as usize,
         );
-        let null_k = null_keys.then_some("k");
+        let null_k = nulls;
         let ctx = SessionContext::new();
         let dup = if both { 0.0 } else { 0.3 };
         register(
@@ -359,6 +366,29 @@ async fn a_matrix_product_matches_the_general_rule_on_awkward_tables() {
 }
 
 #[tokio::test]
+async fn a_masked_matrix_product_matches_the_general_rule() {
+    // A conjunct that reads only grouping keys, as causal attention's
+    // `q.t >= k.t` does, keeps the contraction rule: it applies to whole
+    // groups, so the transpose applies it to the cotangent. A NULL grouping
+    // key makes the mask NULL, which drops the row in both.
+    for (seed, mask, nulls) in [
+        (0x3a5c, "a.s >= w.o", None),
+        (0x3a5d, "a.s >= w.o AND w.o <> 1", None),
+        (0x3a5e, "a.s >= w.o", Some("s")),
+        (0x3a5f, "a.s + w.o <> 2", Some("o")),
+    ] {
+        let loss = |filter: &str| {
+            format!(
+                "WITH c AS (SELECT a.s, w.o, SUM(a.val * w.val) AS z FROM a JOIN w ON a.k = w.k \
+                 WHERE {mask}{filter} GROUP BY a.s, w.o) SELECT SUM(tanh(z) * tanh(z)) AS l FROM c"
+            )
+        };
+        let general = loss(" AND (a.k IS NULL OR a.k + w.o >= 0)");
+        matrix_products_of(seed, 90, mask, &loss(""), &general, nulls).await;
+    }
+}
+
+#[tokio::test]
 async fn a_count_beside_the_sum_matches_the_general_rule() {
     // COUNT moves with no wrt column, so it has no cotangent, and the
     // aggregate is still one SUM of a product for the contraction rule.
@@ -369,8 +399,8 @@ async fn a_count_beside_the_sum_matches_the_general_rule() {
              SELECT SUM(tanh(z) * tanh(z) * n) AS l FROM c"
         )
     };
-    let (fast, general) = (loss(""), loss("WHERE a.s + w.o >= 0"));
-    matrix_products_of(0xc0_4e7, 90, "a.k = w.k", &fast, &general, false).await;
+    let (fast, general) = (loss(""), loss(GENERAL));
+    matrix_products_of(0xc0_4e7, 90, "a.k = w.k", &fast, &general, None).await;
 }
 
 #[tokio::test]
@@ -393,7 +423,7 @@ async fn a_join_on_two_keys_matches_the_general_rule() {
              GROUP BY a.s, w.o) SELECT SUM(z * z) AS l FROM c"
         )
     };
-    let (fast, general) = (loss(""), loss("WHERE a.s + w.o >= 0"));
+    let (fast, general) = (loss(""), loss(GENERAL));
     let mut rng = Rng::new(0x2ce7);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..60 {
@@ -455,7 +485,10 @@ async fn a_second_layer_through_tanh_matches_the_general_rule() {
         )
     };
     let fast = loss("", "");
-    let general = loss("WHERE x.s + w1.j >= 0", "WHERE h.s + w2.o >= 0");
+    let general = loss(
+        "WHERE x.k IS NULL OR x.k + w1.j >= 0",
+        "WHERE h.j IS NULL OR h.j + w2.o >= 0",
+    );
     let saved = |t: &str| t.ends_with("saved_0");
     let mut rng = Rng::new(0x7a17);
     let (mut compared, mut failed) = (0, Vec::new());
@@ -511,7 +544,7 @@ async fn a_factor_of_two_columns_respects_a_null_in_either() {
              {filter} GROUP BY a.s, w.o) SELECT SUM(z * z) AS l FROM c"
         )
     };
-    let (fast, general) = (loss(""), loss("WHERE a.s + w.o >= 0"));
+    let (fast, general) = (loss(""), loss(GENERAL));
     for wrt in [
         vec![ColumnRef::new("a", "val")],
         vec![ColumnRef::new("a", "val"), ColumnRef::new("a", "bias")],
@@ -641,4 +674,223 @@ async fn a_side_that_doubles_at_every_level_falls_back_in_time() {
     ddx_datafusion::engine::execute(&ctx, &program)
         .await
         .unwrap();
+}
+
+/// Runs `cases` random cases of `loss` against `general` over the tables
+/// `make` registers, differentiated in `wrt`, and asserts nearly all
+/// compared and all agreed.
+async fn cases_of(
+    seed: u64,
+    cases: usize,
+    loss: &str,
+    general: &str,
+    wrt: &[ColumnRef],
+    joins: &[Join<'_>],
+    make: &dyn Fn(&mut Rng, &SessionContext),
+) {
+    let mut rng = Rng::new(seed);
+    let (mut compared, mut failed) = (0, Vec::new());
+    for case in 0..cases {
+        let ctx = SessionContext::new();
+        make(&mut rng, &ctx);
+        match compare(&ctx, loss, general, wrt, joins).await {
+            Ok(true) => compared += 1,
+            Ok(false) => {}
+            Err(e) => failed.push(format!("case {case}: {e}")),
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {cases} disagree on `{loss}`:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    assert!(
+        compared * 10 >= cases * 7,
+        "only {compared} of {cases} cases compared on `{loss}`"
+    );
+}
+
+#[tokio::test]
+async fn a_divisor_constant_within_a_group_matches_the_general_rule() {
+    // Attention's output, SUM(w / z * v) over weights, values and the
+    // softmax's normalizer: z is joined on a grouping key, so the sides are
+    // {p, z} (one row per score) and {v}, whatever order the joins are
+    // written in. A table no factor reads (m) goes with the side its join
+    // ties it to, and its repeated keys repeat rows on that side. (Written
+    // `p JOIN z … JOIN v`, no step of either rule joins p to v directly, so
+    // that spelling has no check of which rule ran.)
+    let froms = [
+        "FROM p JOIN v ON p.j = v.t JOIN z ON p.i = z.i",
+        "FROM p JOIN z ON p.i = z.i JOIN v ON p.j = v.t",
+        "FROM v JOIN p ON p.j = v.t JOIN z ON z.i = p.i",
+        "FROM p JOIN v ON p.j = v.t JOIN z ON p.i = z.i JOIN m ON m.i = p.i",
+    ];
+    let (p, v) = (named("p"), named("v"));
+    let checked: [Join; 1] = [(&p, &v)];
+    for (n, from) in froms.into_iter().enumerate() {
+        let loss = |filter: &str| {
+            format!(
+                "WITH o AS (SELECT p.i, v.d, SUM(p.val / z.val * v.val) AS x {from} {filter} \
+                 GROUP BY p.i, v.d) SELECT SUM(tanh(x) * tanh(x)) AS l FROM o"
+            )
+        };
+        let wrt = [
+            ColumnRef::new("p", "val"),
+            ColumnRef::new("v", "val"),
+            ColumnRef::new("z", "val"),
+        ];
+        let make = |rng: &mut Rng, ctx: &SessionContext| {
+            let (ni, nj, nd) = (
+                1 + rng.below(4) as usize,
+                1 + rng.below(3) as usize,
+                1 + rng.below(3) as usize,
+            );
+            register(
+                ctx,
+                "p",
+                table(rng, &[("i", ni), ("j", nj)], &["val"], 0.0, None),
+            );
+            register(
+                ctx,
+                "v",
+                table(rng, &[("t", nj), ("d", nd)], &["val"], 0.0, None),
+            );
+            register(ctx, "z", table(rng, &[("i", ni)], &["val"], 0.0, None));
+            register(ctx, "m", table(rng, &[("i", ni)], &[], 0.3, None));
+        };
+        cases_of(
+            0x0d10 + n as u64,
+            60,
+            &loss(""),
+            &loss("WHERE v.t IS NULL OR v.t + z.i >= 0"),
+            &wrt,
+            if n == 1 { &[] } else { &checked },
+            &make,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn causal_attention_matches_the_general_rule() {
+    // The query of issue #153: a causal mask on the scores, a softmax
+    // through a MAX window, and the normalizer joined on a grouping key.
+    // Neither the scores' join nor the output's may be rebuilt.
+    let loss = |scores: &str, output: &str| {
+        format!(
+            "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.val * k.val) / 8.0 AS s \
+             FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t {scores} GROUP BY q.t, k.t), \
+             weights AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS w FROM scores), \
+             norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i), \
+             attention AS (SELECT w.i AS t, v.d, SUM(w.w / n.z * v.val) AS x \
+             FROM weights w JOIN v ON w.j = v.t JOIN norm n ON w.i = n.i {output} GROUP BY w.i, v.d) \
+             SELECT SUM(x * x) / 2 AS l FROM attention"
+        )
+    };
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    let make = |rng: &mut Rng, ctx: &SessionContext| {
+        let (nt, nd) = (1 + rng.below(4) as usize, 1 + rng.below(3) as usize);
+        for name in ["q", "k", "v"] {
+            register(
+                ctx,
+                name,
+                table(rng, &[("t", nt), ("d", nd)], &["val"], 0.0, None),
+            );
+        }
+    };
+    let scores = |t: &str| t.ends_with("saved_0");
+    cases_of(
+        0xa77e,
+        60,
+        &loss("", ""),
+        &loss(
+            "AND (q.d IS NULL OR q.d + k.t >= 0)",
+            "WHERE v.t IS NULL OR v.t + w.i >= 0",
+        ),
+        &wrt,
+        &[(&named("q"), &named("k")), (&scores, &named("v"))],
+        &make,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_side_that_does_not_move_is_still_checked_for_a_total_order() {
+    // w is constant here, but t recomputes it: a LIMIT inside it may keep
+    // other rows on a second run, so the contraction rule refuses it as the
+    // general rule does.
+    let ctx = SessionContext::new();
+    let mut rng = Rng::new(0x1171);
+    register(
+        &ctx,
+        "a",
+        table(&mut rng, &[("s", 3), ("k", 3)], &["val"], 0.0, None),
+    );
+    register(
+        &ctx,
+        "w",
+        table(&mut rng, &[("k", 3), ("o", 3)], &["val"], 0.0, None),
+    );
+    let loss = "WITH c AS (SELECT a.s, w.o, SUM(a.val * w.val) AS z FROM a \
+                JOIN (SELECT * FROM w LIMIT 4) w ON a.k = w.k GROUP BY a.s, w.o) \
+                SELECT SUM(z * z) AS l FROM c";
+    let refused = ad::grad(&ctx, loss, &[ColumnRef::new("a", "val")]).await;
+    let why = refused
+        .expect_err("a LIMIT in recomputed constant data")
+        .to_string();
+    assert!(why.contains("LIMIT"), "{why}");
+}
+
+#[tokio::test]
+async fn a_side_its_conditions_leave_in_pieces_takes_the_general_rule() {
+    // The factors put p and z on one side, but no condition joins them: each
+    // joins v. Rebuilt alone, that side would be p × z, a cross join the
+    // query never formed, so the general rule applies. Its gradient still
+    // matches, and its steps rebuild the join of p and v.
+    let loss = |filter: &str| {
+        format!(
+            "WITH o AS (SELECT p.i, v.d, SUM(p.val / z.val * v.val) AS x FROM p JOIN v ON p.j = v.t \
+             JOIN z ON v.u = z.i {filter} GROUP BY p.i, v.d) SELECT SUM(tanh(x) * tanh(x)) AS l FROM o"
+        )
+    };
+    let wrt = [ColumnRef::new("p", "val"), ColumnRef::new("z", "val")];
+    let mut rng = Rng::new(0xc055);
+    for _ in 0..10 {
+        let ctx = SessionContext::new();
+        register(
+            &ctx,
+            "p",
+            table(&mut rng, &[("i", 3), ("j", 2)], &["val"], 0.0, None),
+        );
+        register(
+            &ctx,
+            "v",
+            table(
+                &mut rng,
+                &[("t", 2), ("u", 2), ("d", 2)],
+                &["val"],
+                0.0,
+                None,
+            ),
+        );
+        register(&ctx, "z", table(&mut rng, &[("i", 2)], &["val"], 0.0, None));
+        let program = ad::grad(&ctx, &loss(""), &wrt).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &program)
+            .await
+            .unwrap();
+        assert!(rebuilds(&ctx, &program, &named("p"), &named("v")).await);
+        let general = loss("WHERE v.t IS NULL OR v.t + z.i >= 0");
+        let slow = ad::grad(&ctx, &general, &wrt).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &slow).await.unwrap();
+        let (a, b) = (
+            gradients(&ctx, &program, &wrt).await,
+            gradients(&ctx, &slow, &wrt).await,
+        );
+        agree(&a, &b).unwrap();
+    }
 }
