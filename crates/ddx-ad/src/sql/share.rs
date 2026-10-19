@@ -263,14 +263,16 @@ impl Visitor for Refs<'_> {
     }
 
     fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
-        let Some((k, same)) = cte_of(name, self.ctes) else {
-            return ControlFlow::Continue(());
-        };
-        // Every read counts, so the CTE stays in the `WITH` of a scope that
-        // reads it, however it reads it.
-        self.counts[k] += 1;
-        if !same || self.subqueries > 0 {
-            self.unsafe_[k] = true;
+        let matches = ctes_of(name, self.ctes);
+        let alone = matches.len() == 1;
+        for (k, same) in matches {
+            // Every read counts, against each CTE it may be of, so each
+            // stays in the `WITH` of a scope that reads it, however it
+            // reads it.
+            self.counts[k] += 1;
+            if !same || !alone || self.subqueries > 0 {
+                self.unsafe_[k] = true;
+            }
         }
         ControlFlow::Continue(())
     }
@@ -284,16 +286,28 @@ fn is_subquery(expr: &Expr) -> bool {
 }
 
 /// Which of `ctes` a one-part relation name may read, and whether it is
-/// spelled as the CTE is (both unquoted, which every engine compares
-/// without case, or both quoted the same).
-fn cte_of(name: &ObjectName, ctes: &[Cte]) -> Option<(usize, bool)> {
+/// spelled as each is (both unquoted, which every engine compares without
+/// case, or both quoted the same). Engines differ on how case and quotes
+/// resolve, so every CTE whose name matches but for case may be the one
+/// read.
+fn ctes_of(name: &ObjectName, ctes: &[Cte]) -> Vec<(usize, bool)> {
     let [ObjectNamePart::Identifier(id)] = name.0.as_slice() else {
-        return None;
+        return Vec::new();
     };
-    let k = ctes
-        .iter()
-        .position(|c| c.alias.name.value.eq_ignore_ascii_case(&id.value))?;
-    Some((k, same_spelling(id, &ctes[k].alias.name)))
+    ctes.iter()
+        .enumerate()
+        .filter(|(_, c)| c.alias.name.value.eq_ignore_ascii_case(&id.value))
+        .map(|(k, c)| (k, same_spelling(id, &c.alias.name)))
+        .collect()
+}
+
+/// The CTE a relation name surely reads: the one CTE its name may read,
+/// spelled as it is.
+fn cte_of(name: &ObjectName, ctes: &[Cte]) -> Option<usize> {
+    match ctes_of(name, ctes)[..] {
+        [(k, true)] => Some(k),
+        _ => None,
+    }
 }
 
 fn same_spelling(a: &Ident, b: &Ident) -> bool {
@@ -314,7 +328,7 @@ fn replace<V: VisitMut>(node: &mut V, ctes: &[Cte], placeholders: &HashMap<usize
     impl VisitorMut for Replace<'_> {
         type Break = ();
         fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<()> {
-            if let Some((k, true)) = cte_of(name, self.ctes) {
+            if let Some(k) = cte_of(name, self.ctes) {
                 if let Some(p) = self.placeholders.get(&k) {
                     *name = ObjectName::from(vec![quoted(p)]);
                 }
@@ -557,6 +571,23 @@ mod tests {
             "{}",
             s.root
         );
+        // A read that may be of either of two CTEs whose names differ only
+        // in case keeps both, and neither is planned alone.
+        let s = split(
+            &query(
+                "WITH a AS (SELECT 1 AS x), \"A\" AS (SELECT 2 AS x), c AS (SELECT 3 AS y) \
+                 SELECT * FROM c, c, \"A\", \"A\"",
+            ),
+            "__ddx_t_",
+        )
+        .unwrap();
+        assert!(
+            s.root
+                .starts_with("WITH a AS (SELECT 1 AS x), \"A\" AS (SELECT 2 AS x) "),
+            "{}",
+            s.root
+        );
+        assert_eq!(s.ctes.len(), 1);
     }
 
     #[test]
