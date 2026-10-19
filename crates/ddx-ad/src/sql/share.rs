@@ -54,6 +54,9 @@ pub(super) struct Split {
     pub ctes: Vec<Piece>,
     /// The query, reading each such CTE's placeholder.
     pub root: String,
+    /// The namespace the placeholders are named under: fresh to the call,
+    /// so calls that overlap make tables of their own.
+    pub namespace: String,
 }
 
 /// One CTE planned on its own.
@@ -144,6 +147,7 @@ pub(super) fn split(query: &Query, namespace: &str) -> Option<Split> {
     Some(Split {
         ctes: pieces,
         root: format!("{with}{root}"),
+        namespace: namespace.to_string(),
     })
 }
 

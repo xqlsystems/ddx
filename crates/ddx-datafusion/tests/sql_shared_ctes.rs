@@ -200,3 +200,44 @@ async fn a_cte_read_once_is_left_to_the_engine() {
         log.made
     );
 }
+
+/// The prefix, `__ddx_{hex}_{hex}_`, of the program tables `sql` reads.
+fn program_prefix(sql: &str) -> String {
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    let mut found: Vec<String> = sql
+        .match_indices("__ddx_")
+        .filter_map(|(at, _)| {
+            let mut parts = sql[at + "__ddx_".len()..].splitn(3, '_');
+            let (a, b) = (parts.next()?, parts.next()?);
+            parts.next()?;
+            (hex(a) && hex(b)).then(|| format!("__ddx_{a}_{b}_"))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    assert_eq!(found.len(), 1, "one program's tables in {sql}");
+    found.pop().unwrap()
+}
+
+#[tokio::test]
+async fn a_split_objective_s_program_is_kept_between_calls() {
+    // Each call names its placeholders afresh, so overlapping calls make
+    // tables of their own; the program is kept under a key that names them
+    // all alike, so the next call runs it again.
+    let ctx = w().await;
+    let statement = format!("{} SELECT i, grad(loss, val) AS g FROM w", chain(3));
+    let programs = Programs::new();
+    let mut prefixes = Vec::new();
+    for _ in 0..2 {
+        let mut backend = DataFusion(ctx.clone());
+        let out = ddx_ad::rewrite(&mut backend, &programs, &[&statement], &GenericDialect {})
+            .await
+            .unwrap();
+        prefixes.push(program_prefix(&out.statements[0]));
+        out.release(&mut backend, &programs).await.unwrap();
+    }
+    assert_eq!(
+        prefixes[0], prefixes[1],
+        "the second call built its own program"
+    );
+}

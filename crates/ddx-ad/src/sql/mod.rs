@@ -298,7 +298,7 @@ async fn program_of_query<B: Backend>(
     programs: &Programs,
     job: &plan::Job,
 ) -> Result<Option<cache::Key>, RunError<B::Error>> {
-    let key = cache::Key::of(backend, job, std::slice::from_ref(&job.query))
+    let key = cache::Key::of(backend, job, std::slice::from_ref(&job.query), None)
         .await
         .map_err(RunError::Engine)?;
     match key.as_ref().and_then(|k| programs.take(k)) {
@@ -348,7 +348,7 @@ async fn program_of_split<B: Backend>(
             .map(|p| p.sql.clone())
             .chain(std::iter::once(split.root.clone()))
             .collect();
-        let key = cache::Key::of(backend, job, &queries)
+        let key = cache::Key::of(backend, job, &queries, Some(&split.namespace))
             .await
             .map_err(RunError::Engine)?;
         if let Some(program) = key.as_ref().and_then(|k| programs.take(k)) {

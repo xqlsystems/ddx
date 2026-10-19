@@ -97,19 +97,29 @@ impl Key {
     /// fails on a query fails here as it would have planning it; one that
     /// fails on a restriction's, which the build would have left out, keeps
     /// nothing.
+    ///
+    /// `fresh` is a namespace the queries name tables under that is new to
+    /// this call (a split's placeholders): it is written as one name in the
+    /// key, in the queries and in the engine's keys of them, so the next
+    /// call, with a namespace of its own, finds the program.
     pub(super) async fn of<B: Backend>(
         backend: &mut B,
         job: &Job,
         queries: &[String],
+        fresh: Option<&str>,
     ) -> Result<Option<Key>, B::Error> {
+        let same = |s: &str| match fresh {
+            Some(ns) => s.replace(ns, "__ddx_fresh_"),
+            None => s.to_string(),
+        };
         let mut plans = Vec::new();
         for q in queries {
             let Some(plan) = backend.plan_key(q).await? else {
                 return Ok(None);
             };
-            plans.push(plan);
+            plans.push(same(&plan));
         }
-        let mut queries = queries.to_vec();
+        let mut queries: Vec<String> = queries.iter().map(|q| same(q)).collect();
         for r in &job.pushdown {
             let Ok(Some(plan)) = backend.plan_key(&r.query).await else {
                 return Ok(None);
