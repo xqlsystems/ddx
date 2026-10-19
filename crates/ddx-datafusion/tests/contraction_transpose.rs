@@ -845,3 +845,52 @@ async fn a_side_that_does_not_move_is_still_checked_for_a_total_order() {
         .to_string();
     assert!(why.contains("LIMIT"), "{why}");
 }
+
+#[tokio::test]
+async fn a_side_its_conditions_leave_in_pieces_takes_the_general_rule() {
+    // The factors put p and z on one side, but no condition joins them: each
+    // joins v. Rebuilt alone, that side would be p × z, a cross join the
+    // query never formed, so the general rule applies. Its gradient still
+    // matches, and its steps rebuild the join of p and v.
+    let loss = |filter: &str| {
+        format!(
+            "WITH o AS (SELECT p.i, v.d, SUM(p.val / z.val * v.val) AS x FROM p JOIN v ON p.j = v.t \
+             JOIN z ON v.u = z.i {filter} GROUP BY p.i, v.d) SELECT SUM(tanh(x) * tanh(x)) AS l FROM o"
+        )
+    };
+    let wrt = [ColumnRef::new("p", "val"), ColumnRef::new("z", "val")];
+    let mut rng = Rng::new(0xc055);
+    for _ in 0..10 {
+        let ctx = SessionContext::new();
+        register(
+            &ctx,
+            "p",
+            table(&mut rng, &[("i", 3), ("j", 2)], &["val"], 0.0, None),
+        );
+        register(
+            &ctx,
+            "v",
+            table(
+                &mut rng,
+                &[("t", 2), ("u", 2), ("d", 2)],
+                &["val"],
+                0.0,
+                None,
+            ),
+        );
+        register(&ctx, "z", table(&mut rng, &[("i", 2)], &["val"], 0.0, None));
+        let program = ad::grad(&ctx, &loss(""), &wrt).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &program)
+            .await
+            .unwrap();
+        assert!(rebuilds(&ctx, &program, &named("p"), &named("v")).await);
+        let general = loss("WHERE v.t IS NULL OR v.t + z.i >= 0");
+        let slow = ad::grad(&ctx, &general, &wrt).await.unwrap();
+        ddx_datafusion::engine::execute(&ctx, &slow).await.unwrap();
+        let (a, b) = (
+            gradients(&ctx, &program, &wrt).await,
+            gradients(&ctx, &slow, &wrt).await,
+        );
+        agree(&a, &b).unwrap();
+    }
+}

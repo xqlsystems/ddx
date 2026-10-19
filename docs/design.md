@@ -2252,7 +2252,9 @@ keys passes every row of a group or none, so it is applied to the
 cotangent's rows instead. And a side may hold several inputs: inner joins
 can be regrouped, so the inputs are split by which factors of the product
 read them (an input no factor reads goes with the side its conditions tie it
-to), each side is rebuilt as its own join, and each is transposed by the
+to), each side is rebuilt as its own join (falling back to the composed
+rules if the side's own conditions leave it in pieces, which would rebuild
+it as a cross join the query never formed), and each is transposed by the
 ordinary region rules (its projections, windows and inputs) from its
 factor's cotangent, the contraction `t` of the cotangent with the other
 side. This replaced inlining each side's factor down to one input's

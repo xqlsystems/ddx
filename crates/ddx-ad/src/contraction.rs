@@ -80,7 +80,7 @@ use std::cell::Cell;
 use substrait::proto::expression::RexType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
-use substrait::proto::{CrossRel, Expression, Rel};
+use substrait::proto::{Expression, Rel};
 
 use crate::elementwise::depends;
 use crate::emit::{aggregate, filter, join, project};
@@ -593,10 +593,13 @@ impl Transposer<'_> {
     }
 }
 
-/// The side made of `mine`, leaves of `region`, joined left to right, each
+/// The side made of `mine`, leaves of `region`, joined one at a time, each
 /// condition in `within` (with the leaves it reads) at the first join where
-/// all its leaves are present (`and` is the anchor of `and`). `None` if a
-/// leaf's columns are not its own.
+/// all its leaves are present (`and` is the anchor of `and`). Each leaf
+/// joined is one a condition ties to those before it. `None` if there is
+/// none (the side's own conditions leave it in pieces, and rebuilding it
+/// would be a cross join the query never formed, `p × z` in `p JOIN v ON
+/// p.j = v.t JOIN z ON v.u = z.i`), or if a leaf's columns are not its own.
 fn rebuild(
     region: &Region,
     leaves: &[Leaf],
@@ -607,8 +610,24 @@ fn rebuild(
     let mut at = vec![None; region.defs.len()];
     let mut side: Option<Region> = None;
     let mut placed = Vec::new();
+    // The order: each next leaf shares a condition with those placed.
+    let mut order = vec![mine[0]];
+    let mut rest: Vec<usize> = mine[1..].to_vec();
+    while !rest.is_empty() {
+        let tied = rest.iter().position(|&l| {
+            within.iter().any(|(_, ls)| {
+                ls.contains(&l)
+                    && ls.iter().any(|x| order.contains(x))
+                    && ls.iter().all(|x| *x == l || order.contains(x))
+            })
+        });
+        let Some(i) = tied else {
+            return Ok(None);
+        };
+        order.push(rest.remove(i));
+    }
     let mut pending = within;
-    for &l in mine {
+    for l in order {
         let leaf = &leaves[l];
         let Some(part) = slice(region, leaf)? else {
             return Ok(None);
@@ -638,17 +657,11 @@ fn rebuild(
                 let left = std::mem::take(&mut s.rel);
                 let right = part.rel.clone();
                 s.append(part)?;
-                s.rel = match conds.into_iter().reduce(|a, b| call(and, vec![a, b])) {
-                    Some(c) => join(left, right, c, JoinType::Inner),
-                    None => Rel {
-                        rel_type: Some(RelType::Cross(Box::new(CrossRel {
-                            common: None,
-                            left: Some(Box::new(left)),
-                            right: Some(Box::new(right)),
-                            advanced_extension: None,
-                        }))),
-                    },
-                };
+                let cond = conds
+                    .into_iter()
+                    .reduce(|a, b| call(and, vec![a, b]))
+                    .expect("the order ties each leaf to those before it");
+                s.rel = join(left, right, cond, JoinType::Inner);
                 s
             }
         });
