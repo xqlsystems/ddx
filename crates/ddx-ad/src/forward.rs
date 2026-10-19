@@ -549,7 +549,7 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
 }
 
 /// The relations of the subqueries in `e`, pushed onto `out`.
-fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
+pub(crate) fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
     use substrait::proto::expression::subquery::SubqueryType;
     if let Some(RexType::Subquery(sq)) = &e.rex_type {
         match &sq.subquery_type {

@@ -43,7 +43,10 @@ use super::build::quoted;
 use crate::compose::redeclare_rel;
 use crate::emit::{filter, plan as plan_of, select};
 use crate::error::{AdError, Result};
-use crate::forward::{apply_emit, inline_references, read_outputs, rel_inputs_mut, root_of};
+use crate::forward::{
+    apply_emit, inline_references, read_outputs, rel_expressions, rel_inputs, rel_inputs_mut,
+    root_of, subquery_rels,
+};
 use crate::functions::{Extensions, Functions};
 
 /// A query whose CTEs read more than once are planned one by one.
@@ -101,6 +104,18 @@ pub(super) fn split(query: &Query, namespace: &str) -> Option<Split> {
         reads[j][..j.min(n)].copy_from_slice(&refs.counts);
         for (k, bad) in refs.unsafe_.iter().enumerate() {
             unsafe_[k] |= *bad;
+        }
+    }
+    // A CTE left to the engine is inlined wherever it is read, a subquery
+    // included, where a placeholder read could not become a reference; so
+    // what it reads is left to the engine too.
+    for j in (0..n).rev() {
+        if unsafe_[j] {
+            for k in 0..j {
+                if reads[j][k] > 0 {
+                    unsafe_[k] = true;
+                }
+            }
         }
     }
     // How many copies of each CTE the engine's plan would hold, readers
@@ -251,10 +266,11 @@ impl Visitor for Refs<'_> {
         let Some((k, same)) = cte_of(name, self.ctes) else {
             return ControlFlow::Continue(());
         };
+        // Every read counts, so the CTE stays in the `WITH` of a scope that
+        // reads it, however it reads it.
+        self.counts[k] += 1;
         if !same || self.subqueries > 0 {
             self.unsafe_[k] = true;
-        } else {
-            self.counts[k] += 1;
         }
         ControlFlow::Continue(())
     }
@@ -355,6 +371,11 @@ fn one(plan: &Plan, ordinals: &HashMap<&str, i32>, ext: &mut Extensions) -> Resu
             stack.extend(rel_inputs_mut(kind));
         }
     }
+    if reads_placeholder(&rel, ordinals) {
+        return Err(AdError::NotImplemented(
+            "a read of a CTE planned on its own that is not a relation's input".into(),
+        ));
+    }
     Ok(rel)
 }
 
@@ -362,10 +383,30 @@ fn placeholder(read: &ReadRel, ordinals: &HashMap<&str, i32>) -> Option<i32> {
     let Some(ReadType::NamedTable(t)) = &read.read_type else {
         return None;
     };
-    match t.names.as_slice() {
-        [name] => ordinals.get(name.as_str()).copied(),
-        _ => None,
+    // By the last part: a producer may qualify the name with the schema.
+    t.names
+        .last()
+        .and_then(|name| ordinals.get(name.as_str()).copied())
+}
+
+/// Does `rel` still read a placeholder anywhere, subqueries included? The
+/// program never reads one, so such a plan is refused, and the query is
+/// planned whole.
+fn reads_placeholder(rel: &Rel, ordinals: &HashMap<&str, i32>) -> bool {
+    let mut stack = vec![rel];
+    while let Some(r) = stack.pop() {
+        let Some(kind) = &r.rel_type else { continue };
+        if let RelType::Read(read) = kind {
+            if placeholder(read, ordinals).is_some() {
+                return true;
+            }
+        }
+        for e in rel_expressions(kind) {
+            subquery_rels(e, &mut stack);
+        }
+        stack.extend(rel_inputs(kind));
     }
+    false
 }
 
 /// A reference to relation `ordinal` in place of `read`, a read of its
@@ -480,6 +521,81 @@ mod tests {
             shared("WITH a AS (SELECT * FROM b, b), b AS (SELECT 1 AS y) SELECT * FROM a")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_cte_read_only_where_it_might_be_misread_stays_in_the_with() {
+        // b is read only inside a subquery, so it stays in the root's WITH;
+        // a, read twice, would be planned alone, but b reads it and is
+        // inlined into the subquery, so a is left to the engine too.
+        let sql = "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a) \
+                   SELECT * FROM a, a WHERE 1 IN (SELECT x FROM b)";
+        assert!(shared(sql).is_empty());
+        // c, read twice, is planned alone; b reads only a, so the root
+        // keeps b and a in its WITH and reads c's placeholder.
+        let s = split(
+            &query(
+                "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a), c AS (SELECT 2 AS y) \
+                 SELECT * FROM c, c WHERE 1 IN (SELECT x FROM b)",
+            ),
+            "__ddx_t_",
+        )
+        .unwrap();
+        assert_eq!(
+            s.root,
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a) \
+             SELECT * FROM \"__ddx_t_cte_2\", \"__ddx_t_cte_2\" WHERE 1 IN (SELECT x FROM b)"
+        );
+        // Read under another spelling: kept, for the engine to resolve.
+        let s = split(
+            &query("WITH a AS (SELECT 1 AS x), c AS (SELECT 2 AS y) SELECT * FROM c, c, \"A\""),
+            "__ddx_t_",
+        )
+        .unwrap();
+        assert!(
+            s.root.starts_with("WITH a AS (SELECT 1 AS x) "),
+            "{}",
+            s.root
+        );
+    }
+
+    #[test]
+    fn a_placeholder_read_a_reference_cannot_replace_is_refused() {
+        use substrait::proto::expression::subquery::{Scalar, SubqueryType};
+        use substrait::proto::expression::{RexType, Subquery};
+        use substrait::proto::read_rel::NamedTable;
+        use substrait::proto::{Expression, FilterRel};
+        let read = |names: &[&str]| Rel {
+            rel_type: Some(RelType::Read(Box::new(ReadRel {
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        let ordinals = HashMap::from([("__ddx_t_cte_0", 1)]);
+        // Qualified by a schema, it is still the placeholder.
+        assert!(reads_placeholder(
+            &read(&["public", "__ddx_t_cte_0"]),
+            &ordinals
+        ));
+        assert!(!reads_placeholder(&read(&["t"]), &ordinals));
+        // Inside a filter's scalar subquery.
+        let filtered = Rel {
+            rel_type: Some(RelType::Filter(Box::new(FilterRel {
+                input: Some(Box::new(read(&["t"]))),
+                condition: Some(Box::new(Expression {
+                    rex_type: Some(RexType::Subquery(Box::new(Subquery {
+                        subquery_type: Some(SubqueryType::Scalar(Box::new(Scalar {
+                            input: Some(Box::new(read(&["__ddx_t_cte_0"]))),
+                        }))),
+                    }))),
+                })),
+                ..Default::default()
+            }))),
+        };
+        assert!(reads_placeholder(&filtered, &ordinals));
     }
 
     #[test]
