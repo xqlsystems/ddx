@@ -170,8 +170,8 @@ The differentiation cores are deliberately minimal so any engine can drive them:
 
 - **`ddx-core` depends on `sqlparser` only** — no `datafusion`, no `duckdb`, no
   `protoc`. Please don't add dependencies to it. Heavy, engine-specific
-  dependencies belong in the adapter crates (`ddx-datafusion`, `ddx-duckdb`,
-  …), which quarantine them.
+  dependencies belong in the adapters (`ddx-datafusion`, and `ddxdb`'s engine
+  backends), which quarantine them.
 - `sqlparser` is **pinned exactly** (`=0.62.0`) and re-exported as
   `ddx_core::sqlparser`. A `sqlparser` bump is a breaking change to `ddx-core`
   and needs its own discussion, since every crate that passes `sqlparser`
