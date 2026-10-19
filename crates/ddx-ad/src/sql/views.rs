@@ -132,9 +132,30 @@ impl Views {
             if w.recursive {
                 return None;
             }
+            // A name defined again inside the view, in a CTE or its query,
+            // may be read as either: the view is left to the engine.
             let mut inner = Vec::new();
             for c in &w.cte_tables {
                 let _ = c.query.visit(&mut Defined(&mut inner));
+            }
+            let _ = query.visit(&mut Defined(&mut inner));
+            // So is one read under another spelling (`a` and `"a"`), which
+            // engines resolve differently.
+            let mut reads = names(&query);
+            for c in &w.cte_tables {
+                reads.extend(names(&*c.query));
+            }
+            for c in &w.cte_tables {
+                let own = ObjectName::from(vec![c.alias.name.clone()]);
+                let misspelled = reads.iter().any(|r| match r.0.as_slice() {
+                    [ObjectNamePart::Identifier(id)] => {
+                        id.value.eq_ignore_ascii_case(&c.alias.name.value) && !same(r, &own)
+                    }
+                    _ => false,
+                });
+                if misspelled {
+                    return None;
+                }
             }
             for (i, mut c) in w.cte_tables.into_iter().enumerate() {
                 let name = c.alias.name.value.clone();
@@ -289,4 +310,132 @@ fn same(a: &ObjectName, b: &ObjectName) -> bool {
             }
             _ => false,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::Bound;
+    use substrait::proto::{NamedStruct, Plan};
+
+    /// A backend that knows only views' SQL.
+    struct Views(Vec<(&'static str, &'static str)>);
+
+    impl Backend for Views {
+        type Error = String;
+        async fn table_schema(&mut self, _: &str) -> Result<NamedStruct, String> {
+            Err("no tables".into())
+        }
+        async fn returns_rows(&mut self, _: &[Bound]) -> Result<Vec<bool>, String> {
+            Err("no runs".into())
+        }
+        async fn materialize(&mut self, _: &str, _: &Bound) -> Result<(), String> {
+            Err("no runs".into())
+        }
+        async fn drop_table(&mut self, _: &str) -> Result<(), String> {
+            Err("no runs".into())
+        }
+        async fn plan_sql(&mut self, _: &str) -> Result<Plan, String> {
+            Err("no plans".into())
+        }
+        async fn view_sql(&mut self, name: &str) -> Result<Option<String>, String> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, sql)| sql.to_string()))
+        }
+    }
+
+    fn query(sql: &str) -> Query {
+        match Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .remove(0)
+        {
+            Statement::Query(q) => *q,
+            other => panic!("{other}"),
+        }
+    }
+
+    fn expanded(views: Vec<(&'static str, &'static str)>, sql: &str) -> Option<String> {
+        let mut backend = Views(views);
+        let q = query(sql);
+        let fut = expand(&mut backend, &q);
+        ready(fut).map(|q| q.to_string())
+    }
+
+    /// The futures here never wait: each backend call is ready at once.
+    fn ready<F: std::future::Future>(f: F) -> F::Output {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+        match pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(out) => out,
+            Poll::Pending => unreachable!("a stub backend never waits"),
+        }
+    }
+
+    #[test]
+    fn a_view_is_written_as_its_ctes_then_its_query() {
+        let got = expanded(
+            vec![(
+                "v",
+                "CREATE VIEW v AS WITH a AS (SELECT 1 AS x) SELECT x FROM a",
+            )],
+            "SELECT * FROM v",
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                "WITH \"__ddx_view_0_0_a\" AS (SELECT 1 AS x), \"__ddx_view_0\" AS \
+                 (SELECT x FROM \"__ddx_view_0_0_a\") SELECT * FROM \"__ddx_view_0\""
+            )
+        );
+    }
+
+    #[test]
+    fn a_view_whose_query_defines_a_cte_s_name_again_is_left_to_the_engine() {
+        // Its query's inner `a` is read as itself, which renaming every read
+        // of `a` would break.
+        let got = expanded(
+            vec![(
+                "v",
+                "CREATE VIEW v AS WITH a AS (SELECT 1 AS x) \
+                 SELECT * FROM (WITH a AS (SELECT 2 AS x) SELECT * FROM a) s",
+            )],
+            "SELECT * FROM v",
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_view_that_reads_its_cte_under_another_spelling_is_left_to_the_engine() {
+        let got = expanded(
+            vec![(
+                "v",
+                "CREATE VIEW v AS WITH a AS (SELECT 1 AS x) SELECT * FROM \"a\"",
+            )],
+            "SELECT * FROM v",
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn views_that_read_views_take_names_of_their_own() {
+        let got = expanded(
+            vec![
+                (
+                    "outer_v",
+                    "CREATE VIEW outer_v AS SELECT 2 * x AS x FROM inner_v",
+                ),
+                ("inner_v", "CREATE VIEW inner_v AS SELECT 1 AS x"),
+            ],
+            "SELECT * FROM outer_v",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            "WITH \"__ddx_view_1\" AS (SELECT 1 AS x), \"__ddx_view_0\" AS \
+             (SELECT 2 * x AS x FROM \"__ddx_view_1\") SELECT * FROM \"__ddx_view_0\""
+        );
+    }
 }

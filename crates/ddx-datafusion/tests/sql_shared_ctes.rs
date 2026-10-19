@@ -339,3 +339,24 @@ async fn a_view_without_sql_or_under_a_cte_s_name_is_left_to_the_engine() {
     .await;
     assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
 }
+
+#[tokio::test]
+async fn a_view_that_reads_its_cte_under_another_spelling_is_left_to_the_engine() {
+    let ctx = w().await;
+    // A table named like the views' CTE: a read that missed the CTE would
+    // reach it, and its values would show.
+    exec(
+        &ctx,
+        "CREATE TABLE a (i BIGINT, v DOUBLE) AS VALUES (0, 100.0), (1, 100.0), (2, 100.0)",
+    )
+    .await;
+    // The view reads its CTE `a` as `"a"`, which DataFusion resolves to the
+    // CTE: d/dval Σ v² is 2·val.
+    exec(
+        &ctx,
+        "CREATE VIEW quoted AS WITH a AS (SELECT i, val AS v FROM w) SELECT * FROM \"a\"",
+    )
+    .await;
+    let (got, _) = grad_of(&ctx, "WITH loss AS (SELECT SUM(v * v) AS l FROM quoted)").await;
+    assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
+}

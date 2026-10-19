@@ -648,3 +648,16 @@ def test_a_view_without_sql_is_left_to_the_engine(ad, ctx):
     assert ad.DataFusionBackend(ctx).view_sql("squares") is None
     statement = "WITH loss AS (SELECT SUM(v) AS l FROM squares) SELECT i, grad(loss, val) FROM w"
     assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
+    # `v` in a query is public.v, a table; other.v is a view of that name,
+    # and DataFusion does not read it for `v`.
+    ctx.sql("CREATE SCHEMA other").collect()
+    ctx.sql("CREATE VIEW other.v AS SELECT i, 100.0 * val AS val FROM w").collect()
+    ctx.register_record_batches("v", [table([0, 1, 2], [1.0, 1.0, 1.0]).to_batches()])
+    backend = ad.DataFusionBackend(ctx)
+    assert backend.view_sql("v") is None
+    assert backend.view_sql("other.v") is not None
+    statement = "WITH loss AS (SELECT SUM(v.val * w.val) AS l FROM v JOIN w ON v.i = w.i) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 1.0), (1, 1.0), (2, 1.0)]

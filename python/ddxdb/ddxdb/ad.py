@@ -245,22 +245,39 @@ class DataFusionBackend:
     def view_sql(self, name: str) -> Optional[str]:
         # DataFusion keeps the SQL of a view created from SQL, and lists it in
         # its information schema; a view registered from a DataFrame has none.
-        # A name of one part matches a view in any schema, and only when one
-        # does: two would be ambiguous, and the view is left to DataFusion.
+        # A name of one or two parts is resolved as DataFusion resolves it, in
+        # the session's default catalog and schema.
         parts = _name_parts(name)
         if parts is None or not 1 <= len(parts) <= 3:
             return None
-        columns = ["table_name", "table_schema", "table_catalog"]
-        where = " AND ".join(
-            f"{c} = '{p.replace(chr(39), chr(39) * 2)}'" for c, p in zip(columns, reversed(parts))
+        settings = dict(
+            (r["name"], r["value"])
+            for r in self.ctx.sql(
+                "SELECT name, value FROM information_schema.df_settings WHERE name IN "
+                "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema')"
+            )
+            .to_arrow_table()
+            .to_pylist()
         )
+        default = [
+            settings["datafusion.catalog.default_catalog"],
+            settings["datafusion.catalog.default_schema"],
+        ]
+        # The parts a name leaves out are the defaults: `t` is in the default
+        # catalog and schema, `s.t` in the default catalog.
+        catalog, schema, table = default[: 3 - len(parts)] + parts
+        quote = lambda v: "'" + v.replace("'", "''") + "'"  # noqa: E731
         rows = (
-            self.ctx.sql(f"SELECT definition FROM information_schema.views WHERE {where}")
+            self.ctx.sql(
+                "SELECT definition FROM information_schema.views WHERE "
+                f"table_catalog = {quote(catalog)} AND table_schema = {quote(schema)} "
+                f"AND table_name = {quote(table)}"
+            )
             .to_arrow_table()
             .column(0)
             .to_pylist()
         )
-        return rows[0] if len(rows) == 1 else None
+        return rows[0] if rows else None
 
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
