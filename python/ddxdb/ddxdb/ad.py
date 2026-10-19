@@ -65,6 +65,7 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
+import re
 import weakref
 from typing import NamedTuple, Optional, Sequence, Union
 
@@ -291,37 +292,22 @@ class DataFusionBackend:
         self.ctx.deregister_table(name)
 
 
+#: One part of a table name: quoted, with ``""`` for a quote inside it, or
+#: unquoted, up to the next dot.
+_PART = r'"(?:[^"]|"")*"|[^."]+'
+_NAME = re.compile(rf"(?:{_PART})(?:\.(?:{_PART}))*")
+
+
 def _name_parts(name: str) -> Optional[list]:
     """The parts of a table name as SQL writes it, as DataFusion resolves
     them: a quoted part as written, an unquoted one in lower case; ``None``
     if it does not parse."""
-    parts, i = [], 0
-    while i < len(name):
-        if name[i] == '"':
-            j = i + 1
-            part = ""
-            while True:
-                k = name.find('"', j)
-                if k < 0:
-                    return None
-                part += name[j:k]
-                if name[k + 1 : k + 2] == '"':
-                    part += '"'
-                    j = k + 2
-                    continue
-                i = k + 1
-                break
-        else:
-            k = name.find(".", i)
-            k = len(name) if k < 0 else k
-            part = name[i:k].lower()
-            i = k
-        parts.append(part)
-        if i < len(name):
-            if name[i] != ".":
-                return None
-            i += 1
-    return parts
+    if not _NAME.fullmatch(name):
+        return None
+    return [
+        part[1:-1].replace('""', '"') if part.startswith('"') else part.lower()
+        for part in re.findall(_PART, name)
+    ]
 
 
 class Outputs(NamedTuple):
