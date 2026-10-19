@@ -376,8 +376,8 @@ fn share_repeated(plan: &ddx_ad::substrait::proto::Plan) -> ddx_ad::substrait::p
 async fn a_subtree_shared_through_reference_rel_reads_as_the_tree() {
     // From the second-engine spike (#73, B1): DuckDB shares a CTE read twice
     // through ReferenceRel. ddx did not follow it, saw no reads at all, and
-    // said the query "reads {}". Each reference now reads as a copy of the
-    // subtree it names, so the analysis is the tree's.
+    // said the query "reads {}". Each reference now reads the subtree it
+    // names, lowered once, so the analysis is the tree's.
     let ctx = ctx().await;
     let sql = "WITH a AS (SELECT o, val * val AS v FROM w), s AS (SELECT SUM(v) AS t FROM a) \
                SELECT SUM(a.v / s.t) AS loss FROM a CROSS JOIN s";
@@ -426,4 +426,33 @@ async fn a_reference_rel_that_loops_or_points_nowhere_is_an_invalid_plan() {
     });
     let err = Forward::new(&looped, &wrt).unwrap_err();
     assert!(matches!(err, AdError::InvalidPlan(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_reference_under_a_window_relation_is_refused_not_a_panic() {
+    // A window relation (`ConsistentPartitionWindowRel`) over a shared
+    // relation: reverse mode refuses the window relation, and must get as
+    // far as saying so.
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{ConsistentPartitionWindowRel, PlanRel, ReferenceRel, Rel};
+    let ctx = ctx().await;
+    let mut plan = substrait_of(&ctx, "SELECT SUM(val) AS loss FROM w", true).await;
+    let wrt = [ColumnRef::new("w", "val")];
+    let Some(PlanRelType::Root(root)) = plan.relations[0].rel_type.as_mut() else {
+        unreachable!()
+    };
+    let read = root.input.take().unwrap();
+    root.input = Some(Rel {
+        rel_type: Some(RelType::Window(Box::new(ConsistentPartitionWindowRel {
+            input: Some(Box::new(Rel {
+                rel_type: Some(RelType::Reference(ReferenceRel { subtree_ordinal: 1 })),
+            })),
+            ..Default::default()
+        }))),
+    });
+    plan.relations.push(PlanRel {
+        rel_type: Some(PlanRelType::Rel(read)),
+    });
+    assert!(Forward::new(&plan, &wrt).is_err());
 }

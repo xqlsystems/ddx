@@ -372,7 +372,7 @@ impl Forward {
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = root_of(plan)?;
-        let root = &inline_references(root, &plan.relations)?;
+        let order = shared_relations(root, &plan.relations)?;
         if wrt.is_empty() {
             return Err(AdError::UnknownWrt(
                 "no wrt columns were given; name at least one table column".into(),
@@ -385,7 +385,9 @@ impl Forward {
             tables: Vec::new(),
             saved: Vec::new(),
             by_shape: HashMap::new(),
-            shapes: Shapes::of_plan(root),
+            shapes: Shapes::of_plan(root, &plan.relations, &order)?,
+            relations: &plan.relations,
+            shared: HashMap::new(),
             seen: BTreeSet::new(),
             reads: HashMap::new(),
         };
@@ -423,12 +425,97 @@ pub(crate) fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
     Ok((rel, root.names.clone()))
 }
 
+/// The relation at `ordinal` of `relations`, which a `ReferenceRel` names.
+pub(crate) fn referenced(relations: &[PlanRel], ordinal: i32) -> Result<&Rel> {
+    usize::try_from(ordinal)
+        .ok()
+        .and_then(|i| relations.get(i))
+        .and_then(|r| match &r.rel_type {
+            Some(PlanRelType::Rel(r)) => Some(r),
+            Some(PlanRelType::Root(root)) => root.input.as_ref(),
+            None => None,
+        })
+        .ok_or_else(|| {
+            AdError::InvalidPlan(format!(
+                "a ReferenceRel names relation {ordinal}, which the plan does not have"
+            ))
+        })
+}
+
+/// The relations `root` reads through `ReferenceRel`s, directly or through
+/// one another, each once and after every one it reads. A producer shares a
+/// subtree read more than once this way (DuckDB, a CTE read twice; ddx's
+/// own SQL surface), where DataFusion writes the tree out. A missing
+/// ordinal or a cycle is an invalid plan, and a reference inside a subquery
+/// expression is refused rather than read as reading nothing.
+pub(crate) fn shared_relations(root: &Rel, relations: &[PlanRel]) -> Result<Vec<i32>> {
+    /// The ordinals `rel`'s tree reads, in order, its subqueries checked.
+    fn references(rel: &Rel) -> Result<Vec<i32>> {
+        let mut out = Vec::new();
+        let mut stack = vec![rel];
+        while let Some(r) = stack.pop() {
+            let Some(kind) = &r.rel_type else { continue };
+            if let RelType::Reference(x) = kind {
+                out.push(x.subtree_ordinal);
+                continue;
+            }
+            let mut inside = Vec::new();
+            for e in rel_expressions(kind) {
+                subquery_rels(e, &mut inside);
+            }
+            if inside.into_iter().any(mentions_reference) {
+                return Err(AdError::NotImplemented(
+                    "a ReferenceRel inside a subquery expression".into(),
+                ));
+            }
+            // The inputs `Shapes` interns, a window relation's included, so
+            // every reference it meets is one checked here.
+            stack.extend(input_slots(kind).into_iter().flatten().rev());
+        }
+        Ok(out)
+    }
+    // Depth first over the references, as a loop: each ordinal is done once
+    // the ones it reads are, and one met again while open is a cycle.
+    let mut order = Vec::new();
+    let mut done = BTreeSet::new();
+    let mut open: Vec<(i32, Vec<i32>)> = Vec::new();
+    let mut todo = references(root)?;
+    todo.reverse();
+    loop {
+        let next = match open.last_mut() {
+            Some((_, reads)) => reads.pop(),
+            None => todo.pop(),
+        };
+        match next {
+            Some(ordinal) if done.contains(&ordinal) => {}
+            Some(ordinal) => {
+                if open.iter().any(|(o, _)| *o == ordinal) {
+                    return Err(AdError::InvalidPlan(format!(
+                        "relation {ordinal} refers to itself through ReferenceRel"
+                    )));
+                }
+                let mut reads = references(referenced(relations, ordinal)?)?;
+                reads.reverse();
+                open.push((ordinal, reads));
+            }
+            None => match open.pop() {
+                Some((ordinal, _)) => {
+                    done.insert(ordinal);
+                    order.push(ordinal);
+                }
+                None => return Ok(order),
+            },
+        }
+    }
+}
+
 /// `root` with every `ReferenceRel` replaced by a copy of the relation it
-/// names. A producer shares a subtree read more than once this way (DuckDB, a
-/// CTE read twice), where DataFusion writes the tree out; ddx reads trees, and
-/// saves each distinct aggregate once whichever way it was written. A cycle
-/// or a missing ordinal is an invalid plan, and a reference inside a
-/// subquery expression is refused rather than read as reading nothing.
+/// names: for a copy an engine runs (a constant subtree of a step), since
+/// DataFusion's consumer reads no `ReferenceRel`, and for forward mode and
+/// composition, which read trees. Reverse mode reads the DAG itself
+/// ([`shared_relations`]). A cycle or a missing ordinal is an invalid plan,
+/// and a reference inside a subquery expression is refused rather than read
+/// as reading nothing.
 pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel> {
     fn inline(rel: &mut Rel, relations: &[PlanRel], path: &mut Vec<i32>) -> Result<()> {
         if let Some(RelType::Reference(r)) = &rel.rel_type {
@@ -438,20 +525,7 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
                     "relation {ordinal} refers to itself through ReferenceRel"
                 )));
             }
-            let target = usize::try_from(ordinal)
-                .ok()
-                .and_then(|i| relations.get(i))
-                .and_then(|r| match &r.rel_type {
-                    Some(PlanRelType::Rel(r)) => Some(r.clone()),
-                    Some(PlanRelType::Root(root)) => root.input.clone(),
-                    None => None,
-                })
-                .ok_or_else(|| {
-                    AdError::InvalidPlan(format!(
-                        "a ReferenceRel names relation {ordinal}, which the plan does not have"
-                    ))
-                })?;
-            *rel = target;
+            *rel = referenced(relations, ordinal)?.clone();
             path.push(ordinal);
             inline(rel, relations, path)?;
             path.pop();
@@ -474,23 +548,25 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
     Ok(out)
 }
 
-/// Does `rel` still hold a `ReferenceRel` anywhere, subqueries included?
-fn mentions_reference(rel: &Rel) -> bool {
+/// The relations of the subqueries in `e`, pushed onto `out`.
+fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
     use substrait::proto::expression::subquery::SubqueryType;
-    fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
-        if let Some(RexType::Subquery(sq)) = &e.rex_type {
-            match &sq.subquery_type {
-                Some(SubqueryType::Scalar(s)) => out.extend(s.input.as_deref()),
-                Some(SubqueryType::InPredicate(s)) => out.extend(s.haystack.as_deref()),
-                Some(SubqueryType::SetPredicate(s)) => out.extend(s.tuples.as_deref()),
-                Some(SubqueryType::SetComparison(s)) => out.extend(s.right.as_deref()),
-                None => {}
-            }
-        }
-        for c in children(e) {
-            subquery_rels(c, out);
+    if let Some(RexType::Subquery(sq)) = &e.rex_type {
+        match &sq.subquery_type {
+            Some(SubqueryType::Scalar(s)) => out.extend(s.input.as_deref()),
+            Some(SubqueryType::InPredicate(s)) => out.extend(s.haystack.as_deref()),
+            Some(SubqueryType::SetPredicate(s)) => out.extend(s.tuples.as_deref()),
+            Some(SubqueryType::SetComparison(s)) => out.extend(s.right.as_deref()),
+            None => {}
         }
     }
+    for c in children(e) {
+        subquery_rels(c, out);
+    }
+}
+
+/// Does `rel` still hold a `ReferenceRel` anywhere, subqueries included?
+fn mentions_reference(rel: &Rel) -> bool {
     let mut stack = vec![rel];
     while let Some(r) = stack.pop() {
         let Some(kind) = &r.rel_type else { continue };
@@ -520,38 +596,57 @@ struct Shapes {
     /// The id of each aggregate of the plan, by address: the plan is
     /// borrowed for the whole read, so its relations stay put.
     aggregates: HashMap<*const AggregateRel, usize>,
+    /// The id of each relation a `ReferenceRel` names, which every
+    /// reference to it takes: a relation read through a reference has the
+    /// id of the same relation written out in place.
+    references: HashMap<i32, usize>,
 }
 
 impl Shapes {
-    /// The ids of `root`'s aggregates.
-    fn of_plan(root: &Rel) -> Shapes {
+    /// The ids of the aggregates of `root` and of `shared`, the relations
+    /// it reads through `ReferenceRel`s, each after those it reads
+    /// ([`shared_relations`]).
+    fn of_plan(root: &Rel, relations: &[PlanRel], shared: &[i32]) -> Result<Shapes> {
         let mut shapes = Shapes {
             ids: HashMap::new(),
             aggregates: HashMap::new(),
+            references: HashMap::new(),
         };
-        let ids = shapes.intern(root.clone());
+        for &ordinal in shared {
+            let id = shapes.record(referenced(relations, ordinal)?);
+            shapes.references.insert(ordinal, id);
+        }
+        shapes.record(root);
+        Ok(shapes)
+    }
+
+    /// Intern `rel`'s relations, record its aggregates' ids, and return its
+    /// own.
+    fn record(&mut self, rel: &Rel) -> usize {
+        let ids = self.intern(rel.clone());
+        let own = *ids.last().expect("the relation's own id");
         // `intern` numbered the copy's relations in post-order; walk the
-        // plan itself in the same order to find each aggregate's.
+        // relation itself in the same order to find each aggregate's.
         let mut ids = ids.into_iter();
-        let mut stack: Vec<(&Rel, bool)> = vec![(root, false)];
-        while let Some((rel, expanded)) = stack.pop() {
-            let Some(kind) = &rel.rel_type else {
+        let mut stack: Vec<(&Rel, bool)> = vec![(rel, false)];
+        while let Some((r, expanded)) = stack.pop() {
+            let Some(kind) = &r.rel_type else {
                 ids.next();
                 continue;
             };
             if expanded {
                 let id = ids.next().expect("one id per relation");
                 if let RelType::Aggregate(a) = kind {
-                    shapes.aggregates.insert(std::ptr::from_ref(&**a), id);
+                    self.aggregates.insert(std::ptr::from_ref(&**a), id);
                 }
                 continue;
             }
-            stack.push((rel, true));
+            stack.push((r, true));
             for child in input_slots(kind).into_iter().rev().flatten() {
                 stack.push((child, false));
             }
         }
-        shapes
+        own
     }
 
     /// `a`'s id. An aggregate outside the plan's tree of relations (in a
@@ -602,10 +697,13 @@ impl Shapes {
                 None => {
                     let f = stack.pop().expect("the frame just looked at");
                     let next = self.ids.len();
-                    let id = *self
-                        .ids
-                        .entry((f.rel.encode_to_vec(), f.done))
-                        .or_insert(next);
+                    let id = match &f.rel.rel_type {
+                        Some(RelType::Reference(r)) => self.references[&r.subtree_ordinal],
+                        _ => *self
+                            .ids
+                            .entry((f.rel.encode_to_vec(), f.done))
+                            .or_insert(next),
+                    };
                     order.push(id);
                     match stack.last_mut() {
                         Some(parent) => parent.done.push(Some(id)),
@@ -664,6 +762,12 @@ fn take_input_slots(kind: &mut RelType) -> Vec<Option<Rel>> {
 
 struct Builder<'a> {
     functions: &'a Functions,
+    /// The plan's relations, which a `ReferenceRel` names by position.
+    relations: &'a [PlanRel],
+    /// Each relation a `ReferenceRel` names, lowered once and read by every
+    /// reference to it: what lowering a copy of it at each read gives, as
+    /// inlining it did, without the copies.
+    shared: HashMap<i32, Region>,
     namespace: String,
     wrt: &'a [ColumnRef],
     tables: Vec<Table>,
@@ -688,6 +792,13 @@ impl Builder<'_> {
     /// relation lowered over its input's region on the way back up. Only
     /// joins recurse. An aggregate already saved is not walked into again.
     fn lower(&mut self, rel: &Rel) -> Result<Region> {
+        /// A step of the walk down: a relation to lower over the region
+        /// beneath it, or a shared relation whose region that is.
+        enum Link<'r> {
+            Rel(&'r Rel),
+            Shared(i32),
+        }
+        let relations = self.relations;
         let mut chain = Vec::new();
         let mut cur = rel;
         let mut s = loop {
@@ -705,16 +816,34 @@ impl Builder<'_> {
                     }
                     &a.input
                 }
+                // A shared relation is walked into like any other, and its
+                // region kept on the way back up, unless it is lowered
+                // already.
+                Some(RelType::Reference(r)) => {
+                    let ordinal = r.subtree_ordinal;
+                    if let Some(done) = self.shared.get(&ordinal) {
+                        break done.clone();
+                    }
+                    chain.push(Link::Shared(ordinal));
+                    cur = referenced(relations, ordinal)?;
+                    continue;
+                }
                 _ => break self.lower_one(cur, None)?,
             };
-            chain.push(cur);
+            chain.push(Link::Rel(cur));
             cur = input(below)?;
         };
-        while let Some(r) = chain.pop() {
-            s = self.lower_one(r, Some(s))?;
+        while let Some(link) = chain.pop() {
+            match link {
+                Link::Rel(r) => s = self.lower_one(r, Some(s))?,
+                Link::Shared(ordinal) => {
+                    self.shared.insert(ordinal, s.clone());
+                }
+            }
         }
         Ok(s)
     }
+
 
     /// Lower `rel`, which reads a `wrt` table, over `below`, its input's
     /// region, if it is a single-input relation [`Builder::lower`] walked
@@ -802,7 +931,11 @@ impl Builder<'_> {
             }
             RelType::Fetch(fe) => {
                 let mut s = lowered(self, &mut below, &fe.input)?;
-                let below = input(&fe.input)?;
+                // A shared Sort is ordered as it is written out.
+                let mut below = input(&fe.input)?;
+                while let Some(RelType::Reference(r)) = &below.rel_type {
+                    below = referenced(self.relations, r.subtree_ordinal)?;
+                }
                 // The rows a LIMIT keeps are the first in its input's order:
                 // an ORDER BY's keys, or none.
                 let keys = match &below.rel_type {
@@ -870,8 +1003,11 @@ impl Builder<'_> {
         Ok(s)
     }
 
-    /// A subtree that reads no `wrt` table: copied as it is.
+    /// A subtree that reads no `wrt` table: copied as it is, each relation
+    /// it reads through a `ReferenceRel` written out in place, since an
+    /// engine runs the copy.
     fn constant(&mut self, rel: &Rel) -> Result<Region> {
+        let rel = &inline_references(rel, self.relations)?;
         let width = width(rel)?;
         let mut s = empty(rel.clone());
         s.slots.push(Slot {
@@ -1319,6 +1455,9 @@ impl Builder<'_> {
             // assumed to read a wrt table, so lowering refuses it rather than
             // treating it as constant.
             let mut below: Vec<&Rel> = rel_inputs(kind);
+            if let RelType::Reference(r) = kind {
+                below.push(referenced(self.relations, r.subtree_ordinal)?);
+            }
             let mut correlated = false;
             for e in rel_expressions(kind) {
                 let mut subqueries = Vec::new();
@@ -2032,7 +2171,7 @@ mod tests {
     fn the_copies_of_an_aggregate_share_one_id_and_no_other() {
         let k = 6;
         let plan = layers(k, "t");
-        let mut shapes = Shapes::of_plan(&plan);
+        let mut shapes = Shapes::of_plan(&plan, &[], &[]).unwrap();
         let found = aggregates(&plan);
         assert_eq!(found.len(), (1 << (k + 1)) - 1);
         let mut by_depth: HashMap<usize, BTreeSet<usize>> = HashMap::new();
@@ -2051,7 +2190,7 @@ mod tests {
     #[test]
     fn aggregates_that_differ_only_far_below_have_different_ids() {
         let plan = cross(layers(4, "t"), layers(4, "u"));
-        let mut shapes = Shapes::of_plan(&plan);
+        let mut shapes = Shapes::of_plan(&plan, &[], &[]).unwrap();
         let Some(RelType::Cross(c)) = &plan.rel_type else {
             unreachable!()
         };
@@ -2066,9 +2205,35 @@ mod tests {
     }
 
     #[test]
+    fn a_relation_read_through_a_reference_has_its_target_s_id() {
+        // Two layers over one shared first layer, and the same written out.
+        let first = layers(2, "t");
+        let tree = aggregate(cross(first.clone(), first.clone()));
+        let relations = vec![PlanRel {
+            rel_type: Some(PlanRelType::Rel(first)),
+        }];
+        let reference = || Rel {
+            rel_type: Some(RelType::Reference(substrait::proto::ReferenceRel {
+                subtree_ordinal: 0,
+            })),
+        };
+        let dag = aggregate(cross(reference(), reference()));
+        let shapes = Shapes::of_plan(&dag, &relations, &[0]).unwrap();
+        let written = Shapes::of_plan(&tree, &[], &[]).unwrap();
+        let top = |r: &Rel| match &r.rel_type {
+            Some(RelType::Aggregate(a)) => std::ptr::from_ref(&**a),
+            _ => unreachable!(),
+        };
+        // The top aggregate has one id either way, and the shared plan
+        // interns no relation the written-out one does not.
+        assert_eq!(shapes.aggregates[&top(&dag)], written.aggregates[&top(&tree)]);
+        assert_eq!(shapes.ids.len(), written.ids.len());
+    }
+
+    #[test]
     fn an_aggregate_outside_the_plan_is_interned_on_sight_alike() {
         let plan = layers(3, "t");
-        let mut shapes = Shapes::of_plan(&plan);
+        let mut shapes = Shapes::of_plan(&plan, &[], &[]).unwrap();
         let outside = layers(3, "t");
         let (Some(RelType::Aggregate(a)), Some(RelType::Aggregate(b))) =
             (&plan.rel_type, &outside.rel_type)
