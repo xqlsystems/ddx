@@ -607,3 +607,44 @@ def test_a_program_is_kept_again_only_once_its_tables_are_released(ad, ctx):
     # The first call's tables outlived the second's release.
     assert pairs(ctx.sql(first.statements[0])) == [(0, 3.0), (1, 12.0), (2, 0.75)]
     first.release()
+
+
+def _model_view(k):
+    ctes = ["l0 AS (SELECT i, SUM(val) AS v FROM w GROUP BY i)"]
+    for n in range(1, k + 1):
+        ctes.append(
+            f"l{n} AS (SELECT a.i, SUM(a.v * b.v + 0.5 * a.v) AS v "
+            f"FROM l{n - 1} a JOIN l{n - 1} b ON a.i = b.i GROUP BY a.i)"
+        )
+    return ctes
+
+
+def test_a_model_that_is_a_view_has_its_layers_planned_once(ad, ctx):
+    ctes = _model_view(3)
+    ctx.sql(f"CREATE VIEW model AS WITH {', '.join(ctes)} SELECT i, v FROM l3").collect()
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM model) SELECT i, grad(loss, val) FROM w"
+    got = pairs(ad.sql(ctx, statement))
+    # The same objective with the model written in, as CTEs the engine inlines.
+    written = f"WITH {', '.join(ctes)}, loss AS (SELECT SUM(v) AS l FROM l3) SELECT i, grad(loss, val) FROM w"
+    want = pairs(ad.sql(ctx, written))
+    assert [i for i, _ in got] == [i for i, _ in want]
+    assert all(abs(g - w) <= 1e-9 * max(abs(w), 1.0) for (_, g), (_, w) in zip(got, want))
+
+    # The layers read twice are planned on their own: one placeholder each.
+    class Recording(ad.DataFusionBackend):
+        made = []
+
+        def materialize(self, name, plan):
+            Recording.made.append(name)
+            super().materialize(name, plan)
+
+    with ddxdb.rewrite(Recording(ctx), [statement], programs=ddxdb.Programs()):
+        pass
+    assert sum("cte_" in n for n in Recording.made) == 3, Recording.made
+
+
+def test_a_view_without_sql_is_left_to_the_engine(ad, ctx):
+    ctx.register_view("squares", ctx.sql("SELECT i, val * val AS v FROM w"))
+    assert ad.DataFusionBackend(ctx).view_sql("squares") is None
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM squares) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]

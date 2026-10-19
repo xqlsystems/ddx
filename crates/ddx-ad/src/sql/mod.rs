@@ -93,7 +93,9 @@
 //! differentiates once. A CTE that could be misread that way (one a nested
 //! `WITH` defines again, one read inside an expression's subquery) is left
 //! to the engine, and if planning the pieces fails, the query is planned
-//! whole, as it always was. When a statement's `WHERE` keeps
+//! whole, as it always was. A view the objective reads, whose SQL the
+//! engine gives ([`crate::Backend::view_sql`]), is written into it as CTEs
+//! first, so a model that is a view has its CTEs planned once too. When a statement's `WHERE` keeps
 //! some of a table's rows by comparing its columns with literals
 //! (`layer = 1`), the program computes only those rows' gradients, if the
 //! engine's plan of that restriction is one the program can take; otherwise
@@ -115,6 +117,7 @@ mod rewrite;
 mod share;
 #[cfg(test)]
 mod tests;
+mod views;
 
 use std::fmt;
 use std::future::Future;
@@ -253,8 +256,13 @@ async fn run_all<B: Backend>(
         // Each CTE the engine would copy is planned once (see `share`); if
         // anything in that fails, the query is planned whole, as it always
         // was, which is always right.
-        let split = job
-            .tree
+        // The views the objective reads, written as its CTEs, so theirs
+        // are planned once too.
+        let tree = match &job.tree {
+            Some(q) => Some(views::expand(backend, q).await.unwrap_or_else(|| q.clone())),
+            None => None,
+        };
+        let split = tree
             .as_ref()
             .and_then(|q| share::split(q, &crate::forward::new_namespace()));
         let key = match split {

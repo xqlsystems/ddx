@@ -242,6 +242,26 @@ class DataFusionBackend:
         # and nullability: all an optimized plan's meaning depends on.
         return self.ctx.sql(sql).logical_plan().display_indent_schema()
 
+    def view_sql(self, name: str) -> Optional[str]:
+        # DataFusion keeps the SQL of a view created from SQL, and lists it in
+        # its information schema; a view registered from a DataFrame has none.
+        # A name of one part matches a view in any schema, and only when one
+        # does: two would be ambiguous, and the view is left to DataFusion.
+        parts = _name_parts(name)
+        if parts is None or not 1 <= len(parts) <= 3:
+            return None
+        columns = ["table_name", "table_schema", "table_catalog"]
+        where = " AND ".join(
+            f"{c} = '{p.replace(chr(39), chr(39) * 2)}'" for c, p in zip(columns, reversed(parts))
+        )
+        rows = (
+            self.ctx.sql(f"SELECT definition FROM information_schema.views WHERE {where}")
+            .to_arrow_table()
+            .column(0)
+            .to_pylist()
+        )
+        return rows[0] if len(rows) == 1 else None
+
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
         return self.ctx.create_dataframe_from_logical_plan(lp).limit(1).count() > 0
@@ -252,6 +272,39 @@ class DataFusionBackend:
 
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
+
+
+def _name_parts(name: str) -> Optional[list]:
+    """The parts of a table name as SQL writes it, as DataFusion resolves
+    them: a quoted part as written, an unquoted one in lower case; ``None``
+    if it does not parse."""
+    parts, i = [], 0
+    while i < len(name):
+        if name[i] == '"':
+            j = i + 1
+            part = ""
+            while True:
+                k = name.find('"', j)
+                if k < 0:
+                    return None
+                part += name[j:k]
+                if name[k + 1 : k + 2] == '"':
+                    part += '"'
+                    j = k + 2
+                    continue
+                i = k + 1
+                break
+        else:
+            k = name.find(".", i)
+            k = len(name) if k < 0 else k
+            part = name[i:k].lower()
+            i = k
+        parts.append(part)
+        if i < len(name):
+            if name[i] != ".":
+                return None
+            i += 1
+    return parts
 
 
 class Outputs(NamedTuple):

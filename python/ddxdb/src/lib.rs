@@ -695,6 +695,16 @@ impl ddx_ad::Backend for PyBackend {
             b.call_method1("plan_key", (sql,))?.extract()
         })
     }
+
+    fn view_sql(&mut self, name: &str) -> impl Future<Output = PyResult<Option<String>>> + Send {
+        // Optional: a backend without it leaves every view to its engine.
+        self.call(|b| {
+            if !b.hasattr("view_sql")? {
+                return Ok(None);
+            }
+            b.call_method1("view_sql", (name,))?.extract()
+        })
+    }
 }
 
 /// Programs `rewrite` built, kept to run again (`ddx_ad::Programs`): pass

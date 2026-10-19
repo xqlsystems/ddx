@@ -199,6 +199,19 @@ pub trait Backend: Send {
         let _ = sql;
         async { Ok(None) }
     }
+
+    /// The SQL that defines `name`, as a query writes it, if it names a view
+    /// whose SQL the engine keeps: a `CREATE VIEW` statement, or its query.
+    /// [`crate::rewrite`] writes such a view into the objective as CTEs, so
+    /// a model that is a view has the CTEs it reads more than once planned
+    /// once each. `None`, the default, leaves every view to the engine.
+    fn view_sql(
+        &mut self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
+        let _ = name;
+        async { Ok(None) }
+    }
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then

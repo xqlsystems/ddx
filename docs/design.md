@@ -1395,7 +1395,15 @@ once (§4.4). A CTE whose split could change what a read means is left to
 the engine: one a nested `WITH` defines again, one read inside an
 expression's subquery (where ddx refuses a reference), one read under
 another spelling, and every CTE of a `WITH RECURSIVE`. If planning the
-pieces fails, the query is planned whole. What the split costs is the
+pieces fails, the query is planned whole. A model is often a view, whose CTEs the
+objective's text does not show, so first each view the objective reads,
+whose SQL the engine keeps (`Backend::view_sql`: DataFusion's
+`ViewTable::definition`, or its `information_schema.views` from Python), is
+written into the objective as CTEs: its own CTEs under fresh names, then
+its query, all before the objective's own, so that a view's reads, which
+the engine resolves in its catalog, cannot reach one of them. A view with
+no SQL (one registered from a DataFrame), under a name a CTE also has, or
+whose SQL does not parse is left to the engine. What the split costs is the
 optimizations across the pieces: a reader's filter is not pushed into a
 shared CTE, nor a column only some readers use pruned from it, as when
 DuckDB computes a CTE read twice once; ddx prunes the steps it writes, and

@@ -107,6 +107,17 @@ impl ddx_ad::Backend for DataFusion {
         let key = df.logical_plan().display_indent_schema().to_string();
         Ok(Some(key))
     }
+
+    async fn view_sql(&mut self, name: &str) -> Result<Option<String>> {
+        // A name that reads no table, or a table that is not a view (or a
+        // view registered from a DataFrame, which has no SQL), has none.
+        let Ok(provider) = self.0.table_provider(name).await else {
+            return Ok(None);
+        };
+        Ok(provider
+            .downcast_ref::<datafusion::catalog::view::ViewTable>()
+            .and_then(|v| v.definition().cloned()))
+    }
 }
 
 /// Register `df`'s rows as the table `name`, materialized.

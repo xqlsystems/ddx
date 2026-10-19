@@ -53,6 +53,10 @@ impl Backend for Recording {
     async fn plan_key(&mut self, sql: &str) -> Result<Option<String>> {
         self.inner.plan_key(sql).await
     }
+
+    async fn view_sql(&mut self, name: &str) -> Result<Option<String>> {
+        self.inner.view_sql(name).await
+    }
 }
 
 async fn exec(ctx: &SessionContext, sql: &str) {
@@ -240,4 +244,98 @@ async fn a_split_objective_s_program_is_kept_between_calls() {
         prefixes[0], prefixes[1],
         "the second call built its own program"
     );
+}
+
+/// `k` layers over `w`, as `chain`'s, in a view `model` of `(i, v)`.
+fn model_view(k: usize) -> String {
+    let mut ctes = vec!["l0 AS (SELECT i, SUM(val) AS v FROM w GROUP BY i)".to_string()];
+    for n in 1..=k {
+        ctes.push(format!(
+            "l{n} AS (SELECT a.i, SUM(a.v * b.v + 0.5 * a.v) AS v \
+             FROM l{p} a JOIN l{p} b ON a.i = b.i GROUP BY a.i)",
+            p = n - 1
+        ));
+    }
+    format!(
+        "CREATE OR REPLACE VIEW model AS WITH {} SELECT i, v FROM l{k}",
+        ctes.join(", ")
+    )
+}
+
+const OF_MODEL: &str = "WITH loss AS (SELECT SUM(v) AS l FROM model)";
+
+#[tokio::test]
+async fn a_model_that_is_a_view_has_its_layers_planned_once() {
+    // The layers read twice are inside the view, where the objective's text
+    // does not show them: the view is written as CTEs first.
+    let ctx = w().await;
+    exec(&ctx, &model_view(3)).await;
+    let (got, log) = grad_of(&ctx, OF_MODEL).await;
+    let want = written_out(&ctx, &chain(3)).await;
+    assert_eq!(got.len(), want.len());
+    for ((gi, g), (wi, w)) in got.iter().zip(&want) {
+        assert_eq!(gi, wi);
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{got:?} vs {want:?}"
+        );
+    }
+    let placeholders = log.made.iter().filter(|n| n.contains("cte_")).count();
+    assert_eq!(placeholders, 3, "{:?}", log.made);
+}
+
+#[tokio::test]
+async fn a_deep_model_view_is_planned_layer_by_layer() {
+    // Twelve layers: 4,096 copies of the first written out. (DataFusion
+    // plans a view's definition, written out, when it creates the view, so
+    // a view much deeper than this cannot be created at all.) Each query
+    // the engine plans holds one layer.
+    let ctx = w().await;
+    exec(&ctx, &model_view(12)).await;
+    let (got, log) = grad_of(&ctx, OF_MODEL).await;
+    assert_eq!(got.len(), 3);
+    let n = log.made.iter().filter(|n| n.contains("cte_")).count();
+    assert_eq!(n, 12, "{:?}", log.made);
+    for sql in &log.planned {
+        assert!(sql.matches("JOIN").count() <= 2, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn a_view_over_a_view_is_written_out_too() {
+    let ctx = w().await;
+    exec(&ctx, &model_view(2)).await;
+    exec(
+        &ctx,
+        "CREATE VIEW scaled AS SELECT i, 2.0 * v AS v FROM model",
+    )
+    .await;
+    let (got, log) = grad_of(&ctx, "WITH loss AS (SELECT SUM(v) AS l FROM scaled)").await;
+    let want = written_out(&ctx, &chain(2)).await;
+    for ((_, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - 2.0 * w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{got:?} vs 2 × {want:?}"
+        );
+    }
+    assert_eq!(log.made.iter().filter(|n| n.contains("cte_")).count(), 2);
+}
+
+#[tokio::test]
+async fn a_view_without_sql_or_under_a_cte_s_name_is_left_to_the_engine() {
+    let ctx = w().await;
+    // Registered from a DataFrame: DataFusion keeps no SQL for it.
+    let df = ctx.sql("SELECT i, val * val AS v FROM w").await.unwrap();
+    ctx.register_table("squares", df.into_view()).unwrap();
+    let (got, log) = grad_of(&ctx, "WITH loss AS (SELECT SUM(v) AS l FROM squares)").await;
+    assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
+    assert!(!log.made.iter().any(|n| n.contains("cte_")));
+    // A CTE named `model` is what the objective reads, not the view.
+    exec(&ctx, &model_view(2)).await;
+    let (got, _) = grad_of(
+        &ctx,
+        "WITH model AS (SELECT i, val AS v FROM w), loss AS (SELECT SUM(v * v) AS l FROM model)",
+    )
+    .await;
+    assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
 }
