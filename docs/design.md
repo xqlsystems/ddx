@@ -949,7 +949,12 @@ real Substrait plan, the same relationship v1's `ColRef` has to
 
 Because Substrait plans are trees, a CTE read twice arrives as two identical
 subtrees; attention's plan holds eighteen aggregates for the eight the query
-writes. Identical aggregates are saved once and share one cotangent.
+writes. Identical aggregates are saved once and share one cotangent. They
+are found by a structural id per relation, interned bottom-up from its own
+fields and its inputs' ids, so finding them is linear in the plan's size
+however many copies inlining made (#155): encoding each aggregate's whole
+subtree, as ddx first did, re-encoded every aggregate beneath it, and took
+most of the build of a GPT's loss (1,050 aggregates, about 25 distinct).
 
 **One saved aggregate's backward step.** Saved aggregates are processed parents
 first, starting from the output. For each: join the region beneath it to its

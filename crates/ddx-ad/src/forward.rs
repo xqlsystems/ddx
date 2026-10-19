@@ -384,8 +384,8 @@ impl Forward {
             wrt,
             tables: Vec::new(),
             saved: Vec::new(),
-            by_encoding: HashMap::new(),
-            encodings: HashMap::new(),
+            by_shape: HashMap::new(),
+            shapes: Shapes::of_plan(root),
             seen: BTreeSet::new(),
             reads: HashMap::new(),
         };
@@ -505,22 +505,179 @@ fn mentions_reference(rel: &Rel) -> bool {
     false
 }
 
+/// A structural id for each aggregate of a plan: equal ids for equal
+/// subtrees, and only for them. Each relation is interned as its own fields
+/// (encoded with its inputs detached) and its inputs' ids, bottom-up, so
+/// the work is linear in the plan's size. Encoding each aggregate's whole
+/// subtree instead, as ddx once did, re-encoded the aggregates beneath it
+/// at every level: a plan whose CTEs are inlined at every read (a GPT's
+/// loss holds 1,050 copies of about 25 aggregates) spent most of its build
+/// there.
+struct Shapes {
+    /// Each relation seen, by its own fields' encoding and its inputs' ids
+    /// (`None` for an input slot left empty).
+    ids: HashMap<(Vec<u8>, Vec<Option<usize>>), usize>,
+    /// The id of each aggregate of the plan, by address: the plan is
+    /// borrowed for the whole read, so its relations stay put.
+    aggregates: HashMap<*const AggregateRel, usize>,
+}
+
+impl Shapes {
+    /// The ids of `root`'s aggregates.
+    fn of_plan(root: &Rel) -> Shapes {
+        let mut shapes = Shapes {
+            ids: HashMap::new(),
+            aggregates: HashMap::new(),
+        };
+        let ids = shapes.intern(root.clone());
+        // `intern` numbered the copy's relations in post-order; walk the
+        // plan itself in the same order to find each aggregate's.
+        let mut ids = ids.into_iter();
+        let mut stack: Vec<(&Rel, bool)> = vec![(root, false)];
+        while let Some((rel, expanded)) = stack.pop() {
+            let Some(kind) = &rel.rel_type else {
+                ids.next();
+                continue;
+            };
+            if expanded {
+                let id = ids.next().expect("one id per relation");
+                if let RelType::Aggregate(a) = kind {
+                    shapes.aggregates.insert(std::ptr::from_ref(&**a), id);
+                }
+                continue;
+            }
+            stack.push((rel, true));
+            for child in input_slots(kind).into_iter().rev().flatten() {
+                stack.push((child, false));
+            }
+        }
+        shapes
+    }
+
+    /// `a`'s id. An aggregate outside the plan's tree of relations (in a
+    /// subquery of an expression) is interned on first sight.
+    fn of(&mut self, a: &AggregateRel) -> usize {
+        if let Some(&id) = self.aggregates.get(&std::ptr::from_ref(a)) {
+            return id;
+        }
+        let rel = Rel {
+            rel_type: Some(RelType::Aggregate(Box::new(a.clone()))),
+        };
+        let id = *self.intern(rel).last().expect("the aggregate's own id");
+        self.aggregates.insert(std::ptr::from_ref(a), id);
+        id
+    }
+
+    /// Intern every relation of `root`, consuming it, and return their ids
+    /// in post-order (each relation's inputs, left to right, before it). A
+    /// chain of relations can be deeper than recursion allows, so it is a
+    /// loop.
+    fn intern(&mut self, root: Rel) -> Vec<usize> {
+        /// A relation with its inputs detached, the inputs left to intern
+        /// (last first), and the ids of those done.
+        struct Frame {
+            rel: Rel,
+            todo: Vec<Option<Rel>>,
+            done: Vec<Option<usize>>,
+        }
+        fn frame(mut rel: Rel) -> Frame {
+            let mut todo = match &mut rel.rel_type {
+                Some(kind) => take_input_slots(kind),
+                None => Vec::new(),
+            };
+            todo.reverse();
+            Frame {
+                rel,
+                todo,
+                done: Vec::new(),
+            }
+        }
+        let mut order = Vec::new();
+        let mut stack = vec![frame(root)];
+        loop {
+            let top = stack.last_mut().expect("the root's frame");
+            match top.todo.pop() {
+                Some(Some(child)) => stack.push(frame(child)),
+                Some(None) => top.done.push(None),
+                None => {
+                    let f = stack.pop().expect("the frame just looked at");
+                    let next = self.ids.len();
+                    let id = *self
+                        .ids
+                        .entry((f.rel.encode_to_vec(), f.done))
+                        .or_insert(next);
+                    order.push(id);
+                    match stack.last_mut() {
+                        Some(parent) => parent.done.push(Some(id)),
+                        None => return order,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A relation's input slots, in order: each input, or `None` where the
+/// relation has a slot left empty. [`take_input_slots`] must agree.
+fn input_slots(kind: &RelType) -> Vec<Option<&Rel>> {
+    match kind {
+        RelType::Filter(r) => vec![r.input.as_deref()],
+        RelType::Fetch(r) => vec![r.input.as_deref()],
+        RelType::Aggregate(r) => vec![r.input.as_deref()],
+        RelType::Sort(r) => vec![r.input.as_deref()],
+        RelType::Project(r) => vec![r.input.as_deref()],
+        RelType::Window(r) => vec![r.input.as_deref()],
+        RelType::ExtensionSingle(r) => vec![r.input.as_deref()],
+        RelType::Join(r) => vec![r.left.as_deref(), r.right.as_deref()],
+        RelType::Cross(r) => vec![r.left.as_deref(), r.right.as_deref()],
+        RelType::Set(r) => r.inputs.iter().map(Some).collect(),
+        RelType::ExtensionMulti(r) => r.inputs.iter().map(Some).collect(),
+        // Any other relation keeps its inputs in its own fields' encoding:
+        // slower, never wrong.
+        _ => Vec::new(),
+    }
+}
+
+/// [`input_slots`], taken out of the relation.
+fn take_input_slots(kind: &mut RelType) -> Vec<Option<Rel>> {
+    fn take(r: &mut Option<Box<Rel>>) -> Option<Rel> {
+        r.take().map(|b| *b)
+    }
+    match kind {
+        RelType::Filter(r) => vec![take(&mut r.input)],
+        RelType::Fetch(r) => vec![take(&mut r.input)],
+        RelType::Aggregate(r) => vec![take(&mut r.input)],
+        RelType::Sort(r) => vec![take(&mut r.input)],
+        RelType::Project(r) => vec![take(&mut r.input)],
+        RelType::Window(r) => vec![take(&mut r.input)],
+        RelType::ExtensionSingle(r) => vec![take(&mut r.input)],
+        RelType::Join(r) => vec![take(&mut r.left), take(&mut r.right)],
+        RelType::Cross(r) => vec![take(&mut r.left), take(&mut r.right)],
+        RelType::Set(r) => std::mem::take(&mut r.inputs).into_iter().map(Some).collect(),
+        RelType::ExtensionMulti(r) => std::mem::take(&mut r.inputs)
+            .into_iter()
+            .map(Some)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 struct Builder<'a> {
     functions: &'a Functions,
     namespace: String,
     wrt: &'a [ColumnRef],
     tables: Vec<Table>,
     saved: Vec<Saved>,
-    /// Each saved aggregate, by the encoding of the aggregate it was read from.
-    by_encoding: HashMap<Vec<u8>, usize>,
+    /// Each saved aggregate, by the [`Shapes`] id of the aggregate it was
+    /// read from.
+    by_shape: HashMap<usize, usize>,
+    /// Structural ids of the plan's relations.
+    shapes: Shapes,
     /// Every table name the plan reads, for the error when a `wrt` names none.
     seen: BTreeSet<String>,
     /// [`Builder::reads_wrt`]'s answers, by relation: the plan is borrowed for
     /// the whole read, so its relations stay put.
     reads: HashMap<*const Rel, bool>,
-    /// The encodings [`Builder::lower`] computed for aggregates it walked
-    /// into, for [`Builder::read_saved`] to use rather than compute again.
-    encodings: HashMap<*const AggregateRel, Vec<u8>>,
 }
 
 impl Builder<'_> {
@@ -543,11 +700,9 @@ impl Builder<'_> {
                 Some(RelType::Sort(so)) => &so.input,
                 Some(RelType::Fetch(fe)) => &fe.input,
                 Some(RelType::Aggregate(a)) => {
-                    let encoding = a.encode_to_vec();
-                    if self.by_encoding.contains_key(&encoding) {
+                    if self.by_shape.contains_key(&self.shapes.of(a)) {
                         break self.lower_one(cur, None)?;
                     }
-                    self.encodings.insert(std::ptr::from_ref(&**a), encoding);
                     &a.input
                 }
                 _ => break self.lower_one(cur, None)?,
@@ -992,15 +1147,12 @@ impl Builder<'_> {
     /// the module docs describe. Save aggregate `a`, once: lowered over
     /// `below`, its input's region, if [`Builder::lower`] walked down to it.
     fn read_saved(&mut self, a: &AggregateRel, below: Option<Region>) -> Result<usize> {
-        let encoding = match self.encodings.remove(&std::ptr::from_ref(a)) {
-            Some(e) => e,
-            None => a.encode_to_vec(),
-        };
-        if let Some(&n) = self.by_encoding.get(&encoding) {
+        let shape = self.shapes.of(a);
+        if let Some(&n) = self.by_shape.get(&shape) {
             return Ok(n);
         }
         let n = self.read_aggregate(a, below)?;
-        self.by_encoding.insert(encoding, n);
+        self.by_shape.insert(shape, n);
         Ok(n)
     }
 
@@ -1814,5 +1966,120 @@ mod tests {
             .iter()
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_hexdigit())));
         assert_ne!(ns, new_namespace());
+    }
+
+    fn table(name: &str) -> Rel {
+        Rel {
+            rel_type: Some(RelType::Read(Box::new(ReadRel {
+                read_type: Some(ReadType::NamedTable(substrait::proto::read_rel::NamedTable {
+                    names: vec![name.into()],
+                    advanced_extension: None,
+                })),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    fn aggregate(input: Rel) -> Rel {
+        Rel {
+            rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(input)),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    fn cross(left: Rel, right: Rel) -> Rel {
+        Rel {
+            rel_type: Some(RelType::Cross(Box::new(substrait::proto::CrossRel {
+                left: Some(Box::new(left)),
+                right: Some(Box::new(right)),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// `k` layers, each an aggregate of the layer before crossed with
+    /// itself, as a CTE read twice is inlined: 2^k copies of the first.
+    fn layers(k: usize, bottom: &str) -> Rel {
+        let mut rel = aggregate(table(bottom));
+        for _ in 0..k {
+            rel = aggregate(cross(rel.clone(), rel));
+        }
+        rel
+    }
+
+    /// Every aggregate of `rel`, outermost first, with its depth in
+    /// aggregates.
+    fn aggregates(rel: &Rel) -> Vec<(&AggregateRel, usize)> {
+        let mut out = Vec::new();
+        let mut stack = vec![(rel, 0)];
+        while let Some((r, depth)) = stack.pop() {
+            let Some(kind) = &r.rel_type else { continue };
+            let below = match kind {
+                RelType::Aggregate(a) => {
+                    out.push((&**a, depth));
+                    depth + 1
+                }
+                _ => depth,
+            };
+            stack.extend(input_slots(kind).into_iter().flatten().map(|c| (c, below)));
+        }
+        out
+    }
+
+    #[test]
+    fn the_copies_of_an_aggregate_share_one_id_and_no_other() {
+        let k = 6;
+        let plan = layers(k, "t");
+        let mut shapes = Shapes::of_plan(&plan);
+        let found = aggregates(&plan);
+        assert_eq!(found.len(), (1 << (k + 1)) - 1);
+        let mut by_depth: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        for (a, depth) in &found {
+            by_depth.entry(*depth).or_default().insert(shapes.of(a));
+        }
+        // One id per layer, and k + 1 layers.
+        assert!(by_depth.values().all(|ids| ids.len() == 1), "{by_depth:?}");
+        let ids: BTreeSet<usize> = by_depth.values().flatten().copied().collect();
+        assert_eq!(ids.len(), k + 1);
+        // Interning is per distinct relation, not per copy: a read, then an
+        // aggregate per layer and a cross per layer above the first.
+        assert_eq!(shapes.ids.len(), 2 + 2 * k);
+    }
+
+    #[test]
+    fn aggregates_that_differ_only_far_below_have_different_ids() {
+        let plan = cross(layers(4, "t"), layers(4, "u"));
+        let mut shapes = Shapes::of_plan(&plan);
+        let Some(RelType::Cross(c)) = &plan.rel_type else {
+            unreachable!()
+        };
+        fn top(r: &Option<Box<Rel>>) -> &AggregateRel {
+            match &r.as_deref().unwrap().rel_type {
+                Some(RelType::Aggregate(a)) => a,
+                _ => unreachable!(),
+            }
+        }
+        let (l, r) = (top(&c.left), top(&c.right));
+        assert_ne!(shapes.of(l), shapes.of(r));
+    }
+
+    #[test]
+    fn an_aggregate_outside_the_plan_is_interned_on_sight_alike() {
+        let plan = layers(3, "t");
+        let mut shapes = Shapes::of_plan(&plan);
+        let outside = layers(3, "t");
+        let (Some(RelType::Aggregate(a)), Some(RelType::Aggregate(b))) =
+            (&plan.rel_type, &outside.rel_type)
+        else {
+            unreachable!()
+        };
+        assert_eq!(shapes.of(a), shapes.of(b));
+        let other = layers(3, "u");
+        let Some(RelType::Aggregate(c)) = &other.rel_type else {
+            unreachable!()
+        };
+        assert_ne!(shapes.of(a), shapes.of(c));
     }
 }
