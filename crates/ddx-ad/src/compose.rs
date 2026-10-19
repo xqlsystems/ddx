@@ -252,20 +252,26 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
     // columns.
     let mut steps: HashMap<&str, (i32, Vec<String>)> = HashMap::new();
     let mut shared: Vec<PlanRel> = Vec::new();
+    // Each step's relation, from its root: what it computes.
+    let ext = Extensions::new(&functions);
+    let mut rels = Vec::with_capacity(parts.steps.len());
+    for step in &parts.steps {
+        let (root, names) = root_of(&step.plan)?;
+        rels.push((inline_references(root, &step.plan.relations)?, names));
+    }
     // Only the steps the output reads, directly or through each other, are
     // written: another gradient's steps are not, nor anything in them.
     let mut needed: Vec<String> = vec![output.step.clone()];
-    for step in parts.steps.iter().rev() {
+    for (step, (rel, names)) in parts.steps.iter().zip(&rels).rev() {
         if needed.contains(&step.name) {
-            needed.extend(unbound_reads(&step.plan));
+            needed.extend(unbound_reads(&plan_of(rel.clone(), names.clone(), &ext)));
         }
     }
-    for step in &parts.steps {
+    for (step, (rel, names)) in parts.steps.iter().zip(rels) {
         if !needed.contains(&step.name) {
             continue;
         }
-        let (root, names) = root_of(&step.plan)?;
-        let mut rel = inline_references(root, &step.plan.relations)?;
+        let mut rel = rel;
         substitute(&mut rel, &steps)?;
         if step.name != output.step {
             // After the root, which a plan holds first.
@@ -275,7 +281,7 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
             });
             continue;
         }
-        let mut plan = plan_of(rel, names, &Extensions::new(&functions));
+        let mut plan = plan_of(rel, names, &ext);
         plan.relations.extend(shared);
         if let Some(read) = unbound_reads(&plan)
             .into_iter()
@@ -770,6 +776,40 @@ mod tests {
         };
         let plan = output_plan(&parts).unwrap();
         // The root, and `p_a` once.
+        assert_eq!(plan.relations.len(), 2, "{plan:?}");
+    }
+
+    #[test]
+    fn a_step_only_a_relation_the_root_never_reaches_reads_is_left_out() {
+        // The output's plan holds, beside its root, a relation nothing
+        // reaches that reads `p_other`: what the output computes reads
+        // only `p_a`.
+        let a = step("p_a", read_step("t", vec!["c0".into()]));
+        let other = step("p_other", read_step("t", vec!["c0".into()]));
+        let mut out = step(
+            "p_value",
+            select(
+                project(read_step("p_a", vec!["c0".into()]), vec![field(0)]),
+                vec![1],
+            ),
+        );
+        out.plan.0.relations.push(PlanRel {
+            rel_type: Some(PlanRelType::Rel(read_step("p_other", vec!["c0".into()]))),
+        });
+        let value = OutputTable {
+            step: "p_value".into(),
+            of: Of::Output,
+            columns: vec!["c0".into()],
+            tangents: Vec::new(),
+        };
+        let parts = Parts {
+            inputs: &[],
+            checks: &[],
+            steps: vec![&a, &other, &out],
+            value: &value,
+            gradients: &[],
+        };
+        let plan = output_plan(&parts).unwrap();
         assert_eq!(plan.relations.len(), 2, "{plan:?}");
     }
 }
