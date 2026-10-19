@@ -550,7 +550,7 @@ fn redeclare(
 /// read the table as data, and the derivative through it would be lost. A
 /// relation this crate does not know is refused, since a function it calls
 /// would keep an anchor that names another.
-fn redeclare_rel(
+pub(crate) fn redeclare_rel(
     rel: &mut Rel,
     from: &Functions,
     renamed: &HashMap<String, String>,

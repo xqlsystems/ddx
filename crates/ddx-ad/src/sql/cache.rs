@@ -91,19 +91,35 @@ pub(super) struct Key {
 }
 
 impl Key {
-    /// `job`'s key, or `None` if the engine cannot give one for its query
-    /// or a restriction's. An engine that fails on the query fails here
-    /// as it would have planning it; one that fails on a restriction's,
-    /// which the build would have left out, keeps nothing.
+    /// `job`'s key, its query planned as `queries` (the query, or each CTE
+    /// planned on its own and then the query), or `None` if the engine
+    /// cannot give one for one of them or a restriction's. An engine that
+    /// fails on a query fails here as it would have planning it; one that
+    /// fails on a restriction's, which the build would have left out, keeps
+    /// nothing.
+    ///
+    /// `fresh` is a namespace the queries name tables under that is new to
+    /// this call (a split's placeholders): it is written as one name in the
+    /// key, in the queries and in the engine's keys of them, so the next
+    /// call, with a namespace of its own, finds the program.
     pub(super) async fn of<B: Backend>(
         backend: &mut B,
         job: &Job,
+        queries: &[String],
+        fresh: Option<&str>,
     ) -> Result<Option<Key>, B::Error> {
-        let Some(plan) = backend.plan_key(&job.query).await? else {
-            return Ok(None);
+        let same = |s: &str| match fresh {
+            Some(ns) => s.replace(ns, "__ddx_fresh_"),
+            None => s.to_string(),
         };
-        let mut queries = vec![job.query.clone()];
-        let mut plans = vec![plan];
+        let mut plans = Vec::new();
+        for q in queries {
+            let Some(plan) = backend.plan_key(q).await? else {
+                return Ok(None);
+            };
+            plans.push(same(&plan));
+        }
+        let mut queries: Vec<String> = queries.iter().map(|q| same(q)).collect();
         for r in &job.pushdown {
             let Ok(Some(plan)) = backend.plan_key(&r.query).await else {
                 return Ok(None);

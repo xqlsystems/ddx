@@ -55,6 +55,8 @@ struct Text {
     /// As a statement was written, or a query ddx built, written out: what
     /// runs when it holds no call.
     sql: String,
+    /// A query ddx built, as a tree.
+    tree: Option<Query>,
     calls: Option<Calls>,
     /// Which of the planned derivatives each call needs, in order.
     needs: Vec<usize>,
@@ -65,6 +67,8 @@ struct Text {
 /// a gradient to push down.
 pub(super) struct Job {
     pub index: usize,
+    /// [`Job::query`] as a tree.
+    pub tree: Option<Query>,
     /// The transformation and its `wrt` columns, in order: with the query
     /// and the restrictions' queries, what the program is built from
     /// besides the engine's plans.
@@ -120,6 +124,7 @@ impl Derivatives {
         let Some(p) = self.planned.get(index) else {
             return Ok(None);
         };
+        let tree = p.query.rewrite_query(&self.planned, &self.built)?;
         Ok(Some(Job {
             index,
             derivative: format!(
@@ -127,7 +132,11 @@ impl Derivatives {
                 p.derivative.transform().name(),
                 p.derivative.wrt()
             ),
-            query: p.query.rewrite(&self.planned, &self.built)?,
+            query: match &tree {
+                Some(t) => t.to_string(),
+                None => p.query.sql.clone(),
+            },
+            tree,
             pushdown: p.pushdown.clone(),
         }))
     }
@@ -170,6 +179,11 @@ impl Derivatives {
         }
         self.built.push(program);
         Ok(())
+    }
+
+    /// How many programs are built so far.
+    pub fn built_count(&self) -> usize {
+        self.built.len()
     }
 
     /// The programs built so far, in the order of their jobs.
@@ -454,7 +468,7 @@ impl Text {
     /// was.
     fn statement(sql: &str, dialect: &dyn Dialect, planned: &mut Vec<Planned>) -> Result<Text> {
         let calls = Calls::find(sql, dialect)?;
-        Text::of(sql.to_string(), calls, planned, &mut Vec::new())
+        Text::of(sql.to_string(), None, calls, planned, &mut Vec::new())
     }
 
     /// A derivative's query or seed, which ddx built from a statement's
@@ -468,12 +482,13 @@ impl Text {
             ));
         }
         let calls = Calls::in_query(query)?;
-        Text::of(query.to_string(), calls, planned, open)
+        Text::of(query.to_string(), Some(query.clone()), calls, planned, open)
     }
 
     /// `sql`, holding `calls`, each planned.
     fn of(
         sql: String,
+        tree: Option<Query>,
         calls: Option<Calls>,
         planned: &mut Vec<Planned>,
         open: &mut Vec<Query>,
@@ -486,7 +501,12 @@ impl Text {
             }
             open.pop();
         }
-        Ok(Text { sql, calls, needs })
+        Ok(Text {
+            sql,
+            tree,
+            calls,
+            needs,
+        })
     }
 
     /// The derivatives whose programs it reads, each once.
@@ -503,22 +523,40 @@ impl Text {
     /// The text with each call replaced by a read of what its program
     /// computed ([`Calls::rewrite`]).
     fn rewrite(&self, planned: &[Planned], built: &[Box<dyn Built>]) -> Result<String> {
-        let Some(calls) = &self.calls else {
+        if self.calls.is_none() {
             return Ok(self.sql.clone());
+        }
+        Ok(self
+            .rewrite_query(planned, built)?
+            .expect("a text with calls is a tree")
+            .to_string())
+    }
+
+    /// [`Text::rewrite`], as a tree: `None` for a statement with no call,
+    /// which comes back as it was written.
+    fn rewrite_query(
+        &self,
+        planned: &[Planned],
+        built: &[Box<dyn Built>],
+    ) -> Result<Option<Query>> {
+        let Some(calls) = &self.calls else {
+            return Ok(self.tree.clone());
         };
-        calls.rewrite(&|i| {
-            let j = self.needs[i];
-            let program = built
-                .get(j)
-                .ok_or_else(|| AdError::Internal(format!("job {j} is read before it is built")))?;
-            let Subject::Program(parts) = program.subject() else {
-                return Err(AdError::Internal(format!("job {j}'s program is a query")));
-            };
-            match calls.calls[i].derivative.transform() {
-                Transform::Jvp => Ok(Answer::Value(parts.value)),
-                _ => gradient(&calls.calls[i], &planned[j].derivative, parts.gradients),
-            }
-        })
+        calls
+            .rewrite(&|i| {
+                let j = self.needs[i];
+                let program = built.get(j).ok_or_else(|| {
+                    AdError::Internal(format!("job {j} is read before it is built"))
+                })?;
+                let Subject::Program(parts) = program.subject() else {
+                    return Err(AdError::Internal(format!("job {j}'s program is a query")));
+                };
+                match calls.calls[i].derivative.transform() {
+                    Transform::Jvp => Ok(Answer::Value(parts.value)),
+                    _ => gradient(&calls.calls[i], &planned[j].derivative, parts.gradients),
+                }
+            })
+            .map(Some)
     }
 }
 

@@ -52,8 +52,8 @@ impl Calls {
     ///
     /// A call inside a `jvp`'s `SELECT` is its program's to read. The
     /// statement is rewritten as a tree, every replacement built as nodes,
-    /// then written out as SQL.
-    pub fn rewrite<'a>(&self, answer: &dyn Fn(usize) -> Result<Answer<'a>>) -> Result<String> {
+    /// for the caller to write out as SQL.
+    pub fn rewrite<'a>(&self, answer: &dyn Fn(usize) -> Result<Answer<'a>>) -> Result<Query> {
         let mut rewriter = Rewriter::default();
         // Each `grad` or `vjp` call's gradient column. Calls on one read
         // that read the same gradient share one, so that a call written
@@ -183,7 +183,7 @@ impl Calls {
         let mut query = self.query.clone();
         let _ = VisitMut::visit(&mut query, &mut rewriter);
         drop_unread_ctes(&mut query);
-        Ok(query.to_string())
+        Ok(query)
     }
 }
 
