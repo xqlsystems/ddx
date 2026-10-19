@@ -179,6 +179,27 @@ async fn assert_same_programs(ctx: &SessionContext, sql: &str, wrt: &[ColumnRef]
     assert_eq!(format!("{shared:?}"), format!("{tree:?}"), "grad of {sql}");
 }
 
+#[tokio::test]
+async fn a_limit_over_a_shared_sort_keeps_the_sort_s_order() {
+    // Two LIMITs over one ORDER BY: unoptimized, each a Fetch whose input
+    // is the Sort, shared. The Fetch reads its ordering from the Sort it
+    // reads through the reference, as from the Sort written out.
+    let ctx = tables().await;
+    let sql = "SELECT SUM(a.val * b.val) AS l \
+               FROM (SELECT i, val FROM w ORDER BY i LIMIT 2) a \
+               JOIN (SELECT i, val FROM w ORDER BY i LIMIT 3) b ON a.i = b.i";
+    let lp = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
+    let plan = *datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state())
+        .unwrap();
+    let dag = shared(&plan);
+    assert!(shared_count(&dag) > 0, "nothing shared");
+    let wrt = [ColumnRef::new("w", "val")];
+    let options = Options::new().namespace("__ddx_same_");
+    let tree = ddx_ad::grad_with(&plan, &wrt, &options).unwrap();
+    let shared = ddx_ad::grad_with(&dag, &wrt, &options).unwrap();
+    assert_eq!(format!("{shared:?}"), format!("{tree:?}"));
+}
+
 async fn tables() -> SessionContext {
     let ctx = SessionContext::new();
     exec(

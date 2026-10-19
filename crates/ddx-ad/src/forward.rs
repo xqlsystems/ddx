@@ -468,7 +468,9 @@ pub(crate) fn shared_relations(root: &Rel, relations: &[PlanRel]) -> Result<Vec<
                     "a ReferenceRel inside a subquery expression".into(),
                 ));
             }
-            stack.extend(rel_inputs(kind).into_iter().rev());
+            // The inputs `Shapes` interns, a window relation's included, so
+            // every reference it meets is one checked here.
+            stack.extend(input_slots(kind).into_iter().flatten().rev());
         }
         Ok(out)
     }
@@ -929,7 +931,11 @@ impl Builder<'_> {
             }
             RelType::Fetch(fe) => {
                 let mut s = lowered(self, &mut below, &fe.input)?;
-                let below = input(&fe.input)?;
+                // A shared Sort is ordered as it is written out.
+                let mut below = input(&fe.input)?;
+                while let Some(RelType::Reference(r)) = &below.rel_type {
+                    below = referenced(self.relations, r.subtree_ordinal)?;
+                }
                 // The rows a LIMIT keeps are the first in its input's order:
                 // an ORDER BY's keys, or none.
                 let keys = match &below.rel_type {
