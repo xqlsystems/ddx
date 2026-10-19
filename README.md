@@ -81,8 +81,8 @@ equal `jax.grad` to 1e-12.
 ## Status
 
 Query-level AD (`ddx-ad`, with `ddx_datafusion::ad` and `ddxdb.ad` on top) is
-built: it matches `jax.grad` on every fixture, trains an MLP on DataFusion, and
-ships with the next release. ddx's first design, which rewrote `grad(x * y, x)` in a
+built and released (`ddx-ad` 0.2.1, `ddxdb` 0.3.1): it matches `jax.grad` on
+every fixture and trains an MLP on DataFusion. ddx's first design, which rewrote `grad(x * y, x)` in a
 select list to derivative SQL one row at a time, has been removed; its
 derivative rules live on as `ddx-core`, which `ddx-ad` uses for each
 expression.
@@ -93,14 +93,15 @@ through `ddxdb.run` and the `ddxdb.Backend` protocol.
 
 | | | |
 |---|---|---|
-| [`ddx-ad`](crates/ddx-ad) | query-level AD over Substrait | next release |
+| [`ddx-ad`](crates/ddx-ad) | query-level AD over Substrait | [crates.io](https://crates.io/crates/ddx-ad) |
 | [`ddx-core`](crates/ddx-core) | the scalar derivative rules `ddx-ad` uses | [crates.io](https://crates.io/crates/ddx-core) |
 | [`ddx-datafusion`](crates/ddx-datafusion) | DataFusion adapter: `ad` | [crates.io](https://crates.io/crates/ddx-datafusion) |
 | [`ddxdb`](python/ddxdb) | Python wheel: a DataFusion `Context`, `ad`, and the programs for any engine | [PyPI](https://pypi.org/project/ddxdb/) |
-| `ddx-duckdb` | DuckDB community extension | planned |
 
-Next is DuckDB: a community extension that runs ddx's programs through
-DuckDB's own Substrait consumer. The milestone plan is in
+Next is DuckDB-Python, which is how xarray-sql reaches DuckDB: `ddxdb` gets a
+DuckDB backend that plans each query with DuckDB's own Substrait producer and
+runs each step of the program as SQL on your connection. A DuckDB community
+extension comes later. The milestone plan is in
 [docs/design.md](docs/design.md).
 
 ## Correctness

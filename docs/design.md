@@ -1,9 +1,9 @@
 # `ddx` — portable autograd for composable databases
 
 _author_: Alex Merose
-_co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
-_status_: Design — iterating toward implementation
-_last updated_: 2026-10-13
+_co-author_: Claude (Opus 4.8, Fable 5, Opus 5.5), via Claude Code
+_status_: Living design — built on DataFusion; DuckDB-Python in progress (M5)
+_last updated_: 2026-10-18
 
 ---
 
@@ -19,11 +19,12 @@ SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
 
 and the gradient comes back as a column beside each row's value, computed by
 the engine as a sequence of plans. The destination is training ML models in
-SQL — a [differentiable](https://www.youtube.com/watch?v=LNNU33TmBFk) [database](https://www.youtube.com/watch?v=jUe3rvTmv7Q). It ships as one engine-neutral Rust core with
-thin per-engine adapters, into DataFusion (via a Python package, `ddxdb`, into
-[xarray-sql](https://github.com/xqlsystems/xarray-sql)) and DuckDB (via a
-community extension, into
-[duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr)).
+SQL — a [differentiable](https://www.youtube.com/watch?v=LNNU33TmBFk) [database](https://www.youtube.com/watch?v=jUe3rvTmv7Q). It ships as engine-neutral Rust crates with
+thin per-engine adapters. Its Python package, `ddxdb`, brings it to
+[xarray-sql](https://github.com/xqlsystems/xarray-sql) on DataFusion today, and
+on DuckDB-Python next (M5, §4.2). A DuckDB community extension, for
+[duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr) and other DuckDB users
+outside Python, comes after (§8).
 
 **Data model.** `ddx` assumes the XQL data model: an N-dimensional array is a
 long/tidy relational table — one row per coordinate tuple, dimensions and
@@ -49,31 +50,30 @@ implements `grad`/`jvp`/`vjp` for DataFusion, and a follow-on demo,
 trains a real MLP with every gradient computed in SQL. §3 and §4 explain what
 each taught the design and generalize it into a reusable component. Every
 foundational claim below that could be checked with a small program was
-checked with one — the programs live in [`spikes/`](../spikes/README.md) and
+checked with one — the programs live in [`docs/spikes/`](spikes/README.md) and
 are cited by tag throughout.
 
-**Two layers, one engine.** The design has two committed layers, built on one
-differentiation engine:
+**One engine, built in two stages.** ddx was designed as two layers, and the
+first became part of the second:
 
-- **v1 — calculus as columns** (§3). `ddx-core` differentiates SQL scalar
-  expressions and rewrites `grad()`/`jvp()` calls to derivative SQL before
-  planning. This is a real product on its own: sensitivity columns, small
-  Jacobians, Newton steps, curve fitting, physical derivatives on gridded
-  data — the sweet spot no other SQL-native tool covers. It has a real
-  ceiling: an N-parameter gradient computed as N independent scalar
-  derivations does not scale, which is the reason ML left symbolic
-  differentiation for reverse-mode AD in the first place (Baydin et al. [1]).
-- **v2 — query-level reverse-mode AD** (§4), the ML headline. The scalar
-  engine from v1 becomes the *map rule* of a system that differentiates
-  whole queries — not expressions — the way JAX differentiates functions: one
-  transpose rule per relational primitive (map, select, broadcast, reduce),
-  composed. Sharing that scalar mode lacks happens through materialized
-  intermediate relations (the tape) instead of inside expressions. Verified
-  machine-exact against `jax.grad` on an MLP and on attention.
+- **v1 — calculus as columns** (§3, kept as history). `ddx-core`
+  differentiated SQL scalar expressions and rewrote `grad()`/`jvp()` calls to
+  derivative SQL before planning. Its ceiling: an N-parameter gradient
+  computed as N independent scalar derivations does not scale, which is the
+  reason ML left symbolic differentiation for reverse-mode AD in the first
+  place (Baydin et al. [1]).
+- **v2 — query-level AD** (§4), the product. `ddx-ad` differentiates whole
+  queries, not expressions, the way JAX differentiates functions: one rule per
+  relational primitive (map, select, broadcast, reduce), composed, in reverse
+  mode (`grad`, `vjp`) and forward mode (`jvp`), which compose with each other.
+  The sharing that scalar mode lacks comes from materialized intermediate
+  relations (the tape), rather than from shared work inside expressions. v1's scalar engine is
+  v2's map rule. Verified machine-exact against `jax.grad` on an MLP and on
+  attention.
 
-Both layers follow the same shape: a minimal-dependency, engine-neutral core,
-with thin adapters per engine. v1's core depends on `sqlparser` only; v2's
-depends on `substrait` and v1's core. Neither depends on `datafusion` or `duckdb`.
+Both follow the same shape: a minimal-dependency, engine-neutral core, with
+thin adapters per engine. `ddx-core` depends on `sqlparser` only; `ddx-ad` on
+`substrait` and `ddx-core`. Neither depends on `datafusion` or `duckdb`.
 
 **v1's SQL surface is removed (2026-10-13, `S15`).** v2 covers what v1 did: a
 row's derivative is the gradient of a sum over rows, or a `jvp` with a tangent
@@ -83,34 +83,33 @@ kept as the record of how that differentiator was designed.
 
 ### 1.1 Non-goals
 
-- Not a runtime tensor library or a GPU kernel engine. `ddx` differentiates SQL
-  — scalar expressions in v1, whole queries in v2 — never arbitrary imperative
-  code, and there is no tape of Python/Rust operations to record.
-- Not general `u^v` power, `CASE`/conditional subgradients, or other
-  non-smooth ops in v1 (§3.6 roadmap). An unsupported node is a typed error,
-  never a silently wrong derivative.
-- Not using Substrait in v1 (§3.3) — v1 needs no plan IR at all. v2 does, and
-  uses Substrait; the two are consistent, not a reversal (§4.2, `[S1]`).
-- Not two injection paths everywhere in v1. The universal path is a SQL
-  source-to-source rewrite; DataFusion additionally gets an in-engine plan
-  rewrite as the reference proof the core can drive one. Other engines' plan
-  rewrites are deferred.
-- Postgres is later — it needs array/XQL support first (via `pgrx`), and its
-  planner-hook story differs from the two first targets.
+- Not a runtime tensor library or a GPU kernel engine. `ddx` differentiates
+  SQL queries, never imperative code, and its tape is materialized relations,
+  not a record of Python or Rust operations.
+- Not a plan-interchange format of its own. ddx reads Substrait plans and
+  writes Substrait, or SQL where an engine's Substrait consumer falls short
+  (§4.2).
+- Not a derivative where none is defined. An unsupported construct (a rank
+  used as a value, a running `MAX`, a `UNION ALL` in reverse mode for now) is
+  a typed error, never a silently wrong gradient (§4.6).
+- Not every engine at once. DataFusion first, then DuckDB-Python; a DuckDB
+  extension, and Postgres (which needs array/XQL support first, via `pgrx`),
+  later.
 
 ### 1.2 Success criteria
 
-- A single engine-independent core (`ddx-core`) implements each layer's
-  differentiation algorithm once; every database integration is a thin
-  adapter over it.
-- It ships in two real, actively-used projects with no regressions:
-  xarray-sql (DataFusion/Python) and duckdb-zarr (Rust community extension).
-  These are sequenced, not simultaneous — xarray-sql is the v1 acceptance
-  target; duckdb-zarr comes after the v2 track (§8).
-- The `grad`/`jvp` surface is portable — the same SQL-level functions, one
-  shared core defining what they mean, adopted by every target engine.
-  Portability lives at the SQL surface for v1 and at the Substrait plan
-  surface for v2 — never in a project-specific plan-interchange format.
+- A single engine-independent core implements differentiation once; every
+  engine integration is a thin adapter over it. The run loop and the SQL
+  rewrite live in the core too, so an adapter implements only an engine's
+  primitives (`S14`, `S17`).
+- It ships in real, actively-used projects with no regressions, in order:
+  xarray-sql on DataFusion (done, through `ddxdb`), xarray-sql on
+  DuckDB-Python (M5), the other Arrow-based engines xarray-sql registers
+  into, then duckdb-zarr through a DuckDB extension.
+- The `grad`/`vjp`/`jvp` surface is portable — the same SQL-level calls, one
+  core defining what they mean, on every target engine. Portability lives at
+  the SQL surface and at the Substrait plan surface — never in a
+  project-specific plan-interchange format.
 
 ---
 
@@ -120,10 +119,11 @@ kept as the record of how that differentiator was designed.
    directly on `sqlparser::ast::Expr` — the same parser DataFusion uses. v2
    operates directly on `substrait::proto` types. Neither layer invents its
    own representation; each reuses the closest real one for its scope.
-2. **Rewrite, don't execute.** `grad`/`jvp` are compile-time markers, always
-   rewritten away before execution — never functions that run per row. Every
-   integration is fundamentally "find the marker, differentiate what it
-   wraps, splice the result back, hand plain output onward."
+2. **Rewrite, don't execute.** `grad`, `vjp` and `jvp` in SQL are rewritten
+   before the engine sees the statement, into reads of what ddx's programs
+   computed — never functions that run per row (§4.8). Every integration is
+   fundamentally "find the call, differentiate what it names, put the result
+   in its place, hand plain SQL onward."
 3. **Never guess; derive, or be told.** A derivative follows from what an
    operator computes: a `SUM` is linear whatever it sums, a join broadcasts
    whatever it pairs. ddx reads that off the operator, never off a guess about
@@ -134,10 +134,11 @@ kept as the record of how that differentiator was designed.
    never infer", and asked for a tag on every contraction and reduction.
    Building v2 showed those tags classified nothing the rules needed; see
    decision `S10`.)
-4. **SQL (or its plan) is the portable surface.** v1's `grad`/`jvp` are
-   ordinary SQL function calls; v2's `grad` is the same one level up, taking a
-   query instead of an expression. No project-specific interchange format carries meaning between
-   engines — each engine's own SQL-to-plan machinery does.
+4. **SQL (or its plan) is the portable surface.** `grad`, `vjp` and `jvp`
+   are ordinary SQL calls that take a query. ddx reads each query's plan from
+   the engine's own SQL-to-plan machinery, and hands the engine back plans, or
+   SQL where its Substrait consumer falls short (§4.2). No project-specific
+   interchange format carries meaning between engines.
 5. **Fail loud, never silently wrong.** An unsupported construct is a typed
    error, not an approximate or silently-zero derivative. This is a
    numerical-correctness product, and every decision is weighed against this
@@ -152,7 +153,8 @@ kept as the record of how that differentiator was designed.
 > **Removed (2026-10-13, `S15`).** The marker rewrite (`rewrite_sql`), both
 > DataFusion paths (§3.3) and the per-engine integration (§3.4) are gone. The
 > scalar engine of §3.2 and the differentiation surface of §3.6 remain, as
-> `ddx-core`, the map rule of v2 (§4.3). The rest of this section is history.
+> `ddx-core`, the map rule of v2 (§4.3). The rest of this section is history,
+> including §3.4's DuckDB plan, which §4.2 and decision `S22` replace.
 
 ### 3.1 The core insight: markers, not UDFs
 
@@ -377,7 +379,7 @@ confusingly at the bridge.
 `AnalyzerRule` into its `SessionContext` `[R2]` — which is why the SQL rewrite
 is the path here, not a limitation being worked around. The gap is structural,
 not a missing convenience method: re-verified at M1 against `datafusion` 54.0.0
-(`spikes/datafusion_python_analyzer_rule_r2.py`), the *FFI capsule vocabulary*
+(`docs/spikes/datafusion_python_analyzer_rule_r2.py`), the *FFI capsule vocabulary*
 the bindings are built on has no analyzer-rule capsule at all, so a compiled
 Rust extension can't inject one either. `ddxdb` wraps a `Ddx`
 and exposes `rewrite_sql` plus a `Context.sql()` shim; xarray-sql pulls it in
@@ -545,7 +547,8 @@ with a documented kink convention (mirroring how `abs` pins its kink at `0`
 via a portable `CASE`-based sign); `atan2`, `log(base,x)`, `cbrt`,
 `expm1`/`log1p`; a dialect name-normalization table; and a clear, permanent
 taxonomy of "not differentiable" (comparisons, string/temporal ops, window
-functions).
+functions). v2 has since given window aggregates rules: `SUM` and `AVG` over
+any frame, `MAX` and `MIN` over each whole partition (§4.3).
 
 ### 3.7 Known limitation: symbolic expression swell
 
@@ -634,7 +637,7 @@ is computed in SQL, with `grad` appearing only as the elementwise leaf
 written by hand: it is nothing more than the mechanical application of one
 **transpose rule per relational primitive** (§4.3), and all six parameter
 gradients it computes match `jax.grad` to machine precision
-(`spikes/relational_ad_spike.py`, max error ~1e-18). The one gradient the
+(`docs/spikes/relational_ad_spike.py`, max error ~1e-18). The one gradient the
 demo derived "by hand" — the softmax delta — is the *first* thing the rules
 recover mechanically; it was never fundamental.
 
@@ -647,7 +650,7 @@ relations instead of a Python list. `ddx-core`'s scalar `grad` is not
 superseded by any of this — it becomes the elementwise-primitive rule
 (§4.3), unchanged. Everything built for v1 is the foundation v2 stands on.
 
-**Generality past the MLP is confirmed.** `spikes/attention_ad_spike.py`
+**Generality past the MLP is confirmed.** `docs/spikes/attention_ad_spike.py`
 builds a full single-head attention block (Q/K/V projections → `QKᵀ/√d` →
 softmax over the key axis → `A@V`) from the *same* rules and matches
 `jax.grad` on every weight and the input to ~1e-16; the causal mask is just
@@ -703,7 +706,7 @@ consume it.
 (`extension_uris` + `simple_extension_declaration`) gives every function a
 plan-local anchor, so a function ddx has claimed the name of, like
 `ddx_stop_gradient`, is found in the plan wherever it sits.
-`spikes/substrait_ad_marker_spike.py` checks this with a custom identity
+`docs/spikes/substrait_ad_marker_spike.py` checks this with a custom identity
 function (it tried `ddx_contract_mark`, from an earlier draft that tagged every
 contraction). The function survives a same-engine round-trip *and* a genuine
 cross-engine hop: a plan **produced by DataFusion** is **consumed and executed
@@ -737,8 +740,38 @@ alongside Ibis's producer) learned each of these the hard way:
 | Function names | DataFusion: bare (`sum`); DuckDB: compound (`sum:fp64`), bare for its own | compares normalized names (`S9`) |
 | Extension declarations | DataFusion 54 and 55: no URN (`u32::MAX`); DuckDB: a real `extension_urns` table | an emitted plan carries the input's URNs and declarations; a function ddx adds has no URN, as DataFusion writes it. A consumer that resolves only by URN (Acero) is not yet a target |
 | Table names | some producers drop the schema (`s.t` arrives as `t`) | matches a `wrt` table name as `ColumnRef::table` states, refuses a bare name two schemas share, and hints at the bare name when the schema is missing |
-| Consumer coverage | DuckDB's consumer rejects a `window_function` expression | open: the `AVG`, `MAX` and `MIN` rules emit windows (§4.6) |
+| Producer coverage | DuckDB's producer refuses an Arrow-registered scan, which is how xarray-sql registers a Dataset | plans on a connection that mirrors the caller's catalog with schemas only (below) |
+| What a consumer's reads see | DuckDB's consumer reads as if on a connection of its own: committed persistent tables and views over them, not registered objects, temp tables, or the caller's open transaction | DuckDB runs ddx's steps as SQL on the caller's connection (below) |
+| Consumer coverage | DuckDB's consumer rejects every `window_function` expression | the same: ddx's reduce rules, window transposes and `jvp`'s `MAX` tangent all write windows |
 | `emit` on a relation | DataFusion honours it on any relation; DuckDB 1.5.6's consumer ignores it on a join, filter, sort, fetch, cross join or set and returns the leading columns, with no error | writes an emit only on a projection, and narrows anything else with a projection over it; the DataFusion tests check every step for it |
+
+**Substrait in, SQL out, where a consumer falls short (M5, `S22`).**
+`docs/spikes/duckdb_substrait_visibility.py` shows DuckDB's consumer cannot
+run ddx's programs over xarray-sql's data: its reads see only committed
+persistent tables, and it rejects window functions. So on DuckDB-Python ddx
+keeps Substrait for reading a query and writes SQL for running one. DuckDB's
+own producer plans each query, on a planning connection that mirrors the
+caller's catalog with schemas only (an empty table per table or registered
+Dataset, and the caller's views), so the plan has DuckDB's own typing,
+division and functions. `ddx-ad`'s `to_sql` writes each step and each check
+as SQL in the engine's dialect, which the backend runs on the caller's own
+connection (`CREATE TEMP TABLE step AS …` for a step, and for a check a query
+that must return no rows), where both see what the caller's queries see:
+registered data, temp tables and the open transaction. A window is then
+ordinary SQL. The `Backend` protocol does not change: its `materialize` and
+`returns_rows` receive each plan and run the SQL `to_sql` writes for it.
+
+**One backend for SQL engines (`S23`).** Running needs only what every
+Arrow-based engine xarray-sql registers into already has: run SQL, register
+an Arrow table (a program's cotangent or tangent), drop a table, report a
+schema, and a dialect for `to_sql`. So `ddxdb`'s backend is generic over
+those primitives, with DuckDB its first instance and xarray-sql's per-engine
+register adapters the natural place for each engine's glue. Planning is the
+half that isn't universal: it needs a Substrait producer, which DataFusion
+and DuckDB have and Polars and most databases behind ADBC or Flight SQL do
+not. How to plan for those is deferred until one is needed (§9). The writer is a correctness surface of its
+own; its oracle is every program the DataFusion tests build, run both as
+Substrait and as the SQL it writes. This is planned, not built: §8's M5.
 
 A host that holds plans as protobuf bytes, as most of the Substrait ecosystem
 does, needs no `substrait` crate of its own: `decode_plan` takes the bytes and
@@ -849,15 +882,16 @@ SELECT {group_dims}, {route_dim}, val FROM ranked WHERE rk = 1
 That is select, and needs no rule of its own: only the kept row carries the
 cotangent back. The rank itself has no derivative, and gradient reaching it is
 refused. At a tie the query has picked one winner, so the whole cotangent goes
-to it (the convention `spikes/route_ad_spike.py` pins, which differs from JAX's
+to it (the convention `docs/spikes/route_ad_spike.py` pins, which differs from JAX's
 split). The ranking is recomputed in the backward pass, so its `ORDER BY`
 should break ties deterministically. Both idioms are checked, math against
-`jax.grad` away from ties in `spikes/route_ad_spike.py` and the Substrait side
-in `spikes/duckdb_substrait_window_bug.py`: a plain window column round-trips
+`jax.grad` away from ties in `docs/spikes/route_ad_spike.py` and the Substrait side
+in `docs/spikes/duckdb_substrait_window_bug.py`: a plain window column round-trips
 through DuckDB, in the sense that DuckDB produces a plan for it (by rewriting
 the window into an aggregate joined back to the rows); DuckDB's consumer
 rejects a `window_function` expression, so the other direction does not hold,
-and neither do ddx's own windows in the `AVG`, `MAX` and `MIN` rules (§4.6).
+and neither do ddx's own windows, one reason DuckDB runs ddx's steps as SQL
+(§4.2).
 The full top-1-per-group idiom round-trips **silently
 wrong** there — `from_substrait` returns every row instead of the top-1 rows —
 because DuckDB's optimizer rewrites the idiom into an `arg_max`-join before
@@ -938,7 +972,12 @@ recomputed in a region must rank totally (its `PARTITION BY` and `ORDER BY`
 include every dim of the rows it ranks), because SQL leaves ties unordered and
 a parallel engine may break them differently on each run; so must a `LIMIT`'s
 `ORDER BY`, and a ranking on a semi-join's right side, which decides which
-rows are kept. A ranking or `LIMIT` inside constant data joined into a region,
+rows are kept. An aggregate ddx has a rule for, over each whole partition
+(`SUM(x) OVER (PARTITION BY g)`), is exempt, since no row order changes its
+value; a recomputed `SUM` or `AVG` may still round differently, so a `MAX`
+over a value read from one compares with §4.3's tolerance. A `ROW_NUMBER` or
+`FIRST_VALUE` over a whole partition is not exempt: its value is the engine's
+row order. A ranking or `LIMIT` inside constant data joined into a region,
 where ddx has no dims to check, and a volatile function (`random()`, `now()`)
 anywhere a region recomputes, are refused. Each refusal is made only if
 gradient reaches the region. §4.6 lists the rest. Every intermediate value is then a column, defined as an expression
@@ -979,7 +1018,7 @@ gradient.
 **Gradients** are one step per table: every row of the table, its dims, and
 each `wrt` value's gradient under the column's own name and in its type. Two
 conventions are pinned, whatever the loss: `0` where no gradient reached a
-row, and NULL where the row's value is NULL, as v1 pins it (#60). A gradient
+row, and NULL where the row's value is NULL, as the scalar rules pin it. A gradient
 shaped like its table makes an SGD step a plain join.
 
 **Dims are checked, not assumed.** A gradient keyed by dims is only right if
@@ -1065,6 +1104,12 @@ four inputs, `MAX`/`MIN` pooling and a rank filter, with both tie conventions
 pinned. No query carries a label.
 **Found and closed, not left as a risk:** the DuckDB Substrait window-idiom
 bug (workaround verified, no upstream-fix dependency).
+**Built (M4.6):** both modes read one linear form per reduction (§4.3), and
+reverse mode differentiates window values (`SUM` and `AVG` over any frame,
+`MAX` and `MIN` over each whole partition), checked against finite
+differences, against each window's `GROUP BY` form, and against forward mode
+on 13 aggregates and 12 windows; a softmax written with windows equals
+`softmax − onehot`.
 
 **Genuinely open:**
 - Recomputation's other engine assumptions. A region must produce the same
@@ -1088,26 +1133,27 @@ bug (workaround verified, no upstream-fix dependency).
   work.
 - The DuckDB Substrait extension is community-maintained, not core, as of
   1.5.4 — an ongoing-maintenance signal to watch, separate from the
-  correctness bug already found and worked around.
+  correctness bug already found and worked around. ddx will use only its
+  producer (§4.2).
 - Whether a third engine (beyond DataFusion and DuckDB) would tolerate the
   non-spec-conformant extension-URI form DataFusion emits, and ddx keeps for
   the functions it adds, is untested and only matters if/when a third engine
   is targeted.
-- The `AVG`, `MAX` and `MIN` rules compute a group's count and extreme with
-  window functions over the recomputed rows (`S12`), which DuckDB's consumer
-  does not read. A grouped aggregate joined back on the group keys
-  (`IS NOT DISTINCT FROM`, for a NULL key) is the portable form, at the cost
-  of recomputing the region two or three times in that step, and of
-  comparing a row with an extreme from a separate recomputation (which the
-  tie tolerance covers only for values that can jitter). It waits for a
-  DuckDB adapter to test it against and a cost measured with
-  `tests/ad_perf.rs`. The choice has to reach `grad`, since a program is built
-  before anything runs it: an `Options` switch (window functions on by
-  default) that the adapter sets when it builds the program, not a `Backend`
-  capability. `jvp`'s rules use windows too (`tangent.rs`: the `MAX` and
-  `MIN` tangents, and a window `SUM` or `AVG`'s), and the switch must cover
-  them; for forward mode a join back to the group is simpler, since values
-  and tangents are computed in one pass and nothing is recomputed.
+- `UNION ALL` in reverse mode is refused (forward mode has its rule), which
+  blocks the gradient of a GraphCast-shaped model in xarray-sql's ML demos.
+  A `GROUP BY` key computed from a `wrt` value is refused too, even when the
+  other keys determine it.
+- Windows on an engine whose Substrait consumer rejects them. ddx's rules
+  write windows: the `AVG`, `MAX` and `MIN` rules' counts and extremes over
+  the recomputed rows (`S12`), the window transposes, and `jvp`'s `MAX`
+  tangent. DuckDB will run steps as SQL (§4.2), where windows are ordinary,
+  so no portable form is planned. Should an engine that runs only Substrait
+  need one, a grouped aggregate joined back on the group keys
+  (`IS NOT DISTINCT FROM`, for a NULL key) is the portable form of a
+  whole-partition window, at the cost of recomputing the region, and a
+  running frame's is a self-join on its range. Since a program is built
+  before anything runs it, it would be an `Options` switch the adapter sets
+  when it builds the program, covering `jvp`'s windows too.
 
 ### 4.7 What a backward program costs
 
@@ -1124,6 +1170,7 @@ ones, `X̄ = Ȳ·Wᵀ` and `W̄ = Xᵀ·Ȳ`. ddx's work per primitive, for `R` r
 | `MAX`/`MIN` | `R` | `R` (windows over the recomputed rows) | `R` | |
 | a relation read `k` times | `k·R` | `k·R` | `k·R` | with `k ≥ 3` reads, the region's cotangents are materialized once |
 | rank-select | `R log R` | `R log R` | `R log R` | the ranking is recomputed |
+| a window aggregate | `R log R` | `R log R` | `R log R` | the rows beneath it are recomputed, and its cotangents summed back to them once per place that reads it, as a step; a stack of `k` windows costs `k²` in plan size |
 
 So the work is within a constant of the bound wherever contractions
 dominate. Measured (`tests/ad_perf.rs`, backward over forward):
@@ -1525,21 +1572,20 @@ ddx/                               (repo; crates published under the ddx-* names
 ├── crates/
 │   ├── ddx-core/                   # the scalar rules — differentiate sqlparser::ast::Expr
 │   │                               #   dep: sqlparser only
-│   ├── ddx-ad/                      # query-level AD over substrait::proto
+│   ├── ddx-ad/                     # query-level AD over substrait::proto
 │   │                               #   deps: substrait, ddx-core
-│   ├── ddx-datafusion/             # DataFusion adapter: ad
-│   │                               #   deps: ddx-ad, datafusion
-│   └── ddx-duckdb/                 # DuckDB community extension (M5)
+│   └── ddx-datafusion/             # DataFusion adapter: ad
+│                                   #   deps: ddx-ad, datafusion
 ├── python/
-│   └── ddxdb/                      # PyO3/maturin wheel: Context.sql() + ad
+│   └── ddxdb/                      # PyO3/maturin wheel: ad on DataFusion; DuckDB-Python next (M5)
 ├── docs/
-│   └── design.md                   # this file
-├── tests/                          # cross-engine numeric-agreement suites (vs JAX)
-├── spikes/                         # runnable evidence for every load-bearing claim (README.md indexes them)
-└── future/                         # deferred, not on the critical path
-    ├── ddx-duckdb-cpp/             #   C++/cxx.rs hybrid for bare grad() in DuckDB
-    └── ddx-pg/                     #   Postgres via pgrx (needs array/XQL support first)
+│   ├── design.md                   # this file
+│   └── spikes/                     # runnable evidence for every load-bearing claim (README.md indexes them)
+└── tests/                          # cross-engine numeric-agreement suites (vs JAX)
 ```
+
+A DuckDB community extension and a Postgres integration, once laid out here as
+`ddx-duckdb` and `future/`, are not in the repo; §8 says when they come.
 
 `ddx-core` and `ddx-ad` each publish independently, with a single
 minimal dependency (`sqlparser`, `substrait`) and no engine crate, so either
@@ -1588,8 +1634,8 @@ community registry.
 
 **Distribution:** Rust crates on crates.io as above. Python: `pip install
 ddxdb` standalone, and `pip install "xarray-sql[ddx]"` as a coordinated
-optional extra. DuckDB: `INSTALL ddx FROM community;` → the `ddx('<sql>')`
-table function (v1) and its v2 counterpart. Repo: renamed
+optional extra. DuckDB: from Python, `ddxdb` on a DuckDB connection (M5); a dedicated
+extension, `INSTALL ddx FROM community`, later (§8). Repo: renamed
 `substrait-autograd` → `ddx` on GitHub (old name redirects); tagline
 "SQL-portable autograd," not "Substrait" — v1 doesn't use it, and v2's use is
 an implementation detail, not the pitch.
@@ -1632,7 +1678,7 @@ breadth, not de-risking.
   against finite differences for the MLP, attention and max-pool fixtures
   (§4.6). Clean up
   `nn.py` into the canonical relational-backprop example and regression
-  fixture; `spikes/` are the acceptance tests. *Exit:* the rules reproduce
+  fixture; `docs/spikes/` are the acceptance tests. *Exit:* the rules reproduce
   `jax.grad` on the MLP, attention, and Route fixtures (already machine-exact
   by hand), and a ddx-claimed function round-trips through both engines'
   Substrait implementations (already verified).
@@ -1656,7 +1702,7 @@ breadth, not de-risking.
   is ddx's, independent of DataFusion 54's recursive-CTE bug (§3.6); lifting it
   means differentiating a loss inside the recursive term. Query-level `jvp` is
   the next milestone, M4.5.
-- **M4.5 — `jvp` over queries: the forward-mode half (#86).** Completes the
+- **M4.5 — `jvp` over queries: the forward-mode half.** Completes the
   SQL surface as `grad`, `vjp` and `jvp`. Forward mode needs no transposes and
   no tape: tangents travel beside values through the same operators (map via
   `ddx-core`'s scalar `jvp`; sum, mean and join linear in the tangent; `MAX`
@@ -1665,8 +1711,8 @@ breadth, not de-risking.
   table.column, tangent)`, a column of a `SELECT`, from Rust and Python. *Exit:*
   matches `jax.jvp` on the spikes' fixtures, passes the dot-product test
   ⟨J t, c⟩ = ⟨t, Jᵀ c⟩ against `vjp`, and gives a Hessian-vector product on
-  the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built so
-  far:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
+  the MLP (forward-over-reverse) matching `jax.jvp(jax.grad(f))`. **Built,
+  released as ddxdb 0.3.0:** `ddx_ad::jvp` of a query and of a program (forward over reverse) and their
   DataFusion adapter (§4.8), checked against finite differences, `grad` and
   `vjp`; `grad`, `vjp` and `jvp` composed with each other (§4.9); `vjp(…)`
   and `jvp(…)` in SQL, nesting (§4.8); the Python API (`ddxdb` 0.3: `jvp`,
@@ -1678,64 +1724,82 @@ breadth, not de-risking.
   against `vjp`, `H·t`'s symmetry and its value, a repeated tangent key
   refused); 332 cases and 3,350 comparisons in a five-minute run, none
   failing.
-- **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (v1) plus
-  its v2 counterpart, and the `ddxdb` client-side path for DuckDB-python.
-  Integrate with duckdb-zarr; run the re-entrancy smoke test. Named tasks,
-  not discoveries: the bind-time-schema spike (declare result columns by
-  `DESCRIBE`-ing the rewritten query on the inner connection), the DML
-  policy decision (SELECT-only by default), and branding the extension
-  transitional in its own docs. *Exit:* `grad` works end-to-end via `SELECT
-  * FROM ddx('…')` on a real duckdb-zarr dataset, schema/DML behavior
-  documented.
-- **M5-adjacent spike** (scheduled with M5, not after): the miniature of the
-  full C++ hybrid — from an `OptimizerExtension`, serialize one `grad`
-  bound expression out to `ddx-core`, differentiate, and rebuild one bound
-  derivative expression back in with correct `ColumnBinding` indices and
-  catalog entries. *Exit:* a yes/no on tractability in days, so the full
-  extension is schedulable on demand rather than a multi-week unknown,
-  without sitting on duckdb-zarr's critical path.
-- **M6 — Math roadmap & hardening.** Extend v1's rule set (§3.6), cross-engine
-  equivalence vs. JAX, dialect canonicalization table, docs. Plus: the
-  expression-swell size/latency benchmark (§3.7), and the convention-pinning
-  tests for NULL-folding, kinks, and domain edges (§5).
+- **M4.6 — One linear form per reduction; windows in reverse mode.** Both
+  modes read each reduction's linear form from one table (§4.3, `S21`), and
+  reverse mode differentiates window values, which a softmax written with
+  windows needs. **Built,** released as ddx-ad 0.2.1 and ddxdb 0.3.1.
+- **M5 — DuckDB-Python.** `grad`, `vjp` and `jvp` on a DuckDB-Python
+  connection, which is how xarray-sql reaches DuckDB (§4.2, `S22`): `ddx-ad`
+  writes a program's steps as SQL (`to_sql`), checked by running every
+  DataFusion test program both ways; `ddxdb` gets a DuckDB backend that plans
+  with DuckDB's producer on a schema-only mirror of the caller's catalog and
+  runs each step and check on the caller's own connection, built generic
+  over SQL engines with DuckDB its first instance (`S23`); and what DuckDB's producer
+  writes (decimal literals, its optimizer's rewrites, compound function
+  names) is read correctly or refused. The two engines are checked against
+  each other and against JAX. *Exit:* xarray-sql's ML demos differentiate on
+  their DuckDB host, checked against JAX as on DataFusion. (The first plan, a
+  community extension whose `ddx('<sql>')` table function ran v1's rewrite,
+  went with v1; §3.4 is its record.)
+- **M6 — Math roadmap & hardening.** Extend the scalar rules (§3.6's
+  roadmap), a dialect name table (which M5's `to_sql` starts), docs. Plus:
+  the expression-swell size/latency benchmark (§3.7), and the
+  convention-pinning tests for NULL-folding, kinks, and domain edges (§5).
 - **Future, demand-driven:** the physical fused-contraction operator; more
-  v2 architectures (conv, more normalization variants); the C++/cxx.rs
-  hybrid for bare `grad()` in DuckDB; `ddx-pg`.
+  v2 architectures (conv, more normalization variants); a DuckDB community
+  extension, once performance work settles (einfold, a query optimizer that
+  rewrites SQL plans into array algorithms, is one route), with the C++/cxx.rs
+  hybrid for a bare `grad()` in DuckDB and the spike that sizes it; `ddx-pg`.
 
 ---
 
 ## 9. Open questions
 
-- **DuckDB ergonomics** — `SELECT * FROM ddx('…')` is the accepted v1 shape,
-  pending a second opinion from the other duckdb-zarr maintainer before the
-  extension's surface locks.
-- **Custom rule richness** — ship unary custom differentiation rules only in
-  v1, or binary/n-ary too? Unary is easy today (the engine already
-  dispatches on function name); richer rules are a bigger trait, likely
-  post-v1 regardless.
-- **The C++ hybrid's trigger condition** — deferred by default (§3.4), but if
-  the syntactic ambiguity guards prove messier than expected during M0, that
-  shifts the balance toward accelerating it, since the bound path makes
-  those guards unnecessary by construction. Decide if that tripwire fires,
-  not preemptively.
-- **Higher-order AD over an emitted v2 backward plan** — decided (§4.9): a
+- **DuckDB outside Python.** M5 serves DuckDB-Python. A dedicated extension's
+  surface (a table function taking SQL, since DuckDB's extension API has no
+  planner hooks, or a bare `grad()` through a C++ `OptimizerExtension`) waits
+  until performance work settles, and wants the duckdb-zarr maintainers' view.
+- **Planning for an engine with no Substrait producer** (Polars, most
+  databases behind ADBC or Flight SQL). Running is solved for any SQL engine
+  whose tables persist between statements (`S23`: a step's table must be
+  visible to the next statement); planning is not. The candidate is DataFusion's planner over the
+  engine's schemas, with `to_sql` writing every step in the engine's dialect.
+  ddx already vendors DataFusion's SQL parser, but a parser is not a planner:
+  planning needs names, types and functions resolved. einfold's SQL front end
+  is the same planner (it parses SQL into DataFusion's unoptimized plan), so
+  einfold could host this front end, not replace it. The risk is a foreign
+  planner reading a query differently from the engine (integer division,
+  `log`'s base, decimal typing), which would give the derivative of a
+  different function. `to_sql` writing the plan's meaning explicitly keeps
+  ddx's value and gradient consistent with each other; a value check (the
+  query run natively, compared with ddx's value step) would catch a
+  divergence from the engine, at the cost of a forward query, and whether it
+  always runs is undecided. An engine with no session state between
+  statements would also need a program written as one statement, each step a
+  CTE, which is unresolved: a CTE an engine inlines per reference recomputes
+  the work a materialized step saves. Deferred until an engine needs it.
+- **One SQL writer for ddx and einfold.** einfold also writes SQL for named
+  dialects from relational plans, and found that unparsing DataFusion's
+  optimized plans can give SQL DuckDB rejects or, once, a silently wrong
+  answer (its spike S7). `to_sql` is built in `ddx-ad` for M5, with a
+  standalone API (a Substrait plan and a dialect in, SQL out), so the two
+  projects can share it later rather than keep two.
+- **Decimals.** DuckDB types `0.1` as `DECIMAL`, so a DuckDB query's
+  arithmetic may be decimal where ddx's rules assume real arithmetic, the
+  shape of §3.8's integer-division case. Whether to differentiate decimal
+  operands, cast them, or refuse them is M5's to decide.
+- **Custom rule richness** — unary custom differentiation rules only, or
+  binary/n-ary too? Unary is easy today (the engine already dispatches on
+  function name); richer rules are a bigger trait.
+- **Higher-order AD over an emitted backward plan** — decided (§4.9): a
   read of a materialized step is differentiated through by writing the step's
   plan in its place, and `jvp` reads each step's dual. Reverse over reverse
   waits on reverse mode learning that join keys are equal (§4.6).
-- **Query-level `jvp`** (#86). The review that reshaped v2 asked for `grad`,
-  `vjp` and `jvp` as the whole SQL surface. `grad` and `vjp` exist; forward
-  mode through joins and aggregates does not yet. It is the easier half: with
-  no transposes and no tape, tangents travel beside values through the same
-  operators, so a `jvp` can be one rewritten query rather than a program. It
-  would also give Hessian-vector products (forward-over-reverse) and a
-  dot-product test of `vjp` that needs no JAX. Scheduled as M4.5 (§8). The
-  open part is forward-over-reverse, which means differentiating a `grad`
-  program whose steps read saved relations by name (#40).
 - **Recomputation vs. saving inside a region.** A region's backward step
   rebuilds the region's joins rather than reading them from a saved relation
-  (S6). For nn.py's first layer that is one extra join per backward step, the
-  same size as the forward one. Whether some regions should be saved instead
-  is a performance question for the fused-contraction work, not a
+  (`S6`). For nn.py's first layer that is one extra join per backward step,
+  the same size as the forward one. Whether some regions should be saved
+  instead is a performance question for the fused-contraction work, not a
   correctness one. A contraction's region is no longer rebuilt at all
   (`S19`); other regions still are.
 
@@ -1916,14 +1980,14 @@ in a *Rust* community extension and puts `ddx('<sql>')` — plus the deferred
 C++/cxx.rs hybrid — in the design instead. → §3.4.
 
 **R1b — An inner query on the same DuckDB database, run mid-execution of an
-outer one, is safe (`spikes/duckdb_reentrancy_r1b.py`).** No deadlock; reads of
+outer one, is safe (`docs/spikes/duckdb_reentrancy_r1b.py`).** No deadlock; reads of
 committed data work; DML works. One real consequence, and the reason the design
 routes DML training loops elsewhere: the inner connection runs in its own
 transaction, so it cannot see the *outer* connection's uncommitted writes. →
 §3.4.
 
 **R2 — `datafusion-python` cannot inject an `AnalyzerRule`
-(`spikes/datafusion_python_analyzer_rule_r2.py`).** Re-verified at M1 against
+(`docs/spikes/datafusion_python_analyzer_rule_r2.py`).** Re-verified at M1 against
 `datafusion` 54.0.0, checked three ways from the outside in: the public
 `SessionContext` has no `add_analyzer_rule`; neither does the `_internal` PyO3
 class beneath it, which also exposes no `SessionState`/`SessionStateBuilder`
@@ -2023,7 +2087,7 @@ has zero plan hooks (`R1`), so that type is DataFusion-only by construction.
 → §4.2.
 
 **S2 — The marker mechanism verified cross-engine
-(`spikes/substrait_ad_marker_spike.py`).** Before this spike, "Substrait +
+(`docs/spikes/substrait_ad_marker_spike.py`).** Before this spike, "Substrait +
 markers" was an architectural argument; after it, a checked claim. A
 DataFusion-produced, marker-tagged plan is consumed and executed correctly
 by DuckDB, matching DataFusion's own result exactly — the actual portability
@@ -2032,13 +2096,13 @@ the reverse direction (DuckDB produces, DataFusion consumes) deserializes
 but wasn't executed. → §4.2.
 
 **S3 — Route's math verified against `jax.grad`
-(`spikes/route_ad_spike.py`).** Machine-exact away from ties; a genuine,
+(`docs/spikes/route_ad_spike.py`).** Machine-exact away from ties; a genuine,
 now-pinned convention divergence at exact ties (first-index routing vs.
 JAX's tie-splitting) — not a bug, but not something to claim agreement on
 without saying so. → §4.3.
 
 **S4 — A real DuckDB Substrait bug found, isolated, and worked around
-(`spikes/duckdb_substrait_window_bug.py`).** The Route rule's forward idiom
+(`docs/spikes/duckdb_substrait_window_bug.py`).** The Route rule's forward idiom
 — `ROW_NUMBER()`-based top-1-per-group filtering — silently returns wrong
 (unfiltered) results after a DuckDB Substrait round-trip, because DuckDB's
 own optimizer rewrites the idiom into an `arg_max`-join before export and
@@ -2061,7 +2125,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S20`)
+### Building v2 (`S6`–`S23`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -2119,7 +2183,7 @@ concurrently builds a program per task. `ad::sql` keeps its programs from
 call to call, and takes one out of its cache until the caller has dropped
 the tables it wrote, so an overlapping call builds its own (`S20`). → §4.4.
 
-**S12 — What the v2 soak found.** A generated-query soak (#89–#93) checked
+**S12 — What the v2 soak found.** A generated-query soak checked
 gradients against finite differences of the query and against ddx itself,
 and every failure was in how rows are identified, not in a derivative. An
 aggregate that skipped a NULL argument still sent gradient through the rest
@@ -2309,6 +2373,62 @@ a kept program holds the time of the call that built it. Measured on
 running a program built once (88 ms). The SQL training test runs 25 steps
 again. → §4.8.
 
+**S21 — One linear form per reduction, read by both modes; windows in reverse
+mode.** Forward and reverse mode each held a rule per aggregate, and reverse
+mode refused a window value, which blocked a softmax written with windows
+(`x - MAX(x) OVER (PARTITION BY i)`). A JAX-style tape that transposes forward
+mode's dual was considered and not built: reverse mode already transposes the
+linear part over recomputed regions, so a tape would only have moved forward
+mode's machinery. Instead each reduction's tangent is one linear form,
+`Σ coef · ṫ` over its group (`reduce.rs`), which forward mode renders as a
+tangent and reverse mode as its transpose, as JAX's `deflinear` defines a
+linear primitive once. A window is the same reduction over each row's frame:
+a frame's transpose is its mirror, and a whole partition's extreme is the
+grouped rule. Review found three things. A window's transpose must run over
+the rows it read, not the rows above it, or a later filter, semi-join or
+duplicating join changes its counts, ties and frames; finite differences
+caught the wrong gradient. A window read along several paths must be
+transposed once, from the sum of its cotangents, with each window's summed
+cotangent a step, or a stack of windows grows as a power of its depth, since
+a plan is a tree. And two refusals changed: a rounding `SUM` or `AVG` over a
+whole partition is accepted rather than refused, and a `ROW_NUMBER` or
+`FIRST_VALUE` with no `ORDER BY` now needs its ties broken. → §4.3, §4.4.
+
+**S22 — DuckDB-Python first: Substrait in, SQL out.** The first DuckDB plan
+(§3.4) was a community extension whose `ddx('<sql>')` table function ran
+v1's rewrite; it went with v1 (`S15`). xarray-sql reaches DuckDB through
+Python, registering each Dataset as an Arrow dataset on the connection, so
+DuckDB-Python is the target. The obvious backend, DuckDB's own Substrait
+producer and consumer, fails there, as
+`docs/spikes/duckdb_substrait_visibility.py` shows on DuckDB 1.5.5: the
+producer refuses an Arrow-registered scan; the consumer reads as if on a
+connection of its own, seeing committed persistent tables but not registered
+objects, temp tables or the caller's open transaction; and it rejects every
+window function, which ddx's rules write. Copying every table a query reads
+into DuckDB, and writing windows as joins back, would make the consumer work,
+at the cost of xarray-sql's lazy, pushed-down scans, of transaction
+visibility, and of more reliance on a community-maintained extension.
+Instead ddx plans with DuckDB's producer on a schema-only mirror of the
+caller's catalog, so the plan keeps DuckDB's semantics, and writes each step
+and check as SQL that runs on the caller's own connection. The SQL writer is new code
+with an existing oracle: every DataFusion test program, run both ways. It
+also makes any SQL engine with a Substrait producer a target, whatever its
+consumer. A dedicated DuckDB extension waits until performance work
+settles. → §4.2, §8.
+
+**S23 — One backend for SQL engines; planning without a producer deferred.**
+The question that followed `S22`: how would ddx work on any Arrow-based
+engine xarray-sql registers into (DuckDB, Polars, any database behind ADBC
+or Flight SQL)? Every one can run SQL, take an Arrow table, drop a table and
+report a schema, and with `to_sql` that is all running a program needs. So
+the DuckDB backend is built generic over those primitives, DuckDB its first
+instance. Few can produce Substrait, which planning needs. Planning with
+DataFusion over the engine's schemas, directly or through einfold's SQL
+front end (which is DataFusion's planner too), was considered and deferred:
+no engine needs it yet, einfold is still in design, and its central risk, a
+foreign planner reading a query differently from the engine, deserves its
+own decision when an engine needs it (§9). → §4.2, §9.
+
 ## References
 
 Numbered where cited inline in the design above (e.g. `[1]`); everything
@@ -2342,5 +2462,5 @@ inline hyperlink at the point it's used and isn't repeated here.
    transpose rules are checked against, query-shape for query-shape (§4.5).
 5. [substrait-io/duckdb-substrait-extension](https://github.com/substrait-io/duckdb-substrait-extension) —
    DuckDB's community Substrait extension. The round-trip bug found in
-   Decision Log `S4` (`spikes/duckdb_substrait_window_bug.py`) should be
+   Decision Log `S4` (`docs/spikes/duckdb_substrait_window_bug.py`) should be
    filed against this project.
