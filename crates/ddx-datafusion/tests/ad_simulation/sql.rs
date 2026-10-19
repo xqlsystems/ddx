@@ -274,7 +274,15 @@ pub(super) async fn sql_checks(
     // A statement with no call comes back byte for byte.
     let plain = format!("{lp} SELECT loss FROM loss");
     let mut engine = ddx_datafusion::engine::DataFusion(ctx.clone());
-    match ddx_ad::rewrite(&mut engine, &[plain.as_str()], &GenericDialect {}).await {
+    let programs = ddx_ad::Programs::new();
+    match ddx_ad::rewrite(
+        &mut engine,
+        &programs,
+        &[plain.as_str()],
+        &GenericDialect {},
+    )
+    .await
+    {
         Ok(r) => {
             out.meta_compared += 1;
             if r.statements != [plain.clone()] || !r.tables.is_empty() {

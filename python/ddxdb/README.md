@@ -115,6 +115,14 @@ with ddxdb.rewrite(backend, [step_w, step_b]) as rewritten:
         engine.sql(sql)
 ```
 
+In a training loop, pass the same `ddxdb.Programs()` each step
+(`ddxdb.rewrite(backend, statements, programs=programs)`), and each program
+is built once and run again on later steps. A program is kept under the
+backend's `plan_key(sql)`, a text that changes whenever the engine's plan of
+the query could (its tables' schemas, its views' definitions), so a backend
+without that method gets nothing kept. `ddxdb.ad.sql` and `Context.sql` keep
+programs for each context this way on their own.
+
 ## What you can write
 
 Inside the loss: `+ - * /`; the chain rule for the trig / inverse-trig / exp /

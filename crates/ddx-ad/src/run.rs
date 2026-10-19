@@ -183,6 +183,22 @@ pub trait Backend: Send {
         &mut self,
         sql: &str,
     ) -> impl Future<Output = Result<substrait::proto::Plan, Self::Error>> + Send;
+
+    /// Text that is the same at two calls only if [`Backend::plan_sql`] of
+    /// `sql` is: what the engine's plan depends on (the tables `sql` reads,
+    /// with their columns, types and nullability, and the definitions of
+    /// the views it reads), found without optimizing. [`crate::rewrite`]
+    /// keys the programs it keeps ([`crate::Programs`]) by it, so a key
+    /// that leaves out something the plan depends on would rerun a stale
+    /// program. `None`, the default, means the engine cannot say, and
+    /// nothing is kept.
+    fn plan_key(
+        &mut self,
+        sql: &str,
+    ) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
+        let _ = sql;
+        async { Ok(None) }
+    }
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then

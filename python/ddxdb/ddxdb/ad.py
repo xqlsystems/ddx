@@ -65,6 +65,7 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
+import weakref
 from typing import NamedTuple, Optional, Sequence, Union
 
 try:
@@ -78,7 +79,7 @@ from ._ddxdb import (
     UnsupportedExpression,
     _not_in_subquery,
 )
-from . import Backend, rewrite
+from . import Backend, Programs, rewrite
 from ._ddxdb import (
     BackwardProgram,
     Check,
@@ -234,6 +235,13 @@ class DataFusionBackend:
         _refuse_not_in(sql)
         return Serde.serialize_bytes(sql, self.ctx)
 
+    def plan_key(self, sql: str) -> str:
+        # DataFusion expands each view, and each view it reads, as it turns
+        # SQL into a plan, so the plan before optimization holds every
+        # view's definition, and its schemas every table's columns, types
+        # and nullability: all an optimized plan's meaning depends on.
+        return self.ctx.sql(sql).logical_plan().display_indent_schema()
+
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
         return self.ctx.create_dataframe_from_logical_plan(lp).limit(1).count() > 0
@@ -354,18 +362,30 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     return sql_all(ctx, [statement], dialect=dialect)[0]
 
 
+#: The programs :func:`sql_all` keeps for each context, gone with it.
+_programs: "weakref.WeakKeyDictionary[SessionContext, Programs]" = weakref.WeakKeyDictionary()
+
+
 def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "datafusion") -> list:
     """:func:`sql` for several statements. Statements that take ``grad`` of the
     same loss query share one run of its program, so a training step can update
     each parameter table with its own statement and pay for the backward pass
     once; ``vjp`` calls along one cotangent share one too, and identical
-    ``jvp`` calls."""
+    ``jvp`` calls.
+
+    Each program is built once per context and run again by later calls, as
+    a training loop makes them (:class:`ddxdb.Programs`): it depends on the
+    schemas of the tables its query reads and on the views' definitions, not
+    on the tables' values, and is built again when one of those changes. One
+    caveat: DataFusion's optimizer folds ``now()`` into a literal, so a
+    program whose query reads it keeps the time of the call that built it."""
     # Which programs to run, how each is built and run, and how each
     # statement reads them are ddx-ad's (ddx_ad::rewrite); DataFusion plans and
     # runs.
     # A planned DataFrame holds the tables it reads, so they can leave the
     # catalog once every statement is planned.
-    with rewrite(DataFusionBackend(ctx), statements, dialect) as rewritten:
+    programs = _programs.setdefault(ctx, Programs())
+    with rewrite(DataFusionBackend(ctx), statements, dialect, programs) as rewritten:
         # SessionContext's own sql, not a ddxdb.Context's, which would look for
         # calls again.
         return [SessionContext.sql(ctx, s) for s in rewritten.statements]

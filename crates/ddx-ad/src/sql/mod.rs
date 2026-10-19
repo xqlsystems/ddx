@@ -99,12 +99,14 @@
 //! usage.
 
 mod build;
+mod cache;
 mod find;
 mod plan;
 mod rewrite;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::future::Future;
 
 use ddx_core::sqlparser::dialect::Dialect;
@@ -113,12 +115,12 @@ use crate::error::AdError;
 use crate::program::{Options, Unbound};
 use crate::run::{Backend, RunError};
 
+pub use cache::Programs;
 pub(crate) use rewrite::quote;
 
 /// What [`rewrite`] returns: the statements to run, and the tables their
 /// rewritten text reads, which the caller drops once it has planned (or run)
 /// the statements ([`Rewritten::release`]).
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Rewritten {
     /// Each statement, its calls replaced by reads of what their programs
@@ -127,17 +129,41 @@ pub struct Rewritten {
     /// The tables the programs left (values and gradients) and the
     /// cotangents and tangents registered for them.
     pub tables: Vec<String>,
+    /// The programs that wrote them, to keep once they are dropped.
+    kept: Vec<(cache::Key, Box<dyn plan::Built>)>,
+}
+
+impl fmt::Debug for Rewritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rewritten")
+            .field("statements", &self.statements)
+            .field("tables", &self.tables)
+            .field("kept", &self.kept.len())
+            .finish()
+    }
 }
 
 impl Rewritten {
     /// Drop [`Rewritten::tables`] from `backend`, every one even after a
-    /// failed drop; the first failure is reported.
-    pub async fn release<B: Backend>(&self, backend: &mut B) -> Result<(), B::Error> {
+    /// failed drop, reporting the first failure; then keep in `programs`
+    /// the programs that wrote them, for a later [`rewrite`] to run again.
+    ///
+    /// Not before: until the tables are dropped, a program kept would be
+    /// free for another call to run, writing the same tables while this
+    /// call's statements still read them.
+    pub async fn release<B: Backend>(
+        self,
+        backend: &mut B,
+        programs: &Programs,
+    ) -> Result<(), B::Error> {
         let mut first = Ok(());
         for t in &self.tables {
             if let (Err(e), Ok(())) = (backend.drop_table(t).await, &first) {
                 first = Err(e);
             }
+        }
+        for (key, program) in self.kept {
+            programs.keep(key, program);
         }
         first
     }
@@ -146,6 +172,11 @@ impl Rewritten {
 /// Compute what the `grad`, `vjp` and `jvp` calls in `statements` read, on
 /// `backend`, and rewrite each statement to read it (see the module docs).
 /// `dialect` is how the statements are written.
+///
+/// A program kept in `programs` from an earlier call is run again instead
+/// of built, and each program built is kept there once its tables are
+/// released (see [`Programs`]), so a training loop that passes the same
+/// `programs` each step builds its programs once.
 ///
 /// Every program's tables but its results are dropped as it runs. What the
 /// statements read stays until [`Rewritten::release`]; if anything fails,
@@ -158,6 +189,7 @@ impl Rewritten {
 /// dropped.
 pub fn rewrite<'a, B: Backend>(
     backend: &'a mut B,
+    programs: &'a Programs,
     statements: &[&str],
     dialect: &dyn Dialect,
 ) -> impl Future<Output = Result<Rewritten, RunError<B::Error>>> + Send + 'a {
@@ -167,14 +199,29 @@ pub fn rewrite<'a, B: Backend>(
     async move {
         let mut planned = planned.map_err(RunError::Refused)?;
         let mut tables = Vec::new();
-        match run_all(backend, &mut planned, &mut tables).await {
-            Ok(statements) => Ok(Rewritten { statements, tables }),
+        let mut keys = Vec::new();
+        let result = run_all(backend, &mut planned, programs, &mut keys, &mut tables).await;
+        // Every program built or taken goes back once its tables are
+        // dropped, whatever happened: a run that failed (a check that
+        // returned a row, an engine's error) leaves its program as it was.
+        let kept = keys
+            .into_iter()
+            .zip(planned.into_built())
+            .filter_map(|(key, program)| Some((key?, program)))
+            .collect();
+        match result {
+            Ok(statements) => Ok(Rewritten {
+                statements,
+                tables,
+                kept,
+            }),
             Err(e) => {
                 let _ = (Rewritten {
                     statements: Vec::new(),
                     tables,
+                    kept,
                 })
-                .release(backend)
+                .release(backend, programs)
                 .await;
                 Err(e)
             }
@@ -182,39 +229,25 @@ pub fn rewrite<'a, B: Backend>(
     }
 }
 
-/// Build and run every planned program in order, recording in `tables`
-/// what each leaves; then the rewritten statements.
+/// Build (or take from `programs`) and run every planned program in order,
+/// recording in `keys` what each is kept under and in `tables` what each
+/// leaves; then the rewritten statements.
 async fn run_all<B: Backend>(
     backend: &mut B,
     planned: &mut plan::Derivatives,
+    programs: &Programs,
+    keys: &mut Vec<Option<cache::Key>>,
     tables: &mut Vec<String>,
 ) -> Result<Vec<String>, RunError<B::Error>> {
     while let Some(job) = planned.next().map_err(RunError::Refused)? {
-        // Only the gradient rows the statements read, where the engine can
-        // plan the restriction and the program can take it; otherwise every
-        // row, which is always right.
-        let mut options = Options::new();
-        for r in &job.pushdown {
-            if let Ok(plan) = backend.plan_sql(&r.query).await {
-                options = options.restrict(r.table.clone(), plan);
-            }
-        }
-        let plan = backend
-            .plan_sql(&job.query)
+        let key = cache::Key::of(backend, &job)
             .await
             .map_err(RunError::Engine)?;
-        let built = planned.build(&job, &plan, &options).map(|_| ());
-        match built {
-            // An engine's plan of the restriction need not have the shape a
-            // program takes one in (its optimizer may fold the filter away,
-            // or push it into the scan): compute every row instead.
-            Err(AdError::InvalidOptions(_)) if !job.pushdown.is_empty() => {
-                planned
-                    .build(&job, &plan, &Options::new())
-                    .map_err(RunError::Refused)?;
-            }
-            other => other.map_err(RunError::Refused)?,
+        match key.as_ref().and_then(|k| programs.take(k)) {
+            Some(program) => planned.adopt(&job, program).map_err(RunError::Refused)?,
+            None => build(backend, planned, &job).await?,
         }
+        keys.push(key);
         for (name, query) in planned.seeds(&job).map_err(RunError::Refused)? {
             let plan = backend.plan_sql(&query).await.map_err(RunError::Engine)?;
             // The engine's own plan of the query: every read already typed.
@@ -235,4 +268,39 @@ async fn run_all<B: Backend>(
         );
     }
     planned.rewrite().map_err(RunError::Refused)
+}
+
+/// Build `job`'s program from the engine's plans of its query and of its
+/// restrictions.
+async fn build<B: Backend>(
+    backend: &mut B,
+    planned: &mut plan::Derivatives,
+    job: &plan::Job,
+) -> Result<(), RunError<B::Error>> {
+    // Only the gradient rows the statements read, where the engine can
+    // plan the restriction and the program can take it; otherwise every
+    // row, which is always right.
+    let mut options = Options::new();
+    for r in &job.pushdown {
+        if let Ok(plan) = backend.plan_sql(&r.query).await {
+            options = options.restrict(r.table.clone(), plan);
+        }
+    }
+    let plan = backend
+        .plan_sql(&job.query)
+        .await
+        .map_err(RunError::Engine)?;
+    let built = planned.build(job, &plan, &options).map(|_| ());
+    match built {
+        // An engine's plan of the restriction need not have the shape a
+        // program takes one in (its optimizer may fold the filter away,
+        // or push it into the scan): compute every row instead.
+        Err(AdError::InvalidOptions(_)) if !job.pushdown.is_empty() => {
+            planned
+                .build(job, &plan, &Options::new())
+                .map_err(RunError::Refused)?;
+        }
+        other => other.map_err(RunError::Refused)?,
+    }
+    Ok(())
 }

@@ -536,3 +536,74 @@ def test_jvp_along_a_number_is_the_derivative_row_by_row(ad, ctx):
 
     got = ad.sql(ctx, "SELECT i, val, jvp(sin(val), w.val, 1) AS d FROM w ORDER BY i").to_pydict()
     assert got["d"] == pytest.approx([math.cos(v) for v in got["val"]])
+
+
+GRAD = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+
+
+def program_of(df):
+    """The prefix, ``__ddx_{id}_``, of the program tables ``df`` reads: two
+    calls that read the same one ran the same program."""
+    import re
+
+    found = set(re.findall(r"__ddx_[0-9a-f]+_[0-9a-f]+_", df.logical_plan().display_indent()))
+    assert len(found) == 1, found
+    return found.pop()
+
+
+def test_a_second_sql_call_runs_the_program_the_first_built(ad, ctx):
+    first = ad.sql(ctx, GRAD)
+    built = program_of(first)
+    assert pairs(first) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    # New values, the same schema: the same program, on the new values.
+    ctx.deregister_table("w")
+    ctx.register_record_batches("w", [table([0, 1, 2], [2.0, 0.0, -1.0]).to_batches()])
+    second = ad.sql(ctx, GRAD)
+    assert program_of(second) == built
+    assert pairs(second) == [(0, 12.0), (1, 0.0), (2, 3.0)]
+
+
+def test_a_table_of_another_schema_gets_its_program_built_again(ad, ctx):
+    built = program_of(ad.sql(ctx, GRAD))
+    schema = pa.schema([pa.field("i", pa.int64()), pa.field("val", pa.float64(), nullable=False)])
+    ctx.deregister_table("w")
+    ctx.register_record_batches("w", [table([0, 1, 2], [2.0, 0.0, -1.0]).cast(schema).to_batches()])
+    df = ad.sql(ctx, GRAD)
+    assert program_of(df) != built
+    assert pairs(df) == [(0, 12.0), (1, 0.0), (2, 3.0)]
+
+
+def test_rewrite_keeps_programs_only_for_a_backend_with_a_plan_key(ad, ctx):
+    class NoKey:
+        """DataFusionBackend without plan_key."""
+
+        def __init__(self, ctx):
+            self.inner = ad.DataFusionBackend(ctx)
+
+        def __getattr__(self, name):
+            if name == "plan_key":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+    def prefix(backend, programs):
+        with ddxdb.rewrite(backend, [GRAD], programs=programs) as r:
+            return program_of(ctx.sql(r.statements[0]))
+
+    programs = ddxdb.Programs()
+    keyed = ad.DataFusionBackend(ctx)
+    assert prefix(keyed, programs) == prefix(keyed, programs)
+    unkeyed = ddxdb.Programs()
+    assert prefix(NoKey(ctx), unkeyed) != prefix(NoKey(ctx), unkeyed)
+
+
+def test_a_program_is_kept_again_only_once_its_tables_are_released(ad, ctx):
+    programs = ddxdb.Programs()
+    backend = ad.DataFusionBackend(ctx)
+    with ddxdb.rewrite(backend, [GRAD], programs=programs):
+        pass
+    first = ddxdb.rewrite(backend, [GRAD], programs=programs)
+    with ddxdb.rewrite(backend, [GRAD], programs=programs) as second:
+        assert program_of(ctx.sql(second.statements[0])) != program_of(ctx.sql(first.statements[0]))
+    # The first call's tables outlived the second's release.
+    assert pairs(ctx.sql(first.statements[0])) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    first.release()

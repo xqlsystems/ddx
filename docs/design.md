@@ -1305,8 +1305,8 @@ A `jvp`'s tangent may be a number, the same at every row:
 an expression row by row, ddx writing the tangent table itself (the table's
 dims, the number under the column's name).
 
-`ddx_ad::rewrite(&mut backend, statements, dialect)` is the whole of it, on
-any `Backend` that can also plan SQL (`plan_sql`). It finds the calls of
+`ddx_ad::rewrite(&mut backend, &programs, statements, dialect)` is the whole
+of it, on any `Backend` that can also plan SQL (`plan_sql`). It finds the calls of
 several statements, each a `Derivative`: `Grad`, `Vjp` with its cotangent,
 or `Jvp` with its tangent, a query or a number. It plans one program per
 distinct derivative: per objective for `grad`, per objective and cotangent
@@ -1317,7 +1317,9 @@ query on the engine, builds the program, registers its cotangent or tangent
 as the program's input table and runs it; then it rewrites each statement's
 tree to read what the calls need, and writes it out as SQL again (`S18`),
 returning it with the tables it reads, for the caller to drop once it has
-planned it. A table `grad` or
+planned it. A program built by an earlier call and kept in `programs` is
+run again instead of built, so a training loop that rewrites the same
+statements each step builds its programs once (`S20`). A table `grad` or
 `vjp` reads becomes a relation over its rows, under its alias, that also
 holds each call's gradient, left-joined on the table's dims; each call
 reads its own. A `SELECT` with `jvp` columns becomes a read of its
@@ -2054,7 +2056,7 @@ waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
 
 ---
 
-### Building v2 (`S6`–`S19`)
+### Building v2 (`S6`–`S20`)
 
 **S6 — The tape is cut at aggregates, and nothing between them is
 materialized.** Materializing every relation's output, or every relation's
@@ -2108,7 +2110,9 @@ giving a silently zero gradient, or failing with a missing table under
 `tokio::spawn`. Every name now starts with a prefix fresh to its program, and
 an adapter drops the intermediate tables once a run finishes. Running one
 program twice at once still shares its names, so a caller that runs
-concurrently builds a program per task, as `ad::sql` does per call. → §4.4.
+concurrently builds a program per task. `ad::sql` keeps its programs from
+call to call, and takes one out of its cache until the caller has dropped
+the tables it wrote, so an overlapping call builds its own (`S20`). → §4.4.
 
 **S12 — What the v2 soak found.** A generated-query soak (#89–#93) checked
 gradients against finite differences of the query and against ddx itself,
@@ -2267,6 +2271,38 @@ mask, a divisor joined on a grouping key in three join orders and with a
 table no factor reads, and the full attention query, each against the
 composed rules. At 256 tokens, attention's steps went from 1.12 s to
 0.28 s.
+
+**S20 — The SQL surface keeps its programs, keyed without optimizing.**
+`ad::sql` planned and built every program on every call, so a training loop
+paid for differentiating its loss each step. In the GPT demo of xarray-sql's
+ML benchmarks that was about 1.5 s of a 2.4 s step: DataFusion optimizing the
+loss (800 ms), then `ddx_ad::grad`. A program depends on the tables' names
+and schemas and the views' definitions, not their values (which is why
+the program API is built once and run each step), so
+`ddx_ad::rewrite` now keeps each program it builds in a `Programs` passed by
+the caller, at most 16, the least recently used dropped first. The key must
+be found without optimizing, or a hit would save only the build. It is the
+program's transform, `wrt` columns, query text and row restrictions, plus a
+new optional `Backend::plan_key` of each query: on DataFusion, the plan
+before optimization printed with its schemas. DataFusion expands every view
+(transitively) while it turns SQL into a plan, so this text holds each
+view's definition and each table's columns, types and nullability, and ddx
+never resolves a name itself. Keying on the statement text plus schemas ddx
+looks up was rejected for that reason (views over views, default schemas).
+An explicit prepared statement was rejected because every caller, the demos
+included, would have to change. A backend without `plan_key` keeps nothing.
+A program that reads another's result reads it by that program's table
+names, so it is kept only while the program it reads is. A program is taken
+out of the cache while it runs and comes back only when the caller releases
+the tables it wrote (`Rewritten::release`), since its runs write the same
+tables (S11): put back as `rewrite` returned, a call made before the first
+caller had planned its statements would rewrite those tables under it, and
+drop them when it released its own (found by CodeRabbit).
+One semantic change: DataFusion's optimizer folds `now()` into a literal, so
+a kept program holds the time of the call that built it. Measured on
+`nn.rs`'s model, a SQL training step went from 107 ms to 91 ms, within 3% of
+running a program built once (88 ms). The SQL training test runs 25 steps
+again. → §4.8.
 
 ## References
 

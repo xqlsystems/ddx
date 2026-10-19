@@ -297,7 +297,7 @@ async fn training_with_sql_grad_learns() {
     let ctx = setup().await;
     let (update_weight, update_bias) = (model::update_weight(0.5), model::update_bias(0.5));
     let mut losses = Vec::new();
-    for _ in 0..15 {
+    for _ in 0..25 {
         losses.push(scalar(&ctx, &model::loss_sql()).await);
         let mut frames = ad::sql_all(&ctx, &[&update_weight, &update_bias])
             .await
