@@ -995,6 +995,17 @@ however many copies inlining made (#155): encoding each aggregate's whole
 subtree, as ddx first did, re-encoded every aggregate beneath it, and took
 most of the build of a GPT's loss (1,050 aggregates, about 25 distinct).
 
+A plan may also say what it shares: Substrait writes a relation read more
+than once in `plan.relations`, once, and a `ReferenceRel` wherever it is
+read (DuckDB's producer does this for a CTE read twice). Reverse mode lowers
+each such relation once and every reference reads its region, so the
+program is the one its written-out form gives, byte for byte, at the cost
+of the DAG rather than of its copies: forty layers that each read the last
+twice, 2^40 copies written out, are differentiated in milliseconds (#19).
+A relation read through a reference that reads no `wrt` table is written
+out in each step that reads it, since an engine runs the steps and
+DataFusion's consumer reads no `ReferenceRel`.
+
 **One saved aggregate's backward step.** Saved aggregates are processed parents
 first, starting from the output. For each: join the region beneath it to its
 cotangent on the grouping keys (the reduce rule's broadcast); walk the region's

@@ -376,8 +376,8 @@ fn share_repeated(plan: &ddx_ad::substrait::proto::Plan) -> ddx_ad::substrait::p
 async fn a_subtree_shared_through_reference_rel_reads_as_the_tree() {
     // From the second-engine spike (#73, B1): DuckDB shares a CTE read twice
     // through ReferenceRel. ddx did not follow it, saw no reads at all, and
-    // said the query "reads {}". Each reference now reads as a copy of the
-    // subtree it names, so the analysis is the tree's.
+    // said the query "reads {}". Each reference now reads the subtree it
+    // names, lowered once, so the analysis is the tree's.
     let ctx = ctx().await;
     let sql = "WITH a AS (SELECT o, val * val AS v FROM w), s AS (SELECT SUM(v) AS t FROM a) \
                SELECT SUM(a.v / s.t) AS loss FROM a CROSS JOIN s";
