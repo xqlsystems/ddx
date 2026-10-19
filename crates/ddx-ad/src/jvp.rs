@@ -13,7 +13,9 @@
 //!
 //! Forward mode needs no transposes and no tape: tangents travel beside
 //! values through the same operators (see [`crate::tangent`]'s table), so a
-//! query's `jvp` is one plan, the query rewritten. Its result holds the
+//! query's `jvp` is one plan, the query rewritten; a relation the plan
+//! shares through a `ReferenceRel` is rewritten once, as a step its readers
+//! read. Its result holds the
 //! query's own output and, after it, the tangent of each output column that
 //! depends on a `wrt` column, as `jax.jvp` returns both. A tangent is NULL
 //! where its value is.
@@ -29,7 +31,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use substrait::proto::{NamedStruct, Plan};
 
-use crate::compose::{Differentiable, Parts, Subject};
+use crate::compose::{dag_steps, Differentiable, Parts, Subject};
 use crate::emit::{plan as plan_of, project_emit, read_step};
 use crate::error::{AdError, Result};
 use crate::expr::field;
@@ -105,18 +107,42 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
     let ddx = options.ddx_or_default();
     let mut sources = Sources::new(wrt, &namespace)?;
     let functions = Functions::from_plan(plan)?;
-    let ext = Extensions::new(&functions);
-    let mut dp = dual_plan(plan, &ddx, &functions, ext, &mut sources)?;
-    sources.check_every_wrt_was_read()?;
+    let mut ext = Extensions::new(&functions);
     let name = format!("{namespace}jvp");
+    let mut steps = Vec::new();
+    // A relation the plan shares is rewritten once, as a step of its own
+    // that every reader reads with its tangents, as a program's steps are;
+    // then the root.
+    let mut dp = match dag_steps(plan, &namespace, &name)? {
+        None => dual_plan(plan, &ddx, &functions, ext, &mut sources)?,
+        Some(mut dag) => {
+            let root = dag.pop().expect("the root's step");
+            for step in dag {
+                let primal = plan_of(step.rel, step.columns, &ext);
+                let mut dp = dual_plan(&primal, &ddx, &functions, ext, &mut sources)?;
+                sources.steps.insert(
+                    step.name.clone(),
+                    (step.name.clone(), dp.columns.clone(), dp.tans.clone()),
+                );
+                steps.push(Step {
+                    name: step.name,
+                    plan: Unbound(std::mem::take(&mut dp.plan)),
+                });
+                ext = dp.ext;
+            }
+            let primal = plan_of(root.rel, root.columns, &ext);
+            dual_plan(&primal, &ddx, &functions, ext, &mut sources)?
+        }
+    };
+    sources.check_every_wrt_was_read()?;
     // An output no wrt column moves has no tangent column: its tangent is
     // 0, as `jax.jvp` of a constant function returns a zero tangent.
     let value = output_of(&name, Of::Output, &dp)?;
     let (inputs, checks) = sources.inputs(&mut dp.ext, Vec::new());
-    let mut steps = vec![Step {
+    steps.push(Step {
         name,
         plan: Unbound(dp.plan),
-    }];
+    });
     crate::opt::steps(&mut steps);
     Ok(ForwardProgram {
         inputs,

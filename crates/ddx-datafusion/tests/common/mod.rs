@@ -17,6 +17,12 @@ pub mod ad;
 
 use datafusion::arrow::array::{Array, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
+use std::collections::HashMap;
+
+use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+use ddx_ad::substrait::proto::rel::RelType;
+use ddx_ad::substrait::proto::{Plan, PlanRel, ReferenceRel, Rel};
+use prost::Message;
 
 /// Column 0 of `batches` as `f64`s.
 ///
@@ -116,4 +122,139 @@ pub fn emits_off_projections(plan: &ddx_ad::substrait::proto::Plan) -> Vec<&'sta
         stack.extend(inputs);
     }
     out
+}
+
+/// `plan` with each subtree that two places read written once, at the end
+/// of `plan.relations`, and read through a `ReferenceRel` from each: the
+/// plan as a DAG, as a producer that shares a CTE read twice writes it. A
+/// subtree is shared when distinct subtrees read it, or one reads it twice,
+/// so a subtree read only from inside a shared one is not shared again.
+pub fn shared(plan: &Plan) -> Plan {
+    /// How many times distinct subtrees read each subtree, by encoding.
+    fn readers(rel: &Rel, seen: &mut HashMap<Vec<u8>, usize>) -> Vec<u8> {
+        let encoding = rel.encode_to_vec();
+        if seen.contains_key(&encoding) {
+            return encoding;
+        }
+        seen.insert(encoding.clone(), 0);
+        if let Some(kind) = &rel.rel_type {
+            for child in inputs(kind) {
+                let c = readers(child, seen);
+                *seen.get_mut(&c).unwrap() += 1;
+            }
+        }
+        encoding
+    }
+    fn share(
+        rel: &Rel,
+        counts: &HashMap<Vec<u8>, usize>,
+        ordinals: &mut HashMap<Vec<u8>, i32>,
+        relations: &mut Vec<PlanRel>,
+    ) -> Rel {
+        let encoding = rel.encode_to_vec();
+        if counts[&encoding] < 2 {
+            return children_shared(rel, counts, ordinals, relations);
+        }
+        if let Some(&ordinal) = ordinals.get(&encoding) {
+            return reference(ordinal);
+        }
+        let ordinal = relations.len() as i32;
+        ordinals.insert(encoding, ordinal);
+        relations.push(PlanRel { rel_type: None });
+        let body = children_shared(rel, counts, ordinals, relations);
+        relations[ordinal as usize].rel_type = Some(PlanRelType::Rel(body));
+        reference(ordinal)
+    }
+    fn children_shared(
+        rel: &Rel,
+        counts: &HashMap<Vec<u8>, usize>,
+        ordinals: &mut HashMap<Vec<u8>, i32>,
+        relations: &mut Vec<PlanRel>,
+    ) -> Rel {
+        let mut out = rel.clone();
+        if let Some(kind) = &mut out.rel_type {
+            for child in inputs_mut(kind) {
+                *child = share(child, counts, ordinals, relations);
+            }
+        }
+        out
+    }
+    let mut out = plan.clone();
+    let at = out
+        .relations
+        .iter()
+        .position(|r| matches!(r.rel_type, Some(PlanRelType::Root(_))))
+        .unwrap();
+    let Some(PlanRelType::Root(root)) = &out.relations[at].rel_type else {
+        unreachable!()
+    };
+    let input = root.input.clone().unwrap();
+    let mut counts = HashMap::new();
+    readers(&input, &mut counts);
+    let mut relations = std::mem::take(&mut out.relations);
+    let input = children_shared(&input, &counts, &mut HashMap::new(), &mut relations);
+    let Some(PlanRelType::Root(root)) = &mut relations[at].rel_type else {
+        unreachable!()
+    };
+    root.input = Some(input);
+    out.relations = relations;
+    out
+}
+
+pub fn reference(ordinal: i32) -> Rel {
+    Rel {
+        rel_type: Some(RelType::Reference(ReferenceRel {
+            subtree_ordinal: ordinal,
+        })),
+    }
+}
+
+pub fn inputs(kind: &RelType) -> Vec<&Rel> {
+    match kind {
+        RelType::Filter(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Fetch(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Aggregate(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Sort(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Project(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Window(r) => r.input.as_deref().into_iter().collect(),
+        RelType::Join(r) => [r.left.as_deref(), r.right.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        RelType::Cross(r) => [r.left.as_deref(), r.right.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        RelType::Set(r) => r.inputs.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
+    match kind {
+        RelType::Filter(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Fetch(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Aggregate(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Sort(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Project(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Window(r) => r.input.as_deref_mut().into_iter().collect(),
+        RelType::Join(r) => [r.left.as_deref_mut(), r.right.as_deref_mut()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        RelType::Cross(r) => [r.left.as_deref_mut(), r.right.as_deref_mut()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        RelType::Set(r) => r.inputs.iter_mut().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many relations `plan` shares through references.
+pub fn shared_count(plan: &Plan) -> usize {
+    plan.relations
+        .iter()
+        .filter(|r| matches!(r.rel_type, Some(PlanRelType::Rel(_))))
+        .count()
 }
