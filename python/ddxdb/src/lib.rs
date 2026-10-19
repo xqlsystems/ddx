@@ -11,6 +11,7 @@
 
 use std::future::{ready, Future, Ready};
 use std::pin::pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
@@ -759,26 +760,63 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
 /// `backend`, and rewrite each statement to read it (`ddx_ad::rewrite`).
 /// `backend` is as for `run`, with a fifth method, `plan_sql(sql) -> bytes`:
 /// the engine's serialized Substrait plan of a query. Returns the rewritten
-/// statements and the tables they read, for the caller to drop once it has
-/// planned them. `dialect` is how the statements are written (a name
-/// `sqlparser` knows, or `"datafusion"`). A program kept in `programs` is
-/// run again instead of built, and each one built is kept there.
+/// statements, the tables they read, and a `_Release` to drop those tables
+/// once the caller has planned the statements. `dialect` is how the
+/// statements are written (a name `sqlparser` knows, or `"datafusion"`). A
+/// program kept in `programs` is run again instead of built, and each one
+/// built is kept there once its tables are released.
 #[pyfunction]
 #[pyo3(signature = (backend, statements, dialect = "datafusion", programs = None))]
 fn _rewrite(
     backend: Bound<'_, PyAny>,
     statements: Vec<String>,
     dialect: &str,
-    programs: Option<PyRef<'_, Programs>>,
-) -> PyResult<(Vec<String>, Vec<String>)> {
+    programs: Option<Py<Programs>>,
+) -> PyResult<(Vec<String>, Vec<String>, Release)> {
     let parser = parser_for(dialect)?;
     let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
     let mut backend = PyBackend(backend.unbind());
     let fresh = ddx_ad::Programs::new();
-    let programs = programs.as_ref().map_or(&fresh, |p| &p.0);
-    let out = now(ddx_ad::rewrite(&mut backend, programs, &refs, parser.as_ref()))
-        .map_err(run_err)?;
-    Ok((out.statements, out.tables))
+    let out = {
+        let kept = programs.as_ref().map_or(&fresh, |p| &p.get().0);
+        now(ddx_ad::rewrite(&mut backend, kept, &refs, parser.as_ref())).map_err(run_err)?
+    };
+    let (statements, tables) = (out.statements.clone(), out.tables.clone());
+    let release = Release {
+        rewritten: Mutex::new(Some(out)),
+        programs,
+    };
+    Ok((statements, tables, release))
+}
+
+/// What `_rewrite` left for the caller to release: the tables its
+/// statements read, and the programs that wrote them, kept only once the
+/// tables are dropped (`ddx_ad::Rewritten::release`). Until then another
+/// call could run a kept program, writing the same tables.
+#[pyclass(frozen, module = "ddxdb", name = "_Release")]
+struct Release {
+    rewritten: Mutex<Option<ddx_ad::Rewritten>>,
+    programs: Option<Py<Programs>>,
+}
+
+#[pymethods]
+impl Release {
+    /// Drop the tables on `backend`, every one even after a failed drop,
+    /// raising the first failure; then keep the programs. Once only: a
+    /// second call does nothing.
+    fn release(&self, backend: Bound<'_, PyAny>) -> PyResult<()> {
+        let taken = self
+            .rewritten
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(rewritten) = taken else {
+            return Ok(());
+        };
+        let fresh = ddx_ad::Programs::new();
+        let kept = self.programs.as_ref().map_or(&fresh, |p| &p.get().0);
+        now(rewritten.release(&mut PyBackend(backend.unbind()), kept))
+    }
 }
 
 /// A run's failure as the exception a Python caller branches on.

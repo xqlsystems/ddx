@@ -349,7 +349,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     let frames = plan_each(ctx, &out.statements).await;
     // A planned DataFrame holds the tables it reads, so they can leave the
     // catalog now.
-    out.release(&mut engine).await?;
+    out.release(&mut engine, &programs).await?;
     frames
 }
 

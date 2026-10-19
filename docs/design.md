@@ -2111,8 +2111,8 @@ giving a silently zero gradient, or failing with a missing table under
 an adapter drops the intermediate tables once a run finishes. Running one
 program twice at once still shares its names, so a caller that runs
 concurrently builds a program per task. `ad::sql` keeps its programs from
-call to call, and takes one out of its cache while it runs, so an
-overlapping call builds its own (`S20`). → §4.4.
+call to call, and takes one out of its cache until the caller has dropped
+the tables it wrote, so an overlapping call builds its own (`S20`). → §4.4.
 
 **S12 — What the v2 soak found.** A generated-query soak (#89–#93) checked
 gradients against finite differences of the query and against ddx itself,
@@ -2293,7 +2293,11 @@ An explicit prepared statement was rejected because every caller, the demos
 included, would have to change. A backend without `plan_key` keeps nothing.
 A program that reads another's result reads it by that program's table
 names, so it is kept only while the program it reads is. A program is taken
-out of the cache while it runs, since its runs write the same tables (S11).
+out of the cache while it runs and comes back only when the caller releases
+the tables it wrote (`Rewritten::release`), since its runs write the same
+tables (S11): put back as `rewrite` returned, a call made before the first
+caller had planned its statements would rewrite those tables under it, and
+drop them when it released its own (found by CodeRabbit).
 One semantic change: DataFusion's optimizer folds `now()` into a literal, so
 a kept program holds the time of the call that built it. Measured on
 `nn.rs`'s model, a SQL training step went from 107 ms to 91 ms, within 3% of

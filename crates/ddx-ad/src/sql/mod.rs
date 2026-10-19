@@ -106,6 +106,7 @@ mod rewrite;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::future::Future;
 
 use ddx_core::sqlparser::dialect::Dialect;
@@ -120,7 +121,6 @@ pub(crate) use rewrite::quote;
 /// What [`rewrite`] returns: the statements to run, and the tables their
 /// rewritten text reads, which the caller drops once it has planned (or run)
 /// the statements ([`Rewritten::release`]).
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Rewritten {
     /// Each statement, its calls replaced by reads of what their programs
@@ -129,17 +129,41 @@ pub struct Rewritten {
     /// The tables the programs left (values and gradients) and the
     /// cotangents and tangents registered for them.
     pub tables: Vec<String>,
+    /// The programs that wrote them, to keep once they are dropped.
+    kept: Vec<(cache::Key, Box<dyn plan::Built>)>,
+}
+
+impl fmt::Debug for Rewritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rewritten")
+            .field("statements", &self.statements)
+            .field("tables", &self.tables)
+            .field("kept", &self.kept.len())
+            .finish()
+    }
 }
 
 impl Rewritten {
     /// Drop [`Rewritten::tables`] from `backend`, every one even after a
-    /// failed drop; the first failure is reported.
-    pub async fn release<B: Backend>(&self, backend: &mut B) -> Result<(), B::Error> {
+    /// failed drop, reporting the first failure; then keep in `programs`
+    /// the programs that wrote them, for a later [`rewrite`] to run again.
+    ///
+    /// Not before: until the tables are dropped, a program kept would be
+    /// free for another call to run, writing the same tables while this
+    /// call's statements still read them.
+    pub async fn release<B: Backend>(
+        self,
+        backend: &mut B,
+        programs: &Programs,
+    ) -> Result<(), B::Error> {
         let mut first = Ok(());
         for t in &self.tables {
             if let (Err(e), Ok(())) = (backend.drop_table(t).await, &first) {
                 first = Err(e);
             }
+        }
+        for (key, program) in self.kept {
+            programs.keep(key, program);
         }
         first
     }
@@ -150,9 +174,9 @@ impl Rewritten {
 /// `dialect` is how the statements are written.
 ///
 /// A program kept in `programs` from an earlier call is run again instead
-/// of built, and each program built is kept there (see [`Programs`]), so a
-/// training loop that passes the same `programs` each step builds its
-/// programs once.
+/// of built, and each program built is kept there once its tables are
+/// released (see [`Programs`]), so a training loop that passes the same
+/// `programs` each step builds its programs once.
 ///
 /// Every program's tables but its results are dropped as it runs. What the
 /// statements read stays until [`Rewritten::release`]; if anything fails,
@@ -177,22 +201,27 @@ pub fn rewrite<'a, B: Backend>(
         let mut tables = Vec::new();
         let mut keys = Vec::new();
         let result = run_all(backend, &mut planned, programs, &mut keys, &mut tables).await;
-        // Every program built or taken goes back, whatever happened: a run
-        // that failed (a check that returned a row, an engine's error)
-        // leaves its program as it was.
-        for (key, program) in keys.into_iter().zip(planned.into_built()) {
-            if let Some(key) = key {
-                programs.keep(key, program);
-            }
-        }
+        // Every program built or taken goes back once its tables are
+        // dropped, whatever happened: a run that failed (a check that
+        // returned a row, an engine's error) leaves its program as it was.
+        let kept = keys
+            .into_iter()
+            .zip(planned.into_built())
+            .filter_map(|(key, program)| Some((key?, program)))
+            .collect();
         match result {
-            Ok(statements) => Ok(Rewritten { statements, tables }),
+            Ok(statements) => Ok(Rewritten {
+                statements,
+                tables,
+                kept,
+            }),
             Err(e) => {
                 let _ = (Rewritten {
                     statements: Vec::new(),
                     tables,
+                    kept,
                 })
-                .release(backend)
+                .release(backend, programs)
                 .await;
                 Err(e)
             }

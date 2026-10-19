@@ -26,8 +26,9 @@ const CAPACITY: usize = 16;
 /// it reads is redefined, so the program is built again. An engine whose
 /// key is `None` gets nothing kept.
 ///
-/// A program is taken out while it runs and put back after, so calls that
-/// overlap never run one program at once (its runs write the same tables):
+/// A program is taken out while it runs and put back only when the caller
+/// drops the tables it wrote ([`crate::Rewritten::release`]), so calls that
+/// overlap never use one program at once (its runs write the same tables):
 /// the second builds its own. At most 16 are kept, the least recently used
 /// dropped first; dropping one costs only building it again.
 ///

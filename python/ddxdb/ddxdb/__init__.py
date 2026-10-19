@@ -26,7 +26,7 @@ you wrote, ``InvalidColumn`` that a column cannot be differentiated. Catch the
 one you can act on rather than matching on message text.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata as _metadata
 from typing import Optional, Protocol, Sequence
 
@@ -118,18 +118,15 @@ class Rewritten:
     #: and the cotangents and tangents registered for them.
     tables: list
     backend: "Backend"
+    _release: object = field(repr=False, compare=False)
 
     def release(self) -> None:
         """Drop :attr:`tables` from the backend, every one even after a failed
-        drop; the first failure is raised."""
-        first = None
-        for table in self.tables:
-            try:
-                self.backend.drop_table(table)
-            except Exception as e:  # noqa: BLE001 - re-raised below
-                first = first or e
-        if first is not None:
-            raise first
+        drop; the first failure is raised. Then the programs that wrote them
+        are kept in the :class:`Programs` given to :func:`rewrite`: not
+        before, or another call could run one and write the same tables while
+        these statements still read them. A second call does nothing."""
+        self._release.release(self.backend)
 
     def __enter__(self) -> "Rewritten":
         return self
@@ -159,7 +156,8 @@ def rewrite(
     are written: a dialect name ``sqlparser`` knows, or ``"datafusion"``.
 
     A program kept in ``programs`` from an earlier call is run again instead
-    of built, and each one built is kept there, so a training loop that
+    of built, and each one built is kept there once
+    :meth:`Rewritten.release` drops its tables, so a training loop that
     passes the same :class:`Programs` each step builds its programs once
     (with a backend that has :meth:`Backend.plan_key`).
 
@@ -173,8 +171,8 @@ def rewrite(
     # statement, and the calls would never be found.
     if isinstance(statements, str):
         raise TypeError("statements is a list of SQL statements; to rewrite one, pass [statement]")
-    out, tables = _rewrite(backend, list(statements), dialect, programs)
-    return Rewritten(out, tables, backend)
+    out, tables, release = _rewrite(backend, list(statements), dialect, programs)
+    return Rewritten(out, tables, backend, release)
 
 
 # Single-sourced from the installed distribution metadata, which maturin fills

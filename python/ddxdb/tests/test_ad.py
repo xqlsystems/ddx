@@ -594,3 +594,16 @@ def test_rewrite_keeps_programs_only_for_a_backend_with_a_plan_key(ad, ctx):
     assert prefix(keyed, programs) == prefix(keyed, programs)
     unkeyed = ddxdb.Programs()
     assert prefix(NoKey(ctx), unkeyed) != prefix(NoKey(ctx), unkeyed)
+
+
+def test_a_program_is_kept_again_only_once_its_tables_are_released(ad, ctx):
+    programs = ddxdb.Programs()
+    backend = ad.DataFusionBackend(ctx)
+    with ddxdb.rewrite(backend, [GRAD], programs=programs):
+        pass
+    first = ddxdb.rewrite(backend, [GRAD], programs=programs)
+    with ddxdb.rewrite(backend, [GRAD], programs=programs) as second:
+        assert program_of(ctx.sql(second.statements[0])) != program_of(ctx.sql(first.statements[0]))
+    # The first call's tables outlived the second's release.
+    assert pairs(ctx.sql(first.statements[0])) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    first.release()

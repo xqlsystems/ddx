@@ -202,3 +202,46 @@ async fn overlapping_calls_never_run_one_program_at_once() {
         assert_close(&got, &three_val_squared(&[1.0, -2.0, 0.5]));
     }
 }
+
+#[tokio::test]
+async fn a_program_is_kept_again_only_once_its_tables_are_released() {
+    // Between `rewrite` and `release` the caller plans statements that read
+    // the program's tables. Were the program kept already, a call in
+    // between would run it, writing those tables, and its release would
+    // drop them.
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use ddx_datafusion::engine::DataFusion;
+
+    let ctx = SessionContext::new();
+    create_w(&ctx, "DOUBLE", &[1.0, -2.0, 0.5]).await;
+    let programs = ddx_ad::Programs::new();
+    let mut engine = DataFusion(ctx.clone());
+    // One engine per call, as `ad::sql` makes them.
+    let rewrite = || async {
+        let mut engine = DataFusion(ctx.clone());
+        ddx_ad::rewrite(&mut engine, &programs, &[GRAD], &GenericDialect {})
+            .await
+            .unwrap()
+    };
+    let warm = rewrite().await;
+    warm.release(&mut engine, &programs).await.unwrap();
+
+    let first = rewrite().await;
+    let second = rewrite().await;
+    let (a, b) = (prefix(&first.statements[0]), prefix(&second.statements[0]));
+    assert_ne!(
+        a, b,
+        "the second call ran the program the first had not released"
+    );
+    second.release(&mut engine, &programs).await.unwrap();
+    // The first call's tables are still there to read.
+    let df = ctx.sql(&first.statements[0]).await.unwrap();
+    let batches = df.collect().await.unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3);
+    first.release(&mut engine, &programs).await.unwrap();
+    // And both programs are kept now.
+    let third = rewrite().await;
+    assert!([&a, &b].contains(&&prefix(&third.statements[0])));
+    third.release(&mut engine, &programs).await.unwrap();
+}
