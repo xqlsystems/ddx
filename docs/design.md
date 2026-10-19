@@ -1381,7 +1381,26 @@ for `vjp` (so statements updating different tables pay for one backward
 pass), per `SELECT`, columns and tangent for `jvp`, whose `f` is the
 `SELECT` with each `jvp(e, …)` written `e`. For each in turn it plans the
 query on the engine, builds the program, registers its cotangent or tangent
-as the program's input table and runs it; then it rewrites each statement's
+as the program's input table and runs it. A query whose CTEs read one
+another more than once is planned in pieces: an engine inlines a CTE at
+every read, so a model whose layers each read the last twice would reach
+the engine's optimizer and ddx at a size exponential in its depth (a GPT's
+loss held 1,050 copies of about 25 aggregates; GraphCast's plan grew 2.7×
+per round of message passing, of 16). Each CTE the engine would copy is
+planned alone, in order, reading the ones before it as placeholders (empty
+tables of their columns, made from the engine's plan of the CTE with
+`LIMIT 0`), and the plans are stitched into one in which each such CTE is a
+relation read through `ReferenceRel`s, which reverse and forward mode read
+once (§4.4). A CTE whose split could change what a read means is left to
+the engine: one a nested `WITH` defines again, one read inside an
+expression's subquery (where ddx refuses a reference), one read under
+another spelling, and every CTE of a `WITH RECURSIVE`. If planning the
+pieces fails, the query is planned whole. What the split costs is the
+optimizations across the pieces: a reader's filter is not pushed into a
+shared CTE, nor a column only some readers use pruned from it, as when
+DuckDB computes a CTE read twice once; ddx prunes the steps it writes, and
+a filter on a gradient's dims still restricts it, being planned against
+the table. Then it rewrites each statement's
 tree to read what the calls need, and writes it out as SQL again (`S18`),
 returning it with the tables it reads, for the caller to drop once it has
 planned it. A program built by an earlier call and kept in `programs` is

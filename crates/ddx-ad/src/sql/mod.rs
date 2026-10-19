@@ -84,7 +84,16 @@
 //! one tangent. A program comes after any whose result its query reads, and
 //! differentiates through it; a query that reads, through its CTEs, a call
 //! of itself is refused, since no order runs either first. Each is run on
-//! the engine as [`crate::run`] runs one. When a statement's `WHERE` keeps
+//! the engine as [`crate::run`] runs one. An engine inlines a CTE at every
+//! read, so a query whose CTEs read one another twice (a model's layers)
+//! would reach ddx, and the engine's optimizer, at a size exponential in
+//! its depth: each CTE the engine would copy is planned on its own instead,
+//! reading those before it as empty placeholder tables, and the plans are
+//! joined into one that reads each through a `ReferenceRel`, which ddx
+//! differentiates once. A CTE that could be misread that way (one a nested
+//! `WITH` defines again, one read inside an expression's subquery) is left
+//! to the engine, and if planning the pieces fails, the query is planned
+//! whole, as it always was. When a statement's `WHERE` keeps
 //! some of a table's rows by comparing its columns with literals
 //! (`layer = 1`), the program computes only those rows' gradients, if the
 //! engine's plan of that restriction is one the program can take; otherwise
@@ -103,6 +112,7 @@ mod cache;
 mod find;
 mod plan;
 mod rewrite;
+mod share;
 #[cfg(test)]
 mod tests;
 
@@ -240,13 +250,23 @@ async fn run_all<B: Backend>(
     tables: &mut Vec<String>,
 ) -> Result<Vec<String>, RunError<B::Error>> {
     while let Some(job) = planned.next().map_err(RunError::Refused)? {
-        let key = cache::Key::of(backend, &job)
-            .await
-            .map_err(RunError::Engine)?;
-        match key.as_ref().and_then(|k| programs.take(k)) {
-            Some(program) => planned.adopt(&job, program).map_err(RunError::Refused)?,
-            None => build(backend, planned, &job).await?,
-        }
+        // Each CTE the engine would copy is planned once (see `share`); if
+        // anything in that fails, the query is planned whole, as it always
+        // was, which is always right.
+        let split = job
+            .tree
+            .as_ref()
+            .and_then(|q| share::split(q, &crate::forward::new_namespace()));
+        let key = match split {
+            Some(split) => match program_of_split(backend, planned, programs, &job, &split).await {
+                Ok(key) => key,
+                Err(_) if planned.built_count() == job.index => {
+                    program_of_query(backend, planned, programs, &job).await?
+                }
+                Err(e) => return Err(e),
+            },
+            None => program_of_query(backend, planned, programs, &job).await?,
+        };
         keys.push(key);
         for (name, query) in planned.seeds(&job).map_err(RunError::Refused)? {
             let plan = backend.plan_sql(&query).await.map_err(RunError::Engine)?;
@@ -270,12 +290,107 @@ async fn run_all<B: Backend>(
     planned.rewrite().map_err(RunError::Refused)
 }
 
-/// Build `job`'s program from the engine's plans of its query and of its
-/// restrictions.
+/// `job`'s program, taken from `programs` or built from the engine's plan
+/// of its query, and the key it is kept under.
+async fn program_of_query<B: Backend>(
+    backend: &mut B,
+    planned: &mut plan::Derivatives,
+    programs: &Programs,
+    job: &plan::Job,
+) -> Result<Option<cache::Key>, RunError<B::Error>> {
+    let key = cache::Key::of(backend, job, std::slice::from_ref(&job.query))
+        .await
+        .map_err(RunError::Engine)?;
+    match key.as_ref().and_then(|k| programs.take(k)) {
+        Some(program) => planned.adopt(job, program).map_err(RunError::Refused)?,
+        None => {
+            let plan = backend
+                .plan_sql(&job.query)
+                .await
+                .map_err(RunError::Engine)?;
+            build(backend, planned, job, &plan).await?;
+        }
+    }
+    Ok(key)
+}
+
+/// [`program_of_query`], with each CTE of `split` planned on its own: its
+/// placeholder made from the engine's plan of it with `LIMIT 0`, then the
+/// key taken from every piece's plan, then the pieces planned and stitched
+/// into one plan. The placeholders are dropped whatever happens; the
+/// program reads none.
+async fn program_of_split<B: Backend>(
+    backend: &mut B,
+    planned: &mut plan::Derivatives,
+    programs: &Programs,
+    job: &plan::Job,
+    split: &share::Split,
+) -> Result<Option<cache::Key>, RunError<B::Error>> {
+    let mut made: Vec<String> = Vec::new();
+    let result = async {
+        for piece in &split.ctes {
+            let empty = backend
+                .plan_sql(&share::Split::empty(piece))
+                .await
+                .map_err(RunError::Engine)?;
+            let empty = Unbound::from_plan(empty)
+                .bind(&mut |_| None)
+                .map_err(RunError::Refused)?;
+            made.push(piece.placeholder.clone());
+            backend
+                .materialize(&piece.placeholder, &empty)
+                .await
+                .map_err(RunError::Engine)?;
+        }
+        let queries: Vec<String> = split
+            .ctes
+            .iter()
+            .map(|p| p.sql.clone())
+            .chain(std::iter::once(split.root.clone()))
+            .collect();
+        let key = cache::Key::of(backend, job, &queries)
+            .await
+            .map_err(RunError::Engine)?;
+        if let Some(program) = key.as_ref().and_then(|k| programs.take(k)) {
+            planned.adopt(job, program).map_err(RunError::Refused)?;
+            return Ok(key);
+        }
+        let mut pieces = Vec::with_capacity(split.ctes.len());
+        for piece in &split.ctes {
+            pieces.push(
+                backend
+                    .plan_sql(&piece.sql)
+                    .await
+                    .map_err(RunError::Engine)?,
+            );
+        }
+        let root = backend
+            .plan_sql(&split.root)
+            .await
+            .map_err(RunError::Engine)?;
+        let plan = share::stitch(split, pieces, &root).map_err(RunError::Refused)?;
+        build(backend, planned, job, &plan).await?;
+        Ok(key)
+    }
+    .await;
+    let mut dropped = Ok(());
+    for name in made {
+        if let (Err(e), Ok(())) = (backend.drop_table(&name).await, &dropped) {
+            dropped = Err(RunError::Engine(e));
+        }
+    }
+    let key = result?;
+    dropped?;
+    Ok(key)
+}
+
+/// Build `job`'s program from `plan`, the engine's plan of its query, and
+/// the engine's plans of its restrictions.
 async fn build<B: Backend>(
     backend: &mut B,
     planned: &mut plan::Derivatives,
     job: &plan::Job,
+    plan: &substrait::proto::Plan,
 ) -> Result<(), RunError<B::Error>> {
     // Only the gradient rows the statements read, where the engine can
     // plan the restriction and the program can take it; otherwise every
@@ -286,18 +401,14 @@ async fn build<B: Backend>(
             options = options.restrict(r.table.clone(), plan);
         }
     }
-    let plan = backend
-        .plan_sql(&job.query)
-        .await
-        .map_err(RunError::Engine)?;
-    let built = planned.build(job, &plan, &options).map(|_| ());
+    let built = planned.build(job, plan, &options).map(|_| ());
     match built {
         // An engine's plan of the restriction need not have the shape a
         // program takes one in (its optimizer may fold the filter away,
         // or push it into the scan): compute every row instead.
         Err(AdError::InvalidOptions(_)) if !job.pushdown.is_empty() => {
             planned
-                .build(job, &plan, &Options::new())
+                .build(job, plan, &Options::new())
                 .map_err(RunError::Refused)?;
         }
         other => other.map_err(RunError::Refused)?,

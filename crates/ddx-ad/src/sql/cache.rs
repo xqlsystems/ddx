@@ -91,19 +91,25 @@ pub(super) struct Key {
 }
 
 impl Key {
-    /// `job`'s key, or `None` if the engine cannot give one for its query
-    /// or a restriction's. An engine that fails on the query fails here
-    /// as it would have planning it; one that fails on a restriction's,
-    /// which the build would have left out, keeps nothing.
+    /// `job`'s key, its query planned as `queries` (the query, or each CTE
+    /// planned on its own and then the query), or `None` if the engine
+    /// cannot give one for one of them or a restriction's. An engine that
+    /// fails on a query fails here as it would have planning it; one that
+    /// fails on a restriction's, which the build would have left out, keeps
+    /// nothing.
     pub(super) async fn of<B: Backend>(
         backend: &mut B,
         job: &Job,
+        queries: &[String],
     ) -> Result<Option<Key>, B::Error> {
-        let Some(plan) = backend.plan_key(&job.query).await? else {
-            return Ok(None);
-        };
-        let mut queries = vec![job.query.clone()];
-        let mut plans = vec![plan];
+        let mut plans = Vec::new();
+        for q in queries {
+            let Some(plan) = backend.plan_key(q).await? else {
+                return Ok(None);
+            };
+            plans.push(plan);
+        }
+        let mut queries = queries.to_vec();
         for r in &job.pushdown {
             let Ok(Some(plan)) = backend.plan_key(&r.query).await else {
                 return Ok(None);

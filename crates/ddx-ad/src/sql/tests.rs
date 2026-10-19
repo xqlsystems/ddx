@@ -94,6 +94,7 @@ fn rewritten(calls: &Calls) -> String {
             })
         })
         .unwrap()
+        .to_string()
 }
 
 #[test]
