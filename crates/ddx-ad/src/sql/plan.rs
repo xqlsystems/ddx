@@ -65,6 +65,10 @@ struct Text {
 /// a gradient to push down.
 pub(super) struct Job {
     pub index: usize,
+    /// The transformation and its `wrt` columns, in order: with the query
+    /// and the restrictions' queries, what the program is built from
+    /// besides the engine's plans.
+    pub derivative: String,
     pub query: String,
     pub pushdown: Vec<Restriction>,
 }
@@ -118,6 +122,11 @@ impl Derivatives {
         };
         Ok(Some(Job {
             index,
+            derivative: format!(
+                "{} {:?}",
+                p.derivative.transform().name(),
+                p.derivative.wrt()
+            ),
             query: p.query.rewrite(&self.planned, &self.built)?,
             pushdown: p.pushdown.clone(),
         }))
@@ -147,6 +156,25 @@ impl Derivatives {
         };
         self.built.push(program);
         Ok(&*self.built[job.index])
+    }
+
+    /// `program`, built for `job` before (by [`Derivatives::build`], from
+    /// the same plans), as `job`'s program.
+    pub fn adopt(&mut self, job: &Job, program: Box<dyn Built>) -> Result<()> {
+        if job.index != self.built.len() {
+            return Err(AdError::Internal(format!(
+                "job {} adopted out of turn, after {}",
+                job.index,
+                self.built.len()
+            )));
+        }
+        self.built.push(program);
+        Ok(())
+    }
+
+    /// The programs built so far, in the order of their jobs.
+    pub fn into_built(self) -> Vec<Box<dyn Built>> {
+        self.built
     }
 
     /// What to register before `job`'s program, built, runs: each of its

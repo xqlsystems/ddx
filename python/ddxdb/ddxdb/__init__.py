@@ -28,7 +28,7 @@ one you can act on rather than matching on message text.
 
 from dataclasses import dataclass
 from importlib import metadata as _metadata
-from typing import Protocol, Sequence
+from typing import Optional, Protocol, Sequence
 
 from ._ddxdb import (  # noqa: F401  (re-exported)
     DdxError,
@@ -44,6 +44,7 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     ForwardProgram,
     InputTable,
     OutputTable,
+    Programs,
     Step,
     Tangent,
     grad_plan,
@@ -85,6 +86,16 @@ class Backend(Protocol):
         Only :func:`ddxdb.ad.sql`'s rewrite asks for one, to differentiate a
         query a statement names; a backend that only runs programs may
         leave it out."""
+        ...
+
+    def plan_key(self, sql: str) -> Optional[str]:
+        """Optional. Text that is the same at two calls only if
+        :meth:`plan_sql` of ``sql`` is: the schemas of the tables it reads
+        and the definitions of the views it reads, found without optimizing.
+        :func:`rewrite` keeps each program it builds in a :class:`Programs`
+        under it, so leaving out something the plan depends on would rerun
+        a stale program. A backend without it, or that returns ``None``,
+        gets nothing kept."""
         ...
 
 
@@ -136,11 +147,21 @@ class Rewritten:
                 exc.add_note(f"Dropping the rewritten statements' tables failed too: {e!r}")
 
 
-def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "datafusion") -> Rewritten:
+def rewrite(
+    backend: "Backend",
+    statements: Sequence[str],
+    dialect: str = "datafusion",
+    programs: Optional[Programs] = None,
+) -> Rewritten:
     """Compute what the ``grad``, ``vjp`` and ``jvp`` calls in ``statements``
     read, on ``backend`` (any :class:`Backend` with :meth:`Backend.plan_sql`),
     and rewrite each statement to read it. ``dialect`` is how the statements
     are written: a dialect name ``sqlparser`` knows, or ``"datafusion"``.
+
+    A program kept in ``programs`` from an earlier call is run again instead
+    of built, and each one built is kept there, so a training loop that
+    passes the same :class:`Programs` each step builds its programs once
+    (with a backend that has :meth:`Backend.plan_key`).
 
     This is ``ddx_ad::rewrite``, ddx-ad's own Rust: it plans one program per
     distinct derivative, runs each on the backend, and rewrites the
@@ -152,7 +173,7 @@ def rewrite(backend: "Backend", statements: Sequence[str], dialect: str = "dataf
     # statement, and the calls would never be found.
     if isinstance(statements, str):
         raise TypeError("statements is a list of SQL statements; to rewrite one, pass [statement]")
-    out, tables = _rewrite(backend, list(statements), dialect)
+    out, tables = _rewrite(backend, list(statements), dialect, programs)
     return Rewritten(out, tables, backend)
 
 
@@ -183,6 +204,7 @@ __all__ = [
     "ForwardProgram",
     "InputTable",
     "OutputTable",
+    "Programs",
     "Step",
     "Tangent",
     "grad_plan",

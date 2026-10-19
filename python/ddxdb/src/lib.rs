@@ -684,6 +684,37 @@ impl ddx_ad::Backend for PyBackend {
     fn plan_sql(&mut self, sql: &str) -> impl Future<Output = PyResult<Plan>> + Send {
         self.call(|b| decode(&b.call_method1("plan_sql", (sql,))?.extract::<Vec<u8>>()?))
     }
+
+    fn plan_key(&mut self, sql: &str) -> impl Future<Output = PyResult<Option<String>>> + Send {
+        // Optional: a backend without it gets no program kept.
+        self.call(|b| {
+            if !b.hasattr("plan_key")? {
+                return Ok(None);
+            }
+            b.call_method1("plan_key", (sql,))?.extract()
+        })
+    }
+}
+
+/// Programs `rewrite` built, kept to run again (`ddx_ad::Programs`): pass
+/// the same one to each call of a training loop, and its programs are built
+/// once. A program is kept under its query, its `wrt` columns and the
+/// backend's `plan_key` of its query, so a backend without `plan_key` gets
+/// none kept. At most 16 are kept.
+#[pyclass(frozen, module = "ddxdb", name = "Programs")]
+#[derive(Default)]
+struct Programs(ddx_ad::Programs);
+
+#[pymethods]
+impl Programs {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
 }
 
 /// The output of a future whose every await is already done, as a run on a
@@ -730,18 +761,23 @@ fn run(backend: Bound<'_, PyAny>, program: Bound<'_, PyAny>) -> PyResult<()> {
 /// the engine's serialized Substrait plan of a query. Returns the rewritten
 /// statements and the tables they read, for the caller to drop once it has
 /// planned them. `dialect` is how the statements are written (a name
-/// `sqlparser` knows, or `"datafusion"`).
+/// `sqlparser` knows, or `"datafusion"`). A program kept in `programs` is
+/// run again instead of built, and each one built is kept there.
 #[pyfunction]
-#[pyo3(signature = (backend, statements, dialect = "datafusion"))]
+#[pyo3(signature = (backend, statements, dialect = "datafusion", programs = None))]
 fn _rewrite(
     backend: Bound<'_, PyAny>,
     statements: Vec<String>,
     dialect: &str,
+    programs: Option<PyRef<'_, Programs>>,
 ) -> PyResult<(Vec<String>, Vec<String>)> {
     let parser = parser_for(dialect)?;
     let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
     let mut backend = PyBackend(backend.unbind());
-    let out = now(ddx_ad::rewrite(&mut backend, &refs, parser.as_ref())).map_err(run_err)?;
+    let fresh = ddx_ad::Programs::new();
+    let programs = programs.as_ref().map_or(&fresh, |p| &p.0);
+    let out = now(ddx_ad::rewrite(&mut backend, programs, &refs, parser.as_ref()))
+        .map_err(run_err)?;
     Ok((out.statements, out.tables))
 }
 
@@ -813,6 +849,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputTable>()?;
     m.add_class::<OutputTable>()?;
     m.add_class::<Tangent>()?;
+    m.add_class::<Programs>()?;
     m.add_function(wrap_pyfunction!(_rewrite, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;

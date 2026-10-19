@@ -115,7 +115,7 @@ pub use program::{
 };
 pub use relation::ColumnRef;
 pub use run::{run, Backend, Program, RunError};
-pub use sql::{rewrite, Rewritten};
+pub use sql::{rewrite, Programs, Rewritten};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
 #[cfg(feature = "internals")]
 #[doc(hidden)]

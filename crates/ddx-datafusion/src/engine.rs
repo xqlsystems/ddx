@@ -97,6 +97,16 @@ impl ddx_ad::Backend for DataFusion {
         let lp = self.0.sql(sql).await?.into_optimized_plan()?;
         crate::ad::substrait_of(&self.0, &lp).map(|p| *p)
     }
+
+    async fn plan_key(&mut self, sql: &str) -> Result<Option<String>> {
+        // DataFusion expands each view, and each view it reads, as it turns
+        // SQL into a plan, so the plan before optimization holds every
+        // view's definition, and its schemas every table's columns, types
+        // and nullability: all an optimized plan's meaning depends on.
+        let df = self.0.sql(sql).await?;
+        let key = df.logical_plan().display_indent_schema().to_string();
+        Ok(Some(key))
+    }
 }
 
 /// Register `df`'s rows as the table `name`, materialized.

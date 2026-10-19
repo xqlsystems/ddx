@@ -77,12 +77,15 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
+
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::{ident, DataFrame, SessionContext};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion_substrait::logical_plan::producer::to_substrait_plan;
 use ddx_ad::substrait::proto::Plan;
+use ddx_ad::Programs;
 
 pub use ddx_ad::{
     AdError, BackwardProgram, Check, ColumnRef, ForwardProgram, InputTable, Of, OutputTable,
@@ -313,6 +316,14 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
 /// tangents are dropped once the statement is planned; the returned
 /// DataFrame keeps what it reads.
 ///
+/// Each program is built once per context and run again by later calls,
+/// as a training loop makes them ([`ddx_ad::Programs`]): it depends on the
+/// schemas of the tables its query reads and on the views' definitions,
+/// not on the tables' values, and is built again when one of those
+/// changes. One caveat: DataFusion's optimizer folds `now()` into a literal,
+/// so a program whose query reads it keeps the time of the call that built
+/// it.
+///
 /// An objective defined in a `WITH RECURSIVE` clause is refused, so a
 /// training loop cannot yet be written as one recursive statement: each
 /// iteration would need its own program. This is ddx's own limit, separate
@@ -331,7 +342,8 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // Which programs to run, how each is built and run, and how each
     // statement reads them are ddx_ad::rewrite's; DataFusion plans and runs.
     let mut engine = DataFusion(ctx.clone());
-    let out = ddx_ad::rewrite(&mut engine, statements, &GenericDialect {})
+    let programs = programs(ctx);
+    let out = ddx_ad::rewrite(&mut engine, &programs, statements, &GenericDialect {})
         .await
         .map_err(from_run_error)?;
     let frames = plan_each(ctx, &out.statements).await;
@@ -339,6 +351,23 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // catalog now.
     out.release(&mut engine).await?;
     frames
+}
+
+/// The programs [`sql_all`] keeps on `ctx` (and every context that shares
+/// its state), put there on first use.
+fn programs(ctx: &SessionContext) -> Arc<Programs> {
+    let state = ctx.state_ref();
+    if let Some(p) = state.read().config().get_extension::<Programs>() {
+        return p;
+    }
+    let mut state = state.write();
+    // Another call may have put them there since the read.
+    if let Some(p) = state.config().get_extension::<Programs>() {
+        return p;
+    }
+    let p = Arc::new(Programs::new());
+    state.config_mut().set_extension(Arc::clone(&p));
+    p
 }
 
 /// Each of `statements`, planned.
