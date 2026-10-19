@@ -243,6 +243,8 @@ fn read_references(rel: &mut Rel, read: &HashMap<i32, (String, Vec<String>)>) ->
 /// in the plan's relations, and read through a `ReferenceRel` wherever a
 /// step reads it, so a program whose steps read one another more than once
 /// gives a plan of its own size, not of its steps written out at every read.
+/// A step the output does not read, directly or through other steps, is
+/// left out.
 pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
     let output = parts.output()?;
     let functions = Functions::union(parts.plans())?;
@@ -250,7 +252,18 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
     // columns.
     let mut steps: HashMap<&str, (i32, Vec<String>)> = HashMap::new();
     let mut shared: Vec<PlanRel> = Vec::new();
+    // Only the steps the output reads, directly or through each other, are
+    // written: another gradient's steps are not, nor anything in them.
+    let mut needed: Vec<String> = vec![output.step.clone()];
+    for step in parts.steps.iter().rev() {
+        if needed.contains(&step.name) {
+            needed.extend(unbound_reads(&step.plan));
+        }
+    }
     for step in &parts.steps {
+        if !needed.contains(&step.name) {
+            continue;
+        }
         let (root, names) = root_of(&step.plan)?;
         let mut rel = inline_references(root, &step.plan.relations)?;
         substitute(&mut rel, &steps)?;
@@ -706,5 +719,57 @@ fn redeclare_expr(
         _ => Err(AdError::NotImplemented(
             "this kind of expression in a query over another call".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::project;
+    use crate::expr::field;
+
+    fn step(name: &str, rel: Rel) -> Step {
+        let ext = Extensions::new(&Functions::from_plan(&Plan::default()).unwrap());
+        Step {
+            name: name.into(),
+            plan: Unbound(plan_of(rel, vec!["c0".into()], &ext)),
+        }
+    }
+
+    #[test]
+    fn a_step_the_output_does_not_read_is_left_out_of_its_plan() {
+        // The output reads `p_a`; `p_other` (another gradient's step, say)
+        // reads `p_a` too, but nothing reads it, so it is not written.
+        let a = step("p_a", read_step("t", vec!["c0".into()]));
+        let other = step(
+            "p_other",
+            select(
+                project(read_step("p_a", vec!["c0".into()]), vec![field(0)]),
+                vec![1],
+            ),
+        );
+        let out = step(
+            "p_value",
+            select(
+                project(read_step("p_a", vec!["c0".into()]), vec![field(0)]),
+                vec![1],
+            ),
+        );
+        let value = OutputTable {
+            step: "p_value".into(),
+            of: Of::Output,
+            columns: vec!["c0".into()],
+            tangents: Vec::new(),
+        };
+        let parts = Parts {
+            inputs: &[],
+            checks: &[],
+            steps: vec![&a, &other, &out],
+            value: &value,
+            gradients: &[],
+        };
+        let plan = output_plan(&parts).unwrap();
+        // The root, and `p_a` once.
+        assert_eq!(plan.relations.len(), 2, "{plan:?}");
     }
 }
