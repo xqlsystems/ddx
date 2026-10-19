@@ -20,12 +20,12 @@
 //!   Reverse mode needs the whole computation in one plan, to save what the
 //!   backward pass reads and to send each cotangent back along the way it
 //!   came, so the output step's plan is written out with every read of an
-//!   earlier step replaced by that step's plan ([`output_plan`]). That plan
-//!   is pruned before it is differentiated, which drops whatever of the
-//!   program its output does not need (another gradient's steps, a column no
-//!   later step reads), and the program it gives is pruned again, as every
-//!   program is. A step read twice is written out twice; reverse mode saves
-//!   each distinct aggregate once whichever way it is written.
+//!   earlier step a read of that step's plan ([`output_plan`]). Each step is
+//!   written once, among the plan's relations, and read through a
+//!   `ReferenceRel` wherever a step reads it, so the plan is the program's
+//!   size however often its steps read one another; reverse mode lowers
+//!   each once. A step the output does not reach is not read, and the
+//!   program the plan gives is pruned, as every program is.
 //!
 //! Either way the new program reads the old one's input tables (its tangent,
 //! its cotangent) as constants, and the caller registers them as before: they
@@ -40,11 +40,14 @@ use substrait::proto::plan_rel::RelType as PlanRelType;
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::EmitKind;
-use substrait::proto::{Expression, FunctionArgument, Plan, ReadRel, Rel};
+use substrait::proto::{Expression, FunctionArgument, Plan, PlanRel, ReadRel, ReferenceRel, Rel};
 
 use crate::emit::{filter, is_identity, plan as plan_of, read_step, select, unbound_reads};
 use crate::error::{AdError, Result};
-use crate::forward::{inline_references, read_outputs, rel_inputs_mut, root_of};
+use crate::forward::{
+    inline_references, read_outputs, referenced, rel_inputs_mut, root_of, shared_relations,
+    step_columns, width,
+};
 use crate::functions::{Extensions, Functions};
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step, Unbound};
 use crate::tables::{InputTable, Of, OutputTable};
@@ -169,23 +172,98 @@ impl Parts<'_> {
     }
 }
 
+/// A relation of a plan, as a step: its name, relation and columns.
+pub(crate) struct DagStep {
+    pub name: String,
+    pub rel: Rel,
+    pub columns: Vec<String>,
+}
+
+/// `plan`, which shares relations through `ReferenceRel`s, as steps: each
+/// relation it shares, after those it reads ([`shared_relations`]), as the
+/// step `{namespace}shared_{ordinal}` with columns `c0, c1, …`, then its
+/// root, under the name `root`. Each reads the shared relations before it
+/// by name where the plan reads them through a reference, as a program's
+/// steps read each other, so each is computed once and an engine, which
+/// reads no `ReferenceRel`, can run every one. `None` if the plan shares
+/// nothing.
+pub(crate) fn dag_steps(
+    plan: &Plan,
+    namespace: &str,
+    root_name: &str,
+) -> Result<Option<Vec<DagStep>>> {
+    let (root, names) = root_of(plan)?;
+    let order = shared_relations(root, &plan.relations)?;
+    if order.is_empty() {
+        return Ok(None);
+    }
+    let mut read: HashMap<i32, (String, Vec<String>)> = HashMap::new();
+    let mut steps = Vec::with_capacity(order.len() + 1);
+    for ordinal in order {
+        let mut rel = referenced(&plan.relations, ordinal)?.clone();
+        read_references(&mut rel, &read)?;
+        let columns = step_columns(width(&rel)?);
+        let name = format!("{namespace}shared_{ordinal}");
+        read.insert(ordinal, (name.clone(), columns.clone()));
+        steps.push(DagStep { name, rel, columns });
+    }
+    let mut rel = root.clone();
+    read_references(&mut rel, &read)?;
+    steps.push(DagStep {
+        name: root_name.to_string(),
+        rel,
+        columns: names,
+    });
+    Ok(Some(steps))
+}
+
+/// `rel` with each `ReferenceRel` replaced by a read of the step `read`
+/// names for its ordinal. A loop, not recursion.
+fn read_references(rel: &mut Rel, read: &HashMap<i32, (String, Vec<String>)>) -> Result<()> {
+    let mut stack = vec![rel];
+    while let Some(r) = stack.pop() {
+        if let Some(RelType::Reference(x)) = &r.rel_type {
+            let (name, columns) = read.get(&x.subtree_ordinal).ok_or_else(|| {
+                AdError::Internal(format!(
+                    "relation {} read before it was made a step",
+                    x.subtree_ordinal
+                ))
+            })?;
+            *r = read_step(name, columns.clone());
+        } else if let Some(kind) = r.rel_type.as_mut() {
+            stack.extend(rel_inputs_mut(kind));
+        }
+    }
+    Ok(())
+}
+
 /// The plan of `parts`' output table (see [`Parts::output`]): the step that
-/// writes it, with every read of an earlier step replaced by that step's
-/// plan, pruned to the output's columns.
+/// writes it, with every read of an earlier step a read of that step's
+/// plan, pruned to the output's columns. Each earlier step is written once,
+/// in the plan's relations, and read through a `ReferenceRel` wherever a
+/// step reads it, so a program whose steps read one another more than once
+/// gives a plan of its own size, not of its steps written out at every read.
 pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
     let output = parts.output()?;
     let functions = Functions::union(parts.plans())?;
-    // Each step so far, written out: its relation and its columns.
-    let mut steps: HashMap<&str, (Rel, Vec<String>)> = HashMap::new();
+    // Each step so far: the ordinal of its relation in the plan, and its
+    // columns.
+    let mut steps: HashMap<&str, (i32, Vec<String>)> = HashMap::new();
+    let mut shared: Vec<PlanRel> = Vec::new();
     for step in &parts.steps {
         let (root, names) = root_of(&step.plan)?;
         let mut rel = inline_references(root, &step.plan.relations)?;
         substitute(&mut rel, &steps)?;
         if step.name != output.step {
-            steps.insert(&step.name, (rel, names));
+            // After the root, which a plan holds first.
+            steps.insert(&step.name, (shared.len() as i32 + 1, names));
+            shared.push(PlanRel {
+                rel_type: Some(PlanRelType::Rel(rel)),
+            });
             continue;
         }
         let mut plan = plan_of(rel, names, &Extensions::new(&functions));
+        plan.relations.extend(shared);
         if let Some(read) = unbound_reads(&plan)
             .into_iter()
             .find(|r| steps.contains_key(r.as_str()))
@@ -204,10 +282,10 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
     )))
 }
 
-/// `rel` with every read of a step in `steps` replaced by the step's
-/// relation, its columns picked by name. A loop, not recursion: a program's
-/// steps can chain hundreds of relations deep.
-fn substitute(rel: &mut Rel, steps: &HashMap<&str, (Rel, Vec<String>)>) -> Result<()> {
+/// `rel` with every read of a step in `steps` replaced by a reference to
+/// the step's relation, its columns picked by name. A loop, not recursion:
+/// a program's steps can chain hundreds of relations deep.
+fn substitute(rel: &mut Rel, steps: &HashMap<&str, (i32, Vec<String>)>) -> Result<()> {
     let mut stack = vec![rel];
     while let Some(r) = stack.pop() {
         if let Some(RelType::Read(read)) = &r.rel_type {
@@ -221,15 +299,16 @@ fn substitute(rel: &mut Rel, steps: &HashMap<&str, (Rel, Vec<String>)>) -> Resul
     Ok(())
 }
 
-/// The step `read` reads, written out, if it reads one of `steps`.
-fn step_of(read: &ReadRel, steps: &HashMap<&str, (Rel, Vec<String>)>) -> Result<Option<Rel>> {
+/// A reference to the step `read` reads, its columns picked, if it reads
+/// one of `steps`.
+fn step_of(read: &ReadRel, steps: &HashMap<&str, (i32, Vec<String>)>) -> Result<Option<Rel>> {
     let (Some(ReadType::NamedTable(t)), Some(schema)) = (&read.read_type, &read.base_schema) else {
         return Ok(None);
     };
     let ([name], None) = (t.names.as_slice(), &schema.r#struct) else {
         return Ok(None);
     };
-    let Some((rel, columns)) = steps.get(name.as_str()) else {
+    let Some((ordinal, columns)) = steps.get(name.as_str()) else {
         return Ok(None);
     };
     if read.filter.is_some() || read.projection.is_some() || read.common.is_some() {
@@ -247,7 +326,12 @@ fn step_of(read: &ReadRel, steps: &HashMap<&str, (Rel, Vec<String>)>) -> Result<
                 .ok_or_else(|| AdError::Internal(format!("step `{name}` has no column `{c}`")))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Some(select(rel.clone(), picked)))
+    let reference = Rel {
+        rel_type: Some(RelType::Reference(ReferenceRel {
+            subtree_ordinal: *ordinal,
+        })),
+    };
+    Ok(Some(select(reference, picked)))
 }
 
 /// A query over the tables of earlier programs, as one program: theirs
@@ -315,21 +399,33 @@ impl After {
             }
         }
         let (root, names) = root_of(query)?;
-        let mut rel = inline_references(root, &query.relations)?;
-        let mut plan = plan_of(Rel::default(), names.clone(), &ext);
         let from = Functions::from_plan(query)?;
-        redeclare_rel(&mut rel, &from, &renamed, &mut ext)?;
-        set_root(&mut plan, rel);
         let value = OutputTable {
             step: format!("{namespace}value"),
             of: Of::Output,
-            columns: names,
+            columns: names.clone(),
             tangents: Vec::new(),
         };
-        steps.push(Step {
-            name: value.step.clone(),
-            plan: Unbound(plan),
-        });
+        // A relation the query shares is a step of its own, read by name
+        // wherever the query reads it; the query's root writes the value.
+        let query_steps = match dag_steps(query, &namespace, &value.step)? {
+            Some(dag) => dag,
+            None => vec![DagStep {
+                name: value.step.clone(),
+                rel: root.clone(),
+                columns: names,
+            }],
+        };
+        for step in query_steps {
+            let mut rel = step.rel;
+            redeclare_rel(&mut rel, &from, &renamed, &mut ext)?;
+            let mut plan = plan_of(Rel::default(), step.columns, &ext);
+            set_root(&mut plan, rel);
+            steps.push(Step {
+                name: step.name,
+                plan: Unbound(plan),
+            });
+        }
         // Every plan declares the whole set, which only grew, so an anchor
         // names one function in all of them.
         for plan in steps

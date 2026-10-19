@@ -1275,7 +1275,11 @@ both.
 Forward mode has no transposes and no tape. Tangents travel beside values
 through the same operators, so a query's `jvp` is one plan: the query
 rewritten so each relation carries, after its own columns, a tangent for
-each of them that depends on `wrt` (its **dual**). Nothing is recomputed and
+each of them that depends on `wrt` (its **dual**). A relation the plan
+shares through a `ReferenceRel` (§4.4) is rewritten once, as a step of its
+own that every reader reads with its tangents, the way a program's steps
+read each other: it is computed once, not at every read, and an engine,
+which reads no `ReferenceRel`, can run every step. Nothing is recomputed and
 nothing saved, so the rules need none of §4.4's machinery for keeping
 recomputations repeatable.
 
@@ -1456,13 +1460,13 @@ value: what the function it computes returns.
   program with several gradients is refused: build it with respect to one
   table). Reverse mode needs the whole computation in one plan, to save what
   the backward pass reads and to send each cotangent back the way it came, so
-  the output step's plan is written out with each read of an earlier step
-  replaced by that step's plan. That plan is pruned before it is
-  differentiated, which drops whatever of the program the output does not
-  need (another gradient's steps, a column no later step reads), and the
-  program it gives is pruned again, as every program is (§4.7). A step read
-  twice is written out twice; reverse mode saves each distinct aggregate once
-  whichever way it is written.
+  the output step's plan is written out with each read of an earlier step a
+  read of that step's plan. Each step is written once, among the plan's
+  relations, and read through a `ReferenceRel` wherever a step reads it
+  (§4.4), so the plan is the program's size however often its steps read one
+  another. A step the output does not reach is not read (another gradient's
+  steps), and the program the plan gives is pruned, as every program is
+  (§4.7).
 
 Either way the new program reads the old one's input tables (its tangent,
 its cotangent) as constants, which the caller registers as before: they come

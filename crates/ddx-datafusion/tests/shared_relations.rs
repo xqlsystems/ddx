@@ -10,153 +10,18 @@
 //! reference. So a model whose CTEs read one another twice costs ddx its
 //! number of CTEs, not its number of copies.
 
+mod common;
+
 #[path = "../examples/nn/model.rs"]
 #[allow(dead_code)]
 mod model;
 
-use std::collections::HashMap;
-
+use common::{inputs, inputs_mut, shared, shared_count};
 use datafusion::prelude::SessionContext;
 use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
-use ddx_ad::substrait::proto::{Plan, PlanRel, ReferenceRel, Rel};
+use ddx_ad::substrait::proto::{Plan, PlanRel, Rel};
 use ddx_ad::{ColumnRef, Options};
-use prost::Message;
-
-/// `plan` with each subtree that two places read written once, at the end
-/// of `plan.relations`, and read through a `ReferenceRel` from each: the
-/// plan as a DAG, as a producer that shares a CTE read twice writes it. A
-/// subtree is shared when distinct subtrees read it, or one reads it twice,
-/// so a subtree read only from inside a shared one is not shared again.
-fn shared(plan: &Plan) -> Plan {
-    /// How many times distinct subtrees read each subtree, by encoding.
-    fn readers(rel: &Rel, seen: &mut HashMap<Vec<u8>, usize>) -> Vec<u8> {
-        let encoding = rel.encode_to_vec();
-        if seen.contains_key(&encoding) {
-            return encoding;
-        }
-        seen.insert(encoding.clone(), 0);
-        if let Some(kind) = &rel.rel_type {
-            for child in inputs(kind) {
-                let c = readers(child, seen);
-                *seen.get_mut(&c).unwrap() += 1;
-            }
-        }
-        encoding
-    }
-    fn share(
-        rel: &Rel,
-        counts: &HashMap<Vec<u8>, usize>,
-        ordinals: &mut HashMap<Vec<u8>, i32>,
-        relations: &mut Vec<PlanRel>,
-    ) -> Rel {
-        let encoding = rel.encode_to_vec();
-        if counts[&encoding] < 2 {
-            return children_shared(rel, counts, ordinals, relations);
-        }
-        if let Some(&ordinal) = ordinals.get(&encoding) {
-            return reference(ordinal);
-        }
-        let ordinal = relations.len() as i32;
-        ordinals.insert(encoding, ordinal);
-        relations.push(PlanRel { rel_type: None });
-        let body = children_shared(rel, counts, ordinals, relations);
-        relations[ordinal as usize].rel_type = Some(PlanRelType::Rel(body));
-        reference(ordinal)
-    }
-    fn children_shared(
-        rel: &Rel,
-        counts: &HashMap<Vec<u8>, usize>,
-        ordinals: &mut HashMap<Vec<u8>, i32>,
-        relations: &mut Vec<PlanRel>,
-    ) -> Rel {
-        let mut out = rel.clone();
-        if let Some(kind) = &mut out.rel_type {
-            for child in inputs_mut(kind) {
-                *child = share(child, counts, ordinals, relations);
-            }
-        }
-        out
-    }
-    let mut out = plan.clone();
-    let at = out
-        .relations
-        .iter()
-        .position(|r| matches!(r.rel_type, Some(PlanRelType::Root(_))))
-        .unwrap();
-    let Some(PlanRelType::Root(root)) = &out.relations[at].rel_type else {
-        unreachable!()
-    };
-    let input = root.input.clone().unwrap();
-    let mut counts = HashMap::new();
-    readers(&input, &mut counts);
-    let mut relations = std::mem::take(&mut out.relations);
-    let input = children_shared(&input, &counts, &mut HashMap::new(), &mut relations);
-    let Some(PlanRelType::Root(root)) = &mut relations[at].rel_type else {
-        unreachable!()
-    };
-    root.input = Some(input);
-    out.relations = relations;
-    out
-}
-
-fn reference(ordinal: i32) -> Rel {
-    Rel {
-        rel_type: Some(RelType::Reference(ReferenceRel {
-            subtree_ordinal: ordinal,
-        })),
-    }
-}
-
-fn inputs(kind: &RelType) -> Vec<&Rel> {
-    match kind {
-        RelType::Filter(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Fetch(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Aggregate(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Sort(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Project(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Window(r) => r.input.as_deref().into_iter().collect(),
-        RelType::Join(r) => [r.left.as_deref(), r.right.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect(),
-        RelType::Cross(r) => [r.left.as_deref(), r.right.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect(),
-        RelType::Set(r) => r.inputs.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
-    match kind {
-        RelType::Filter(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Fetch(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Aggregate(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Sort(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Project(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Window(r) => r.input.as_deref_mut().into_iter().collect(),
-        RelType::Join(r) => [r.left.as_deref_mut(), r.right.as_deref_mut()]
-            .into_iter()
-            .flatten()
-            .collect(),
-        RelType::Cross(r) => [r.left.as_deref_mut(), r.right.as_deref_mut()]
-            .into_iter()
-            .flatten()
-            .collect(),
-        RelType::Set(r) => r.inputs.iter_mut().collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// How many relations `plan` shares through references.
-fn shared_count(plan: &Plan) -> usize {
-    plan.relations
-        .iter()
-        .filter(|r| matches!(r.rel_type, Some(PlanRelType::Rel(_))))
-        .count()
-}
 
 async fn plan_of(ctx: &SessionContext, sql: &str) -> Plan {
     let lp = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
@@ -310,48 +175,14 @@ async fn a_chain_too_deep_to_write_out_is_differentiated_shared() {
     // DAG is built from a two-layer plan: its second layer's relation,
     // which reads the first through references, is copied for each further
     // layer, reading the one before.
-    let ctx = tables().await;
-    let mut dag = shared(&plan_of(&ctx, &chain(2)).await);
-    let root_at = dag
-        .relations
-        .iter()
-        .position(|r| matches!(r.rel_type, Some(PlanRelType::Root(_))))
-        .unwrap();
-    // The root reads the second layer, which reads the first.
-    let Some(PlanRelType::Root(root)) = &dag.relations[root_at].rel_type else {
-        unreachable!()
-    };
-    let template_at = only_reference(root.input.as_ref().unwrap());
-    let Some(PlanRelType::Rel(template)) = dag.relations[template_at as usize].rel_type.clone()
-    else {
-        unreachable!()
-    };
-    let first = only_reference(&template);
-    let mut last = template_at;
-    for _ in 0..40 {
-        let mut layer = template.clone();
-        retarget(&mut layer, first, last);
-        dag.relations.push(PlanRel {
-            rel_type: Some(PlanRelType::Rel(layer)),
-        });
-        last = dag.relations.len() as i32 - 1;
-    }
-    let Some(PlanRelType::Root(root)) = &mut dag.relations[root_at].rel_type else {
-        unreachable!()
-    };
-    retarget(root.input.as_mut().unwrap(), template_at, last);
+    let dag = deep_chain(40).await;
     // Lowering recurses at each join, as it always has, and each layer
     // nests one: forty of them need more than a test thread's 2 MB.
-    let built = std::thread::Builder::new()
-        .stack_size(256 << 20)
-        .spawn(move || {
-            let started = std::time::Instant::now();
-            let program = ddx_ad::grad(&dag, &[ColumnRef::new("w", "val")]).unwrap();
-            (started.elapsed(), ddx_ad::Program::step_count(&program))
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+    let built = on_a_big_stack(move || {
+        let started = std::time::Instant::now();
+        let program = ddx_ad::grad(&dag, &[ColumnRef::new("w", "val")]).unwrap();
+        (started.elapsed(), ddx_ad::Program::step_count(&program))
+    });
     let (took, steps) = built;
     assert!(took < std::time::Duration::from_secs(20), "{took:?}");
     // A saved aggregate per layer, and a step to compute each, at least.
@@ -384,4 +215,82 @@ fn retarget(rel: &mut Rel, from: i32, to: i32) {
             .into_iter()
             .for_each(|c| retarget(c, from, to)),
     }
+}
+
+/// `k` + 2 layers over `w`, each reading the last twice, as a DAG: built
+/// from a two-layer plan, whose second layer's relation, reading the first
+/// through references, is copied for each further layer, reading the one
+/// before.
+async fn deep_chain(k: usize) -> Plan {
+    let ctx = tables().await;
+    let mut dag = shared(&plan_of(&ctx, &chain(2)).await);
+    let root_at = dag
+        .relations
+        .iter()
+        .position(|r| matches!(r.rel_type, Some(PlanRelType::Root(_))))
+        .unwrap();
+    // The root reads the second layer, which reads the first.
+    let Some(PlanRelType::Root(root)) = &dag.relations[root_at].rel_type else {
+        unreachable!()
+    };
+    let template_at = only_reference(root.input.as_ref().unwrap());
+    let Some(PlanRelType::Rel(template)) = dag.relations[template_at as usize].rel_type.clone()
+    else {
+        unreachable!()
+    };
+    let first = only_reference(&template);
+    let mut last = template_at;
+    for _ in 0..k {
+        let mut layer = template.clone();
+        retarget(&mut layer, first, last);
+        dag.relations.push(PlanRel {
+            rel_type: Some(PlanRelType::Rel(layer)),
+        });
+        last = dag.relations.len() as i32 - 1;
+    }
+    let Some(PlanRelType::Root(root)) = &mut dag.relations[root_at].rel_type else {
+        unreachable!()
+    };
+    retarget(root.input.as_mut().unwrap(), template_at, last);
+    dag
+}
+
+/// `f` on a thread with room for `k` nested joins: lowering recurses at
+/// each join, as it always has.
+fn on_a_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn forward_mode_differentiates_a_chain_too_deep_to_write_out() {
+    // Each shared relation is one step, with its tangents, that every
+    // reader reads: forty-two steps, not 2^40 copies.
+    let dag = deep_chain(40).await;
+    let (took, steps) = on_a_big_stack(move || {
+        let started = std::time::Instant::now();
+        let program = ddx_ad::jvp(&dag, &[ColumnRef::new("w", "val")]).unwrap();
+        (started.elapsed(), program.steps.len())
+    });
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+    assert!(steps > 40, "{steps} steps");
+}
+
+#[tokio::test]
+async fn reverse_over_forward_of_a_chain_too_deep_to_write_out() {
+    // vjp of the jvp program writes its output as one plan: each step once,
+    // read through references, not written out at every read.
+    let dag = deep_chain(40).await;
+    let took = on_a_big_stack(move || {
+        let wrt = [ColumnRef::new("w", "val")];
+        let started = std::time::Instant::now();
+        let jvp = ddx_ad::jvp(&dag, &wrt).unwrap();
+        ddx_ad::vjp(&jvp, &wrt).unwrap();
+        started.elapsed()
+    });
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
 }

@@ -70,6 +70,14 @@ const LAYER: &str = "WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val) + MAX(b.v
 const MAX_AND_MEAN: &str = "WITH g AS (SELECT o, MAX(val * val) AS m, AVG(sin(val)) AS a \
                             FROM w GROUP BY o) SELECT SUM(m * a + a * a) AS loss FROM g";
 
+/// A residual connection: a layer read twice, which a producer may share
+/// through a `ReferenceRel` rather than write out at each read.
+const RESIDUAL: &str = "WITH h AS (SELECT x.n, w.o, tanh(SUM(x.v * w.val)) AS y \
+                        FROM x JOIN w ON x.i = w.i GROUP BY x.n, w.o), \
+                        r AS (SELECT a.n, a.o, a.y + a.y * b.y AS z \
+                        FROM h a JOIN h b ON a.n = b.n AND a.o = b.o) \
+                        SELECT SUM(z * z) AS loss FROM r";
+
 /// The losses, their tables and their `wrt` columns.
 fn cases() -> Vec<(&'static str, Vec<Table>, Vec<ColumnRef>)> {
     vec![
@@ -84,6 +92,11 @@ fn cases() -> Vec<(&'static str, Vec<Table>, Vec<ColumnRef>)> {
             ],
         ),
         (MAX_AND_MEAN, vec![w()], vec![ColumnRef::new("w", "val")]),
+        (
+            RESIDUAL,
+            vec![x(), w()],
+            vec![ColumnRef::new("x", "v"), ColumnRef::new("w", "val")],
+        ),
     ]
 }
 
@@ -183,14 +196,25 @@ async fn read(
     out
 }
 
+/// `loss`'s plan, and the same plan sharing each subtree two places read
+/// through a `ReferenceRel` (as DuckDB's producer writes a CTE read twice),
+/// if it has one: every composition must give the same numbers from both.
+async fn plans(ctx: &SessionContext, loss: &str) -> Vec<ddx_ad::substrait::proto::Plan> {
+    let plan = substrait_of(ctx, loss, true).await;
+    let dag = common::shared(&plan);
+    if common::shared_count(&dag) == 0 {
+        return vec![plan];
+    }
+    vec![plan, dag]
+}
+
 /// `H·v`, forward over reverse, with each tangent along seed 0.
 async fn forward_over_reverse(
     ctx: &SessionContext,
-    loss: &str,
+    plan: &ddx_ad::substrait::proto::Plan,
     wrt: &[ColumnRef],
 ) -> BTreeMap<String, BTreeMap<Vec<i64>, Vec<f64>>> {
-    let plan = substrait_of(ctx, loss, true).await;
-    let hvp = ddx_ad::jvp(&ddx_ad::grad(&plan, wrt).unwrap(), wrt).unwrap();
+    let hvp = ddx_ad::jvp(&ddx_ad::grad(plan, wrt).unwrap(), wrt).unwrap();
     for input in &hvp.inputs {
         register_tangent(ctx, input, 0.0).await;
     }
@@ -223,87 +247,96 @@ fn assert_close(
 
 #[tokio::test]
 async fn reverse_over_forward_is_a_hessian_vector_product() {
+    let mut shared = 0;
     for (loss, tables, wrt) in cases() {
         let ctx = setup(&tables).await;
-        let want = forward_over_reverse(&ctx, loss, &wrt).await;
-
-        let plan = substrait_of(&ctx, loss, true).await;
-        let jvp = ddx_ad::jvp(&plan, &wrt).unwrap();
-        let program = ddx_ad::vjp(&jvp, &wrt).unwrap_or_else(|e| panic!("vjp of a jvp: {e}"));
-        // The jvp's tangents first, then the vjp's cotangent.
-        assert_eq!(program.inputs.len(), jvp.inputs.len() + 1);
-        for (carried, input) in program.inputs.iter().zip(&jvp.inputs) {
-            assert_eq!(carried.name, input.name);
+        let want = forward_over_reverse(&ctx, &substrait_of(&ctx, loss, true).await, &wrt).await;
+        let plans = plans(&ctx, loss).await;
+        shared += plans.len() - 1;
+        for plan in plans {
+            assert_close(
+                &format!("jvp of grad of {loss}, shared or not"),
+                &forward_over_reverse(&ctx, &plan, &wrt).await,
+                &want,
+            );
+            let jvp = ddx_ad::jvp(&plan, &wrt).unwrap();
+            let program = ddx_ad::vjp(&jvp, &wrt).unwrap_or_else(|e| panic!("vjp of a jvp: {e}"));
+            // The jvp's tangents first, then the vjp's cotangent.
+            assert_eq!(program.inputs.len(), jvp.inputs.len() + 1);
+            for (carried, input) in program.inputs.iter().zip(&jvp.inputs) {
+                assert_eq!(carried.name, input.name);
+            }
+            for input in &jvp.inputs {
+                register_tangent(&ctx, input, 0.0).await;
+            }
+            // Cotangent 0 on the loss and 1 on its tangent: the gradient of the
+            // directional derivative ∇l·v, which is H·v.
+            let cotangent = program.inputs.last().unwrap();
+            assert_eq!(cotangent.columns, jvp.value.columns);
+            register_cotangent(&ctx, cotangent, &[0.0, 1.0]).await;
+            common::ad::run(&ctx, &program).await;
+            let got = read(&ctx, &program.gradients, &wrt, false).await;
+            assert_close(&format!("vjp of jvp of {loss}"), &got, &want);
         }
-        for input in &jvp.inputs {
-            register_tangent(&ctx, input, 0.0).await;
-        }
-        // Cotangent 0 on the loss and 1 on its tangent: the gradient of the
-        // directional derivative ∇l·v, which is H·v.
-        let cotangent = program.inputs.last().unwrap();
-        assert_eq!(cotangent.columns, jvp.value.columns);
-        register_cotangent(&ctx, cotangent, &[0.0, 1.0]).await;
-        common::ad::run(&ctx, &program).await;
-        let got = read(&ctx, &program.gradients, &wrt, false).await;
-        assert_close(&format!("vjp of jvp of {loss}"), &got, &want);
     }
+    assert!(shared > 0, "no case shares a subtree");
 }
 
 #[tokio::test]
 async fn forward_over_forward_is_a_second_directional_derivative() {
     for (loss, tables, wrt) in cases() {
         let ctx = setup(&tables).await;
-        let hv = forward_over_reverse(&ctx, loss, &wrt).await;
-
-        let plan = substrait_of(&ctx, loss, true).await;
-        let inner = ddx_ad::jvp(&plan, &wrt).unwrap();
-        let outer = ddx_ad::jvp(&inner, &wrt).unwrap_or_else(|e| panic!("jvp of a jvp: {e}"));
-        let n = inner.inputs.len();
-        assert_eq!(outer.inputs.len(), 2 * n, "v's tables, then u's");
-        // v along seed 0, as for H·v; u along seed 1.
-        for input in &outer.inputs[..n] {
-            register_tangent(&ctx, input, 0.0).await;
-        }
-        for input in &outer.inputs[n..] {
-            register_tangent(&ctx, input, 1.0).await;
-        }
-        ddx_datafusion::engine::execute(&ctx, &outer).await.unwrap();
-
-        // uᵀ (H v), from H·v and u's tables.
-        let mut want = 0.0;
-        for input in &outer.inputs[n..] {
-            let table = input.of.table().and_then(|t| t.last()).unwrap();
-            for r in rows(&ctx, &format!("SELECT * FROM {}", input.name)).await {
-                let key: Vec<i64> = r[..input.keys].iter().map(|&k| k as i64).collect();
-                let hv = &hv[table][&key];
-                want += r[input.keys..]
-                    .iter()
-                    .zip(hv)
-                    .map(|(u, h)| u * h)
-                    .sum::<f64>();
+        let hv = forward_over_reverse(&ctx, &substrait_of(&ctx, loss, true).await, &wrt).await;
+        for plan in plans(&ctx, loss).await {
+            let inner = ddx_ad::jvp(&plan, &wrt).unwrap();
+            let outer = ddx_ad::jvp(&inner, &wrt).unwrap_or_else(|e| panic!("jvp of a jvp: {e}"));
+            let n = inner.inputs.len();
+            assert_eq!(outer.inputs.len(), 2 * n, "v's tables, then u's");
+            // v along seed 0, as for H·v; u along seed 1.
+            for input in &outer.inputs[..n] {
+                register_tangent(&ctx, input, 0.0).await;
             }
+            for input in &outer.inputs[n..] {
+                register_tangent(&ctx, input, 1.0).await;
+            }
+            ddx_datafusion::engine::execute(&ctx, &outer).await.unwrap();
+
+            // uᵀ (H v), from H·v and u's tables.
+            let mut want = 0.0;
+            for input in &outer.inputs[n..] {
+                let table = input.of.table().and_then(|t| t.last()).unwrap();
+                for r in rows(&ctx, &format!("SELECT * FROM {}", input.name)).await {
+                    let key: Vec<i64> = r[..input.keys].iter().map(|&k| k as i64).collect();
+                    let hv = &hv[table][&key];
+                    want += r[input.keys..]
+                        .iter()
+                        .zip(hv)
+                        .map(|(u, h)| u * h)
+                        .sum::<f64>();
+                }
+            }
+            // The loss, ∇l·v, ∇l·u, and uᵀ H v, the tangent of ∇l·v along u.
+            let value = &outer.value;
+            assert_eq!(value.columns.len(), 4, "{:?}", value.columns);
+            let inner_tangent = &inner.value.tangents[0].tangent;
+            let second = value
+                .tangents
+                .iter()
+                .find(|t| t.column == *inner_tangent)
+                .expect("the inner tangent has a tangent");
+            let c = value
+                .columns
+                .iter()
+                .position(|n| *n == second.tangent)
+                .unwrap();
+            let got = rows(&ctx, &format!("SELECT * FROM {}", value.step)).await;
+            assert_eq!(got.len(), 1);
+            assert!(
+                (got[0][c] - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "uᵀHv of {loss}: {} vs {want}",
+                got[0][c]
+            );
         }
-        // The loss, ∇l·v, ∇l·u, and uᵀ H v, the tangent of ∇l·v along u.
-        let value = &outer.value;
-        assert_eq!(value.columns.len(), 4, "{:?}", value.columns);
-        let inner_tangent = &inner.value.tangents[0].tangent;
-        let second = value
-            .tangents
-            .iter()
-            .find(|t| t.column == *inner_tangent)
-            .expect("the inner tangent has a tangent");
-        let c = value
-            .columns
-            .iter()
-            .position(|n| *n == second.tangent)
-            .unwrap();
-        let got = rows(&ctx, &format!("SELECT * FROM {}", value.step)).await;
-        assert_eq!(got.len(), 1);
-        assert!(
-            (got[0][c] - want).abs() <= 1e-9 * want.abs().max(1.0),
-            "uᵀHv of {loss}: {} vs {want}",
-            got[0][c]
-        );
     }
 }
 
@@ -355,7 +388,8 @@ async fn grad_of_a_value_and_its_tangent_is_refused_as_not_a_loss() {
 async fn the_adapter_composes_from_sql() {
     let ctx = setup(&[w()]).await;
     let wrt = [ColumnRef::new("w", "val")];
-    let want = forward_over_reverse(&ctx, MAX_AND_MEAN, &wrt).await;
+    let want =
+        forward_over_reverse(&ctx, &substrait_of(&ctx, MAX_AND_MEAN, true).await, &wrt).await;
     let jvp = ad::jvp(&ctx, MAX_AND_MEAN, &wrt).await.unwrap();
     let program = ad::vjp(&ctx, &jvp, &wrt).await.unwrap();
     for input in &jvp.inputs {
