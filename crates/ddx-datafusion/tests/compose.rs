@@ -208,6 +208,23 @@ async fn plans(ctx: &SessionContext, loss: &str) -> Vec<ddx_ad::substrait::proto
     vec![plan, dag]
 }
 
+/// A run leaves no step a shared relation became (`{namespace}shared_{n}`):
+/// they are intermediate tables, which a run drops; its value and
+/// gradients stay for the reads that follow.
+fn assert_no_shared_steps(ctx: &SessionContext) {
+    let tables = ctx
+        .catalog("datafusion")
+        .unwrap()
+        .schema("public")
+        .unwrap()
+        .table_names();
+    let left: Vec<&String> = tables
+        .iter()
+        .filter(|t| t.starts_with("__ddx_") && t.contains("_shared_"))
+        .collect();
+    assert!(left.is_empty(), "shared steps left behind: {left:?}");
+}
+
 /// `H·v`, forward over reverse, with each tangent along seed 0.
 async fn forward_over_reverse(
     ctx: &SessionContext,
@@ -219,6 +236,7 @@ async fn forward_over_reverse(
         register_tangent(ctx, input, 0.0).await;
     }
     ddx_datafusion::engine::execute(ctx, &hvp).await.unwrap();
+    assert_no_shared_steps(ctx);
     read(ctx, &hvp.gradients, wrt, true).await
 }
 
@@ -275,6 +293,7 @@ async fn reverse_over_forward_is_a_hessian_vector_product() {
             assert_eq!(cotangent.columns, jvp.value.columns);
             register_cotangent(&ctx, cotangent, &[0.0, 1.0]).await;
             common::ad::run(&ctx, &program).await;
+            assert_no_shared_steps(&ctx);
             let got = read(&ctx, &program.gradients, &wrt, false).await;
             assert_close(&format!("vjp of jvp of {loss}"), &got, &want);
         }
@@ -300,6 +319,7 @@ async fn forward_over_forward_is_a_second_directional_derivative() {
                 register_tangent(&ctx, input, 1.0).await;
             }
             ddx_datafusion::engine::execute(&ctx, &outer).await.unwrap();
+            assert_no_shared_steps(&ctx);
 
             // uᵀ (H v), from H·v and u's tables.
             let mut want = 0.0;
