@@ -123,6 +123,15 @@ the query could (its tables' schemas, its views' definitions), so a backend
 without that method gets nothing kept. `ddxdb.ad.sql` and `Context.sql` keep
 programs for each context this way on their own.
 
+A loss may read a view whose layers read each other more than once, as a
+model defined with `CREATE VIEW` does. A backend with a `view_sql(name)` method
+returns the view's SQL. ddxdb then writes the view into the loss as CTEs, so
+each layer is planned once rather than copied at every read.
+`DataFusionBackend` reads the SQL from DataFusion's information schema. The
+information schema is on in a bare `SessionContext()`. A context made from its
+own `SessionConfig` needs `.with_information_schema(True)`; without it, ddxdb
+warns and leaves the view to the engine.
+
 ## What you can write
 
 Inside the loss: `+ - * /`; the chain rule for the trig / inverse-trig / exp /

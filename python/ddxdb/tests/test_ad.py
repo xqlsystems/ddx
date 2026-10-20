@@ -650,6 +650,26 @@ def test_a_view_without_sql_is_left_to_the_engine(ad, ctx):
     assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
+def test_a_view_in_a_context_without_information_schema_warns(ad):
+    import datafusion
+
+    c = datafusion.SessionContext(datafusion.SessionConfig())
+    c.register_record_batches("w", [table([0, 1, 2], [1.0, -2.0, 0.5]).to_batches()])
+    c.sql("CREATE VIEW squares AS SELECT i, val * val AS v FROM w").collect()
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM squares) SELECT i, grad(loss, val) FROM w"
+    with pytest.warns(UserWarning, match="information_schema"):
+        assert pairs(ad.sql(c, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    # A table is not a view: nothing to warn of.
+    import warnings
+
+    c2 = datafusion.SessionContext(datafusion.SessionConfig())
+    c2.register_record_batches("w", [table([0, 1, 2], [1.0, -2.0, 0.5]).to_batches()])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+        assert pairs(ad.sql(c2, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
 def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
     # `v` in a query is public.v, a table; other.v is a view of that name,
     # and DataFusion does not read it for `v`.

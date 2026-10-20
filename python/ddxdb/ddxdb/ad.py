@@ -66,6 +66,7 @@ Importing this module requires DataFusion.
 from __future__ import annotations
 
 import re
+import warnings
 import weakref
 from typing import NamedTuple, Optional, Sequence, Union
 
@@ -251,15 +252,21 @@ class DataFusionBackend:
         parts = _name_parts(name)
         if parts is None or not 1 <= len(parts) <= 3:
             return None
-        settings = dict(
-            (r["name"], r["value"])
-            for r in self.ctx.sql(
-                "SELECT name, value FROM information_schema.df_settings WHERE name IN "
-                "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema')"
+        try:
+            settings = dict(
+                (r["name"], r["value"])
+                for r in self.ctx.sql(
+                    "SELECT name, value FROM information_schema.df_settings WHERE name IN "
+                    "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema')"
+                )
+                .to_arrow_table()
+                .to_pylist()
             )
-            .to_arrow_table()
-            .to_pylist()
-        )
+        except Exception:
+            # The information schema is off: the view's SQL can't be read,
+            # and it is left to the engine.
+            _warn_if_view(self.ctx, parts)
+            return None
         default = [
             settings["datafusion.catalog.default_catalog"],
             settings["datafusion.catalog.default_schema"],
@@ -290,6 +297,33 @@ class DataFusionBackend:
 
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
+
+
+_warned: "weakref.WeakSet[SessionContext]" = weakref.WeakSet()
+
+
+def _warn_if_view(ctx: SessionContext, parts: list) -> None:
+    """Warns, once per context, that a view is left to the engine because
+    the information schema that holds its SQL is off. The name is resolved
+    against DataFusion's default catalog and schema, which can't be read
+    without it; a view it misses only goes unwarned."""
+    if ctx in _warned:
+        return
+    catalog, schema, table = ["datafusion", "public"][: 3 - len(parts)] + parts
+    try:
+        kind = ctx.catalog(catalog).schema(schema).table(table).kind
+    except Exception:
+        return
+    if kind == "view":
+        _warned.add(ctx)
+        warnings.warn(
+            f"ddxdb can't read the SQL of view {'.'.join(parts)!r}, because this "
+            "SessionContext has no information_schema, so the view is planned as "
+            "the engine expands it: a view that reads its layers more than once "
+            "is copied that many times. Create the context with "
+            "SessionConfig().with_information_schema(True).",
+            stacklevel=2,
+        )
 
 
 #: One part of a table name: quoted, with ``""`` for a quote inside it, or

@@ -207,8 +207,18 @@ impl Views {
         for (_, c) in &hoisted {
             reads.extend(names(&*c.query));
         }
+        // Nor is a name a CTE nested in it has, at any depth: that read may
+        // be of the CTE, and renaming it would read the catalog instead.
+        let mut nested = Vec::new();
+        let _ = query.visit(&mut Defined(&mut nested));
+        for (_, c) in &hoisted {
+            let _ = c.query.visit(&mut Defined(&mut nested));
+        }
         reads.retain(|n| match n.0.as_slice() {
-            [ObjectNamePart::Identifier(id)] => !hoisted_names.contains(&id.value),
+            [ObjectNamePart::Identifier(id)] => {
+                !hoisted_names.contains(&id.value)
+                    && !nested.iter().any(|d| d.eq_ignore_ascii_case(&id.value))
+            }
             _ => true,
         });
         for read in reads {
@@ -374,6 +384,27 @@ mod tests {
             Poll::Ready(out) => out,
             Poll::Pending => unreachable!("a stub backend never waits"),
         }
+    }
+
+    #[test]
+    fn a_name_a_cte_nested_in_a_view_has_is_not_read_as_a_view() {
+        // x is a view, but v's subquery defines a CTE x and reads that.
+        let got = expanded(
+            vec![
+                (
+                    "v",
+                    "CREATE VIEW v AS SELECT * FROM (WITH x AS (SELECT 1 AS c) SELECT c FROM x) s",
+                ),
+                ("x", "CREATE VIEW x AS SELECT 2 AS c"),
+            ],
+            "SELECT * FROM v",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            "WITH \"__ddx_view_0\" AS (SELECT * FROM (WITH x AS (SELECT 1 AS c) SELECT c FROM x) s) \
+             SELECT * FROM \"__ddx_view_0\" AS v"
+        );
     }
 
     #[test]
