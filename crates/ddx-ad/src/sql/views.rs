@@ -64,7 +64,7 @@ pub(super) async fn expand<B: Backend>(backend: &mut B, query: &Query) -> Option
     let mut out = query.clone();
     let mut body_names = names(&out);
     body_names.retain(|n| !views.is_cte(n));
-    if body_names.iter().any(reserved) {
+    if body_names.iter().any(reserved) || ambiguous(&body_names) {
         return None;
     }
     let mut any = false;
@@ -155,6 +155,15 @@ impl Views {
         let sql = backend.view_sql(&key).await.ok().flatten()?;
         let (mut query, columns) = definition(&sql)?;
         if names(&query).iter().any(reserved) {
+            self.clash = true;
+            return None;
+        }
+        // Each CTE's query is visited apart, as each is renamed apart.
+        let mut each = vec![names(&query)];
+        if let Some(w) = &query.with {
+            each.extend(w.cte_tables.iter().map(|c| names(&*c.query)));
+        }
+        if each.iter().any(|n| ambiguous(n)) {
             self.clash = true;
             return None;
         }
@@ -334,6 +343,17 @@ fn reserved(name: &ObjectName) -> bool {
     }
 }
 
+/// Whether two of `names` are alike but for case (`Model` and `model`). An
+/// engine may resolve them to two tables, where a rename would take both
+/// for one.
+fn ambiguous(names: &[ObjectName]) -> bool {
+    names.iter().enumerate().any(|(i, a)| {
+        names[i + 1..]
+            .iter()
+            .any(|b| same(a, b) && a.to_string() != b.to_string())
+    })
+}
+
 /// Pushes the name of every CTE in what it visits.
 struct Defined<'a>(&'a mut Vec<String>);
 
@@ -434,6 +454,21 @@ mod tests {
             "WITH \"__ddx_view_0\" AS (SELECT * FROM (WITH x AS (SELECT 1 AS c) SELECT c FROM x) s) \
              SELECT * FROM \"__ddx_view_0\" AS v"
         );
+    }
+
+    #[test]
+    fn names_alike_but_for_case_leave_the_objective_to_the_engine() {
+        // With case kept, `Model` and `model` may be two views; a rename
+        // would read one for both.
+        let views = || {
+            vec![
+                ("Model", "CREATE VIEW Model AS SELECT 1 AS x"),
+                ("model", "CREATE VIEW model AS SELECT 2 AS x"),
+                ("v", "CREATE VIEW v AS SELECT * FROM Model, model"),
+            ]
+        };
+        assert_eq!(expanded(views(), "SELECT * FROM Model, model"), None);
+        assert_eq!(expanded(views(), "SELECT * FROM v"), None);
     }
 
     #[test]
