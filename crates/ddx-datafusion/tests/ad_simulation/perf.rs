@@ -441,12 +441,14 @@ async fn agree(
             }
         }
         Err(e) => {
-            // Planned whole, the loss is what the soak's base case is; a
-            // spelling the engine refuses or ddx refuses is not a finding.
-            out.engine.push(format!(
-                "{label}: the oracle refused: {}",
-                short(&e.to_string())
-            ));
+            // A spelling the engine or ddx may refuse is not a finding; an
+            // internal error or invalid plan is.
+            match classify(e) {
+                Refusal::Bug(b) => out.fail(format!("[{label}] the oracle: {b}\n  {query}")),
+                Refusal::Allowed(why) => out
+                    .engine
+                    .push(format!("{label}: the oracle refused: {why}")),
+            }
             return Ok(false);
         }
     };
@@ -584,6 +586,14 @@ async fn shared_checks(
             }
         };
         out.meta_compared += 1;
+        if want.gradients.len() != got.gradients.len() {
+            out.fail(format!(
+                "[perf-shared-{what}] {} gradients, the tree's {}\n  {label}",
+                got.gradients.len(),
+                want.gradients.len()
+            ));
+            continue;
+        }
         let tables = std::iter::once((&want.output, &got.output))
             .chain(want.gradients.iter().zip(&got.gradients));
         for (w, g) in tables {
