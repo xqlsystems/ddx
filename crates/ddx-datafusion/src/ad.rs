@@ -290,7 +290,7 @@ pub(crate) async fn refuse_replaced_tables(ctx: &SessionContext, plan: &LogicalP
         Some(name) => Err(to_df_err(AdError::NotImplemented(format!(
             "the query reads a view made over a table `{name}` that has since been \
              registered again: DataFusion's view still reads the old table, while ddx \
-             would read the new one (ddx issue #172). Create the view again after \
+             would read the new one. Create the view again after \
              registering what it reads"
         )))),
         None => Ok(()),

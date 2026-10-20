@@ -51,7 +51,7 @@ async fn replace_x(ctx: &SessionContext) {
 fn is_refusal(e: &DataFusionError) -> bool {
     // ddx's refusal, however DataFusion wraps it.
     let m = e.to_string();
-    m.contains("registered again") && m.contains("#172")
+    m.contains("registered again") && m.contains("Create the view again")
 }
 
 async fn pairs(ctx: &SessionContext, sql: &str) -> Result<Vec<(i64, f64)>, DataFusionError> {
