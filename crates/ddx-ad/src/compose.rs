@@ -583,7 +583,6 @@ pub(crate) fn redeclare_rel(
                 for m in a.measures.iter_mut() {
                     if let Some(f) = m.measure.as_mut() {
                         f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
-                        redeclare_args(&mut f.arguments, from, renamed, ext)?;
                         for s in f.sorts.iter_mut() {
                             if let Some(e) = s.expr.as_mut() {
                                 redeclare_expr(e, from, renamed, ext)?;

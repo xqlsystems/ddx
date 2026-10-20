@@ -444,6 +444,57 @@ pub fn children(e: &Expression) -> Vec<&Expression> {
     out
 }
 
+/// [`children`] of an expression of kind `rex`, mutably.
+pub(crate) fn rex_children_mut(rex: &mut RexType) -> Vec<&mut Expression> {
+    let mut out = Vec::new();
+    fn args<'e>(a: &'e mut [FunctionArgument], out: &mut Vec<&'e mut Expression>) {
+        for x in a {
+            if let Some(ArgType::Value(v)) = x.arg_type.as_mut() {
+                out.push(v);
+            }
+        }
+    }
+    match rex {
+        RexType::ScalarFunction(s) => {
+            args(&mut s.arguments, &mut out);
+            #[allow(deprecated)]
+            out.extend(s.args.iter_mut());
+        }
+        RexType::WindowFunction(w) => {
+            args(&mut w.arguments, &mut out);
+            #[allow(deprecated)]
+            out.extend(w.args.iter_mut());
+            out.extend(w.partitions.iter_mut());
+            out.extend(w.sorts.iter_mut().filter_map(|s| s.expr.as_mut()));
+        }
+        RexType::IfThen(it) => {
+            for c in it.ifs.iter_mut() {
+                out.extend(c.r#if.iter_mut());
+                out.extend(c.then.iter_mut());
+            }
+            out.extend(it.r#else.as_deref_mut());
+        }
+        RexType::SwitchExpression(sw) => {
+            out.extend(sw.r#match.as_deref_mut());
+            out.extend(sw.ifs.iter_mut().filter_map(|c| c.then.as_mut()));
+            out.extend(sw.r#else.as_deref_mut());
+        }
+        RexType::SingularOrList(sl) => {
+            out.extend(sl.value.as_deref_mut());
+            out.extend(sl.options.iter_mut());
+        }
+        RexType::MultiOrList(ml) => {
+            out.extend(ml.value.iter_mut());
+            for rec in ml.options.iter_mut() {
+                out.extend(rec.fields.iter_mut());
+            }
+        }
+        RexType::Cast(c) => out.extend(c.input.as_deref_mut()),
+        _ => {}
+    }
+    out
+}
+
 /// Does `e`, or any expression inside it, satisfy `pred`?
 pub fn contains(e: &Expression, pred: &dyn Fn(&Expression) -> bool) -> bool {
     pred(e) || children(e).into_iter().any(|c| contains(c, pred))
