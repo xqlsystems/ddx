@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.2...ddx-ad-v0.2.3) - 2026-10-20
+
+### Fixed
+
+- *(ddx-ad)* count a near-tie at MAX or MIN in jvp as grad does ([#180](https://github.com/xqlsystems/ddx/pull/180))
+- *(ddx-ad)* give a join with no condition the condition true ([#174](https://github.com/xqlsystems/ddx/pull/174))
+
+### Other
+
+- *(ddx-ad)* walk plans with optics, each walk said once ([#177](https://github.com/xqlsystems/ddx/pull/177))
+- *(ddx-ad)* write the views an objective reads as its CTEs ([#169](https://github.com/xqlsystems/ddx/pull/169))
+- *(ddx-ad)* plan each CTE an objective reads more than once on its own ([#168](https://github.com/xqlsystems/ddx/pull/168))
+- *(ddx-ad)* forward mode and composition over shared relations ([#167](https://github.com/xqlsystems/ddx/pull/167))
+- *(ddx-ad)* lower a relation shared through ReferenceRel once ([#166](https://github.com/xqlsystems/ddx/pull/166))
+- *(ddx-ad)* find repeated aggregates by structural id, not encoding ([#165](https://github.com/xqlsystems/ddx/pull/165))
+- *(ddx-ad)* keep the SQL surface's programs between calls ([#164](https://github.com/xqlsystems/ddx/pull/164))
+- *(ddx-ad)* contract through masks and sides of several inputs ([#162](https://github.com/xqlsystems/ddx/pull/162))
+
 ## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.1...ddx-ad-v0.2.2) - 2026-10-18
 
 ### Changed
