@@ -11,23 +11,15 @@ Entries below the first release are maintained automatically by
 
 ## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.2...ddx-datafusion-v0.2.3) - 2026-10-20
 
+### Changed
+
+- Implements `Backend::plan_key`, the plan before optimization with its schemas, so `rewrite` reuses a program while the plan it was built from still holds ([#164](https://github.com/xqlsystems/ddx/pull/164)), and `Backend::view_sql`, a view's definition, so a view's CTEs are planned once ([#169](https://github.com/xqlsystems/ddx/pull/169))
+- ddx-ad 0.2.3's faster gradients: causal attention's contractions ([#162](https://github.com/xqlsystems/ddx/pull/162)), programs kept between calls ([#164](https://github.com/xqlsystems/ddx/pull/164)), CTEs read more than once differentiated once ([#165](https://github.com/xqlsystems/ddx/pull/165)–[#169](https://github.com/xqlsystems/ddx/pull/169)), and plan walks written once ([#177](https://github.com/xqlsystems/ddx/pull/177))
+
 ### Fixed
 
-- *(ddx-ad)* count a near-tie at MAX or MIN in jvp as grad does ([#180](https://github.com/xqlsystems/ddx/pull/180))
-- *(ddx-datafusion)* refuse a view over a table registered again since the view was made ([#175](https://github.com/xqlsystems/ddx/pull/175))
-- *(ddx-ad)* give a join with no condition the condition true ([#174](https://github.com/xqlsystems/ddx/pull/174))
-
-### Other
-
-- *(ddx-ad)* walk plans with optics, each walk said once ([#177](https://github.com/xqlsystems/ddx/pull/177))
-- *(ddx-datafusion)* read a constant loss's missing tangent as 0 in the jvp soak ([#178](https://github.com/xqlsystems/ddx/pull/178))
-- *(ddx-datafusion)* fuzz the SQL surface's fast paths ([#173](https://github.com/xqlsystems/ddx/pull/173))
-- *(ddx-ad)* write the views an objective reads as its CTEs ([#169](https://github.com/xqlsystems/ddx/pull/169))
-- *(ddx-ad)* plan each CTE an objective reads more than once on its own ([#168](https://github.com/xqlsystems/ddx/pull/168))
-- *(ddx-ad)* forward mode and composition over shared relations ([#167](https://github.com/xqlsystems/ddx/pull/167))
-- *(ddx-ad)* lower a relation shared through ReferenceRel once ([#166](https://github.com/xqlsystems/ddx/pull/166))
-- *(ddx-ad)* keep the SQL surface's programs between calls ([#164](https://github.com/xqlsystems/ddx/pull/164))
-- *(ddx-ad)* contract through masks and sides of several inputs ([#162](https://github.com/xqlsystems/ddx/pull/162))
+- A query that reads a view made over a table registered again since is refused: DataFusion's view still reads the old table, while ddx would read the new one ([#175](https://github.com/xqlsystems/ddx/pull/175))
+- ddx-ad 0.2.3's fixes: `jvp` at a near-tie of `MAX` or `MIN` ([#180](https://github.com/xqlsystems/ddx/pull/180)), and a semi or anti join with no condition ([#174](https://github.com/xqlsystems/ddx/pull/174))
 
 ## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.1...ddx-datafusion-v0.2.2) - 2026-10-18
 
