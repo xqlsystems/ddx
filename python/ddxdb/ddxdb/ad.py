@@ -246,11 +246,12 @@ class DataFusionBackend:
         return self.ctx.sql(sql).logical_plan().display_indent_schema()
 
     def view_sql(self, name: str) -> Optional[str]:
-        # DataFusion keeps the SQL of a view created from SQL, and lists it in
-        # its information schema; a view registered from a DataFrame has none.
-        # A name of one or two parts is resolved as DataFusion resolves it, in
-        # the session's default catalog and schema, and an unquoted part in
-        # lower case only if the session normalizes them.
+        """The SQL of the view ``name``, read from DataFusion's information
+        schema. The information schema is on in a bare ``SessionContext()``;
+        a context made from its own ``SessionConfig`` needs
+        ``.with_information_schema(True)``, or every view is left to the
+        engine, with a warning. A view registered from a DataFrame has no
+        SQL, and is left to the engine too."""
         try:
             settings = dict(
                 (r["name"], r["value"])
@@ -262,30 +263,29 @@ class DataFusionBackend:
                 .to_arrow_table()
                 .to_pylist()
             )
-        except Exception:
-            # The information schema is off: the view's SQL can't be read,
-            # and it is left to the engine.
+        except ValueError:
+            # DataFusion raises ValueError for a table it can't find: here,
+            # the information schema is off.
             parts = _name_parts(name)
             if parts is not None and 1 <= len(parts) <= 3:
                 _warn_if_view(self.ctx, parts)
             return None
+        # A name is resolved as DataFusion resolves it: an unquoted part in
+        # lower case only if the session normalizes them.
         normalize = settings["datafusion.sql_parser.enable_ident_normalization"] == "true"
         parts = _name_parts(name, normalize)
         if parts is None or not 1 <= len(parts) <= 3:
             return None
-        default = [
+        defaults = [
             settings["datafusion.catalog.default_catalog"],
             settings["datafusion.catalog.default_schema"],
         ]
-        # The parts a name leaves out are the defaults: `t` is in the default
-        # catalog and schema, `s.t` in the default catalog.
-        catalog, schema, table = default[: 3 - len(parts)] + parts
-        quote = lambda v: "'" + v.replace("'", "''") + "'"  # noqa: E731
+        catalog, schema, table = _qualified(parts, defaults)
         rows = (
             self.ctx.sql(
-                "SELECT definition FROM information_schema.views WHERE "
-                f"table_catalog = {quote(catalog)} AND table_schema = {quote(schema)} "
-                f"AND table_name = {quote(table)}"
+                "SELECT definition FROM information_schema.views "
+                "WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3",
+                param_values={"1": catalog, "2": schema, "3": table},
             )
             .to_arrow_table()
             .column(0)
@@ -296,17 +296,16 @@ class DataFusionBackend:
         # DataFusion keeps the plan a view was made with, so once a view it
         # reads is redefined, its SQL means something else than what runs.
         # The SQL is given only if its query, read in the view's place,
-        # plans as reading the view does, under the projection and alias
-        # each puts on top.
+        # plans as reading the view does.
         probe = _view_probe(rows[0])
         if probe is None:
             return None
-        under = lambda sql: (  # noqa: E731
-            self.ctx.sql(sql).logical_plan().inputs()[0].inputs()[0].display_indent_schema()
-        )
         try:
-            same = under(f"SELECT * FROM {name}") == under(probe)
-        except Exception:
+            same = _plan_under_alias(self.ctx, f"SELECT * FROM {name}") == _plan_under_alias(
+                self.ctx, probe
+            )
+        except ValueError:
+            # The view's tables, or its SQL's, no longer plan.
             return None
         return rows[0] if same else None
 
@@ -322,6 +321,21 @@ class DataFusionBackend:
         self.ctx.deregister_table(name)
 
 
+def _plan_under_alias(ctx: SessionContext, sql: str) -> str:
+    """The plan of ``sql``, a ``SELECT *`` from one aliased relation, under
+    the projection and alias it puts on top: what that relation reads."""
+    return ctx.sql(sql).logical_plan().inputs()[0].inputs()[0].display_indent_schema()
+
+
+def _qualified(parts: list, defaults: list) -> list:
+    """A name of one to three parts as catalog, schema and table. A name
+    leaves out leading parts, which are taken from the front of
+    ``defaults``, the default catalog and schema: ``t`` is in both,
+    ``s.t`` in the default catalog."""
+    missing = 3 - len(parts)
+    return defaults[:missing] + parts
+
+
 _warned: "weakref.WeakSet[SessionContext]" = weakref.WeakSet()
 
 
@@ -332,12 +346,12 @@ def _warn_if_view(ctx: SessionContext, parts: list) -> None:
     without it; a view it misses only goes unwarned."""
     if ctx in _warned:
         return
-    catalog, schema, table = ["datafusion", "public"][: 3 - len(parts)] + parts
+    catalog, schema, table = _qualified(parts, ["datafusion", "public"])
     try:
-        kind = ctx.catalog(catalog).schema(schema).table(table).kind
-    except Exception:
+        tables = ctx.catalog(catalog).schema(schema)
+    except KeyError:
         return
-    if kind == "view":
+    if tables.table_exist(table) and tables.table(table).kind == "view":
         _warned.add(ctx)
         warnings.warn(
             f"ddxdb can't read the SQL of view {'.'.join(parts)!r}, because this "
