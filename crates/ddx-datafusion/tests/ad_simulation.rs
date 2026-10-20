@@ -51,6 +51,10 @@
 //!   user's tables are never touched.
 //! - **the SQL surface**: `grad(loss, t.val)` in SQL is the program's gradient,
 //!   and an SGD step written as a join is `θ − lr·∇L`.
+//! - **the fast paths**: planning a shared CTE once, writing views out as
+//!   CTEs, the program cache and shared relations (`ReferenceRel`) move no
+//!   gradient, under decoys, respellings and changes the cache must see
+//!   (see `ad_simulation/perf.rs`).
 //! - **shape**: one gradient row per table row, keyed by the table's dims,
 //!   DOUBLE, NULL exactly where the value is NULL.
 //!
@@ -107,6 +111,9 @@ mod jvp;
 
 #[path = "ad_simulation/sql.rs"]
 mod sql;
+
+#[path = "ad_simulation/perf.rs"]
+mod perf;
 
 // ---------------------------------------------------------------------------
 // Tables.
@@ -1934,6 +1941,9 @@ fn engine_fault(msg: &str) -> Option<String> {
         "EnforceDistribution",
         "EnforceSorting",
         "LimitPushdown",
+        // DataFusion's producer writes an uncorrelated EXISTS as a semi-join
+        // with no condition, which its consumer refuses (#171).
+        "join condition should not be empty",
     ];
     PHYSICAL
         .iter()
@@ -2425,6 +2435,7 @@ struct Props {
     cost: bool,
     jvp: bool,
     sql: bool,
+    perf: bool,
 }
 
 const ALL: Props = Props {
@@ -2441,6 +2452,7 @@ const ALL: Props = Props {
     cost: true,
     jvp: true,
     sql: true,
+    perf: true,
 };
 
 async fn check_case(seed: u64, props: Props) -> Outcome {
@@ -2872,6 +2884,10 @@ async fn check_case_inner(
 
     if props.sql {
         sql::sql_checks(rng, &ctx, case, l0, &grads, out).await?;
+    }
+
+    if props.perf {
+        perf::perf_checks(rng, case, &sql, &grads, out).await?;
     }
     Ok(())
 }
@@ -4740,6 +4756,7 @@ const NONE: Props = Props {
     cost: false,
     jvp: false,
     sql: false,
+    perf: false,
 };
 
 #[test]
@@ -4774,6 +4791,17 @@ fn sql_calls_are_their_programs() {
         13_000,
         seeds(),
         Props { sql: true, ..NONE },
+        seeds() / 3,
+    );
+}
+
+#[test]
+fn the_fast_paths_move_no_gradient() {
+    bounded(
+        "fast paths",
+        14_000,
+        seeds(),
+        Props { perf: true, ..NONE },
         seeds() / 3,
     );
 }
@@ -5053,7 +5081,7 @@ fn replay_one_seed() {
 
 /// The property groups a soak runs: all of them, or the comma-separated
 /// names in `DDX_AD_PROPS` (`fd,calculus,vjp,invariance,contract,surface,sql,
-/// shapes,names,train,exact,cost,jvp`), to spend a soak's budget on one surface.
+/// shapes,names,train,exact,cost,jvp,perf`), to spend a soak's budget on one surface.
 fn soak_props() -> Props {
     let Ok(names) = std::env::var("DDX_AD_PROPS") else {
         return ALL;
@@ -5073,6 +5101,7 @@ fn soak_props() -> Props {
         cost: on("cost"),
         jvp: on("jvp"),
         sql: on("sql"),
+        perf: on("perf"),
     }
 }
 
