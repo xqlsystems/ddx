@@ -120,10 +120,9 @@ fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<For
             for step in dag {
                 let primal = plan_of(step.rel, step.columns, &ext);
                 let mut dp = dual_plan(&primal, &ddx, &functions, ext, &mut sources)?;
-                sources.steps.insert(
-                    step.name.clone(),
-                    (step.name.clone(), dp.columns.clone(), dp.tans.clone()),
-                );
+                sources
+                    .steps
+                    .insert(step.name.clone(), dp.source(step.name.clone()));
                 steps.push(Step {
                     name: step.name,
                     plan: Unbound(std::mem::take(&mut dp.plan)),
@@ -186,10 +185,9 @@ fn jvp_of_steps(parts: &Parts, wrt: &[ColumnRef], options: &Options) -> Result<F
         if let Some(&of) = wanted.get(step.name.as_str()) {
             outputs.insert(step.name.clone(), output_of(&name, of.clone(), &dp)?);
         }
-        sources.steps.insert(
-            step.name.clone(),
-            (name.clone(), dp.columns.clone(), dp.tans.clone()),
-        );
+        sources
+            .steps
+            .insert(step.name.clone(), dp.source(name.clone()));
         steps.push(Step {
             name,
             plan: Unbound(std::mem::take(&mut dp.plan)),
@@ -228,8 +226,22 @@ struct DualPlan {
     /// For each of the plan's columns, its tangent: [`Tan::Col`] names one of
     /// `columns`.
     tans: Vec<Tan>,
+    /// For each of the plan's columns, its [`Dual::jitters`](crate::tangent::Dual::jitters).
+    jitters: Vec<bool>,
     /// The declarations the plan uses.
     ext: Extensions,
+}
+
+impl DualPlan {
+    /// Where a read of this dual, materialized as `dual`, gets its tangents.
+    fn source(&self, dual: String) -> Source {
+        Source::Step {
+            dual,
+            columns: self.columns.clone(),
+            tans: self.tans.clone(),
+            jitters: self.jitters.clone(),
+        }
+    }
 }
 
 /// `plan`'s dual as a plan: its columns, then the tangent of each that has
@@ -270,6 +282,7 @@ fn dual_plan(
         plan,
         columns,
         tans,
+        jitters: d.jitters,
         ext: dz.ext,
     })
 }
@@ -303,9 +316,9 @@ struct Sources<'a> {
     namespace: &'a str,
     tables: Vec<Table>,
     seen: BTreeSet<String>,
-    /// Each rewritten step, by its name in the program: its dual's name,
-    /// columns and tangents.
-    steps: HashMap<String, (String, Vec<String>, Vec<Tan>)>,
+    /// Each rewritten step, by its name in the program: where a read of it
+    /// gets its tangents, a [`Source::Step`].
+    steps: HashMap<String, Source>,
 }
 
 impl<'a> Sources<'a> {
@@ -326,12 +339,8 @@ impl<'a> Sources<'a> {
 
     fn source(&mut self, names: &[String], schema: Option<&NamedStruct>) -> Result<Option<Source>> {
         if let [name] = names {
-            if let Some((dual, columns, tans)) = self.steps.get(name) {
-                return Ok(Some(Source::Step {
-                    dual: dual.clone(),
-                    columns: columns.clone(),
-                    tans: tans.clone(),
-                }));
+            if let Some(step) = self.steps.get(name) {
+                return Ok(Some(step.clone()));
             }
         }
         self.seen.insert(names.join("."));

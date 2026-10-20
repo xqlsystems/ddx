@@ -30,8 +30,11 @@
 //! over reverse) is read from its own dual, already materialized.
 //!
 //! Nothing is recomputed and nothing is saved: values and tangents are
-//! computed together, in one pass, so a `MAX`'s attaining rows are compared
-//! with exactly the values the `MAX` saw, with no tolerance.
+//! computed together, in one pass. Still, a `MAX`'s attaining rows are
+//! found with reverse mode's test ([`crate::reduce::attains`]): within a
+//! few ulps where the argument is computed by a sum or a mean, whose last
+//! bits change from run to run, and exactly elsewhere. Each dual records
+//! which of its columns can change so ([`Dual::jitters`]).
 //!
 //! # NULL
 //!
@@ -67,10 +70,13 @@ use crate::expr::{
     as_field, as_number, call, cast, field, fields_of, fp64, if_then, lit_bool, lit_f64,
     map_fields, null_f64, scalar_args, uncorrelated_scalar,
 };
-use crate::forward::{apply_emit, grouping_expressions, input, read_outputs, rel_name, width};
+use crate::forward::{
+    apply_emit, grouping_expressions, input, read_outputs, rel_name, rounds_under, subquery_rounds,
+    width,
+};
 use crate::functions::{Extensions, Function, Functions};
 use crate::optics::{subqueries, Compose, Cosmos, Exprs, Fold, Inputs, Setter};
-use crate::reduce::{no_rule, reduce_rule, whole_partition, Linear, Reduce};
+use crate::reduce::{attains, no_rule, reduce_rule, whole_partition, Linear, Reduce};
 use crate::relation::Table;
 
 /// A column's tangent.
@@ -97,6 +103,11 @@ pub(crate) struct Dual {
     pub rel: Rel,
     pub width: usize,
     pub tans: Vec<Tan>,
+    /// For each of the relation's columns, whether its last bits can change
+    /// from run to run: whether it is computed by an aggregate, window or
+    /// subquery that rounds (see [`Functions::rounds`]), as reverse mode's
+    /// `jitters` decides it.
+    pub jitters: Vec<bool>,
 }
 
 /// Where a read of a named table gets its tangents.
@@ -112,6 +123,8 @@ pub(crate) enum Source {
         dual: String,
         columns: Vec<String>,
         tans: Vec<Tan>,
+        /// The step's [`Dual::jitters`].
+        jitters: Vec<bool>,
     },
 }
 
@@ -168,6 +181,7 @@ impl<'a> Dualizer<'a> {
                     rel: cur.clone(),
                     width,
                     tans: vec![Tan::Zero; width],
+                    jitters: vec![rounds_under(self.functions, cur)?; width],
                 };
             }
             let kind = cur
@@ -528,10 +542,12 @@ impl<'a> Dualizer<'a> {
         common: Option<&RelCommon>,
         width: usize,
         tans: Vec<Tan>,
+        jitters: Vec<bool>,
         build: impl FnOnce(Option<RelCommon>) -> Rel,
         direct_of: &dyn Fn(usize) -> usize,
     ) -> Result<Dual> {
         let outputs = apply_emit(common, (0..width).collect())?;
+        let out_jitters = outputs.iter().map(|&o| jitters[o]).collect();
         let mut emit: Vec<usize> = outputs.iter().map(|&o| direct_of(o)).collect();
         let n = outputs.len();
         let mut out_tans = Vec::with_capacity(n);
@@ -556,6 +572,7 @@ impl<'a> Dualizer<'a> {
             },
             width: n,
             tans: out_tans,
+            jitters: out_jitters,
         })
     }
 
@@ -609,12 +626,14 @@ impl<'a> Dualizer<'a> {
                     rel: project_emit(joined, exprs, Some(emit)),
                     width: outputs.len(),
                     tans,
+                    jitters: vec![false; outputs.len()],
                 })
             }
             Source::Step {
                 dual,
                 columns,
                 tans: step_tans,
+                jitters: step_jitters,
             } => {
                 // A read of a step names the columns it takes (a program's
                 // steps read only what they use), so each is found by name,
@@ -627,12 +646,14 @@ impl<'a> Dualizer<'a> {
                 let step_columns = &columns[..step_tans.len()];
                 let mut read_columns = named.clone();
                 let mut read_tans = Vec::with_capacity(named.len());
+                let mut read_jitters = Vec::with_capacity(named.len());
                 for n in &named {
                     let c = step_columns.iter().position(|x| x == n).ok_or_else(|| {
                         AdError::Internal(format!(
                             "a read of `{dual}` names a column `{n}` it lacks"
                         ))
                     })?;
+                    read_jitters.push(step_jitters[c]);
                     read_tans.push(match &step_tans[c] {
                         Tan::Col(j) => {
                             read_columns.push(columns[*j].clone());
@@ -661,6 +682,10 @@ impl<'a> Dualizer<'a> {
                     rel: select(base, emit),
                     width: outputs.len(),
                     tans,
+                    jitters: outputs
+                        .iter()
+                        .map(|&o| read_jitters.get(o).copied().unwrap_or(true))
+                        .collect(),
                 })
             }
         }
@@ -675,7 +700,14 @@ impl<'a> Dualizer<'a> {
         // they go in a second projection over this one.
         let mut deferred: Vec<(usize, Expression)> = Vec::new();
         let mut expr_tans: Vec<Tan> = Vec::with_capacity(m);
+        let mut jitters = d.jitters.clone();
         for (i, e) in p.expressions.iter().enumerate() {
+            // A window's value can change from run to run as reverse mode
+            // assumes it can, whatever its function.
+            jitters.push(match &e.rex_type {
+                Some(RexType::WindowFunction(_)) => true,
+                _ => self.jitters(e, &d.jitters),
+            });
             let tan = if let Some(c) = as_field(e) {
                 // A bare reference is its column, tangent and all.
                 match d.tans.get(c) {
@@ -684,7 +716,7 @@ impl<'a> Dualizer<'a> {
                     None => Tan::Zero,
                 }
             } else if let Some(RexType::WindowFunction(wf)) = &e.rex_type {
-                match self.window(wf, &d.tans, big + i)? {
+                match self.window(wf, &d.tans, &d.jitters, big + i)? {
                     WindowTan::Zero => Tan::Zero,
                     WindowTan::Refused(why) => Tan::Refused(why),
                     WindowTan::Now(t) => {
@@ -726,12 +758,19 @@ impl<'a> Dualizer<'a> {
         tans.extend(expr_tans);
         let direct_of = |o: usize| if o < w_in { o } else { big + (o - w_in) };
         let common = p.common.as_ref();
-        self.emitted(common, w_in + m, tans, |_| rel, &direct_of)
+        self.emitted(common, w_in + m, tans, jitters, |_| rel, &direct_of)
     }
 
     /// A window function's tangent, in a projection over a dual whose
-    /// tangents are `tans`; `at` is the window's own column.
-    fn window(&mut self, wf: &WindowFunction, tans: &[Tan], at: usize) -> Result<WindowTan> {
+    /// tangents are `tans` and [`Dual::jitters`] `jitters`; `at` is the
+    /// window's own column.
+    fn window(
+        &mut self,
+        wf: &WindowFunction,
+        tans: &[Tan],
+        jitters: &[bool],
+        at: usize,
+    ) -> Result<WindowTan> {
         let varied = |f: usize| tans.get(f).is_some_and(Tan::varied);
         let mut reads_varied = false;
         let args = value_args(&wf.arguments);
@@ -790,7 +829,8 @@ impl<'a> Dualizer<'a> {
         }
         // The rows attaining the extreme (the window's own column) share
         // the tangent, over the same partition.
-        let (f, counted) = self.counted(rule, arg, masked, field(at));
+        let tolerant = self.jitters(&arg, jitters);
+        let (f, counted) = self.counted(rule, arg, masked, field(at), tolerant);
         Ok(WindowTan::Later(crate::expr::window(
             f,
             vec![counted],
@@ -800,19 +840,21 @@ impl<'a> Dualizer<'a> {
 
     /// The function and argument of the aggregate that renders `rule`'s
     /// linear form: the tangents of the rows that count (`masked`, NULL on
-    /// the others), summed, or averaged when they share it.
+    /// the others), summed, or averaged when they share it. A row attains
+    /// `extreme` by [`attains`], within its tolerance if `tolerant`.
     fn counted(
         &mut self,
         rule: Linear,
         arg: Expression,
         masked: Expression,
         extreme: Expression,
+        tolerant: bool,
     ) -> (u32, Expression) {
         let counted = match rule.extreme {
             None => masked,
             Some(_) => {
-                let equal = self.ext.anchor(Function::Equal);
-                if_then(vec![(call(equal, vec![arg, extreme]), masked)], null_f64())
+                let attains = attains(&mut self.ext, arg, extreme, tolerant);
+                if_then(vec![(attains, masked)], null_f64())
             }
         };
         let f = self.ext.anchor(if rule.shared {
@@ -824,12 +866,13 @@ impl<'a> Dualizer<'a> {
     }
 
     fn filter(&mut self, f: &FilterRel, d: Dual) -> Result<Dual> {
-        let (w, tans) = (d.width, d.tans.clone());
+        let (w, tans, jitters) = (d.width, d.tans.clone(), d.jitters.clone());
         let condition = f.condition.clone();
         self.emitted(
             f.common.as_ref(),
             w,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Filter(Box::new(FilterRel {
                     common,
@@ -843,12 +886,13 @@ impl<'a> Dualizer<'a> {
     }
 
     fn sort(&mut self, s: &SortRel, d: Dual) -> Result<Dual> {
-        let (w, tans) = (d.width, d.tans.clone());
+        let (w, tans, jitters) = (d.width, d.tans.clone(), d.jitters.clone());
         let sorts = s.sorts.clone();
         self.emitted(
             s.common.as_ref(),
             w,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Sort(Box::new(SortRel {
                     common,
@@ -862,11 +906,12 @@ impl<'a> Dualizer<'a> {
     }
 
     fn fetch(&mut self, f: &FetchRel, d: Dual) -> Result<Dual> {
-        let (w, tans) = (d.width, d.tans.clone());
+        let (w, tans, jitters) = (d.width, d.tans.clone(), d.jitters.clone());
         self.emitted(
             f.common.as_ref(),
             w,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Fetch(Box::new(FetchRel {
                     common,
@@ -902,18 +947,23 @@ impl<'a> Dualizer<'a> {
                 .collect()
         };
         type Direct = Box<dyn Fn(usize) -> usize>;
-        let (width, tans, direct_of): (usize, Vec<Tan>, Direct) = match kind {
+        let (width, tans, jitters, direct_of): (usize, Vec<Tan>, Vec<bool>, Direct) = match kind {
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer => {
                 let mut tans = l.tans.clone();
                 tans.extend(right_tans(&r.tans));
                 (
                     wl + wr,
                     tans,
+                    [&l.jitters[..], &r.jitters[..]].concat(),
                     Box::new(move |o| if o < wl { o } else { big_l + (o - wl) }),
                 )
             }
-            JoinType::LeftSemi | JoinType::LeftAnti => (wl, l.tans.clone(), Box::new(|o| o)),
-            JoinType::RightSemi | JoinType::RightAnti => (wr, r.tans.clone(), Box::new(|o| o)),
+            JoinType::LeftSemi | JoinType::LeftAnti => {
+                (wl, l.tans.clone(), l.jitters.clone(), Box::new(|o| o))
+            }
+            JoinType::RightSemi | JoinType::RightAnti => {
+                (wr, r.tans.clone(), r.jitters.clone(), Box::new(|o| o))
+            }
             other => {
                 return Err(AdError::NotImplemented(format!(
                     "a {} join on the path from a wrt table to the output",
@@ -927,6 +977,7 @@ impl<'a> Dualizer<'a> {
             j.common.as_ref(),
             width,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Join(Box::new(JoinRel {
                     common,
@@ -952,11 +1003,13 @@ impl<'a> Dualizer<'a> {
             Tan::Col(c) => Tan::Col(big_l + c),
             other => other.clone(),
         }));
+        let jitters = [&l.jitters[..], &r.jitters[..]].concat();
         let (left, right) = (l.rel, r.rel);
         self.emitted(
             c.common.as_ref(),
             wl + wr,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Cross(Box::new(CrossRel {
                     common,
@@ -974,6 +1027,10 @@ impl<'a> Dualizer<'a> {
         let varied = |f: usize| d.tans.get(f).is_some_and(Tan::varied);
         let g = groupings.len();
         let mut tans: Vec<Tan> = Vec::new();
+        let mut jitters: Vec<bool> = groupings
+            .iter()
+            .map(|k| self.jitters(k, &d.jitters))
+            .collect();
         for k in &groupings {
             tans.push(if depends(self.functions, k, &varied)? {
                 Tan::Refused(AdError::NotImplemented(
@@ -994,7 +1051,8 @@ impl<'a> Dualizer<'a> {
         let base = d.rel_width();
         let m = a.measures.len();
         for measure in &a.measures {
-            let tan = self.measure(measure, &groupings, &d.tans, base, &mut windows);
+            jitters.push(self.measure_jitters(measure, &d.jitters));
+            let tan = self.measure(measure, &groupings, &d, base, &mut windows);
             tans.push(match tan {
                 Ok(Some(tm)) => {
                     tangent_measures.push(tm);
@@ -1057,6 +1115,7 @@ impl<'a> Dualizer<'a> {
             a.common.as_ref(),
             g + m,
             tans,
+            jitters,
             |common| Rel {
                 rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
                     common,
@@ -1070,17 +1129,18 @@ impl<'a> Dualizer<'a> {
         )
     }
 
-    /// A measure's tangent measure, or `None` when it has none. `windows`
-    /// collects the windows it reads, appended to the input after `base`
-    /// columns.
+    /// A measure's tangent measure over the aggregate's input `d`, or
+    /// `None` when it has none. `windows` collects the windows it reads,
+    /// appended to the input after `base` columns.
     fn measure(
         &mut self,
         measure: &Measure,
         groupings: &[Expression],
-        tans: &[Tan],
+        d: &Dual,
         base: usize,
         windows: &mut Vec<Expression>,
     ) -> Result<Option<Measure>> {
+        let tans = &d.tans[..];
         let f = measure
             .measure
             .as_ref()
@@ -1148,7 +1208,8 @@ impl<'a> Dualizer<'a> {
             }
         };
         let masked = self.masked(arg.clone(), t);
-        let (function_reference, counted) = self.counted(rule, arg, masked, extreme);
+        let tolerant = self.jitters(&arg, &d.jitters);
+        let (function_reference, counted) = self.counted(rule, arg, masked, extreme, tolerant);
         Ok(Some(Measure {
             measure: Some(AggregateFunction {
                 function_reference,
@@ -1159,6 +1220,30 @@ impl<'a> Dualizer<'a> {
             }),
             filter: None,
         }))
+    }
+
+    /// Can `e`, over columns whose [`Dual::jitters`] are `jitters`, change
+    /// in its last bits from run to run? If it reads a column that can, or
+    /// a subquery that rounds. Unknown, it can.
+    fn jitters(&self, e: &Expression, jitters: &[bool]) -> bool {
+        subquery_rounds(self.functions, e).unwrap_or(true)
+            || fields_of(e).map_or(true, |fields| {
+                fields
+                    .into_iter()
+                    .any(|c| jitters.get(c).copied().unwrap_or(true))
+            })
+    }
+
+    /// Can `measure`'s value change in its last bits from run to run? If
+    /// its function rounds, or it reads a value that can.
+    fn measure_jitters(&self, measure: &Measure, jitters: &[bool]) -> bool {
+        let Some(f) = &measure.measure else {
+            return true;
+        };
+        self.functions.rounds(f.function_reference).unwrap_or(true)
+            || value_args(&f.arguments)
+                .into_iter()
+                .any(|e| self.jitters(e, jitters))
     }
 
     fn set(&mut self, s: &SetRel) -> Result<Dual> {
@@ -1187,6 +1272,13 @@ impl<'a> Dualizer<'a> {
                     (_, Tan::Refused(why)) => out[c] = Tan::Refused(why.clone()),
                     (_, Tan::Col(_)) => out[c] = Tan::Col(0),
                 }
+            }
+        }
+        // A column can change from run to run if any input's can.
+        let mut jitters = vec![false; w];
+        for d in &duals {
+            for (j, &x) in jitters.iter_mut().zip(&d.jitters) {
+                *j |= x;
             }
         }
         let carried: Vec<usize> = (0..w).filter(|&c| matches!(out[c], Tan::Col(_))).collect();
@@ -1219,7 +1311,7 @@ impl<'a> Dualizer<'a> {
                 advanced_extension: None,
             })),
         };
-        self.emitted(s.common.as_ref(), w, out, |_| set, &|o| o)
+        self.emitted(s.common.as_ref(), w, out, jitters, |_| set, &|o| o)
     }
 }
 
