@@ -79,6 +79,7 @@
 
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::{ident, DataFrame, SessionContext};
@@ -185,7 +186,7 @@ impl sealed::Sealed for str {
     ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
         Box::pin(async move {
             let lp = ctx.sql(self).await?.into_optimized_plan()?;
-            Ok(sealed::Subject::Plan(substrait_of(ctx, &lp)?))
+            Ok(sealed::Subject::Plan(substrait_of(ctx, &lp).await?))
         })
     }
 }
@@ -206,7 +207,7 @@ impl sealed::Sealed for LogicalPlan {
         &'a self,
         ctx: &'a SessionContext,
     ) -> BoxFuture<'a, Result<sealed::Subject<'a>>> {
-        Box::pin(async move { Ok(sealed::Subject::Plan(substrait_of(ctx, self)?)) })
+        Box::pin(async move { Ok(sealed::Subject::Plan(substrait_of(ctx, self).await?)) })
     }
 }
 impl Differentiable for LogicalPlan {}
@@ -232,9 +233,68 @@ impl sealed::Sealed for ForwardProgram {
 impl Differentiable for ForwardProgram {}
 
 /// `plan` as Substrait, refused if the conversion would lose its meaning.
-pub(crate) fn substrait_of(ctx: &SessionContext, plan: &LogicalPlan) -> Result<Box<Plan>> {
+pub(crate) async fn substrait_of(ctx: &SessionContext, plan: &LogicalPlan) -> Result<Box<Plan>> {
     refuse_what_substrait_loses(plan)?;
+    refuse_replaced_tables(ctx, plan).await?;
     to_substrait_plan(plan, &ctx.state())
+}
+
+/// The first table `plan` reads that is no longer the one registered under
+/// its name, if any. A view keeps the tables it was made over: after one is
+/// registered again, reading the view reads the old one, while a Substrait
+/// plan names the table and its consumer reads the new one (ddx issue
+/// #172). A catalog that makes a new table each time it is asked cannot be
+/// told apart from one whose table was replaced, so a table is taken as
+/// replaced only if asking twice gives the same table, and not the one
+/// read.
+pub(crate) async fn replaced_table(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+) -> Result<Option<TableReference>> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::source_as_provider;
+    let mut scans = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            scans.push((scan.table_name.clone(), Arc::clone(&scan.source)));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let same = |a: &Arc<dyn datafusion::catalog::TableProvider>,
+                b: &Arc<dyn datafusion::catalog::TableProvider>| {
+        std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+    };
+    for (name, source) in scans {
+        // A source that is not a registered table's: nothing to compare.
+        let Ok(read) = source_as_provider(&source) else {
+            continue;
+        };
+        let Ok(now) = ctx.table_provider(name.clone()).await else {
+            return Ok(Some(name));
+        };
+        if same(&now, &read) {
+            continue;
+        }
+        let again = ctx.table_provider(name.clone()).await?;
+        if same(&now, &again) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Refuse a plan that reads a table no longer registered under its name
+/// (see [`replaced_table`]): ddx would differentiate the new one.
+pub(crate) async fn refuse_replaced_tables(ctx: &SessionContext, plan: &LogicalPlan) -> Result<()> {
+    match replaced_table(ctx, plan).await? {
+        Some(name) => Err(to_df_err(AdError::NotImplemented(format!(
+            "the query reads a view made over a table `{name}` that has since been \
+             registered again: DataFusion's view still reads the old table, while ddx \
+             would read the new one (ddx issue #172). Create the view again after \
+             registering what it reads"
+        )))),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a plan whose meaning DataFusion's Substrait producer does not
