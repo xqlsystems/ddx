@@ -60,7 +60,7 @@ use crate::elementwise::depends;
 use crate::emit;
 use crate::error::{AdError, Result};
 use crate::expr::{
-    as_field, children, contains, field, fields_of, if_then, lit_bool, map_fields,
+    as_field, children, contains, rex_children_mut, field, fields_of, if_then, lit_bool, map_fields,
     uncorrelated_scalar,
 };
 use crate::functions::Functions;
@@ -554,14 +554,46 @@ pub(crate) fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
     if let Some(RexType::Subquery(sq)) = &e.rex_type {
         match &sq.subquery_type {
             Some(SubqueryType::Scalar(s)) => out.extend(s.input.as_deref()),
-            Some(SubqueryType::InPredicate(s)) => out.extend(s.haystack.as_deref()),
+            Some(SubqueryType::InPredicate(s)) => {
+                out.extend(s.haystack.as_deref());
+                s.needles.iter().for_each(|n| subquery_rels(n, out));
+            }
             Some(SubqueryType::SetPredicate(s)) => out.extend(s.tuples.as_deref()),
-            Some(SubqueryType::SetComparison(s)) => out.extend(s.right.as_deref()),
+            Some(SubqueryType::SetComparison(s)) => {
+                out.extend(s.right.as_deref());
+                s.left.iter().for_each(|l| subquery_rels(l, out));
+            }
             None => {}
         }
     }
     for c in children(e) {
         subquery_rels(c, out);
+    }
+}
+
+/// [`subquery_rels`], mutably: the relations of the subqueries in `e`.
+pub(crate) fn subquery_rels_mut(e: &mut Expression) -> Vec<&mut Rel> {
+    use substrait::proto::expression::subquery::SubqueryType;
+    let Some(rex) = e.rex_type.as_mut() else {
+        return Vec::new();
+    };
+    let RexType::Subquery(sq) = rex else {
+        return rex_children_mut(rex).into_iter().flat_map(subquery_rels_mut).collect();
+    };
+    match sq.subquery_type.as_mut() {
+        Some(SubqueryType::Scalar(s)) => s.input.as_deref_mut().into_iter().collect(),
+        Some(SubqueryType::InPredicate(s)) => {
+            let mut out: Vec<&mut Rel> = s.haystack.as_deref_mut().into_iter().collect();
+            out.extend(s.needles.iter_mut().flat_map(subquery_rels_mut));
+            out
+        }
+        Some(SubqueryType::SetPredicate(s)) => s.tuples.as_deref_mut().into_iter().collect(),
+        Some(SubqueryType::SetComparison(s)) => {
+            let mut out: Vec<&mut Rel> = s.right.as_deref_mut().into_iter().collect();
+            out.extend(s.left.as_deref_mut().into_iter().flat_map(subquery_rels_mut));
+            out
+        }
+        None => Vec::new(),
     }
 }
 
@@ -2040,9 +2072,17 @@ pub(crate) fn rel_expressions_mut(kind: &mut RelType) -> Vec<&mut Expression> {
         }
         RelType::Sort(r) => r.sorts.iter_mut().filter_map(|s| s.expr.as_mut()).collect(),
         RelType::Aggregate(r) => {
-            let (g, ms) = (&mut r.grouping_expressions, &mut r.measures);
-            let mut out: Vec<&mut Expression> = g.iter_mut().collect();
-            out.extend(ms.iter_mut().filter_map(|m| m.filter.as_mut()));
+            let mut out: Vec<&mut Expression> = r.grouping_expressions.iter_mut().collect();
+            for m in r.measures.iter_mut() {
+                if let Some(f) = m.measure.as_mut() {
+                    for a in f.arguments.iter_mut() {
+                        if let Some(ArgType::Value(e)) = a.arg_type.as_mut() {
+                            out.push(e);
+                        }
+                    }
+                }
+                out.extend(m.filter.as_mut());
+            }
             out
         }
         RelType::Read(r) => {

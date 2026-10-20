@@ -37,6 +37,8 @@ use substrait::proto::{
 };
 
 use crate::error::{AdError, Result};
+use crate::expr::lit_bool;
+use crate::forward::{rel_expressions_mut, rel_inputs_mut, subquery_rels_mut};
 use crate::functions::Extensions;
 
 /// A read of every column of a table whose schema is known.
@@ -200,7 +202,8 @@ pub fn union_all(inputs: Vec<Rel>) -> Rel {
 }
 
 /// A plan whose root is `root`, with output columns named `names`.
-pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
+pub fn plan(mut root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
+    condition_joins(&mut root);
     Plan {
         version: Some(substrait::version::version_with_producer("ddx")),
         extension_urns: ext.urns(),
@@ -212,6 +215,30 @@ pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
             })),
         }],
         ..Default::default()
+    }
+}
+
+/// `root` with each join but an inner one that has no condition given the
+/// condition `true`, which means the same. DataFusion plans an `EXISTS` or
+/// `IN` whose subquery reads nothing of the outer row as such a semi or
+/// anti join, and its Substrait consumer refuses one with no condition
+/// (ddx issue #171).
+fn condition_joins(root: &mut Rel) {
+    let mut stack = vec![root];
+    while let Some(rel) = stack.pop() {
+        let Some(kind) = rel.rel_type.as_mut() else {
+            continue;
+        };
+        if let RelType::Join(j) = kind {
+            let typed = !matches!(j.r#type(), JoinType::Inner | JoinType::Unspecified);
+            if typed && j.expression.is_none() {
+                j.expression = Some(Box::new(lit_bool(true)));
+            }
+        }
+        for e in rel_expressions_mut(kind) {
+            subquery_rels_mut(e).into_iter().for_each(condition_joins);
+        }
+        stack.extend(rel_inputs_mut(kind));
     }
 }
 
@@ -374,6 +401,91 @@ mod tests {
                 nullability: r#type::Nullability::Nullable as i32,
             })),
         }
+    }
+
+    /// A join of `kind` with no condition.
+    fn bare_join(kind: JoinType) -> Rel {
+        let side = || Box::new(read_step("t", vec!["c".into()]));
+        Rel {
+            rel_type: Some(RelType::Join(Box::new(JoinRel {
+                left: Some(side()),
+                right: Some(side()),
+                r#type: kind as i32,
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// The conditions of the joins in `rel`, subqueries included, in the
+    /// order a depth-first walk meets them.
+    fn join_conditions(rel: &Rel) -> Vec<Option<Expression>> {
+        let mut out = Vec::new();
+        let mut stack = vec![rel];
+        while let Some(r) = stack.pop() {
+            let Some(kind) = &r.rel_type else { continue };
+            if let RelType::Join(j) = kind {
+                out.push(j.expression.as_deref().cloned());
+            }
+            for e in crate::forward::rel_expressions(kind) {
+                crate::forward::subquery_rels(e, &mut stack);
+            }
+            stack.extend(crate::forward::rel_inputs(kind));
+        }
+        out
+    }
+
+    #[test]
+    fn a_join_but_an_inner_one_with_no_condition_is_given_true_subqueries_included() {
+        use substrait::proto::expression::subquery::{InPredicate, Scalar, SubqueryType};
+        use substrait::proto::expression::nested::{self, NestedType};
+        use substrait::proto::expression::{Nested, RexType, Subquery};
+        use substrait::proto::function_argument::ArgType;
+        let subquery = |t: SubqueryType| Expression {
+            rex_type: Some(RexType::Subquery(Box::new(Subquery {
+                subquery_type: Some(t),
+            }))),
+        };
+        // An `IN` whose needle is a struct literal holding a subquery over a
+        // semi join.
+        let needle = Expression {
+            rex_type: Some(RexType::Nested(Nested {
+                nested_type: Some(NestedType::Struct(nested::Struct {
+                    fields: vec![subquery(SubqueryType::Scalar(Box::new(Scalar {
+                        input: Some(Box::new(bare_join(JoinType::LeftSemi))),
+                    })))],
+                })),
+                ..Default::default()
+            })),
+        };
+        let in_anti = subquery(SubqueryType::InPredicate(Box::new(InPredicate {
+            needles: vec![needle],
+            haystack: Some(Box::new(bare_join(JoinType::LeftAnti))),
+        })));
+        // ... as the argument of an aggregate over an inner join with none.
+        let aggregate = Rel {
+            rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(bare_join(JoinType::Inner))),
+                measures: vec![Measure {
+                    measure: Some(AggregateFunction {
+                        arguments: vec![FunctionArgument {
+                            arg_type: Some(ArgType::Value(in_anti)),
+                        }],
+                        ..Default::default()
+                    }),
+                    filter: None,
+                }],
+                ..Default::default()
+            }))),
+        };
+        let ext = Extensions::new(&Functions::default());
+        let p = plan(aggregate, vec!["s".into()], &ext);
+        let (root, _) = crate::forward::root_of(&p).unwrap();
+        // The inner join keeps no condition; the anti and semi joins in
+        // the subqueries get `true`.
+        assert_eq!(
+            join_conditions(root),
+            vec![None, Some(lit_bool(true)), Some(lit_bool(true))]
+        );
     }
 
     #[test]

@@ -715,3 +715,13 @@ def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
     assert backend.view_sql("other.v") is not None
     statement = "WITH loss AS (SELECT SUM(v.val * w.val) AS l FROM v JOIN w ON v.i = w.i) SELECT i, grad(loss, val) FROM w"
     assert pairs(ad.sql(ctx, statement)) == [(0, 1.0), (1, 1.0), (2, 1.0)]
+
+
+def test_a_subquery_with_no_condition_on_the_outer_row_is_differentiated(ad, ctx):
+    # DataFusion plans it as a semi join with no condition, which its
+    # Substrait consumer refuses unless ddx writes one (ddx issue #171).
+    statement = (
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM w WHERE EXISTS (SELECT 1 FROM b)) "
+        "SELECT i, grad(loss, val) FROM w"
+    )
+    assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
