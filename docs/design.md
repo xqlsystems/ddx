@@ -1403,7 +1403,12 @@ written into the objective as CTEs: its own CTEs under fresh names, then
 its query, all before the objective's own, so that a view's reads, which
 the engine resolves in its catalog, cannot reach one of them. A view with
 no SQL (one registered from a DataFrame), under a name a CTE also has, or
-whose SQL does not parse is left to the engine. What the split costs is the
+whose SQL does not parse is left to the engine. So is a view whose SQL no
+longer means what the engine runs: DataFusion keeps the plan a view was
+made with, so after a view it reads is redefined, its SQL reads the new
+one and the engine the old. Its backend gives the SQL only if the view's
+query, read in its place (`ddx_ad::view_probe`), plans as the view's kept
+plan. What the split costs is the
 optimizations across the pieces: a reader's filter is not pushed into a
 shared CTE, nor a column only some readers use pruned from it, as when
 DuckDB computes a CTE read twice once; ddx prunes the steps it writes, and

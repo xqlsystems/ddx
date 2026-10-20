@@ -130,6 +130,7 @@ use crate::run::{Backend, RunError};
 
 pub use cache::Programs;
 pub(crate) use rewrite::quote;
+pub use views::view_probe;
 
 /// What [`rewrite`] returns: the statements to run, and the tables their
 /// rewritten text reads, which the caller drops once it has planned (or run)

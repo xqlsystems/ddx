@@ -688,6 +688,22 @@ def test_a_view_s_name_is_resolved_with_the_session_s_case_rules(ad):
     assert "SELECT 2" in backend.view_sql("model")
 
 
+def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
+    # DataFusion keeps the plan outer_v was made with, which reads the first
+    # inner_v; its SQL now reads the second.
+    ctx.sql("CREATE VIEW inner_v AS SELECT i, val AS v FROM w").collect()
+    ctx.sql(
+        "CREATE VIEW outer_v AS WITH a AS (SELECT i, v FROM inner_v) "
+        "SELECT a.i, a.v * b.v AS v FROM a JOIN a b ON a.i = b.i"
+    ).collect()
+    backend = ad.DataFusionBackend(ctx)
+    assert backend.view_sql("outer_v") is not None
+    ctx.sql("CREATE OR REPLACE VIEW inner_v AS SELECT i, 3.0 * val AS v FROM w").collect()
+    assert backend.view_sql("outer_v") is None
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM outer_v) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
 def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
     # `v` in a query is public.v, a table; other.v is a view of that name,
     # and DataFusion does not read it for `v`.

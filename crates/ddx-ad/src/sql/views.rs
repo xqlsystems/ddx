@@ -20,13 +20,15 @@
 //! writing it out could change what a read means: under a name a CTE of
 //! the objective also has, with SQL that does not parse, or with a
 //! `WITH RECURSIVE` or a CTE name defined again inside it.
+//! The backend is trusted to give a view's SQL only while it still means
+//! what the engine runs for the view ([`crate::Backend::view_sql`]).
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, ObjectName, ObjectNamePart, Query, Statement, TableAlias, TableAliasColumnDef, Visit,
-    VisitMut, Visitor, With,
+    Cte, Ident, ObjectName, ObjectNamePart, Query, Statement, TableAlias, TableAliasColumnDef,
+    Visit, VisitMut, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
@@ -259,6 +261,24 @@ impl Views {
         self.written.insert(key, Some(alias.clone()));
         Some(alias)
     }
+}
+
+/// A query that reads the query of a view's SQL (see [`Backend::view_sql`])
+/// in the view's place, under its column list if it has one:
+/// `SELECT * FROM (<query>) AS __ddx_probe (<columns>)`. Its plan, under the
+/// projection and alias, is what an engine that keeps the plan a view was
+/// made with (as DataFusion does) would keep for the view if it were made
+/// now; a backend compares the two to tell whether the SQL still means what
+/// the engine runs. `None` if the SQL is not a view's.
+pub fn view_probe(sql: &str) -> Option<String> {
+    let (query, columns) = definition(sql)?;
+    let alias = TableAlias {
+        explicit: false,
+        name: Ident::new("__ddx_probe"),
+        columns,
+        at: None,
+    };
+    Some(format!("SELECT * FROM ({query}) AS {alias}"))
 }
 
 /// The query of a view's SQL, `CREATE VIEW … AS <query>` or the query

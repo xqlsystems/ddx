@@ -205,6 +205,11 @@ pub trait Backend: Send {
     /// [`crate::rewrite`] writes such a view into the objective as CTEs, so
     /// a model that is a view has the CTEs it reads more than once planned
     /// once each. `None`, the default, leaves every view to the engine.
+    /// The SQL must still mean what the engine runs for the view: an engine
+    /// that keeps the plan a view was made with, as DataFusion does, runs
+    /// the old definition of a view it reads after that view is redefined,
+    /// and its backend returns `None` for it ([`crate::view_probe`] helps
+    /// tell).
     fn view_sql(
         &mut self,
         name: &str,

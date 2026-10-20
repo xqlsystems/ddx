@@ -481,3 +481,50 @@ async fn a_view_s_name_is_resolved_with_the_session_s_case_rules() {
     let sql = backend.view_sql("model").await.unwrap().unwrap();
     assert!(sql.contains("SELECT 2"), "{sql}");
 }
+
+#[tokio::test]
+async fn a_view_that_reads_a_redefined_view_is_left_to_the_engine() {
+    // DataFusion keeps the plan `outer_v` was made with, which reads the
+    // first `inner_v`; its SQL now reads the second. The gradient is the
+    // engine's loss's, not the SQL's.
+    let ctx = w().await;
+    exec(&ctx, "CREATE VIEW inner_v AS SELECT i, val AS v FROM w").await;
+    exec(
+        &ctx,
+        "CREATE VIEW outer_v AS WITH a AS (SELECT i, v FROM inner_v) \
+         SELECT a.i, a.v * b.v AS v FROM a JOIN a b ON a.i = b.i",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE OR REPLACE VIEW inner_v AS SELECT i, 3.0 * val AS v FROM w",
+    )
+    .await;
+    let (got, log) = grad_of(&ctx, "WITH loss AS (SELECT SUM(v) AS l FROM outer_v)").await;
+    // d/dval of SUM(val^2) is 2 val.
+    assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
+    assert!(
+        !log.made.iter().any(|n| n.contains("cte_")),
+        "{:?}",
+        log.made
+    );
+}
+
+#[tokio::test]
+async fn a_view_with_a_column_list_is_written_out() {
+    // Its kept plan renames the query's columns; the probe must too.
+    let ctx = w().await;
+    exec(
+        &ctx,
+        "CREATE VIEW sq (j, s) AS WITH a AS (SELECT i, val FROM w) \
+         SELECT a.i, a.val * b.val FROM a JOIN a b ON a.i = b.i",
+    )
+    .await;
+    let (got, log) = grad_of(&ctx, "WITH loss AS (SELECT SUM(s) AS l FROM sq)").await;
+    assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
+    assert!(
+        log.made.iter().any(|n| n.contains("cte_")),
+        "{:?}",
+        log.made
+    );
+}

@@ -80,6 +80,7 @@ except ImportError as e:  # pragma: no cover - depends on the environment
 from ._ddxdb import (
     UnsupportedExpression,
     _not_in_subquery,
+    _view_probe,
 )
 from . import Backend, Programs, rewrite
 from ._ddxdb import (
@@ -290,7 +291,24 @@ class DataFusionBackend:
             .column(0)
             .to_pylist()
         )
-        return rows[0] if rows else None
+        if not rows or rows[0] is None:
+            return None
+        # DataFusion keeps the plan a view was made with, so once a view it
+        # reads is redefined, its SQL means something else than what runs.
+        # The SQL is given only if its query, read in the view's place,
+        # plans as reading the view does, under the projection and alias
+        # each puts on top.
+        probe = _view_probe(rows[0])
+        if probe is None:
+            return None
+        under = lambda sql: (  # noqa: E731
+            self.ctx.sql(sql).logical_plan().inputs()[0].inputs()[0].display_indent_schema()
+        )
+        try:
+            same = under(f"SELECT * FROM {name}") == under(probe)
+        except Exception:
+            return None
+        return rows[0] if same else None
 
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))

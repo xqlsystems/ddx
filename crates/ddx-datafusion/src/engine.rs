@@ -124,9 +124,31 @@ impl ddx_ad::Backend for DataFusion {
         let Ok(provider) = self.0.table_provider(reference).await else {
             return Ok(None);
         };
-        Ok(provider
-            .downcast_ref::<datafusion::catalog::view::ViewTable>()
-            .and_then(|v| v.definition().cloned()))
+        let Some(view) = provider.downcast_ref::<datafusion::catalog::view::ViewTable>() else {
+            return Ok(None);
+        };
+        let Some(sql) = view.definition() else {
+            return Ok(None);
+        };
+        // DataFusion keeps the plan a view was made with, so once a view it
+        // reads is redefined, its SQL means something else than what runs:
+        // its SQL is given only if it plans as the view's kept plan.
+        let Some(probe) = ddx_ad::view_probe(sql) else {
+            return Ok(None);
+        };
+        let Ok(now) = self.0.state().create_logical_plan(&probe).await else {
+            return Ok(None);
+        };
+        // Under the projection and alias of `SELECT * FROM (…) AS …`.
+        let inner = now
+            .inputs()
+            .first()
+            .and_then(|alias| alias.inputs().first().copied());
+        let same = inner.is_some_and(|now| {
+            now.display_indent_schema().to_string()
+                == view.logical_plan().display_indent_schema().to_string()
+        });
+        Ok(same.then(|| sql.clone()))
     }
 }
 
