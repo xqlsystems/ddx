@@ -252,6 +252,7 @@ pub(crate) async fn replaced_table(
     plan: &LogicalPlan,
 ) -> Result<Option<TableReference>> {
     use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::cte_worktable::CteWorkTable;
     use datafusion::datasource::source_as_provider;
     let mut scans = Vec::new();
     plan.apply_with_subqueries(|node| {
@@ -269,6 +270,11 @@ pub(crate) async fn replaced_table(
         let Ok(read) = source_as_provider(&source) else {
             continue;
         };
+        // A recursive CTE reads its own rows through a work table named
+        // after it, which no catalog holds.
+        if (read.as_ref() as &dyn std::any::Any).is::<CteWorkTable>() {
+            continue;
+        }
         let Ok(now) = ctx.table_provider(name.clone()).await else {
             return Ok(Some(name));
         };

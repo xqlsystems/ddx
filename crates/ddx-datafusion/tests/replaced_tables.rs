@@ -134,3 +134,22 @@ async fn a_table_registered_again_and_read_by_name_is_not_refused() {
         vec![(0, 100.0), (1, 200.0)]
     );
 }
+
+/// A recursive CTE reads its own rows through a work table named after
+/// it, which no catalog holds: that is not a table registered again.
+#[tokio::test]
+async fn a_recursive_cte_is_not_taken_for_a_table_registered_again() {
+    let ctx = replaced().await;
+    let r = "WITH RECURSIVE r AS (SELECT CAST(1 AS BIGINT) AS n UNION ALL \
+             SELECT n + 1 FROM r WHERE n < 3)";
+    exec(&ctx, &format!("CREATE VIEW rv AS {r} SELECT n FROM r")).await;
+    use ddx_ad::Backend;
+    let mut backend = ddx_datafusion::engine::DataFusion(ctx.clone());
+    assert!(backend.view_sql("rv").await.unwrap().is_some());
+    // DataFusion's Substrait producer refuses a recursive query; that, not
+    // this check, is what refuses its gradient.
+    let wrt = [ColumnRef::new("w", "val")];
+    let loss = format!("{r} SELECT SUM(w.val * r.n) AS l FROM w JOIN r ON w.i + 1 = r.n");
+    let err = ad::grad(&ctx, &loss, &wrt).await.unwrap_err();
+    assert!(!is_refusal(&err), "{err}");
+}
