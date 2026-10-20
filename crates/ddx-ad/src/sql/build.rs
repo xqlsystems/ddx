@@ -15,8 +15,8 @@ use ddx_core::sqlparser::ast::helpers::attached_token::AttachedToken;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectFlavor, SelectItem,
-    SetExpr, TableAlias, TableFactor, TableWithJoins, VisitMut, VisitorMut,
+    Cte, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectFlavor,
+    SelectItem, SetExpr, TableAlias, TableFactor, TableWithJoins, VisitMut, VisitorMut,
     WildcardAdditionalOptions, With,
 };
 use ddx_core::sqlparser::tokenizer::Span;
@@ -120,17 +120,23 @@ pub(super) fn quoted(name: &str) -> Ident {
 
 /// `node` with each table it reads that `to` names anew read under that
 /// name instead. A read with no alias keeps its old name, the last part,
-/// as one, so a column qualified by it (`model.v`) still resolves.
+/// as one, so a column qualified by it (`model.v`) still resolves, and a
+/// column qualified by all of a longer one (`public.model.v`) is qualified
+/// by the alias instead.
 pub(super) fn rename_reads<V: VisitMut>(
     node: &mut V,
     to: impl FnMut(&ObjectName) -> Option<Ident>,
 ) {
-    struct Rename<F>(F);
+    struct Rename<F> {
+        to: F,
+        /// Each name of more than one part read with no alias, renamed.
+        qualified: Vec<ObjectName>,
+    }
     impl<F: FnMut(&ObjectName) -> Option<Ident>> VisitorMut for Rename<F> {
         type Break = ();
         fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
             if let TableFactor::Table { name, alias, .. } = factor {
-                if let Some(new) = (self.0)(name) {
+                if let Some(new) = (self.to)(name) {
                     if alias.is_none() {
                         if let Some(ObjectNamePart::Identifier(old)) = name.0.last() {
                             *alias = Some(TableAlias {
@@ -140,6 +146,9 @@ pub(super) fn rename_reads<V: VisitMut>(
                                 at: None,
                             });
                         }
+                        if name.0.len() > 1 && !self.qualified.iter().any(|q| same(q, name)) {
+                            self.qualified.push(name.clone());
+                        }
                     }
                     *name = ObjectName::from(vec![new]);
                 }
@@ -147,7 +156,50 @@ pub(super) fn rename_reads<V: VisitMut>(
             ControlFlow::Continue(())
         }
     }
-    let _ = node.visit(&mut Rename(to));
+    let mut rename = Rename {
+        to,
+        qualified: Vec::new(),
+    };
+    let _ = node.visit(&mut rename);
+    if rename.qualified.is_empty() {
+        return;
+    }
+    // A select's columns come before its FROM, so they are requalified
+    // once every read is renamed.
+    struct Requalify(Vec<ObjectName>);
+    impl VisitorMut for Requalify {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                for q in &self.0 {
+                    let n = q.0.len();
+                    let prefix = ObjectName::from(parts.get(..n).unwrap_or_default().to_vec());
+                    if parts.len() > n && same(&prefix, q) {
+                        parts.drain(..n - 1);
+                        break;
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = node.visit(&mut Requalify(rename.qualified));
+}
+
+/// Whether two names are written alike: part for part, unquoted parts
+/// without case, quoted ones exactly.
+pub(super) fn same(a: &ObjectName, b: &ObjectName) -> bool {
+    a.0.len() == b.0.len()
+        && a.0.iter().zip(&b.0).all(|(x, y)| match (x, y) {
+            (ObjectNamePart::Identifier(x), ObjectNamePart::Identifier(y)) => {
+                match (x.quote_style, y.quote_style) {
+                    (None, None) => x.value.eq_ignore_ascii_case(&y.value),
+                    (Some(_), Some(_)) => x.value == y.value,
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
 }
 
 /// `ident`, unplaced: as the statement writes it, quotes included, but

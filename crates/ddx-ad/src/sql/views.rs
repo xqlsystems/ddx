@@ -31,7 +31,7 @@ use ddx_core::sqlparser::ast::{
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
 
-use super::build::{quoted, rename_reads};
+use super::build::{quoted, rename_reads, same};
 use crate::run::Backend;
 
 /// How many views deep a view may read others: past it, the rest are left
@@ -306,22 +306,6 @@ impl Visitor for Defined<'_> {
 /// `node` with each read of `from`, as written, a read of `to`.
 fn rename<V: VisitMut>(node: &mut V, from: &ObjectName, to: &str) {
     rename_reads(node, |name| same(name, from).then(|| quoted(to)));
-}
-
-/// Whether two names are written alike: part for part, unquoted parts
-/// without case, quoted ones exactly.
-fn same(a: &ObjectName, b: &ObjectName) -> bool {
-    a.0.len() == b.0.len()
-        && a.0.iter().zip(&b.0).all(|(x, y)| match (x, y) {
-            (ObjectNamePart::Identifier(x), ObjectNamePart::Identifier(y)) => {
-                match (x.quote_style, y.quote_style) {
-                    (None, None) => x.value.eq_ignore_ascii_case(&y.value),
-                    (Some(_), Some(_)) => x.value == y.value,
-                    _ => false,
-                }
-            }
-            _ => false,
-        })
 }
 
 #[cfg(test)]

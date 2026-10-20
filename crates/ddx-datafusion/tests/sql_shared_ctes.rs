@@ -349,6 +349,29 @@ async fn a_view_whose_columns_are_qualified_by_its_name_is_still_written_out() {
 }
 
 #[tokio::test]
+async fn a_view_read_by_its_schema_s_name_is_still_written_out() {
+    // `public.model.v` names the column by the view's whole name: once the
+    // read is renamed, it is qualified by the alias the read keeps.
+    let ctx = w().await;
+    exec(&ctx, &model_view(3)).await;
+    let (got, log) = grad_of(
+        &ctx,
+        "WITH loss AS (SELECT SUM(public.model.v) AS l FROM public.model)",
+    )
+    .await;
+    let want = written_out(&ctx, &chain(3)).await;
+    for ((_, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{got:?} vs {want:?}"
+        );
+    }
+    for sql in &log.planned {
+        assert!(!sql.contains("public.model"), "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn a_deep_model_view_is_planned_layer_by_layer() {
     // Twelve layers: 4,096 copies of the first written out. (DataFusion
     // plans a view's definition, written out, when it creates the view, so
