@@ -43,11 +43,9 @@ use super::build::{quoted, rename_reads};
 use crate::compose::redeclare_rel;
 use crate::emit::{filter, plan as plan_of, select};
 use crate::error::{AdError, Result};
-use crate::forward::{
-    apply_emit, inline_references, read_outputs, rel_expressions, rel_inputs, rel_inputs_mut,
-    root_of, subquery_rels,
-};
+use crate::forward::{apply_emit, inline_references, read_outputs, root_of};
 use crate::functions::{Extensions, Functions};
+use crate::optics::{AsRead, Compose, Deep, Fold, RelKind, Setter, Tree};
 
 /// A query whose CTEs read more than once are planned one by one.
 #[derive(Debug, Clone, PartialEq)]
@@ -361,18 +359,16 @@ fn one(plan: &Plan, ordinals: &HashMap<&str, i32>, ext: &mut Extensions) -> Resu
     let (root, _) = root_of(plan)?;
     let mut rel = inline_references(root, &plan.relations)?;
     redeclare_rel(&mut rel, &Functions::from_plan(plan)?, &HashMap::new(), ext)?;
-    let mut stack = vec![&mut rel];
-    while let Some(r) = stack.pop() {
+    // Not inside subqueries, where a reference can't sit: a read left there
+    // is refused below.
+    Tree.try_modify(&mut rel, &mut |r| {
         if let Some(RelType::Read(read)) = &r.rel_type {
             if let Some(ordinal) = placeholder(read, ordinals) {
                 *r = referenced_as_read(read, ordinal)?;
             }
-            continue;
         }
-        if let Some(kind) = r.rel_type.as_mut() {
-            stack.extend(rel_inputs_mut(kind));
-        }
-    }
+        Ok::<(), AdError>(())
+    })?;
     if reads_placeholder(&rel, ordinals) {
         return Err(AdError::NotImplemented(
             "a read of a CTE planned on its own that is not a relation's input".into(),
@@ -395,20 +391,9 @@ fn placeholder(read: &ReadRel, ordinals: &HashMap<&str, i32>) -> Option<i32> {
 /// program never reads one, so such a plan is refused, and the query is
 /// planned whole.
 fn reads_placeholder(rel: &Rel, ordinals: &HashMap<&str, i32>) -> bool {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
-        let Some(kind) = &r.rel_type else { continue };
-        if let RelType::Read(read) = kind {
-            if placeholder(read, ordinals).is_some() {
-                return true;
-            }
-        }
-        for e in rel_expressions(kind) {
-            subquery_rels(e, &mut stack);
-        }
-        stack.extend(rel_inputs(kind));
-    }
-    false
+    Deep.then(RelKind)
+        .then(AsRead)
+        .any(rel, |read| placeholder(read, ordinals).is_some())
 }
 
 /// A reference to relation `ordinal` in place of `read`, a read of its

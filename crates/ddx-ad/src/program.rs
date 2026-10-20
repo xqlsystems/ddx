@@ -55,6 +55,7 @@ use crate::error::{AdError, Result};
 use crate::expr::{call, cast, field, if_then, lit_f64, map_fields, null_f64};
 use crate::forward::{saved_name, step_columns, Forward, Input};
 use crate::functions::{Extensions, Function, Functions};
+use crate::optics::{Cosmos, Setter};
 use crate::relation::ColumnRef;
 use crate::relation::Table;
 use crate::tables::{InputTable, Of, OutputTable};
@@ -786,49 +787,20 @@ fn redeclare_functions(
     ext: &mut Extensions,
 ) -> Result<Expression> {
     use substrait::proto::expression::RexType;
-    use substrait::proto::function_argument::ArgType;
-    fn walk(e: &mut Expression, from: &Functions, ext: &mut Extensions) -> Result<()> {
-        match e.rex_type.as_mut() {
-            Some(RexType::Literal(_)) | Some(RexType::Selection(_)) => Ok(()),
-            Some(RexType::ScalarFunction(f)) => {
-                f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
-                for a in f.arguments.iter_mut() {
-                    if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
-                        walk(x, from, ext)?;
-                    }
-                }
-                Ok(())
-            }
-            Some(RexType::Cast(c)) => match c.input.as_deref_mut() {
-                Some(x) => walk(x, from, ext),
-                None => Ok(()),
-            },
-            Some(RexType::IfThen(it)) => {
-                for c in it.ifs.iter_mut() {
-                    for x in c.r#if.iter_mut().chain(c.then.iter_mut()) {
-                        walk(x, from, ext)?;
-                    }
-                }
-                for x in it.r#else.iter_mut() {
-                    walk(x, from, ext)?;
-                }
-                Ok(())
-            }
-            Some(RexType::SingularOrList(l)) => {
-                for x in l.value.iter_mut() {
-                    walk(x, from, ext)?;
-                }
-                for x in l.options.iter_mut() {
-                    walk(x, from, ext)?;
-                }
-                Ok(())
-            }
-            _ => Err(AdError::InvalidOptions(
-                "a restriction may only compare a table's dims with literals".into(),
-            )),
+    Cosmos.try_modify(&mut e, &mut |x| match x.rex_type.as_mut() {
+        Some(RexType::Literal(_))
+        | Some(RexType::Selection(_))
+        | Some(RexType::Cast(_))
+        | Some(RexType::IfThen(_))
+        | Some(RexType::SingularOrList(_)) => Ok(()),
+        Some(RexType::ScalarFunction(f)) => {
+            f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
+            Ok(())
         }
-    }
-    walk(&mut e, from, ext)?;
+        _ => Err(AdError::InvalidOptions(
+            "a restriction may only compare a table's dims with literals".into(),
+        )),
+    })?;
     Ok(e)
 }
 

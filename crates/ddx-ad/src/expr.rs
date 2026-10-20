@@ -8,18 +8,20 @@
 //! messages. These helpers build the few shapes ddx emits and recognize the few
 //! it reads.
 
+use std::ops::ControlFlow;
+
 use substrait::proto::expression::field_reference::{ReferenceType, RootReference, RootType};
 use substrait::proto::expression::literal::LiteralType;
 use substrait::proto::expression::reference_segment::{self, StructField};
 use substrait::proto::expression::{
     cast, if_then, FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
 };
-use substrait::proto::expression::nested::NestedType;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::r#type::{Fp64, Kind, Nullability};
 use substrait::proto::{Expression, FunctionArgument, Type};
 
 use crate::error::{AdError, Result};
+use crate::optics::{AsField, Compose, Cosmos, Exprs, Fold, RelKind, Rex, Setter, Tree};
 
 /// A reference to field `i` of the input row.
 pub fn field(i: usize) -> Expression {
@@ -234,105 +236,58 @@ pub fn map_fields(e: &Expression, f: &mut dyn FnMut(usize) -> Result<usize>) -> 
 /// Every input field `e` references, in order of appearance.
 pub fn fields_of(e: &Expression) -> Result<Vec<usize>> {
     let mut out = Vec::new();
-    map_fields(e, &mut |i| {
-        out.push(i);
-        Ok(i)
-    })?;
-    Ok(out)
+    let refused = Cosmos.try_each(e, &mut |x| {
+        let here = followed(x).and_then(|()| match &x.rex_type {
+            Some(RexType::Selection(r)) => plain_field(r).map(|i| out.push(i)).ok_or_else(|| {
+                AdError::NotImplemented(format!("a field reference ddx cannot follow: {r:?}"))
+            }),
+            _ => Ok(()),
+        });
+        match here {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(e) => ControlFlow::Break(e),
+        }
+    });
+    match refused {
+        ControlFlow::Break(e) => Err(e),
+        ControlFlow::Continue(()) => Ok(out),
+    }
 }
 
-/// Visit every field reference in `e`, recursing into every expression kind
-/// that can contain one.
+/// Visit every field reference in `e`, in order of appearance.
 fn walk_fields(
     e: &mut Expression,
-    f: &mut dyn FnMut(&mut FieldReference) -> Result<()>,
+    mut f: &mut dyn FnMut(&mut FieldReference) -> Result<()>,
 ) -> Result<()> {
-    let Some(rex) = e.rex_type.as_mut() else {
+    Cosmos.try_modify(e, &mut |x| {
+        followed(x)?;
+        Rex.then(AsField).try_modify(x, &mut f)
+    })
+}
+
+/// Whether a walk over the fields of an expression can follow the fields
+/// of `x`, one of its subexpressions; why not if it can't.
+fn followed(x: &Expression) -> Result<()> {
+    let Some(rex) = &x.rex_type else {
         return Err(AdError::InvalidPlan("an expression with no content".into()));
     };
     match rex {
-        RexType::Literal(_) | RexType::DynamicParameter(_) => Ok(()),
-        RexType::Selection(r) => {
-            // An expression-rooted reference (a field of a struct-valued
-            // expression) recurses into that expression; ddx does not produce
-            // or differentiate those, so it is refused by the caller.
-            f(r)
+        RexType::Literal(_)
+        | RexType::DynamicParameter(_)
+        // An expression-rooted reference (a field of a struct-valued
+        // expression) is refused by the caller: ddx does not produce or
+        // differentiate those.
+        | RexType::Selection(_)
+        | RexType::ScalarFunction(_)
+        | RexType::WindowFunction(_)
+        | RexType::IfThen(_)
+        | RexType::SwitchExpression(_)
+        | RexType::SingularOrList(_)
+        | RexType::MultiOrList(_) => Ok(()),
+        RexType::Cast(c) if c.input.is_none() => {
+            Err(AdError::InvalidPlan("a cast with no input".into()))
         }
-        RexType::ScalarFunction(s) => {
-            #[allow(deprecated)]
-            for a in s.args.iter_mut() {
-                walk_fields(a, f)?;
-            }
-            walk_arguments(&mut s.arguments, f)
-        }
-        RexType::WindowFunction(w) => {
-            #[allow(deprecated)]
-            for a in w.args.iter_mut() {
-                walk_fields(a, f)?;
-            }
-            walk_arguments(&mut w.arguments, f)?;
-            for p in w.partitions.iter_mut() {
-                walk_fields(p, f)?;
-            }
-            for s in w.sorts.iter_mut() {
-                if let Some(x) = s.expr.as_mut() {
-                    walk_fields(x, f)?;
-                }
-            }
-            Ok(())
-        }
-        RexType::IfThen(it) => {
-            for c in it.ifs.iter_mut() {
-                if let Some(x) = c.r#if.as_mut() {
-                    walk_fields(x, f)?;
-                }
-                if let Some(x) = c.then.as_mut() {
-                    walk_fields(x, f)?;
-                }
-            }
-            if let Some(x) = it.r#else.as_mut() {
-                walk_fields(x, f)?;
-            }
-            Ok(())
-        }
-        RexType::SwitchExpression(sw) => {
-            if let Some(x) = sw.r#match.as_mut() {
-                walk_fields(x, f)?;
-            }
-            for c in sw.ifs.iter_mut() {
-                if let Some(x) = c.then.as_mut() {
-                    walk_fields(x, f)?;
-                }
-            }
-            if let Some(x) = sw.r#else.as_mut() {
-                walk_fields(x, f)?;
-            }
-            Ok(())
-        }
-        RexType::SingularOrList(sl) => {
-            if let Some(x) = sl.value.as_mut() {
-                walk_fields(x, f)?;
-            }
-            for o in sl.options.iter_mut() {
-                walk_fields(o, f)?;
-            }
-            Ok(())
-        }
-        RexType::MultiOrList(ml) => {
-            for v in ml.value.iter_mut() {
-                walk_fields(v, f)?;
-            }
-            for rec in ml.options.iter_mut() {
-                for v in rec.fields.iter_mut() {
-                    walk_fields(v, f)?;
-                }
-            }
-            Ok(())
-        }
-        RexType::Cast(c) => match c.input.as_mut() {
-            Some(x) => walk_fields(x, f),
-            None => Err(AdError::InvalidPlan("a cast with no input".into())),
-        },
+        RexType::Cast(_) => Ok(()),
         // An uncorrelated scalar subquery reads nothing from the row it sits
         // in, so it has no field of this row to visit: it is a constant here.
         RexType::Subquery(sq) if uncorrelated_scalar(sq).is_some() => Ok(()),
@@ -341,18 +296,6 @@ fn walk_fields(
             rex_name(other)
         ))),
     }
-}
-
-fn walk_arguments(
-    args: &mut [FunctionArgument],
-    f: &mut dyn FnMut(&mut FieldReference) -> Result<()>,
-) -> Result<()> {
-    for a in args.iter_mut() {
-        if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
-            walk_fields(x, f)?;
-        }
-    }
-    Ok(())
 }
 
 /// The relation of `sq`, if it is a scalar subquery that refers to nothing
@@ -372,153 +315,16 @@ pub fn uncorrelated_scalar(
             _ => false,
         })
     };
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
-        let Some(kind) = &r.rel_type else { continue };
-        if crate::forward::rel_expressions(kind)
-            .into_iter()
-            .any(refers_out)
-        {
-            return None;
-        }
-        if let substrait::proto::rel::RelType::Read(read) = kind {
-            if read.filter.as_deref().is_some_and(refers_out) {
-                return None;
-            }
-        }
-        stack.extend(crate::forward::rel_inputs(kind));
+    // A read's filter is among its expressions.
+    if Tree.then(RelKind).then(Exprs).any(rel, refers_out) {
+        return None;
     }
     Some(rel)
 }
 
-/// The direct subexpressions of `e`. A subquery's relation is not included.
-pub fn children(e: &Expression) -> Vec<&Expression> {
-    let mut out = Vec::new();
-    let Some(rex) = &e.rex_type else {
-        return out;
-    };
-    fn args<'e>(a: &'e [FunctionArgument], out: &mut Vec<&'e Expression>) {
-        for x in a {
-            if let Some(ArgType::Value(v)) = &x.arg_type {
-                out.push(v);
-            }
-        }
-    }
-    match rex {
-        RexType::ScalarFunction(s) => {
-            args(&s.arguments, &mut out);
-            #[allow(deprecated)]
-            out.extend(s.args.iter());
-        }
-        RexType::WindowFunction(w) => {
-            args(&w.arguments, &mut out);
-            #[allow(deprecated)]
-            out.extend(w.args.iter());
-            out.extend(w.partitions.iter());
-            out.extend(w.sorts.iter().filter_map(|s| s.expr.as_ref()));
-        }
-        RexType::IfThen(it) => {
-            for c in &it.ifs {
-                out.extend(c.r#if.iter());
-                out.extend(c.then.iter());
-            }
-            out.extend(it.r#else.as_deref());
-        }
-        RexType::SwitchExpression(sw) => {
-            out.extend(sw.r#match.as_deref());
-            out.extend(sw.ifs.iter().filter_map(|c| c.then.as_ref()));
-            out.extend(sw.r#else.as_deref());
-        }
-        RexType::SingularOrList(sl) => {
-            out.extend(sl.value.as_deref());
-            out.extend(sl.options.iter());
-        }
-        RexType::MultiOrList(ml) => {
-            out.extend(ml.value.iter());
-            for rec in &ml.options {
-                out.extend(rec.fields.iter());
-            }
-        }
-        RexType::Cast(c) => out.extend(c.input.as_deref()),
-        RexType::Nested(n) => match &n.nested_type {
-            Some(NestedType::Struct(s)) => out.extend(s.fields.iter()),
-            Some(NestedType::List(l)) => out.extend(l.values.iter()),
-            Some(NestedType::Map(m)) => {
-                for kv in &m.key_values {
-                    out.extend(kv.key.iter().chain(kv.value.iter()));
-                }
-            }
-            None => {}
-        },
-        _ => {}
-    }
-    out
-}
-
-/// [`children`] of an expression of kind `rex`, mutably.
-pub(crate) fn rex_children_mut(rex: &mut RexType) -> Vec<&mut Expression> {
-    let mut out = Vec::new();
-    fn args<'e>(a: &'e mut [FunctionArgument], out: &mut Vec<&'e mut Expression>) {
-        for x in a {
-            if let Some(ArgType::Value(v)) = x.arg_type.as_mut() {
-                out.push(v);
-            }
-        }
-    }
-    match rex {
-        RexType::ScalarFunction(s) => {
-            args(&mut s.arguments, &mut out);
-            #[allow(deprecated)]
-            out.extend(s.args.iter_mut());
-        }
-        RexType::WindowFunction(w) => {
-            args(&mut w.arguments, &mut out);
-            #[allow(deprecated)]
-            out.extend(w.args.iter_mut());
-            out.extend(w.partitions.iter_mut());
-            out.extend(w.sorts.iter_mut().filter_map(|s| s.expr.as_mut()));
-        }
-        RexType::IfThen(it) => {
-            for c in it.ifs.iter_mut() {
-                out.extend(c.r#if.iter_mut());
-                out.extend(c.then.iter_mut());
-            }
-            out.extend(it.r#else.as_deref_mut());
-        }
-        RexType::SwitchExpression(sw) => {
-            out.extend(sw.r#match.as_deref_mut());
-            out.extend(sw.ifs.iter_mut().filter_map(|c| c.then.as_mut()));
-            out.extend(sw.r#else.as_deref_mut());
-        }
-        RexType::SingularOrList(sl) => {
-            out.extend(sl.value.as_deref_mut());
-            out.extend(sl.options.iter_mut());
-        }
-        RexType::MultiOrList(ml) => {
-            out.extend(ml.value.iter_mut());
-            for rec in ml.options.iter_mut() {
-                out.extend(rec.fields.iter_mut());
-            }
-        }
-        RexType::Cast(c) => out.extend(c.input.as_deref_mut()),
-        RexType::Nested(n) => match n.nested_type.as_mut() {
-            Some(NestedType::Struct(s)) => out.extend(s.fields.iter_mut()),
-            Some(NestedType::List(l)) => out.extend(l.values.iter_mut()),
-            Some(NestedType::Map(m)) => {
-                for kv in m.key_values.iter_mut() {
-                    out.extend(kv.key.iter_mut().chain(kv.value.iter_mut()));
-                }
-            }
-            None => {}
-        },
-        _ => {}
-    }
-    out
-}
-
 /// Does `e`, or any expression inside it, satisfy `pred`?
 pub fn contains(e: &Expression, pred: &dyn Fn(&Expression) -> bool) -> bool {
-    pred(e) || children(e).into_iter().any(|c| contains(c, pred))
+    Cosmos.any(e, pred)
 }
 
 /// A short name for an expression kind, for error messages.

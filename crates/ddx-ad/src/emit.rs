@@ -38,7 +38,7 @@ use substrait::proto::{
 
 use crate::error::{AdError, Result};
 use crate::expr::lit_bool;
-use crate::forward::{rel_expressions_mut, rel_inputs_mut, subquery_rels_mut};
+use crate::optics::{AsJoin, AsRead, Compose, Deep, Fold, RelKind, PlanRels, Setter};
 use crate::functions::Extensions;
 
 /// A read of every column of a table whose schema is known.
@@ -224,28 +224,24 @@ pub fn plan(mut root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
 /// anti join, and its Substrait consumer refuses one with no condition
 /// (ddx issue #171).
 fn condition_joins(root: &mut Rel) {
-    let mut stack = vec![root];
-    while let Some(rel) = stack.pop() {
-        let Some(kind) = rel.rel_type.as_mut() else {
-            continue;
-        };
-        if let RelType::Join(j) = kind {
-            let typed = !matches!(j.r#type(), JoinType::Inner | JoinType::Unspecified);
-            if typed && j.expression.is_none() {
-                j.expression = Some(Box::new(lit_bool(true)));
-            }
+    Deep.then(RelKind).then(AsJoin).modify(root, |j| {
+        let typed = !matches!(j.r#type(), JoinType::Inner | JoinType::Unspecified);
+        if typed && j.expression.is_none() {
+            j.expression = Some(Box::new(lit_bool(true)));
         }
-        for e in rel_expressions_mut(kind) {
-            subquery_rels_mut(e).into_iter().for_each(condition_joins);
-        }
-        stack.extend(rel_inputs_mut(kind));
-    }
+    })
+}
+
+/// Every read in a plan, its shared relations' and its subqueries'
+/// included.
+fn reads() -> impl Fold<Plan, ReadRel> + Setter<Plan, ReadRel> {
+    PlanRels.then(Deep).then(RelKind).then(AsRead)
 }
 
 /// Each read in `plan` that names its columns without their types (an
 /// earlier step's table), with the columns it names.
 pub(crate) fn for_each_unbound_read(plan: &Plan, f: &mut dyn FnMut(&str, &[String])) {
-    for_each_read(plan, &mut |read| {
+    reads().each(plan, |read| {
         if let (Some(ReadType::NamedTable(t)), Some(s)) = (&read.read_type, &read.base_schema) {
             if s.r#struct.is_none() {
                 f(&t.names.join("."), &s.names);
@@ -258,7 +254,7 @@ pub(crate) fn for_each_unbound_read(plan: &Plan, f: &mut dyn FnMut(&str, &[Strin
 /// order they appear. These are the steps it depends on.
 pub fn unbound_reads(plan: &Plan) -> Vec<String> {
     let mut out = Vec::new();
-    for_each_read(plan, &mut |read| {
+    reads().each(plan, |read| {
         if let (Some(ReadType::NamedTable(t)), Some(s)) = (&read.read_type, &read.base_schema) {
             if s.r#struct.is_none() {
                 out.push(t.names.join("."));
@@ -277,24 +273,19 @@ pub fn bind_reads(
     plan: &mut Plan,
     schema: &mut dyn FnMut(&str) -> Option<NamedStruct>,
 ) -> Result<()> {
-    let mut failure = None;
-    for_each_read_mut(plan, &mut |read| {
-        if failure.is_some() {
-            return;
-        }
+    reads().try_modify(plan, &mut |read| {
         let (Some(ReadType::NamedTable(t)), Some(base)) = (&read.read_type, &mut read.base_schema)
         else {
-            return;
+            return Ok(());
         };
         if base.r#struct.is_some() {
-            return;
+            return Ok(());
         }
         let name = t.names.join(".");
         let Some(actual) = schema(&name) else {
-            failure = Some(AdError::InvalidPlan(format!(
+            return Err(AdError::InvalidPlan(format!(
                 "step `{name}` is read before it exists"
             )));
-            return;
         };
         let types = actual.r#struct.map(|s| s.types).unwrap_or_default();
         let mut picked = Vec::with_capacity(base.names.len());
@@ -304,20 +295,18 @@ pub fn bind_reads(
                 // The schema names the column but types fewer columns than
                 // it names: an engine's schema with no struct, say.
                 Some(_) => {
-                    failure = Some(AdError::InvalidPlan(format!(
+                    return Err(AdError::InvalidPlan(format!(
                         "the schema given for step `{name}` names {} columns but types {}, \
                          so `{col}` has no type",
                         actual.names.len(),
                         types.len()
                     )));
-                    return;
                 }
                 None => {
-                    failure = Some(AdError::InvalidPlan(format!(
+                    return Err(AdError::InvalidPlan(format!(
                         "step `{name}` has no column `{col}` (it has {:?})",
                         actual.names
                     )));
-                    return;
                 }
             }
         }
@@ -326,65 +315,8 @@ pub fn bind_reads(
             type_variation_reference: 0,
             nullability: r#type::Nullability::Required as i32,
         });
-    });
-    match failure {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-fn for_each_read(plan: &Plan, f: &mut dyn FnMut(&ReadRel)) {
-    let mut plan = plan.clone();
-    for_each_read_mut(&mut plan, &mut |r| f(r));
-}
-
-fn for_each_read_mut(plan: &mut Plan, f: &mut dyn FnMut(&mut ReadRel)) {
-    for rel in plan.relations.iter_mut() {
-        match rel.rel_type.as_mut() {
-            Some(PlanRelType::Root(root)) => {
-                if let Some(r) = root.input.as_mut() {
-                    walk_rel(r, f);
-                }
-            }
-            Some(PlanRelType::Rel(r)) => walk_rel(r, f),
-            None => {}
-        }
-    }
-}
-
-/// Visit every read in a relation tree. Covers the relations ddx emits and
-/// the ones it copies from a forward plan.
-fn walk_rel(rel: &mut Rel, f: &mut dyn FnMut(&mut ReadRel)) {
-    let Some(kind) = rel.rel_type.as_mut() else {
-        return;
-    };
-    let mut visit = |r: &mut Option<Box<Rel>>| {
-        if let Some(r) = r.as_mut() {
-            walk_rel(r, f);
-        }
-    };
-    match kind {
-        RelType::Read(r) => f(r),
-        RelType::Filter(r) => visit(&mut r.input),
-        RelType::Fetch(r) => visit(&mut r.input),
-        RelType::Aggregate(r) => visit(&mut r.input),
-        RelType::Sort(r) => visit(&mut r.input),
-        RelType::Project(r) => visit(&mut r.input),
-        RelType::Join(r) => {
-            visit(&mut r.left);
-            visit(&mut r.right);
-        }
-        RelType::Cross(r) => {
-            visit(&mut r.left);
-            visit(&mut r.right);
-        }
-        RelType::Set(r) => {
-            for i in r.inputs.iter_mut() {
-                walk_rel(i, f);
-            }
-        }
-        _ => {}
-    }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -417,21 +349,14 @@ mod tests {
     }
 
     /// The conditions of the joins in `rel`, subqueries included, in the
-    /// order a depth-first walk meets them.
+    /// order [`Deep`] meets them.
     fn join_conditions(rel: &Rel) -> Vec<Option<Expression>> {
-        let mut out = Vec::new();
-        let mut stack = vec![rel];
-        while let Some(r) = stack.pop() {
-            let Some(kind) = &r.rel_type else { continue };
-            if let RelType::Join(j) = kind {
-                out.push(j.expression.as_deref().cloned());
-            }
-            for e in crate::forward::rel_expressions(kind) {
-                crate::forward::subquery_rels(e, &mut stack);
-            }
-            stack.extend(crate::forward::rel_inputs(kind));
-        }
-        out
+        Deep.then(RelKind)
+            .then(AsJoin)
+            .to_vec(rel)
+            .into_iter()
+            .map(|j| j.expression.as_deref().cloned())
+            .collect()
     }
 
     #[test]
@@ -480,11 +405,12 @@ mod tests {
         let ext = Extensions::new(&Functions::default());
         let p = plan(aggregate, vec!["s".into()], &ext);
         let (root, _) = crate::forward::root_of(&p).unwrap();
-        // The inner join keeps no condition; the anti and semi joins in
-        // the subqueries get `true`.
+        // The anti and semi joins in the subqueries get `true` (a
+        // relation's subqueries come before its inputs); the inner join
+        // keeps no condition.
         assert_eq!(
             join_conditions(root),
-            vec![None, Some(lit_bool(true)), Some(lit_bool(true))]
+            vec![Some(lit_bool(true)), Some(lit_bool(true)), None]
         );
     }
 
@@ -520,7 +446,7 @@ mod tests {
         assert!(unbound_reads(&p).is_empty());
 
         let mut types = Vec::new();
-        for_each_read(&p, &mut |r| {
+        reads().each(&p, |r| {
             types.push(
                 r.base_schema
                     .as_ref()
