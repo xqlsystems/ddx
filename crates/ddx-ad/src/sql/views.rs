@@ -25,13 +25,13 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, Ident, ObjectName, ObjectNamePart, Query, Statement, TableAlias, TableAliasColumnDef,
-    Visit, VisitMut, Visitor, VisitorMut, With,
+    Cte, ObjectName, ObjectNamePart, Query, Statement, TableAlias, TableAliasColumnDef, Visit,
+    VisitMut, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
 
-use super::build::quoted;
+use super::build::{quoted, rename_reads};
 use crate::run::Backend;
 
 /// How many views deep a view may read others: past it, the rest are left
@@ -104,6 +104,25 @@ impl Views {
         }
     }
 
+    /// The next name for a view's CTE that neither it nor the names of its
+    /// own CTEs, `{name}_{i}_{cte}`, can make the same as one the objective
+    /// defines.
+    fn fresh(&mut self) -> String {
+        loop {
+            let name = format!("__ddx_view_{}", self.named);
+            self.named += 1;
+            let prefix = format!("{name}_");
+            let taken = self.defined.iter().any(|d| {
+                d.eq_ignore_ascii_case(&name)
+                    || d.get(..prefix.len())
+                        .is_some_and(|p| p.eq_ignore_ascii_case(&prefix))
+            });
+            if !taken {
+                return name;
+            }
+        }
+    }
+
     /// The CTE the view `name` is written as, writing it (and the views it
     /// reads) if it is not yet; `None` if `name` is not a view whose SQL the
     /// engine gives, or it is left to the engine.
@@ -124,8 +143,7 @@ impl Views {
         }
         let sql = backend.view_sql(&key).await.ok().flatten()?;
         let (mut query, columns) = definition(&sql)?;
-        let alias = format!("__ddx_view_{}", self.named);
-        self.named += 1;
+        let alias = self.fresh();
         // Its own CTEs, hoisted beside it under names of their own.
         let mut hoisted = Vec::new();
         if let Some(w) = query.with.take() {
@@ -277,23 +295,7 @@ impl Visitor for Defined<'_> {
 
 /// `node` with each read of `from`, as written, a read of `to`.
 fn rename<V: VisitMut>(node: &mut V, from: &ObjectName, to: &str) {
-    struct Rename<'a> {
-        from: &'a ObjectName,
-        to: Ident,
-    }
-    impl VisitorMut for Rename<'_> {
-        type Break = ();
-        fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<()> {
-            if same(name, self.from) {
-                *name = ObjectName::from(vec![self.to.clone()]);
-            }
-            ControlFlow::Continue(())
-        }
-    }
-    let _ = node.visit(&mut Rename {
-        from,
-        to: quoted(to),
-    });
+    rename_reads(node, |name| same(name, from).then(|| quoted(to)));
 }
 
 /// Whether two names are written alike: part for part, unquoted parts
@@ -375,6 +377,28 @@ mod tests {
     }
 
     #[test]
+    fn a_view_takes_no_name_the_objective_defines() {
+        // The objective defines the first view name, and one the second
+        // view's own CTE would take: each view takes the next free name.
+        let got = expanded(
+            vec![(
+                "v",
+                "CREATE VIEW v AS WITH a AS (SELECT 1 AS x) SELECT x FROM a",
+            )],
+            "WITH \"__ddx_view_0\" AS (SELECT 2 AS x), \"__ddx_view_1_0_a\" AS (SELECT 3 AS x) \
+             SELECT * FROM v, \"__ddx_view_0\", \"__ddx_view_1_0_a\"",
+        )
+        .unwrap();
+        assert!(
+            got.starts_with(
+                "WITH \"__ddx_view_2_0_a\" AS (SELECT 1 AS x), \"__ddx_view_2\" AS \
+                 (SELECT x FROM \"__ddx_view_2_0_a\" AS a), \"__ddx_view_0\" AS"
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
     fn a_view_is_written_as_its_ctes_then_its_query() {
         let got = expanded(
             vec![(
@@ -387,7 +411,7 @@ mod tests {
             got.as_deref(),
             Some(
                 "WITH \"__ddx_view_0_0_a\" AS (SELECT 1 AS x), \"__ddx_view_0\" AS \
-                 (SELECT x FROM \"__ddx_view_0_0_a\") SELECT * FROM \"__ddx_view_0\""
+                 (SELECT x FROM \"__ddx_view_0_0_a\" AS a) SELECT * FROM \"__ddx_view_0\" AS v"
             )
         );
     }
@@ -435,7 +459,8 @@ mod tests {
         assert_eq!(
             got,
             "WITH \"__ddx_view_1\" AS (SELECT 1 AS x), \"__ddx_view_0\" AS \
-             (SELECT 2 * x AS x FROM \"__ddx_view_1\") SELECT * FROM \"__ddx_view_0\""
+             (SELECT 2 * x AS x FROM \"__ddx_view_1\" AS inner_v) \
+             SELECT * FROM \"__ddx_view_0\" AS outer_v"
         );
     }
 }

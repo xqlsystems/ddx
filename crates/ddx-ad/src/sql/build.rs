@@ -12,9 +12,12 @@
 //! ends up.
 
 use ddx_core::sqlparser::ast::helpers::attached_token::AttachedToken;
+use std::ops::ControlFlow;
+
 use ddx_core::sqlparser::ast::{
-    Cte, GroupByExpr, Ident, ObjectName, Query, Select, SelectFlavor, SelectItem, SetExpr,
-    TableAlias, TableFactor, TableWithJoins, WildcardAdditionalOptions, With,
+    Cte, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectFlavor, SelectItem,
+    SetExpr, TableAlias, TableFactor, TableWithJoins, VisitMut, VisitorMut,
+    WildcardAdditionalOptions, With,
 };
 use ddx_core::sqlparser::tokenizer::Span;
 
@@ -113,6 +116,38 @@ pub(super) fn named(name: Ident) -> Option<TableAlias> {
 /// `name` as a quoted identifier.
 pub(super) fn quoted(name: &str) -> Ident {
     Ident::with_quote('"', name)
+}
+
+/// `node` with each table it reads that `to` names anew read under that
+/// name instead. A read with no alias keeps its old name, the last part,
+/// as one, so a column qualified by it (`model.v`) still resolves.
+pub(super) fn rename_reads<V: VisitMut>(
+    node: &mut V,
+    to: impl FnMut(&ObjectName) -> Option<Ident>,
+) {
+    struct Rename<F>(F);
+    impl<F: FnMut(&ObjectName) -> Option<Ident>> VisitorMut for Rename<F> {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { name, alias, .. } = factor {
+                if let Some(new) = (self.0)(name) {
+                    if alias.is_none() {
+                        if let Some(ObjectNamePart::Identifier(old)) = name.0.last() {
+                            *alias = Some(TableAlias {
+                                explicit: true,
+                                name: unplaced(old),
+                                columns: Vec::new(),
+                                at: None,
+                            });
+                        }
+                    }
+                    *name = ObjectName::from(vec![new]);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = node.visit(&mut Rename(to));
 }
 
 /// `ident`, unplaced: as the statement writes it, quotes included, but

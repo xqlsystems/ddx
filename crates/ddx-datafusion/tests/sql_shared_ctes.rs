@@ -192,6 +192,43 @@ fn a_chain_too_deep_to_write_out_is_differentiated_from_sql() {
         .unwrap();
 }
 
+/// `k` layers over `w`, as `chain`'s, but each reads the last once by its
+/// own name, qualifying columns with it, as a residual connection is often
+/// written.
+fn chain_by_name(k: usize) -> String {
+    let mut ctes = vec!["l0 AS (SELECT i, SUM(val) AS v FROM w GROUP BY i)".to_string()];
+    for n in 1..=k {
+        let p = n - 1;
+        ctes.push(format!(
+            "l{n} AS (SELECT l{p}.i, SUM(l{p}.v * b.v + 0.5 * l{p}.v) AS v \
+             FROM l{p} JOIN l{p} b ON l{p}.i = b.i GROUP BY l{p}.i)"
+        ));
+    }
+    ctes.push(format!("loss AS (SELECT SUM(l{k}.v) AS l FROM l{k})"));
+    format!("WITH {}", ctes.join(", "))
+}
+
+#[tokio::test]
+async fn a_cte_whose_columns_are_qualified_by_its_name_is_still_planned_once() {
+    // A placeholder read keeps the CTE's name as its alias, so `l0.v` still
+    // resolves and the split does not fall back to the query written out.
+    let ctx = w().await;
+    let (got, log) = grad_of(&ctx, &chain_by_name(3)).await;
+    let want = written_out(&ctx, &chain(3)).await;
+    for ((_, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{got:?} vs {want:?}"
+        );
+    }
+    let placeholders = log.made.iter().filter(|n| n.contains("cte_")).count();
+    assert_eq!(placeholders, 3, "{:?}", log.made);
+    // Nothing planned reads a layer twice, as the query planned whole would.
+    for sql in &log.planned {
+        assert!(sql.matches("JOIN").count() <= 2, "{sql}");
+    }
+}
+
 #[tokio::test]
 async fn a_cte_read_once_is_left_to_the_engine() {
     let ctx = w().await;
@@ -282,6 +319,33 @@ async fn a_model_that_is_a_view_has_its_layers_planned_once() {
     }
     let placeholders = log.made.iter().filter(|n| n.contains("cte_")).count();
     assert_eq!(placeholders, 3, "{:?}", log.made);
+    for sql in &log.planned {
+        assert!(!sql.contains("FROM model"), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn a_view_whose_columns_are_qualified_by_its_name_is_still_written_out() {
+    // The objective qualifies the view's columns by the view's name, and
+    // the view its CTE's columns by the CTE's: both still resolve once
+    // renamed, so the layers are planned once.
+    let ctx = w().await;
+    let view = model_view(3).replace("SELECT i, v FROM l3", "SELECT l3.i, l3.v FROM l3");
+    exec(&ctx, &view).await;
+    let (got, log) = grad_of(&ctx, "WITH loss AS (SELECT SUM(model.v) AS l FROM model)").await;
+    let want = written_out(&ctx, &chain(3)).await;
+    for ((_, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{got:?} vs {want:?}"
+        );
+    }
+    let placeholders = log.made.iter().filter(|n| n.contains("cte_")).count();
+    assert_eq!(placeholders, 3, "{:?}", log.made);
+    // Nothing planned reads the view, as the objective planned whole would.
+    for sql in &log.planned {
+        assert!(!sql.contains("FROM model"), "{sql}");
+    }
 }
 
 #[tokio::test]

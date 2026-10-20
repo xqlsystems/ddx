@@ -33,13 +33,13 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, Expr, Ident, ObjectName, ObjectNamePart, Query, Visit, VisitMut, Visitor, VisitorMut,
+    Cte, Expr, Ident, ObjectName, ObjectNamePart, Query, Visit, VisitMut, Visitor,
 };
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::{Plan, PlanRel, ReadRel, ReferenceRel, Rel};
 
-use super::build::quoted;
+use super::build::{quoted, rename_reads};
 use crate::compose::redeclare_rel;
 use crate::emit::{filter, plan as plan_of, select};
 use crate::error::{AdError, Result};
@@ -321,22 +321,10 @@ fn same_spelling(a: &Ident, b: &Ident) -> bool {
 /// `query` with each read of one of `ctes` planned alone replaced by a read
 /// of its placeholder.
 fn replace<V: VisitMut>(node: &mut V, ctes: &[Cte], placeholders: &HashMap<usize, String>) {
-    struct Replace<'a> {
-        ctes: &'a [Cte],
-        placeholders: &'a HashMap<usize, String>,
-    }
-    impl VisitorMut for Replace<'_> {
-        type Break = ();
-        fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<()> {
-            if let Some(k) = cte_of(name, self.ctes) {
-                if let Some(p) = self.placeholders.get(&k) {
-                    *name = ObjectName::from(vec![quoted(p)]);
-                }
-            }
-            ControlFlow::Continue(())
-        }
-    }
-    let _ = node.visit(&mut Replace { ctes, placeholders });
+    rename_reads(node, |name| {
+        let k = cte_of(name, ctes)?;
+        placeholders.get(&k).map(|p| quoted(p))
+    });
 }
 
 /// One plan from `split`'s: `pieces`, the engine's plan of each CTE in
@@ -558,7 +546,8 @@ mod tests {
         assert_eq!(
             s.root,
             "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a) \
-             SELECT * FROM \"__ddx_t_cte_2\", \"__ddx_t_cte_2\" WHERE 1 IN (SELECT x FROM b)"
+             SELECT * FROM \"__ddx_t_cte_2\" AS c, \"__ddx_t_cte_2\" AS c \
+             WHERE 1 IN (SELECT x FROM b)"
         );
         // Read under another spelling: kept, for the engine to resolve.
         let s = split(
@@ -646,12 +635,12 @@ mod tests {
         assert_eq!(s.ctes[0].sql, "SELECT * FROM (SELECT 1) AS __ddx_cte (x)");
         assert_eq!(
             s.ctes[1].sql,
-            "WITH m AS (SELECT x FROM \"__ddx_t_cte_0\") \
+            "WITH m AS (SELECT x FROM \"__ddx_t_cte_0\" AS a) \
              SELECT * FROM (SELECT p.x FROM m p, \"__ddx_t_cte_0\" q) AS __ddx_cte"
         );
         assert_eq!(
             s.root,
-            "SELECT * FROM \"__ddx_t_cte_2\", \"__ddx_t_cte_2\", \"__ddx_t_cte_0\""
+            "SELECT * FROM \"__ddx_t_cte_2\" AS b, \"__ddx_t_cte_2\" AS b, \"__ddx_t_cte_0\" AS a"
         );
     }
 }
