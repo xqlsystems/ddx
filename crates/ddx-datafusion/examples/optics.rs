@@ -1,6 +1,6 @@
 //! Prototype: optics (lenses, prisms, traversals) over Substrait plans, as
 //! a way to define each walk of ddx-ad's trees once. Not used by the crates
-//! yet; see the GitHub issue that links here.
+//! yet; see https://github.com/xqlsystems/ddx/issues/176.
 //!
 //! An optic names where some parts of a tree are: a lens one part that is
 //! always there, a prism one that may be (one case of an enum), a traversal
