@@ -12,7 +12,7 @@
 //! join of a plan, subqueries included. This is the idea of Haskell's
 //! `lens` library, and of DataFusion's `TreeNode` for its own plans.
 //!
-//! Each one-level optic below is written as one table ([`optic!`]), from
+//! Each one-level optic below is written as one table (`optic!`), from
 //! which its shared walk, its in-place walk and its worklist walk
 //! ([`Plate`]) are all derived, so the three cannot disagree. (Rust can't
 //! write one function for both `&T` and `&mut T`; this crate kept a `_mut`
@@ -29,6 +29,22 @@
 //!
 //! The optics take generic closures, so a composed walk compiles to direct
 //! loops, and none allocates per node.
+//!
+//! # Reading this file
+//!
+//! - A **whole** is the value an optic looks inside (a `Rel`, a `Plan`);
+//!   its **parts** are what the optic finds there (the relation's inputs).
+//!   The traits are generic over both: `Fold<Whole, Part>`.
+//! - [`Fold`] reads the parts, [`Setter`] changes them, and [`Plate`] lends
+//!   them all mutably at once, which a walk needs to keep them on a stack.
+//!   The first two are named as in Haskell's `lens` library, and `Plate`
+//!   after its `Plated` class, which lends a node's children the same way.
+//! - Most optics here look one level down. `optic!` writes one from a
+//!   table of cases, and `leaf!` the four that look inside a field's
+//!   shape (`Option`, `Vec`, ...). [`Compose::then`] joins two optics into
+//!   one that looks two levels down.
+//! - [`Tree`], [`Deep`] and [`Cosmos`] are written out by hand, because
+//!   they look at every level: each is a loop over a stack.
 
 use std::ops::ControlFlow;
 
@@ -49,34 +65,39 @@ use substrait::proto::{
     SortField,
 };
 
-/// Reads the parts an `S` holds, each borrowed for as long as `S` is (so a
-/// walk can keep them), stopping when `f` breaks.
-pub(crate) trait Fold<S: ?Sized + 'static, A: ?Sized + 'static> {
-    fn try_each<'s, B, F: FnMut(&'s A) -> ControlFlow<B>>(
+/// Reads the parts a `Whole` holds, in order, stopping early if `visit`
+/// returns `ControlFlow::Break`. Each part is lent for as long as the
+/// whole is borrowed (`'whole`), so a walk can keep parts on a stack.
+///
+/// [`ControlFlow`] is the standard library's "keep going or stop" value:
+/// `Continue(())` moves on to the next part, `Break(value)` ends the walk
+/// and hands `value` back to the caller.
+pub(crate) trait Fold<Whole: ?Sized + 'static, Part: ?Sized + 'static> {
+    fn try_each<'whole, Stop, Visit: FnMut(&'whole Part) -> ControlFlow<Stop>>(
         &self,
-        s: &'s S,
-        f: &mut F,
-    ) -> ControlFlow<B>;
+        whole: &'whole Whole,
+        visit: &mut Visit,
+    ) -> ControlFlow<Stop>;
 
-    /// `f` on each part.
-    fn each<'s, F: FnMut(&'s A)>(&self, s: &'s S, mut f: F) {
-        let _ = self.try_each::<(), _>(s, &mut |a| {
-            f(a);
+    /// Call `visit` on each part.
+    fn each<'whole, Visit: FnMut(&'whole Part)>(&self, whole: &'whole Whole, mut visit: Visit) {
+        let _ = self.try_each::<(), _>(whole, &mut |part| {
+            visit(part);
             ControlFlow::Continue(())
         });
     }
 
     /// Each part, in order.
-    fn to_vec<'s>(&self, s: &'s S) -> Vec<&'s A> {
-        let mut out = Vec::new();
-        self.each(s, |a| out.push(a));
-        out
+    fn to_vec<'whole>(&self, whole: &'whole Whole) -> Vec<&'whole Part> {
+        let mut parts = Vec::new();
+        self.each(whole, |part| parts.push(part));
+        parts
     }
 
-    /// Whether any part satisfies `p`; stops at the first that does.
-    fn any(&self, s: &S, mut p: impl FnMut(&A) -> bool) -> bool {
-        self.try_each(s, &mut |a| {
-            if p(a) {
+    /// Whether any part satisfies `matches`; stops at the first that does.
+    fn any(&self, whole: &Whole, mut matches: impl FnMut(&Part) -> bool) -> bool {
+        self.try_each(whole, &mut |part| {
+            if matches(part) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -86,136 +107,167 @@ pub(crate) trait Fold<S: ?Sized + 'static, A: ?Sized + 'static> {
     }
 }
 
-/// Changes each part an `S` holds in place, stopping at the first error.
-pub(crate) trait Setter<S: ?Sized + 'static, A: ?Sized + 'static> {
-    fn try_modify<E, F: FnMut(&mut A) -> Result<(), E>>(
+/// Changes each part a `Whole` holds in place, in order, stopping at the
+/// first error `change` returns.
+pub(crate) trait Setter<Whole: ?Sized + 'static, Part: ?Sized + 'static> {
+    fn try_modify<Error, Change: FnMut(&mut Part) -> Result<(), Error>>(
         &self,
-        s: &mut S,
-        f: &mut F,
-    ) -> Result<(), E>;
+        whole: &mut Whole,
+        change: &mut Change,
+    ) -> Result<(), Error>;
 
-    /// `f` on each part.
-    fn modify(&self, s: &mut S, mut f: impl FnMut(&mut A)) {
-        let _ = self.try_modify::<std::convert::Infallible, _>(s, &mut |a| {
-            f(a);
+    /// Call `change` on each part.
+    fn modify(&self, whole: &mut Whole, mut change: impl FnMut(&mut Part)) {
+        let _ = self.try_modify::<std::convert::Infallible, _>(whole, &mut |part| {
+            change(part);
             Ok(())
         });
     }
 }
 
-/// A one-level optic that also lends its parts mutably for as long as `S`
-/// is borrowed, all at once: what a worklist walk needs to push them.
-pub(crate) trait Plate<S: ?Sized + 'static, A: ?Sized + 'static>:
-    Fold<S, A> + Setter<S, A>
+/// A one-level optic that can also lend all its parts mutably at once, for
+/// as long as the whole is borrowed. A walk over a tree needs this to push
+/// a node's children onto its stack and change them later; [`Setter`]
+/// lends each part only during its own call.
+pub(crate) trait Plate<Whole: ?Sized + 'static, Part: ?Sized + 'static>:
+    Fold<Whole, Part> + Setter<Whole, Part>
 {
-    fn each_mut<'s, F: FnMut(&'s mut A)>(&self, s: &'s mut S, f: &mut F);
+    fn each_mut<'whole, Visit: FnMut(&'whole mut Part)>(
+        &self,
+        whole: &'whole mut Whole,
+        visit: &mut Visit,
+    );
 }
 
-/// `a.then(b)`: the parts `b` names inside each part `a` names. `M` is the
-/// type between them.
-pub(crate) struct Then<T, U, M: ?Sized>(T, U, std::marker::PhantomData<fn(&M)>);
+/// `first.then(second)`: for each part `first` finds, the parts `second`
+/// finds inside it. `Middle` is the type of `first`'s parts, which
+/// `second` looks inside; Rust can't infer it from `first` and `second`
+/// alone, so it is a parameter of its own.
+pub(crate) struct Then<First, Second, Middle: ?Sized> {
+    first: First,
+    second: Second,
+    middle: std::marker::PhantomData<fn(&Middle)>,
+}
 
 pub(crate) trait Compose: Sized {
-    fn then<U, M: ?Sized>(self, next: U) -> Then<Self, U, M> {
-        Then(self, next, std::marker::PhantomData)
+    fn then<Second, Middle: ?Sized>(self, second: Second) -> Then<Self, Second, Middle> {
+        Then {
+            first: self,
+            second,
+            middle: std::marker::PhantomData,
+        }
     }
 }
-impl<T> Compose for T {}
+impl<Optic> Compose for Optic {}
 
-impl<S, M, A, T, U> Fold<S, A> for Then<T, U, M>
+impl<Whole, Middle, Part, First, Second> Fold<Whole, Part> for Then<First, Second, Middle>
 where
-    S: ?Sized + 'static,
-    M: ?Sized + 'static,
-    A: ?Sized + 'static,
-    T: Fold<S, M>,
-    U: Fold<M, A>,
+    Whole: ?Sized + 'static,
+    Middle: ?Sized + 'static,
+    Part: ?Sized + 'static,
+    First: Fold<Whole, Middle>,
+    Second: Fold<Middle, Part>,
 {
-    fn try_each<'s, B, F: FnMut(&'s A) -> ControlFlow<B>>(
+    fn try_each<'whole, Stop, Visit: FnMut(&'whole Part) -> ControlFlow<Stop>>(
         &self,
-        s: &'s S,
-        f: &mut F,
-    ) -> ControlFlow<B> {
-        self.0.try_each(s, &mut |m| self.1.try_each(m, f))
+        whole: &'whole Whole,
+        visit: &mut Visit,
+    ) -> ControlFlow<Stop> {
+        self.first
+            .try_each(whole, &mut |middle| self.second.try_each(middle, visit))
     }
 }
 
-impl<S, M, A, T, U> Setter<S, A> for Then<T, U, M>
+impl<Whole, Middle, Part, First, Second> Setter<Whole, Part> for Then<First, Second, Middle>
 where
-    S: ?Sized + 'static,
-    M: ?Sized + 'static,
-    A: ?Sized + 'static,
-    T: Setter<S, M>,
-    U: Setter<M, A>,
+    Whole: ?Sized + 'static,
+    Middle: ?Sized + 'static,
+    Part: ?Sized + 'static,
+    First: Setter<Whole, Middle>,
+    Second: Setter<Middle, Part>,
 {
-    fn try_modify<E, F: FnMut(&mut A) -> Result<(), E>>(
+    fn try_modify<Error, Change: FnMut(&mut Part) -> Result<(), Error>>(
         &self,
-        s: &mut S,
-        f: &mut F,
-    ) -> Result<(), E> {
-        self.0.try_modify(s, &mut |m| self.1.try_modify(m, f))
+        whole: &mut Whole,
+        change: &mut Change,
+    ) -> Result<(), Error> {
+        self.first
+            .try_modify(whole, &mut |middle| self.second.try_modify(middle, change))
     }
 }
 
-impl<S, M, A, T, U> Plate<S, A> for Then<T, U, M>
+impl<Whole, Middle, Part, First, Second> Plate<Whole, Part> for Then<First, Second, Middle>
 where
-    S: ?Sized + 'static,
-    M: ?Sized + 'static,
-    A: ?Sized + 'static,
-    T: Plate<S, M>,
-    U: Plate<M, A>,
+    Whole: ?Sized + 'static,
+    Middle: ?Sized + 'static,
+    Part: ?Sized + 'static,
+    First: Plate<Whole, Middle>,
+    Second: Plate<Middle, Part>,
 {
-    fn each_mut<'s, F: FnMut(&'s mut A)>(&self, s: &'s mut S, f: &mut F) {
-        self.0.each_mut(s, &mut |m| self.1.each_mut(m, f))
+    fn each_mut<'whole, Visit: FnMut(&'whole mut Part)>(
+        &self,
+        whole: &'whole mut Whole,
+        visit: &mut Visit,
+    ) {
+        self.first
+            .each_mut(whole, &mut |middle| self.second.each_mut(middle, visit))
     }
 }
 
-/// A one-level optic from one table: each arm a pattern on `S` and the
-/// parts it holds, each as `optic => place`. Its [`Fold`], [`Setter`] and
-/// [`Plate`] are all generated from the table. A pattern binds by
-/// reference in all three (`&S` or `&mut S`), so one pattern serves each.
+/// A one-level optic from one table. Each row of the table is a pattern
+/// on the whole, then the parts that case holds, each written
+/// `optic => place`: the field `place`, looked inside with `optic` (a leaf
+/// optic below, or a composed one). The macro writes the optic's [`Fold`],
+/// [`Setter`] and [`Plate`] from the one table. Rust's patterns bind by
+/// reference when matched against a reference, so the same pattern works
+/// on `&Whole` in the first and `&mut Whole` in the other two.
 macro_rules! optic {
-    ($(#[$m:meta])* $name:ident : $S:ty => $A:ty {
-        $($pat:pat => [$($o:expr => $place:expr),* $(,)?]),* $(,)?
+    ($(#[$attr:meta])* $name:ident : $Whole:ty => $Part:ty {
+        $($pattern:pat => [$($optic:expr => $place:expr),* $(,)?]),* $(,)?
     }) => {
-        $(#[$m])*
+        $(#[$attr])*
         #[derive(Clone, Copy)]
         pub(crate) struct $name;
 
-        impl Fold<$S, $A> for $name {
+        impl Fold<$Whole, $Part> for $name {
             #[allow(unused_variables, unreachable_patterns, deprecated)]
-            fn try_each<'s, B, F: FnMut(&'s $A) -> ControlFlow<B>>(
+            fn try_each<'whole, Stop, Visit: FnMut(&'whole $Part) -> ControlFlow<Stop>>(
                 &self,
-                s: &'s $S,
-                f: &mut F,
-            ) -> ControlFlow<B> {
-                match s {
-                    $($pat => { $(Fold::try_each(&$o, &$place, f)?;)* })*
+                whole: &'whole $Whole,
+                visit: &mut Visit,
+            ) -> ControlFlow<Stop> {
+                match whole {
+                    $($pattern => { $(Fold::try_each(&$optic, &$place, visit)?;)* })*
                     _ => {}
                 }
                 ControlFlow::Continue(())
             }
         }
 
-        impl Setter<$S, $A> for $name {
+        impl Setter<$Whole, $Part> for $name {
             #[allow(unused_variables, unreachable_patterns, deprecated)]
-            fn try_modify<E, F: FnMut(&mut $A) -> Result<(), E>>(
+            fn try_modify<Error, Change: FnMut(&mut $Part) -> Result<(), Error>>(
                 &self,
-                s: &mut $S,
-                f: &mut F,
-            ) -> Result<(), E> {
-                match s {
-                    $($pat => { $(Setter::try_modify(&$o, &mut $place, f)?;)* })*
+                whole: &mut $Whole,
+                change: &mut Change,
+            ) -> Result<(), Error> {
+                match whole {
+                    $($pattern => { $(Setter::try_modify(&$optic, &mut $place, change)?;)* })*
                     _ => {}
                 }
                 Ok(())
             }
         }
 
-        impl Plate<$S, $A> for $name {
+        impl Plate<$Whole, $Part> for $name {
             #[allow(unused_variables, unreachable_patterns, deprecated)]
-            fn each_mut<'s, F: FnMut(&'s mut $A)>(&self, s: &'s mut $S, f: &mut F) {
-                match s {
-                    $($pat => { $(Plate::each_mut(&$o, &mut $place, f);)* })*
+            fn each_mut<'whole, Visit: FnMut(&'whole mut $Part)>(
+                &self,
+                whole: &'whole mut $Whole,
+                visit: &mut Visit,
+            ) {
+                match whole {
+                    $($pattern => { $(Plate::each_mut(&$optic, &mut $place, visit);)* })*
                     _ => {}
                 }
             }
@@ -224,37 +276,42 @@ macro_rules! optic {
 }
 
 /// The leaf optics, one per shape a protobuf field has: the value itself,
-/// an `Option`, an `Option<Box>` and a `Vec`. Each is written three times,
-/// once per access, as it is the one place a shape is spelled out.
+/// an `Option`, an `Option<Box>` and a `Vec`. Each says how to reach the
+/// values inside its shape three times, once per kind of access: `shared`
+/// for [`Fold`], `unique` for [`Setter`] and `lend` for [`Plate`].
 macro_rules! leaf {
-    ($(#[$m:meta])* $name:ident, $S:ty, |$s:ident, $f:ident|
+    ($(#[$attr:meta])* $name:ident, $Whole:ty, |$whole:ident, $visit:ident|
         shared $shared:expr, unique $unique:expr, lend $lend:expr) => {
-        $(#[$m])*
+        $(#[$attr])*
         #[derive(Clone, Copy)]
         pub(crate) struct $name;
 
-        impl<T: 'static> Fold<$S, T> for $name {
-            fn try_each<'s, B, F: FnMut(&'s T) -> ControlFlow<B>>(
+        impl<Item: 'static> Fold<$Whole, Item> for $name {
+            fn try_each<'whole, Stop, Visit: FnMut(&'whole Item) -> ControlFlow<Stop>>(
                 &self,
-                $s: &'s $S,
-                $f: &mut F,
-            ) -> ControlFlow<B> {
+                $whole: &'whole $Whole,
+                $visit: &mut Visit,
+            ) -> ControlFlow<Stop> {
                 $shared
             }
         }
 
-        impl<T: 'static> Setter<$S, T> for $name {
-            fn try_modify<E, F: FnMut(&mut T) -> Result<(), E>>(
+        impl<Item: 'static> Setter<$Whole, Item> for $name {
+            fn try_modify<Error, Change: FnMut(&mut Item) -> Result<(), Error>>(
                 &self,
-                $s: &mut $S,
-                $f: &mut F,
-            ) -> Result<(), E> {
+                $whole: &mut $Whole,
+                $visit: &mut Change,
+            ) -> Result<(), Error> {
                 $unique
             }
         }
 
-        impl<T: 'static> Plate<$S, T> for $name {
-            fn each_mut<'s, F: FnMut(&'s mut T)>(&self, $s: &'s mut $S, $f: &mut F) {
+        impl<Item: 'static> Plate<$Whole, Item> for $name {
+            fn each_mut<'whole, Visit: FnMut(&'whole mut Item)>(
+                &self,
+                $whole: &'whole mut $Whole,
+                $visit: &mut Visit,
+            ) {
                 $lend
             }
         }
@@ -263,29 +320,29 @@ macro_rules! leaf {
 
 leaf!(
     /// The value itself.
-    Id, T, |s, f|
-    shared f(s), unique f(s), lend f(s)
+    Id, Item, |item, visit|
+    shared visit(item), unique visit(item), lend visit(item)
 );
 leaf!(
     /// The value of an `Option`, if any.
-    Opt, Option<T>, |s, f|
-    shared match s { Some(t) => f(t), None => ControlFlow::Continue(()) },
-    unique match s { Some(t) => f(t), None => Ok(()) },
-    lend if let Some(t) = s { f(t) }
+    Opt, Option<Item>, |option, visit|
+    shared match option { Some(item) => visit(item), None => ControlFlow::Continue(()) },
+    unique match option { Some(item) => visit(item), None => Ok(()) },
+    lend if let Some(item) = option { visit(item) }
 );
 leaf!(
     /// The value of an `Option<Box<_>>`, if any.
-    OptBox, Option<Box<T>>, |s, f|
-    shared match s { Some(t) => f(t), None => ControlFlow::Continue(()) },
-    unique match s { Some(t) => f(t), None => Ok(()) },
-    lend if let Some(t) = s { f(t) }
+    OptBox, Option<Box<Item>>, |option, visit|
+    shared match option { Some(item) => visit(item), None => ControlFlow::Continue(()) },
+    unique match option { Some(item) => visit(item), None => Ok(()) },
+    lend if let Some(item) = option { visit(item) }
 );
 leaf!(
     /// Each value of a `Vec`, in order.
-    Each, Vec<T>, |s, f|
-    shared { for t in s { f(t)?; } ControlFlow::Continue(()) },
-    unique { for t in s { f(t)?; } Ok(()) },
-    lend for t in s { f(t) }
+    Each, Vec<Item>, |items, visit|
+    shared { for item in items { visit(item)?; } ControlFlow::Continue(()) },
+    unique { for item in items { visit(item)?; } Ok(()) },
+    lend for item in items { visit(item) }
 );
 
 // ---------------------------------------------------------------- relations
@@ -298,9 +355,11 @@ optic! {
 }
 
 optic! {
+    /// The relation of one of a plan's entries: the root's input, or a
+    /// relation the plan shares.
     PlanRelRel: PlanRel => Rel {
         PlanRel { rel_type: Some(PlanRelType::Root(root)) } => [Opt => root.input],
-        PlanRel { rel_type: Some(PlanRelType::Rel(r)) } => [Id => *r],
+        PlanRel { rel_type: Some(PlanRelType::Rel(rel)) } => [Id => *rel],
     }
 }
 
@@ -313,17 +372,17 @@ optic! {
     /// The inputs of a relation, in order. The one list of them, a window
     /// relation's included.
     Inputs: RelType => Rel {
-        RelType::Filter(r) => [OptBox => r.input],
-        RelType::Fetch(r) => [OptBox => r.input],
-        RelType::Aggregate(r) => [OptBox => r.input],
-        RelType::Sort(r) => [OptBox => r.input],
-        RelType::Project(r) => [OptBox => r.input],
-        RelType::Window(r) => [OptBox => r.input],
-        RelType::ExtensionSingle(r) => [OptBox => r.input],
-        RelType::Join(r) => [OptBox => r.left, OptBox => r.right],
-        RelType::Cross(r) => [OptBox => r.left, OptBox => r.right],
-        RelType::Set(r) => [Each => r.inputs],
-        RelType::ExtensionMulti(r) => [Each => r.inputs],
+        RelType::Filter(filter) => [OptBox => filter.input],
+        RelType::Fetch(fetch) => [OptBox => fetch.input],
+        RelType::Aggregate(aggregate) => [OptBox => aggregate.input],
+        RelType::Sort(sort) => [OptBox => sort.input],
+        RelType::Project(project) => [OptBox => project.input],
+        RelType::Window(window) => [OptBox => window.input],
+        RelType::ExtensionSingle(extension) => [OptBox => extension.input],
+        RelType::Join(join) => [OptBox => join.left, OptBox => join.right],
+        RelType::Cross(cross) => [OptBox => cross.left, OptBox => cross.right],
+        RelType::Set(set) => [Each => set.inputs],
+        RelType::ExtensionMulti(extension) => [Each => extension.inputs],
     }
 }
 
@@ -336,36 +395,39 @@ optic! {
     /// (DataFusion writes a projection over one empty row, `SELECT
     /// random()`, as one).
     Exprs: RelType => Expression {
-        RelType::Filter(r) => [OptBox => r.condition],
-        RelType::Project(r) => [Each => r.expressions],
-        RelType::Join(r) => [OptBox => r.expression, OptBox => r.post_join_filter],
-        RelType::Sort(r) => [Each.then(SortExpr) => r.sorts],
-        RelType::Aggregate(r) => [
-            Each => r.grouping_expressions,
-            Each.then(GroupingExprs) => r.groupings,
-            Each.then(MeasureExprs) => r.measures,
+        RelType::Filter(filter) => [OptBox => filter.condition],
+        RelType::Project(project) => [Each => project.expressions],
+        RelType::Join(join) => [OptBox => join.expression, OptBox => join.post_join_filter],
+        RelType::Sort(sort) => [Each.then(SortExpr) => sort.sorts],
+        RelType::Aggregate(aggregate) => [
+            Each => aggregate.grouping_expressions,
+            Each.then(GroupingExprs) => aggregate.groupings,
+            Each.then(MeasureExprs) => aggregate.measures,
         ],
-        RelType::Read(r) => [
-            OptBox => r.filter,
-            OptBox => r.best_effort_filter,
-            Opt.then(VirtualRows) => r.read_type,
+        RelType::Read(read) => [
+            OptBox => read.filter,
+            OptBox => read.best_effort_filter,
+            Opt.then(VirtualRows) => read.read_type,
         ],
     }
 }
 
 optic! {
+    /// The values of a virtual table's rows, if the read is of one.
     VirtualRows: ReadType => Expression {
-        ReadType::VirtualTable(v) => [Id.then(VirtualFields) => *v],
+        ReadType::VirtualTable(table) => [Id.then(VirtualFields) => *table],
     }
 }
 
 optic! {
+    /// The values of a virtual table's rows, row by row.
     VirtualFields: VirtualTable => Expression {
         VirtualTable { expressions, .. } => [Each.then(StructFields) => *expressions],
     }
 }
 
 optic! {
+    /// The values of a struct literal: one virtual table row's.
     StructFields: substrait::proto::expression::nested::Struct => Expression {
         substrait::proto::expression::nested::Struct { fields, .. } => [Each => *fields],
     }
@@ -381,6 +443,7 @@ optic! {
 }
 
 optic! {
+    /// The expression a sort key sorts by.
     SortExpr: SortField => Expression { SortField { expr, .. } => [Opt => *expr] }
 }
 
@@ -395,6 +458,7 @@ optic! {
 }
 
 optic! {
+    /// An aggregate function's value arguments, then its sort keys.
     AggregateExprs: AggregateFunction => Expression {
         AggregateFunction { arguments, sorts, .. } => [
             Each.then(Value) => *arguments,
@@ -405,12 +469,12 @@ optic! {
 
 optic! {
     /// A join (a prism on a relation's kind).
-    AsJoin: RelType => JoinRel { RelType::Join(j) => [Id => **j] }
+    AsJoin: RelType => JoinRel { RelType::Join(join) => [Id => **join] }
 }
 
 optic! {
     /// A read (a prism on a relation's kind).
-    AsRead: RelType => ReadRel { RelType::Read(r) => [Id => **r] }
+    AsRead: RelType => ReadRel { RelType::Read(read) => [Id => **read] }
 }
 
 // -------------------------------------------------------------- expressions
@@ -423,7 +487,7 @@ optic! {
 optic! {
     /// A function argument that is a value.
     Value: FunctionArgument => Expression {
-        FunctionArgument { arg_type: Some(ArgType::Value(e)) } => [Id => *e],
+        FunctionArgument { arg_type: Some(ArgType::Value(value)) } => [Id => *value],
     }
 }
 
@@ -435,72 +499,82 @@ optic! {
     /// struct, list or map literal's values, and a subquery's needles or
     /// left side, which the row computes. Not a subquery's relation.
     SubExprs: RexType => Expression {
-        RexType::ScalarFunction(s) => [Each.then(Value) => s.arguments, Each => s.args],
-        RexType::WindowFunction(w) => [
-            Each.then(Value) => w.arguments,
-            Each => w.args,
-            Each => w.partitions,
-            Each.then(SortExpr) => w.sorts,
+        RexType::ScalarFunction(function) => [
+            Each.then(Value) => function.arguments,
+            Each => function.args,
         ],
-        RexType::IfThen(it) => [Each.then(IfBranch) => it.ifs, OptBox => it.r#else],
-        RexType::SwitchExpression(sw) => [
-            OptBox => sw.r#match,
-            Each.then(SwitchBranch) => sw.ifs,
-            OptBox => sw.r#else,
+        RexType::WindowFunction(window) => [
+            Each.then(Value) => window.arguments,
+            Each => window.args,
+            Each => window.partitions,
+            Each.then(SortExpr) => window.sorts,
         ],
-        RexType::SingularOrList(l) => [OptBox => l.value, Each => l.options],
-        RexType::MultiOrList(l) => [Each => l.value, Each.then(RecordFields) => l.options],
-        RexType::Cast(c) => [OptBox => c.input],
-        RexType::Nested(n) => [Opt.then(NestedValues) => n.nested_type],
-        RexType::Subquery(sq) => [Opt.then(SubqueryOuter) => sq.subquery_type],
+        RexType::IfThen(case) => [Each.then(IfBranch) => case.ifs, OptBox => case.r#else],
+        RexType::SwitchExpression(switch) => [
+            OptBox => switch.r#match,
+            Each.then(SwitchBranch) => switch.ifs,
+            OptBox => switch.r#else,
+        ],
+        RexType::SingularOrList(list) => [OptBox => list.value, Each => list.options],
+        RexType::MultiOrList(list) => [Each => list.value, Each.then(RecordFields) => list.options],
+        RexType::Cast(cast) => [OptBox => cast.input],
+        RexType::Nested(literal) => [Opt.then(NestedValues) => literal.nested_type],
+        RexType::Subquery(subquery) => [Opt.then(SubqueryOuter) => subquery.subquery_type],
     }
 }
 
 optic! {
+    /// A `CASE WHEN` branch's condition, then its result.
     IfBranch: IfClause => Expression { IfClause { r#if, then } => [Opt => *r#if, Opt => *then] }
 }
 
 optic! {
+    /// A `CASE x WHEN` branch's result. (The value it matches is a
+    /// literal, not an expression.)
     SwitchBranch: IfValue => Expression { IfValue { then, .. } => [Opt => *then] }
 }
 
 optic! {
+    /// The values of one option of a multi-column `IN` list.
     RecordFields: Record => Expression { Record { fields } => [Each => *fields] }
 }
 
 optic! {
+    /// The values of a struct, list or map literal; a map's keys too.
     NestedValues: NestedType => Expression {
-        NestedType::Struct(s) => [Each => s.fields],
-        NestedType::List(l) => [Each => l.values],
-        NestedType::Map(m) => [Each.then(MapEntry) => m.key_values],
+        NestedType::Struct(structure) => [Each => structure.fields],
+        NestedType::List(list) => [Each => list.values],
+        NestedType::Map(map) => [Each.then(MapEntry) => map.key_values],
     }
 }
 
 optic! {
+    /// A map literal entry's key, then its value.
     MapEntry: KeyValue => Expression { KeyValue { key, value } => [Opt => *key, Opt => *value] }
 }
 
 optic! {
     /// A subquery's expressions of the row it sits in.
     SubqueryOuter: SubqueryType => Expression {
-        SubqueryType::InPredicate(s) => [Each => s.needles],
-        SubqueryType::SetComparison(s) => [OptBox => s.left],
+        SubqueryType::InPredicate(in_list) => [Each => in_list.needles],
+        SubqueryType::SetComparison(comparison) => [OptBox => comparison.left],
     }
 }
 
 optic! {
     /// The relation of an expression of this kind, if it is a subquery.
     SubqueryRel: RexType => Rel {
-        RexType::Subquery(sq) => [Opt.then(SubqueryInner) => sq.subquery_type],
+        RexType::Subquery(subquery) => [Opt.then(SubqueryInner) => subquery.subquery_type],
     }
 }
 
 optic! {
+    /// The relation a subquery runs.
     SubqueryInner: SubqueryType => Rel {
-        SubqueryType::Scalar(s) => [OptBox => s.input],
-        SubqueryType::InPredicate(s) => [OptBox => s.haystack],
-        SubqueryType::SetPredicate(s) => [OptBox => s.tuples],
-        SubqueryType::SetComparison(s) => [OptBox => s.right],
+        SubqueryType::Scalar(scalar) => [OptBox => scalar.input],
+        SubqueryType::InPredicate(in_list) => [OptBox => in_list.haystack],
+        SubqueryType::SetPredicate(exists) => [OptBox => exists.tuples],
+        SubqueryType::SetComparison(comparison) => [OptBox => comparison.right],
     }
 }
 
@@ -532,35 +606,41 @@ optic! {
 #[derive(Clone, Copy)]
 pub(crate) struct Cosmos;
 
+// Each walk below keeps a stack of the nodes still to visit. It pops a
+// node, visits it, and pushes its children; the children are pushed in
+// order and then reversed in place, so the first child is popped next and
+// the walk visits nodes in pre-order, left to right.
+
 impl Fold<Expression, Expression> for Cosmos {
-    fn try_each<'s, B, F: FnMut(&'s Expression) -> ControlFlow<B>>(
+    fn try_each<'whole, Stop, Visit: FnMut(&'whole Expression) -> ControlFlow<Stop>>(
         &self,
-        s: &'s Expression,
-        f: &mut F,
-    ) -> ControlFlow<B> {
-        let mut stack = vec![s];
-        while let Some(e) = stack.pop() {
-            f(e)?;
-            let from = stack.len();
-            Rex.then(SubExprs).each(e, |c| stack.push(c));
-            stack[from..].reverse();
+        root: &'whole Expression,
+        visit: &mut Visit,
+    ) -> ControlFlow<Stop> {
+        let mut to_visit = vec![root];
+        while let Some(expr) = to_visit.pop() {
+            visit(expr)?;
+            let first_child = to_visit.len();
+            Rex.then(SubExprs).each(expr, |child| to_visit.push(child));
+            to_visit[first_child..].reverse();
         }
         ControlFlow::Continue(())
     }
 }
 
 impl Setter<Expression, Expression> for Cosmos {
-    fn try_modify<E, F: FnMut(&mut Expression) -> Result<(), E>>(
+    fn try_modify<Error, Change: FnMut(&mut Expression) -> Result<(), Error>>(
         &self,
-        s: &mut Expression,
-        f: &mut F,
-    ) -> Result<(), E> {
-        let mut stack = vec![s];
-        while let Some(e) = stack.pop() {
-            f(e)?;
-            let from = stack.len();
-            Rex.then(SubExprs).each_mut(e, &mut |c| stack.push(c));
-            stack[from..].reverse();
+        root: &mut Expression,
+        change: &mut Change,
+    ) -> Result<(), Error> {
+        let mut to_visit = vec![root];
+        while let Some(expr) = to_visit.pop() {
+            change(expr)?;
+            let first_child = to_visit.len();
+            Rex.then(SubExprs)
+                .each_mut(expr, &mut |child| to_visit.push(child));
+            to_visit[first_child..].reverse();
         }
         Ok(())
     }
@@ -573,34 +653,36 @@ impl Setter<Expression, Expression> for Cosmos {
 pub(crate) struct Tree;
 
 impl Fold<Rel, Rel> for Tree {
-    fn try_each<'s, B, F: FnMut(&'s Rel) -> ControlFlow<B>>(
+    fn try_each<'whole, Stop, Visit: FnMut(&'whole Rel) -> ControlFlow<Stop>>(
         &self,
-        s: &'s Rel,
-        f: &mut F,
-    ) -> ControlFlow<B> {
-        let mut stack = vec![s];
-        while let Some(r) = stack.pop() {
-            f(r)?;
-            let from = stack.len();
-            RelKind.then(Inputs).each(r, |c| stack.push(c));
-            stack[from..].reverse();
+        root: &'whole Rel,
+        visit: &mut Visit,
+    ) -> ControlFlow<Stop> {
+        let mut to_visit = vec![root];
+        while let Some(rel) = to_visit.pop() {
+            visit(rel)?;
+            let first_child = to_visit.len();
+            RelKind.then(Inputs).each(rel, |input| to_visit.push(input));
+            to_visit[first_child..].reverse();
         }
         ControlFlow::Continue(())
     }
 }
 
 impl Setter<Rel, Rel> for Tree {
-    fn try_modify<E, F: FnMut(&mut Rel) -> Result<(), E>>(
+    fn try_modify<Error, Change: FnMut(&mut Rel) -> Result<(), Error>>(
         &self,
-        s: &mut Rel,
-        f: &mut F,
-    ) -> Result<(), E> {
-        let mut stack = vec![s];
-        while let Some(r) = stack.pop() {
-            f(r)?;
-            let from = stack.len();
-            RelKind.then(Inputs).each_mut(r, &mut |c| stack.push(c));
-            stack[from..].reverse();
+        root: &mut Rel,
+        change: &mut Change,
+    ) -> Result<(), Error> {
+        let mut to_visit = vec![root];
+        while let Some(rel) = to_visit.pop() {
+            change(rel)?;
+            let first_child = to_visit.len();
+            RelKind
+                .then(Inputs)
+                .each_mut(rel, &mut |input| to_visit.push(input));
+            to_visit[first_child..].reverse();
         }
         Ok(())
     }
@@ -620,44 +702,49 @@ pub(crate) fn subquery_rels() -> impl Fold<Expression, Rel> + Setter<Expression,
 }
 
 impl Fold<Rel, Rel> for Deep {
-    fn try_each<'s, B, F: FnMut(&'s Rel) -> ControlFlow<B>>(
+    fn try_each<'whole, Stop, Visit: FnMut(&'whole Rel) -> ControlFlow<Stop>>(
         &self,
-        s: &'s Rel,
-        f: &mut F,
-    ) -> ControlFlow<B> {
-        let mut stack = vec![s];
-        while let Some(r) = stack.pop() {
-            f(r)?;
-            let from = stack.len();
+        root: &'whole Rel,
+        visit: &mut Visit,
+    ) -> ControlFlow<Stop> {
+        let mut to_visit = vec![root];
+        while let Some(rel) = to_visit.pop() {
+            visit(rel)?;
+            let first_child = to_visit.len();
             RelKind
                 .then(Exprs)
                 .then(subquery_rels())
-                .each(r, |c| stack.push(c));
-            RelKind.then(Inputs).each(r, |c| stack.push(c));
-            stack[from..].reverse();
+                .each(rel, |subquery| to_visit.push(subquery));
+            RelKind.then(Inputs).each(rel, |input| to_visit.push(input));
+            to_visit[first_child..].reverse();
         }
         ControlFlow::Continue(())
     }
 }
 
 impl Setter<Rel, Rel> for Deep {
-    fn try_modify<E, F: FnMut(&mut Rel) -> Result<(), E>>(
+    fn try_modify<Error, Change: FnMut(&mut Rel) -> Result<(), Error>>(
         &self,
-        s: &mut Rel,
-        f: &mut F,
-    ) -> Result<(), E> {
-        let mut stack = vec![s];
-        while let Some(r) = stack.pop() {
-            f(r)?;
+        root: &mut Rel,
+        change: &mut Change,
+    ) -> Result<(), Error> {
+        let mut to_visit = vec![root];
+        while let Some(rel) = to_visit.pop() {
+            change(rel)?;
             // A subquery's relations are walked now, recursively (subqueries
-            // nest shallowly); the inputs later, off the stack.
+            // nest shallowly); the inputs later, off the stack. They can't
+            // be pushed for later as the Fold does: `Cosmos`, which finds
+            // them, keeps its own stack, so it has no [`Plate`] to lend
+            // them past its own call.
             RelKind
                 .then(Exprs)
                 .then(subquery_rels())
-                .try_modify(r, &mut |sub| self.try_modify(sub, f))?;
-            let from = stack.len();
-            RelKind.then(Inputs).each_mut(r, &mut |c| stack.push(c));
-            stack[from..].reverse();
+                .try_modify(rel, &mut |subquery| self.try_modify(subquery, change))?;
+            let first_child = to_visit.len();
+            RelKind
+                .then(Inputs)
+                .each_mut(rel, &mut |input| to_visit.push(input));
+            to_visit[first_child..].reverse();
         }
         Ok(())
     }
