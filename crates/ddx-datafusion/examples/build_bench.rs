@@ -129,7 +129,7 @@ fn plan_rows(case: &str, p: &Plan, wrt: &[ColumnRef]) {
     let g = ddx_ad::grad(p, wrt).unwrap();
     match ddx_ad::jvp(&g, wrt) {
         Ok(_) => row(case, "hvp", || {
-            ddx_ad::jvp(&ddx_ad::grad(p, wrt).unwrap(), wrt).unwrap();
+            ddx_ad::jvp(&g, wrt).unwrap();
         }),
         Err(e) => println!("{case:<22} hvp      refused: {e}"),
     }

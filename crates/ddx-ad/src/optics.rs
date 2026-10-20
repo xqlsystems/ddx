@@ -32,7 +32,7 @@
 
 use std::ops::ControlFlow;
 
-use substrait::proto::aggregate_rel::Measure;
+use substrait::proto::aggregate_rel::{Grouping, Measure};
 use substrait::proto::expression::if_then::IfClause;
 use substrait::proto::expression::multi_or_list::Record;
 use substrait::proto::expression::nested::map::KeyValue;
@@ -330,7 +330,8 @@ optic! {
 optic! {
     /// The expressions of a relation, outermost each: a filter's condition,
     /// a projection's expressions, a join's condition and post-join filter,
-    /// a sort's keys, an aggregate's groupings and its measures' arguments,
+    /// a sort's keys, an aggregate's groupings (each grouping's deprecated
+    /// copy too) and its measures' arguments,
     /// sort keys and filters, and a read's filters and a virtual table's rows
     /// (DataFusion writes a projection over one empty row, `SELECT
     /// random()`, as one).
@@ -341,6 +342,7 @@ optic! {
         RelType::Sort(r) => [Each.then(SortExpr) => r.sorts],
         RelType::Aggregate(r) => [
             Each => r.grouping_expressions,
+            Each.then(GroupingExprs) => r.groupings,
             Each.then(MeasureExprs) => r.measures,
         ],
         RelType::Read(r) => [
@@ -366,6 +368,15 @@ optic! {
 optic! {
     StructFields: substrait::proto::expression::nested::Struct => Expression {
         substrait::proto::expression::nested::Struct { fields, .. } => [Each => *fields],
+    }
+}
+
+optic! {
+    /// A grouping's own copy of its expressions: deprecated, but older
+    /// producers fill only these, and ddx writes them beside the top-level
+    /// list, so a rewrite must reach both.
+    GroupingExprs: Grouping => Expression {
+        Grouping { grouping_expressions, .. } => [Each => *grouping_expressions],
     }
 }
 
@@ -765,6 +776,37 @@ mod tests {
             }
         });
         assert_eq!(names(Deep.to_vec(&rel)), ["s2", "t2"]);
+    }
+
+    #[test]
+    fn exprs_reaches_a_grouping_s_deprecated_copy_of_its_expressions() {
+        // ddx writes each grouping expression twice: top-level, and in the
+        // grouping (deprecated). A rewrite through `Exprs` changes both.
+        let mut kind = RelType::Aggregate(Box::new(substrait::proto::AggregateRel {
+            grouping_expressions: vec![call(7, vec![field(0)])],
+            #[allow(deprecated)]
+            groupings: vec![Grouping {
+                grouping_expressions: vec![call(7, vec![field(0)])],
+                expression_references: vec![0],
+            }],
+            ..Default::default()
+        }));
+        Exprs.then(Cosmos).then(Rex).modify(&mut kind, |rex| {
+            if let RexType::ScalarFunction(f) = rex {
+                f.function_reference = 9;
+            }
+        });
+        let anchors: Vec<u32> = Exprs
+            .then(Cosmos)
+            .then(Rex)
+            .to_vec(&kind)
+            .into_iter()
+            .filter_map(|rex| match rex {
+                RexType::ScalarFunction(f) => Some(f.function_reference),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchors, [9, 9]);
     }
 
     #[test]
