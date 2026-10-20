@@ -19,7 +19,8 @@
 use substrait::proto::{Plan, Rel};
 
 use crate::emit::read_step;
-use crate::forward::{rel_inputs, rel_inputs_mut, root_of, step_columns, width};
+use crate::forward::{root_of, step_columns, width};
+use crate::optics::{Compose, Fold, Inputs, RelKind, Setter};
 use crate::program::{Step, Unbound};
 
 /// The most relations deep a step may be: 64 levels of protobuf nesting,
@@ -85,9 +86,7 @@ fn depth(rel: &Rel) -> usize {
     let mut stack = vec![(rel, 1)];
     while let Some((r, d)) = stack.pop() {
         deepest = deepest.max(d);
-        if let Some(kind) = &r.rel_type {
-            stack.extend(rel_inputs(kind).into_iter().map(|i| (i, d + 1)));
-        }
+        RelKind.then(Inputs).each(r, |i| stack.push((i, d + 1)));
     }
     deepest
 }
@@ -98,14 +97,11 @@ fn depth(rel: &Rel) -> usize {
 /// bounded: a subtree is cut before it is [`MAX_DEPTH`] deep, so no call
 /// is deeper than the plan, whose depth is what this exists to bound.
 fn height(rel: &mut Rel, name: &str, cut: &mut Vec<(String, Rel, usize)>) -> usize {
-    let h = 1 + match rel.rel_type.as_mut() {
-        Some(kind) => rel_inputs_mut(kind)
-            .into_iter()
-            .map(|input| height(input, name, cut))
-            .max()
-            .unwrap_or(0),
-        None => 0,
-    };
+    let mut below = 0;
+    RelKind
+        .then(Inputs)
+        .modify(rel, |input| below = below.max(height(input, name, cut)));
+    let h = 1 + below;
     if h < MAX_DEPTH {
         return h;
     }

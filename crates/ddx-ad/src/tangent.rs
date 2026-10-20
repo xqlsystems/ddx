@@ -67,11 +67,9 @@ use crate::expr::{
     as_field, as_number, call, cast, field, fields_of, fp64, if_then, lit_bool, lit_f64,
     map_fields, null_f64, scalar_args, uncorrelated_scalar,
 };
-use crate::forward::{
-    apply_emit, collect_subqueries, grouping_expressions, input, read_outputs, rel_expressions,
-    rel_inputs, rel_name, width,
-};
+use crate::forward::{apply_emit, grouping_expressions, input, read_outputs, rel_name, width};
 use crate::functions::{Extensions, Function, Functions};
+use crate::optics::{subqueries, Compose, Cosmos, Exprs, Fold, Inputs, Setter};
 use crate::reduce::{no_rule, reduce_rule, whole_partition, Linear, Reduce};
 use crate::relation::Table;
 
@@ -255,18 +253,14 @@ impl<'a> Dualizer<'a> {
                 self.varied.insert(k, v);
                 continue;
             }
-            let mut below: Vec<&Rel> = rel_inputs(kind);
+            let mut below: Vec<&Rel> = Inputs.to_vec(kind);
             let mut correlated = false;
-            for e in rel_expressions(kind) {
-                let mut subqueries = Vec::new();
-                collect_subqueries(e, &mut subqueries);
-                for sq in subqueries {
-                    match uncorrelated_scalar(sq) {
-                        Some(inner) => below.push(inner),
-                        None => correlated = true,
-                    }
-                }
-            }
+            Exprs
+                .then(subqueries())
+                .each(kind, |sq| match uncorrelated_scalar(sq) {
+                    Some(inner) => below.push(inner),
+                    None => correlated = true,
+                });
             if ready {
                 let v = correlated
                     || below
@@ -284,22 +278,18 @@ impl<'a> Dualizer<'a> {
     /// A subquery in a relation on the varied path is carried through as a
     /// constant, which is only right if it reads nothing varied.
     fn refuse_varied_subqueries(&mut self, kind: &RelType) -> Result<()> {
-        for e in rel_expressions(kind) {
-            let mut subqueries = Vec::new();
-            collect_subqueries(e, &mut subqueries);
-            for sq in subqueries {
-                let varied = match uncorrelated_scalar(sq) {
-                    Some(inner) => self.reads_varied(inner)?,
-                    None => true,
-                };
-                if varied {
-                    return Err(AdError::NotImplemented(
-                        "a subquery that is correlated, or reads a wrt table, inside an \
-                         expression on the path from a wrt table to the output; write it as a \
-                         join"
-                            .into(),
-                    ));
-                }
+        for sq in Exprs.then(subqueries()).to_vec(kind) {
+            let varied = match uncorrelated_scalar(sq) {
+                Some(inner) => self.reads_varied(inner)?,
+                None => true,
+            };
+            if varied {
+                return Err(AdError::NotImplemented(
+                    "a subquery that is correlated, or reads a wrt table, inside an \
+                     expression on the path from a wrt table to the output; write it as a \
+                     join"
+                        .into(),
+                ));
             }
         }
         Ok(())
@@ -1297,49 +1287,13 @@ const SLOT: usize = 1 << 30;
 
 /// `e` with each placeholder field `SLOT + i` replaced by `args[i]`.
 fn substitute(e: &Expression, args: &[&Expression]) -> Expression {
-    fn walk(e: &mut Expression, args: &[&Expression]) {
-        if let Some(f) = as_field(e) {
-            if let Some(a) = f.checked_sub(SLOT).and_then(|i| args.get(i)) {
-                *e = (*a).clone();
-            }
-            return;
-        }
-        match e.rex_type.as_mut() {
-            Some(RexType::ScalarFunction(f)) => {
-                for a in f.arguments.iter_mut() {
-                    if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
-                        walk(x, args);
-                    }
-                }
-            }
-            Some(RexType::IfThen(it)) => {
-                for c in it.ifs.iter_mut() {
-                    for x in c.r#if.iter_mut().chain(c.then.iter_mut()) {
-                        walk(x, args);
-                    }
-                }
-                for x in it.r#else.iter_mut() {
-                    walk(x, args);
-                }
-            }
-            Some(RexType::Cast(c)) => {
-                for x in c.input.iter_mut() {
-                    walk(x, args);
-                }
-            }
-            Some(RexType::SingularOrList(l)) => {
-                for x in l.value.iter_mut() {
-                    walk(x, args);
-                }
-                for x in l.options.iter_mut() {
-                    walk(x, args);
-                }
-            }
-            _ => {}
-        }
-    }
     let mut out = e.clone();
-    walk(&mut out, args);
+    Cosmos.modify(&mut out, |x| {
+        let slot = as_field(x).and_then(|f| f.checked_sub(SLOT));
+        if let Some(a) = slot.and_then(|i| args.get(i)) {
+            *x = (*a).clone();
+        }
+    });
     out
 }
 

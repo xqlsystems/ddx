@@ -42,7 +42,8 @@ use substrait::proto::{Expression, Plan, ProjectRel, Rel, RelCommon};
 
 use crate::emit::{is_identity, project_emit};
 use crate::expr::{as_field, contains, field, fields_of, map_fields};
-use crate::forward::{apply_emit, rel_inputs_mut, width};
+use crate::forward::{apply_emit, width};
+use crate::optics::{Setter, Tree};
 
 /// Fuse every projection of `plan` into the projections beneath it, where
 /// that is free (see the module docs).
@@ -59,15 +60,11 @@ pub(crate) fn fuse_plan(plan: &mut Plan) {
 /// [`fuse_plan`] on one tree. A loop, not recursion: a chain of relations
 /// can be hundreds deep.
 fn fuse(rel: &mut Rel) {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
+    Tree.modify(rel, |r| {
         while let Some(fused) = fused(r) {
             *r = fused;
         }
-        if let Some(kind) = r.rel_type.as_mut() {
-            stack.extend(rel_inputs_mut(kind));
-        }
-    }
+    })
 }
 
 /// `rel` as one projection, if it is a projection over a projection that can

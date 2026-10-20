@@ -39,6 +39,7 @@
 //! a refusal that is raised only if gradient actually reaches it.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::rc::Rc;
 
 use prost::Message;
@@ -60,10 +61,13 @@ use crate::elementwise::depends;
 use crate::emit;
 use crate::error::{AdError, Result};
 use crate::expr::{
-    as_field, children, contains, rex_children_mut, field, fields_of, if_then, lit_bool, map_fields,
-    uncorrelated_scalar,
+    as_field, contains, field, fields_of, if_then, lit_bool, map_fields, uncorrelated_scalar,
 };
 use crate::functions::Functions;
+use crate::optics::{
+    subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs, RelKind, Rex,
+    Setter, Tree,
+};
 use crate::reduce::{reduce_rule, whole_partition, Reduce};
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
 
@@ -452,25 +456,20 @@ pub(crate) fn shared_relations(root: &Rel, relations: &[PlanRel]) -> Result<Vec<
     /// The ordinals `rel`'s tree reads, in order, its subqueries checked.
     fn references(rel: &Rel) -> Result<Vec<i32>> {
         let mut out = Vec::new();
-        let mut stack = vec![rel];
-        while let Some(r) = stack.pop() {
-            let Some(kind) = &r.rel_type else { continue };
+        // Every relation `Shapes` interns, so every reference it meets is
+        // one checked here.
+        let inside = Tree.then(RelKind).try_each(rel, &mut |kind| {
             if let RelType::Reference(x) = kind {
                 out.push(x.subtree_ordinal);
-                continue;
+            } else if Exprs.then(subquery_rels()).any(kind, mentions_reference) {
+                return ControlFlow::Break(());
             }
-            let mut inside = Vec::new();
-            for e in rel_expressions(kind) {
-                subquery_rels(e, &mut inside);
-            }
-            if inside.into_iter().any(mentions_reference) {
-                return Err(AdError::NotImplemented(
-                    "a ReferenceRel inside a subquery expression".into(),
-                ));
-            }
-            // The inputs `Shapes` interns, a window relation's included, so
-            // every reference it meets is one checked here.
-            stack.extend(input_slots(kind).into_iter().flatten().rev());
+            ControlFlow::Continue(())
+        });
+        if inside.is_break() {
+            return Err(AdError::NotImplemented(
+                "a ReferenceRel inside a subquery expression".into(),
+            ));
         }
         Ok(out)
     }
@@ -531,12 +530,7 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
             path.pop();
             return Ok(());
         }
-        if let Some(kind) = rel.rel_type.as_mut() {
-            for input in rel_inputs_mut(kind) {
-                inline(input, relations, path)?;
-            }
-        }
-        Ok(())
+        RelKind.then(Inputs).try_modify(rel, &mut |input| inline(input, relations, path))
     }
     let mut out = root.clone();
     inline(&mut out, relations, &mut Vec::new())?;
@@ -548,69 +542,9 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
     Ok(out)
 }
 
-/// The relations of the subqueries in `e`, pushed onto `out`.
-pub(crate) fn subquery_rels<'e>(e: &'e Expression, out: &mut Vec<&'e Rel>) {
-    use substrait::proto::expression::subquery::SubqueryType;
-    if let Some(RexType::Subquery(sq)) = &e.rex_type {
-        match &sq.subquery_type {
-            Some(SubqueryType::Scalar(s)) => out.extend(s.input.as_deref()),
-            Some(SubqueryType::InPredicate(s)) => {
-                out.extend(s.haystack.as_deref());
-                s.needles.iter().for_each(|n| subquery_rels(n, out));
-            }
-            Some(SubqueryType::SetPredicate(s)) => out.extend(s.tuples.as_deref()),
-            Some(SubqueryType::SetComparison(s)) => {
-                out.extend(s.right.as_deref());
-                s.left.iter().for_each(|l| subquery_rels(l, out));
-            }
-            None => {}
-        }
-    }
-    for c in children(e) {
-        subquery_rels(c, out);
-    }
-}
-
-/// [`subquery_rels`], mutably: the relations of the subqueries in `e`.
-pub(crate) fn subquery_rels_mut(e: &mut Expression) -> Vec<&mut Rel> {
-    use substrait::proto::expression::subquery::SubqueryType;
-    let Some(rex) = e.rex_type.as_mut() else {
-        return Vec::new();
-    };
-    let RexType::Subquery(sq) = rex else {
-        return rex_children_mut(rex).into_iter().flat_map(subquery_rels_mut).collect();
-    };
-    match sq.subquery_type.as_mut() {
-        Some(SubqueryType::Scalar(s)) => s.input.as_deref_mut().into_iter().collect(),
-        Some(SubqueryType::InPredicate(s)) => {
-            let mut out: Vec<&mut Rel> = s.haystack.as_deref_mut().into_iter().collect();
-            out.extend(s.needles.iter_mut().flat_map(subquery_rels_mut));
-            out
-        }
-        Some(SubqueryType::SetPredicate(s)) => s.tuples.as_deref_mut().into_iter().collect(),
-        Some(SubqueryType::SetComparison(s)) => {
-            let mut out: Vec<&mut Rel> = s.right.as_deref_mut().into_iter().collect();
-            out.extend(s.left.as_deref_mut().into_iter().flat_map(subquery_rels_mut));
-            out
-        }
-        None => Vec::new(),
-    }
-}
-
 /// Does `rel` still hold a `ReferenceRel` anywhere, subqueries included?
 fn mentions_reference(rel: &Rel) -> bool {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
-        let Some(kind) = &r.rel_type else { continue };
-        if matches!(kind, RelType::Reference(_)) {
-            return true;
-        }
-        for e in rel_expressions(kind) {
-            subquery_rels(e, &mut stack);
-        }
-        stack.extend(rel_inputs(kind));
-    }
-    false
+    Deep.then(RelKind).any(rel, |k| matches!(k, RelType::Reference(_)))
 }
 
 /// A structural id for each aggregate of a plan: equal ids for equal
@@ -899,28 +833,22 @@ impl Builder<'_> {
         // A subquery in this relation's expressions is carried through as a
         // constant (see `uncorrelated_scalar`). That is only right if it reads
         // no wrt table; otherwise the gradient through it would be dropped.
-        for e in rel_expressions(kind) {
-            let mut subqueries = Vec::new();
-            collect_subqueries(e, &mut subqueries);
-            for sq in subqueries {
-                let reads = match uncorrelated_scalar(sq) {
-                    Some(inner) => self.reads_wrt(inner)?,
-                    None => true,
-                };
-                if reads {
-                    return Err(AdError::NotImplemented(
-                        "a subquery that is correlated, or reads a wrt table, inside an \
-                         expression on the path from a wrt table to the output; write it as a \
-                         join"
-                            .into(),
-                    ));
-                }
+        for sq in Exprs.then(subqueries()).to_vec(kind) {
+            let reads = match uncorrelated_scalar(sq) {
+                Some(inner) => self.reads_wrt(inner)?,
+                None => true,
+            };
+            if reads {
+                return Err(AdError::NotImplemented(
+                    "a subquery that is correlated, or reads a wrt table, inside an \
+                     expression on the path from a wrt table to the output; write it as a \
+                     join"
+                        .into(),
+                ));
             }
         }
-        let volatile = !matches!(kind, RelType::Aggregate(_))
-            && rel_expressions(kind)
-                .into_iter()
-                .any(|e| self.calls_volatile(e));
+        let volatile =
+            !matches!(kind, RelType::Aggregate(_)) && Exprs.any(kind, |e| self.calls_volatile(e));
         let (mut s, direct, common) = match kind {
             RelType::Read(r) => {
                 let s = self.read(r)?;
@@ -1431,10 +1359,8 @@ impl Builder<'_> {
                 .unwrap_or(false),
             _ => false,
         });
-        let mut subqueries = Vec::new();
-        collect_subqueries(e, &mut subqueries);
         direct
-            || subqueries.into_iter().any(|sq| {
+            || subqueries().any(e, |sq| {
                 // A subquery ddx cannot read is refused elsewhere.
                 uncorrelated_scalar(sq).is_some_and(|r| self.volatile_under(r))
             })
@@ -1442,13 +1368,7 @@ impl Builder<'_> {
 
     /// Does anything in `rel` call a volatile function?
     fn volatile_under(&self, rel: &Rel) -> bool {
-        let Some(kind) = rel.rel_type.as_ref() else {
-            return false;
-        };
-        rel_expressions(kind)
-            .into_iter()
-            .any(|e| self.calls_volatile(e))
-            || rel_inputs(kind).into_iter().any(|r| self.volatile_under(r))
+        Tree.then(RelKind).then(Exprs).any(rel, |e| self.calls_volatile(e))
     }
 
     /// Does anything under `rel` read a `wrt` table? Records every table name
@@ -1486,21 +1406,15 @@ impl Builder<'_> {
             // read like any other input; anything else is conservatively
             // assumed to read a wrt table, so lowering refuses it rather than
             // treating it as constant.
-            let mut below: Vec<&Rel> = rel_inputs(kind);
+            let mut below: Vec<&Rel> = Inputs.to_vec(kind);
             if let RelType::Reference(r) = kind {
                 below.push(referenced(self.relations, r.subtree_ordinal)?);
             }
             let mut correlated = false;
-            for e in rel_expressions(kind) {
-                let mut subqueries = Vec::new();
-                collect_subqueries(e, &mut subqueries);
-                for sq in subqueries {
-                    match uncorrelated_scalar(sq) {
-                        Some(inner) => below.push(inner),
-                        None => correlated = true,
-                    }
-                }
-            }
+            Exprs.then(subqueries()).each(kind, |sq| match uncorrelated_scalar(sq) {
+                Some(inner) => below.push(inner),
+                None => correlated = true,
+            });
             if ready {
                 let found = correlated
                     || below
@@ -1676,18 +1590,10 @@ fn rename_in_place(rel: Rel, width: usize, cols: &[usize]) -> Rel {
 /// anywhere in it: then which rows it gives can depend on how the engine
 /// orders ties, and a recomputation need not give the same ones.
 fn is_ordered(rel: &Rel) -> bool {
-    let Some(kind) = rel.rel_type.as_ref() else {
-        return false;
-    };
-    if matches!(kind, RelType::Fetch(_) | RelType::Window(_)) {
-        return true;
-    }
-    let window = |e: &Expression| {
-        contains(e, &|x| {
-            matches!(x.rex_type, Some(RexType::WindowFunction(_)))
-        })
-    };
-    rel_expressions(kind).into_iter().any(window) || rel_inputs(kind).into_iter().any(is_ordered)
+    Tree.then(RelKind).any(rel, |kind| {
+        matches!(kind, RelType::Fetch(_) | RelType::Window(_))
+            || Exprs.then(Cosmos).then(Rex).any(kind, |x| matches!(x, RexType::WindowFunction(_)))
+    })
 }
 
 fn empty(rel: Rel) -> Region {
@@ -1890,212 +1796,60 @@ pub fn width(rel: &Rel) -> Result<usize> {
 /// Does anything under `rel`, a subquery's included, call an aggregate or
 /// window function that rounds (see [`Functions::rounds`])?
 pub(crate) fn rounds_under(functions: &Functions, rel: &Rel) -> Result<bool> {
-    let Some(kind) = rel.rel_type.as_ref() else {
-        return Ok(false);
-    };
     let calls = |anchor: u32| functions.rounds(anchor);
-    match kind {
-        RelType::Aggregate(a) => {
-            for m in &a.measures {
-                if let Some(f) = &m.measure {
+    // Whether this relation itself calls one, its subqueries included.
+    let here = |kind: &RelType| -> Result<bool> {
+        match kind {
+            RelType::Aggregate(a) => {
+                for m in &a.measures {
+                    if let Some(f) = &m.measure {
+                        if calls(f.function_reference)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            RelType::Window(w) => {
+                for f in &w.window_functions {
                     if calls(f.function_reference)? {
                         return Ok(true);
                     }
                 }
             }
+            _ => {}
         }
-        RelType::Window(w) => {
-            for f in &w.window_functions {
-                if calls(f.function_reference)? {
+        for e in Exprs.to_vec(kind) {
+            let windows = Cosmos.then(Rex).then(AsWindow).to_vec(e);
+            for w in windows {
+                if calls(w.function_reference)? {
                     return Ok(true);
                 }
             }
-        }
-        _ => {}
-    }
-    for e in rel_expressions(kind) {
-        let mut windows = Vec::new();
-        collect_window_functions(e, &mut windows);
-        for f in windows {
-            if calls(f)? {
+            if subquery_rounds(functions, e)? {
                 return Ok(true);
             }
         }
-        if subquery_rounds(functions, e)? {
-            return Ok(true);
-        }
+        Ok(false)
+    };
+    match Tree.then(RelKind).try_each(rel, &mut |kind| match here(kind) {
+        Ok(false) => ControlFlow::Continue(()),
+        found => ControlFlow::Break(found),
+    }) {
+        ControlFlow::Break(found) => found,
+        ControlFlow::Continue(()) => Ok(false),
     }
-    for r in rel_inputs(kind) {
-        if rounds_under(functions, r)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Does `e` read a subquery computed by a function that rounds? A
 /// subquery that is not an uncorrelated scalar one is assumed to.
 pub(crate) fn subquery_rounds(functions: &Functions, e: &Expression) -> Result<bool> {
-    let mut subqueries = Vec::new();
-    collect_subqueries(e, &mut subqueries);
-    for sq in subqueries {
+    for sq in subqueries().to_vec(e) {
         match uncorrelated_scalar(sq) {
             Some(inner) if !rounds_under(functions, inner)? => {}
             _ => return Ok(true),
         }
     }
     Ok(false)
-}
-
-/// The function of every window function inside `e`; not inside subqueries.
-fn collect_window_functions(e: &Expression, out: &mut Vec<u32>) {
-    match &e.rex_type {
-        Some(RexType::WindowFunction(w)) => out.push(w.function_reference),
-        Some(RexType::Subquery(_)) => return,
-        _ => {}
-    }
-    for c in children(e) {
-        collect_window_functions(c, out);
-    }
-}
-
-/// Every subquery inside `e`, outermost first; not inside the subqueries.
-pub(crate) fn collect_subqueries<'e>(
-    e: &'e Expression,
-    out: &mut Vec<&'e substrait::proto::expression::Subquery>,
-) {
-    if let Some(RexType::Subquery(sq)) = &e.rex_type {
-        out.push(sq);
-        return;
-    }
-    for c in children(e) {
-        collect_subqueries(c, out);
-    }
-}
-
-fn one(r: &Option<Box<Rel>>) -> Vec<&Rel> {
-    r.as_deref().into_iter().collect()
-}
-
-pub(crate) fn rel_inputs(kind: &RelType) -> Vec<&Rel> {
-    match kind {
-        RelType::Filter(r) => one(&r.input),
-        RelType::Fetch(r) => one(&r.input),
-        RelType::Aggregate(r) => one(&r.input),
-        RelType::Sort(r) => one(&r.input),
-        RelType::Project(r) => one(&r.input),
-        RelType::Join(r) => one(&r.left).into_iter().chain(one(&r.right)).collect(),
-        RelType::Cross(r) => one(&r.left).into_iter().chain(one(&r.right)).collect(),
-        RelType::Set(r) => r.inputs.iter().collect(),
-        RelType::ExtensionSingle(r) => one(&r.input),
-        RelType::ExtensionMulti(r) => r.inputs.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-pub(crate) fn rel_inputs_mut(kind: &mut RelType) -> Vec<&mut Rel> {
-    fn one(r: &mut Option<Box<Rel>>) -> Vec<&mut Rel> {
-        r.as_deref_mut().into_iter().collect()
-    }
-    match kind {
-        RelType::Filter(r) => one(&mut r.input),
-        RelType::Fetch(r) => one(&mut r.input),
-        RelType::Aggregate(r) => one(&mut r.input),
-        RelType::Sort(r) => one(&mut r.input),
-        RelType::Project(r) => one(&mut r.input),
-        RelType::Join(r) => {
-            let (l, rt) = (&mut r.left, &mut r.right);
-            one(l).into_iter().chain(one(rt)).collect()
-        }
-        RelType::Cross(r) => {
-            let (l, rt) = (&mut r.left, &mut r.right);
-            one(l).into_iter().chain(one(rt)).collect()
-        }
-        RelType::Set(r) => r.inputs.iter_mut().collect(),
-        RelType::ExtensionSingle(r) => one(&mut r.input),
-        RelType::ExtensionMulti(r) => r.inputs.iter_mut().collect(),
-        _ => Vec::new(),
-    }
-}
-
-pub(crate) fn rel_expressions(kind: &RelType) -> Vec<&Expression> {
-    match kind {
-        RelType::Filter(r) => r.condition.as_deref().into_iter().collect(),
-        RelType::Project(r) => r.expressions.iter().collect(),
-        RelType::Join(r) => r
-            .expression
-            .as_deref()
-            .into_iter()
-            .chain(r.post_join_filter.as_deref())
-            .collect(),
-        RelType::Sort(r) => r.sorts.iter().filter_map(|s| s.expr.as_ref()).collect(),
-        RelType::Aggregate(r) => {
-            let mut out: Vec<&Expression> = r.grouping_expressions.iter().collect();
-            for m in &r.measures {
-                if let Some(f) = &m.measure {
-                    for a in &f.arguments {
-                        if let Some(ArgType::Value(e)) = &a.arg_type {
-                            out.push(e);
-                        }
-                    }
-                }
-            }
-            out.extend(r.measures.iter().filter_map(|m| m.filter.as_ref()));
-            out
-        }
-        // A read's filters, and a virtual table's rows (DataFusion writes a
-        // projection over one empty row, `SELECT random()`, as one).
-        RelType::Read(r) => {
-            let mut out: Vec<&Expression> = r
-                .filter
-                .as_deref()
-                .into_iter()
-                .chain(r.best_effort_filter.as_deref())
-                .collect();
-            if let Some(ReadType::VirtualTable(v)) = &r.read_type {
-                out.extend(v.expressions.iter().flat_map(|row| &row.fields));
-            }
-            out
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// [`rel_expressions`], mutably.
-pub(crate) fn rel_expressions_mut(kind: &mut RelType) -> Vec<&mut Expression> {
-    match kind {
-        RelType::Filter(r) => r.condition.as_deref_mut().into_iter().collect(),
-        RelType::Project(r) => r.expressions.iter_mut().collect(),
-        RelType::Join(r) => {
-            let (e, p) = (&mut r.expression, &mut r.post_join_filter);
-            e.as_deref_mut().into_iter().chain(p.as_deref_mut()).collect()
-        }
-        RelType::Sort(r) => r.sorts.iter_mut().filter_map(|s| s.expr.as_mut()).collect(),
-        RelType::Aggregate(r) => {
-            let mut out: Vec<&mut Expression> = r.grouping_expressions.iter_mut().collect();
-            for m in r.measures.iter_mut() {
-                if let Some(f) = m.measure.as_mut() {
-                    for a in f.arguments.iter_mut() {
-                        if let Some(ArgType::Value(e)) = a.arg_type.as_mut() {
-                            out.push(e);
-                        }
-                    }
-                }
-                out.extend(m.filter.as_mut());
-            }
-            out
-        }
-        RelType::Read(r) => {
-            let (f, b, t) = (&mut r.filter, &mut r.best_effort_filter, &mut r.read_type);
-            let mut out: Vec<&mut Expression> =
-                f.as_deref_mut().into_iter().chain(b.as_deref_mut()).collect();
-            if let Some(ReadType::VirtualTable(v)) = t {
-                out.extend(v.expressions.iter_mut().flat_map(|row| row.fields.iter_mut()));
-            }
-            out
-        }
-        _ => Vec::new(),
-    }
 }
 
 pub(crate) fn rel_name(kind: &RelType) -> &'static str {
@@ -2188,6 +1942,42 @@ mod tests {
         rel
     }
 
+    #[test]
+    fn input_slots_agree_with_the_inputs_optic() {
+        // `Shapes` keeps inputs by slot, empty ones included; every other
+        // walk reads them through `Inputs`. They must name the same inputs.
+        use substrait::proto::{
+            ConsistentPartitionWindowRel, CrossRel, FetchRel, FilterRel, JoinRel, SetRel, SortRel,
+        };
+        let r = || Some(Box::new(crate::emit::read_step("t", vec!["c".into()])));
+        let kinds = vec![
+            RelType::Filter(Box::new(FilterRel { input: r(), ..Default::default() })),
+            RelType::Fetch(Box::new(FetchRel { input: r(), ..Default::default() })),
+            RelType::Aggregate(Box::new(AggregateRel { input: r(), ..Default::default() })),
+            RelType::Sort(Box::new(SortRel { input: r(), ..Default::default() })),
+            RelType::Project(Box::new(ProjectRel { input: r(), ..Default::default() })),
+            RelType::Window(Box::new(ConsistentPartitionWindowRel {
+                input: r(),
+                ..Default::default()
+            })),
+            RelType::Join(Box::new(JoinRel { left: r(), right: None, ..Default::default() })),
+            RelType::Cross(Box::new(CrossRel { left: r(), right: r(), ..Default::default() })),
+            RelType::Set(SetRel {
+                inputs: vec![*r().unwrap(), *r().unwrap()],
+                ..Default::default()
+            }),
+        ];
+        for mut kind in kinds {
+            let slots: Vec<*const Rel> =
+                input_slots(&kind).into_iter().flatten().map(|r| r as *const Rel).collect();
+            let inputs: Vec<*const Rel> =
+                Inputs.to_vec(&kind).into_iter().map(|r| r as *const Rel).collect();
+            assert_eq!(slots, inputs, "{}", rel_name(&kind));
+            let taken = take_input_slots(&mut kind).into_iter().flatten().count();
+            assert_eq!(taken, inputs.len(), "{}", rel_name(&kind));
+        }
+    }
+
     /// Every aggregate of `rel`, outermost first, with its depth in
     /// aggregates.
     fn aggregates(rel: &Rel) -> Vec<(&AggregateRel, usize)> {
@@ -2202,7 +1992,7 @@ mod tests {
                 }
                 _ => depth,
             };
-            stack.extend(input_slots(kind).into_iter().flatten().map(|c| (c, below)));
+            Inputs.each(kind, |c| stack.push((c, below)));
         }
         out
     }

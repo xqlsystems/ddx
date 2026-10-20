@@ -35,20 +35,19 @@
 use std::collections::HashMap;
 
 use substrait::proto::expression::RexType;
-use substrait::proto::function_argument::ArgType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::EmitKind;
-use substrait::proto::{Expression, FunctionArgument, Plan, PlanRel, ReadRel, ReferenceRel, Rel};
+use substrait::proto::{Plan, PlanRel, ReadRel, ReferenceRel, Rel};
 
 use crate::emit::{filter, is_identity, plan as plan_of, read_step, select, unbound_reads};
 use crate::error::{AdError, Result};
 use crate::forward::{
-    inline_references, read_outputs, referenced, rel_inputs_mut, root_of, shared_relations,
-    step_columns, width,
+    inline_references, read_outputs, referenced, root_of, shared_relations, step_columns, width,
 };
 use crate::functions::{Extensions, Functions};
+use crate::optics::{Compose, Cosmos, Deep, Exprs, Rex, Setter, Tree};
 use crate::program::{BackwardProgram, Check, ForwardProgram, Step, Unbound};
 use crate::tables::{InputTable, Of, OutputTable};
 
@@ -218,10 +217,10 @@ pub(crate) fn dag_steps(
 }
 
 /// `rel` with each `ReferenceRel` replaced by a read of the step `read`
-/// names for its ordinal. A loop, not recursion.
+/// names for its ordinal. Not inside subqueries, which hold no reference
+/// ([`inline_references`] refuses one there).
 fn read_references(rel: &mut Rel, read: &HashMap<i32, (String, Vec<String>)>) -> Result<()> {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
+    Tree.try_modify(rel, &mut |r| {
         if let Some(RelType::Reference(x)) = &r.rel_type {
             let (name, columns) = read.get(&x.subtree_ordinal).ok_or_else(|| {
                 AdError::Internal(format!(
@@ -230,11 +229,9 @@ fn read_references(rel: &mut Rel, read: &HashMap<i32, (String, Vec<String>)>) ->
                 ))
             })?;
             *r = read_step(name, columns.clone());
-        } else if let Some(kind) = r.rel_type.as_mut() {
-            stack.extend(rel_inputs_mut(kind));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The plan of `parts`' output table (see [`Parts::output`]): the step that
@@ -302,20 +299,18 @@ pub(crate) fn output_plan(parts: &Parts) -> Result<Plan> {
 }
 
 /// `rel` with every read of a step in `steps` replaced by a reference to
-/// the step's relation, its columns picked by name. A loop, not recursion:
-/// a program's steps can chain hundreds of relations deep.
+/// the step's relation, its columns picked by name. Not inside subqueries:
+/// a reference can't sit in one, so a step read there is left, and
+/// [`output_plan`] refuses it.
 fn substitute(rel: &mut Rel, steps: &HashMap<&str, (i32, Vec<String>)>) -> Result<()> {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
+    Tree.try_modify(rel, &mut |r| {
         if let Some(RelType::Read(read)) = &r.rel_type {
             if let Some(step) = step_of(read, steps)? {
                 *r = step;
             }
-        } else if let Some(kind) = r.rel_type.as_mut() {
-            stack.extend(rel_inputs_mut(kind));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// A reference to the step `read` reads, its columns picked, if it reads
@@ -556,19 +551,21 @@ pub(crate) fn redeclare_rel(
     renamed: &HashMap<String, String>,
     ext: &mut Extensions,
 ) -> Result<()> {
-    let mut stack = vec![rel];
-    while let Some(r) = stack.pop() {
+    let mut anchor = |a: &mut u32| -> Result<()> {
+        *a = ext.anchor_named(from.name(*a)?);
+        Ok(())
+    };
+    Deep.try_modify(rel, &mut |r| {
         if let Some(RelType::Read(read)) = &r.rel_type {
             if let Some(step) = step_read(read, renamed)? {
-                // Walk what replaced it, for the filter's functions: its
-                // read names a step under a new name, which `renamed` lacks.
+                // What replaced it is walked in its place, for the filter's
+                // functions: its read names a step under a new name, which
+                // `renamed` lacks.
                 *r = step;
-                stack.push(r);
-                continue;
             }
         }
         let Some(kind) = r.rel_type.as_mut() else {
-            continue;
+            return Ok(());
         };
         match kind {
             RelType::Read(_)
@@ -580,15 +577,8 @@ pub(crate) fn redeclare_rel(
             | RelType::Cross(_)
             | RelType::Set(_) => {}
             RelType::Aggregate(a) => {
-                for m in a.measures.iter_mut() {
-                    if let Some(f) = m.measure.as_mut() {
-                        f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
-                        for s in f.sorts.iter_mut() {
-                            if let Some(e) = s.expr.as_mut() {
-                                redeclare_expr(e, from, renamed, ext)?;
-                            }
-                        }
-                    }
+                for f in a.measures.iter_mut().filter_map(|m| m.measure.as_mut()) {
+                    anchor(&mut f.function_reference)?;
                 }
             }
             other => {
@@ -598,133 +588,22 @@ pub(crate) fn redeclare_rel(
                 )))
             }
         }
-        for e in crate::forward::rel_expressions_mut(kind) {
-            redeclare_expr(e, from, renamed, ext)?;
-        }
-        stack.extend(rel_inputs_mut(kind));
-    }
-    Ok(())
-}
-
-fn redeclare_args(
-    args: &mut [FunctionArgument],
-    from: &Functions,
-    renamed: &HashMap<String, String>,
-    ext: &mut Extensions,
-) -> Result<()> {
-    for a in args.iter_mut() {
-        if let Some(ArgType::Value(e)) = a.arg_type.as_mut() {
-            redeclare_expr(e, from, renamed, ext)?;
-        }
-    }
-    Ok(())
-}
-
-fn redeclare_expr(
-    e: &mut Expression,
-    from: &Functions,
-    renamed: &HashMap<String, String>,
-    ext: &mut Extensions,
-) -> Result<()> {
-    use substrait::proto::expression::nested::NestedType;
-    use substrait::proto::expression::subquery::SubqueryType;
-    let Some(rex) = e.rex_type.as_mut() else {
-        return Ok(());
-    };
-    let mut each = |es: &mut dyn Iterator<Item = &mut Expression>| -> Result<()> {
-        for x in es {
-            redeclare_expr(x, from, renamed, ext)?;
-        }
-        Ok(())
-    };
-    match rex {
-        RexType::Literal(_) | RexType::Selection(_) | RexType::DynamicParameter(_) => Ok(()),
-        RexType::ScalarFunction(f) => {
-            f.function_reference = ext.anchor_named(from.name(f.function_reference)?);
-            #[allow(deprecated)]
-            for x in f.args.iter_mut() {
-                redeclare_expr(x, from, renamed, ext)?;
-            }
-            redeclare_args(&mut f.arguments, from, renamed, ext)
-        }
-        RexType::WindowFunction(w) => {
-            w.function_reference = ext.anchor_named(from.name(w.function_reference)?);
-            #[allow(deprecated)]
-            for x in w.args.iter_mut() {
-                redeclare_expr(x, from, renamed, ext)?;
-            }
-            redeclare_args(&mut w.arguments, from, renamed, ext)?;
-            for x in w.partitions.iter_mut() {
-                redeclare_expr(x, from, renamed, ext)?;
-            }
-            for s in w.sorts.iter_mut() {
-                if let Some(x) = s.expr.as_mut() {
-                    redeclare_expr(x, from, renamed, ext)?;
+        // A subquery's relations are `Deep`'s to walk.
+        Exprs
+            .then(Cosmos)
+            .then(Rex)
+            .try_modify(kind, &mut |rex| match rex {
+                RexType::ScalarFunction(f) => anchor(&mut f.function_reference),
+                RexType::WindowFunction(w) => anchor(&mut w.function_reference),
+                #[allow(deprecated)]
+                RexType::Lambda(_) | RexType::LambdaInvocation(_) | RexType::Enum(_) => {
+                    Err(AdError::NotImplemented(
+                        "this kind of expression in a query over another call".into(),
+                    ))
                 }
-            }
-            Ok(())
-        }
-        RexType::IfThen(it) => {
-            for c in it.ifs.iter_mut() {
-                each(&mut c.r#if.iter_mut().chain(c.then.iter_mut()))?;
-            }
-            each(&mut it.r#else.iter_mut().map(|b| &mut **b))
-        }
-        RexType::SwitchExpression(sw) => {
-            each(&mut sw.r#match.iter_mut().map(|b| &mut **b))?;
-            each(&mut sw.ifs.iter_mut().filter_map(|c| c.then.as_mut()))?;
-            each(&mut sw.r#else.iter_mut().map(|b| &mut **b))
-        }
-        RexType::SingularOrList(l) => {
-            each(&mut l.value.iter_mut().map(|b| &mut **b))?;
-            each(&mut l.options.iter_mut())
-        }
-        RexType::MultiOrList(l) => {
-            each(&mut l.value.iter_mut())?;
-            each(&mut l.options.iter_mut().flat_map(|r| r.fields.iter_mut()))
-        }
-        RexType::Cast(c) => each(&mut c.input.iter_mut().map(|b| &mut **b)),
-        RexType::Nested(n) => match n.nested_type.as_mut() {
-            Some(NestedType::Struct(s)) => each(&mut s.fields.iter_mut()),
-            Some(NestedType::List(l)) => each(&mut l.values.iter_mut()),
-            Some(NestedType::Map(m)) => each(
-                &mut m
-                    .key_values
-                    .iter_mut()
-                    .flat_map(|kv| kv.key.iter_mut().chain(kv.value.iter_mut())),
-            ),
-            None => Ok(()),
-        },
-        RexType::Subquery(sq) => match sq.subquery_type.as_mut() {
-            Some(SubqueryType::Scalar(s)) => match s.input.as_deref_mut() {
-                Some(r) => redeclare_rel(r, from, renamed, ext),
-                None => Ok(()),
-            },
-            Some(SubqueryType::InPredicate(p)) => {
-                each(&mut p.needles.iter_mut())?;
-                match p.haystack.as_deref_mut() {
-                    Some(r) => redeclare_rel(r, from, renamed, ext),
-                    None => Ok(()),
-                }
-            }
-            Some(SubqueryType::SetPredicate(p)) => match p.tuples.as_deref_mut() {
-                Some(r) => redeclare_rel(r, from, renamed, ext),
-                None => Ok(()),
-            },
-            Some(SubqueryType::SetComparison(c)) => {
-                each(&mut c.left.iter_mut().map(|b| &mut **b))?;
-                match c.right.as_deref_mut() {
-                    Some(r) => redeclare_rel(r, from, renamed, ext),
-                    None => Ok(()),
-                }
-            }
-            None => Ok(()),
-        },
-        #[allow(unreachable_patterns)]
-        _ => Err(AdError::NotImplemented(
-            "this kind of expression in a query over another call".into(),
-        )),
-    }
+                _ => Ok(()),
+            })
+    })
 }
 
 #[cfg(test)]

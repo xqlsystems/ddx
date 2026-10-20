@@ -88,6 +88,7 @@ use crate::error::Result;
 use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, map_fields, scalar_args};
 use crate::forward::{subquery_rounds, width, Def, Output, Region, Saved, Slot};
 use crate::functions::Function;
+use crate::optics::{subqueries, Fold};
 use crate::transpose::Transposer;
 
 /// A subtree of a region's join tree that is not itself an inner join: its
@@ -255,9 +256,7 @@ impl Transposer<'_> {
         ties(&factor_leaves, &mut side_of);
         let mut cond_leaves = Vec::new();
         for c in &conds {
-            let mut subqueries = Vec::new();
-            crate::forward::collect_subqueries(c, &mut subqueries);
-            if !subqueries.is_empty() {
+            if subqueries().any(c, |_| true) {
                 return Ok(None);
             }
             let mut ls = Vec::new();

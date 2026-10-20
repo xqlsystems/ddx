@@ -91,6 +91,7 @@ mod error;
 mod functions;
 mod jvp;
 mod opt;
+mod optics;
 mod program;
 mod reduce;
 mod run;
