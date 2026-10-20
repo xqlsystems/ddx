@@ -246,14 +246,20 @@ fn tangent_positions(o: &ddx_ad::OutputTable) -> Vec<(usize, usize)> {
 fn scalar(label: &str, program: &ForwardProgram, r: &JvpRun) -> Result<(f64, f64), String> {
     check_columns(label, &r.output, &program.value.columns)?;
     let pos = tangent_positions(&program.value);
-    let [(c, j)] = pos.as_slice() else {
-        return Err(format!(
-            "[{label}] a scalar loss should have one tangent, has {:?}",
-            program.value.tangents
-        ));
+    // A loss no wrt column moves has no tangent column: its tangent is 0
+    // (#138), or NULL with its value.
+    let (c, j) = match (pos.as_slice(), program.value.tangents.as_slice()) {
+        ([(c, j)], _) => (*c, Some(*j)),
+        ([], []) if program.value.columns.len() == 1 => (0, None),
+        _ => {
+            return Err(format!(
+                "[{label}] a scalar loss should have one tangent, has {:?}",
+                program.value.tangents
+            ))
+        }
     };
     match r.output.rows.as_slice() {
-        [row] => match (row[*c], row[*j]) {
+        [row] => match (row[c], j.map_or(row[c].map(|_| 0.0), |j| row[j])) {
             (Some(v), Some(t)) => Ok((v, t)),
             (Some(v), None) => Err(format!(
                 "[{label}] the loss is {v} but its tangent is NULL (NULL is for a NULL value)"
