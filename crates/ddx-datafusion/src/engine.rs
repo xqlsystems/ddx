@@ -95,7 +95,7 @@ impl ddx_ad::Backend for DataFusion {
 
     async fn plan_sql(&mut self, sql: &str) -> Result<Plan> {
         let lp = self.0.sql(sql).await?.into_optimized_plan()?;
-        crate::ad::substrait_of(&self.0, &lp).map(|p| *p)
+        crate::ad::substrait_of(&self.0, &lp).await.map(|p| *p)
     }
 
     async fn plan_key(&mut self, sql: &str) -> Result<Option<String>> {
@@ -103,7 +103,10 @@ impl ddx_ad::Backend for DataFusion {
         // SQL into a plan, so the plan before optimization holds every
         // view's definition, and its schemas every table's columns, types
         // and nullability: all an optimized plan's meaning depends on.
+        // Its text names tables but not which: a program kept for a view
+        // whose table is registered again since would read the new one.
         let df = self.0.sql(sql).await?;
+        crate::ad::refuse_replaced_tables(&self.0, df.logical_plan()).await?;
         let key = df.logical_plan().display_indent_schema().to_string();
         Ok(Some(key))
     }
@@ -130,6 +133,14 @@ impl ddx_ad::Backend for DataFusion {
         let Some(sql) = view.definition() else {
             return Ok(None);
         };
+        // A view over a table registered again since reads the old table,
+        // its SQL the new one.
+        if crate::ad::replaced_table(&self.0, view.logical_plan())
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
         // DataFusion keeps the plan a view was made with, so once a view it
         // reads is redefined, its SQL means something else than what runs:
         // its SQL is given only if it plans as the view's kept plan.

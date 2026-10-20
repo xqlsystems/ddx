@@ -251,7 +251,14 @@ class DataFusionBackend:
         a context made from its own ``SessionConfig`` needs
         ``.with_information_schema(True)``, or every view is left to the
         engine, with a warning. A view registered from a DataFrame has no
-        SQL, and is left to the engine too."""
+        SQL, and is left to the engine too.
+
+        A DataFusion view keeps the tables it was made over, while ddxdb
+        reads tables by name. After a table a view reads is registered again
+        under its name, the view still reads the old one, and ddxdb would
+        differentiate the new one. DataFusion's Python API doesn't say which
+        table a view reads, so this can't be refused here as it is from
+        Rust: create a view again after registering what it reads."""
         try:
             settings = dict(
                 (r["name"], r["value"])
