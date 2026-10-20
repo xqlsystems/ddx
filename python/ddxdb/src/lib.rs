@@ -695,6 +695,16 @@ impl ddx_ad::Backend for PyBackend {
             b.call_method1("plan_key", (sql,))?.extract()
         })
     }
+
+    fn view_sql(&mut self, name: &str) -> impl Future<Output = PyResult<Option<String>>> + Send {
+        // Optional: a backend without it leaves every view to its engine.
+        self.call(|b| {
+            if !b.hasattr("view_sql")? {
+                return Ok(None);
+            }
+            b.call_method1("view_sql", (name,))?.extract()
+        })
+    }
 }
 
 /// Programs `rewrite` built, kept to run again (`ddx_ad::Programs`): pass
@@ -828,6 +838,13 @@ fn run_err(e: ddx_ad::RunError<PyErr>) -> PyErr {
     }
 }
 
+/// A query that reads a view's query in the view's place
+/// (`ddx_ad::view_probe`), or `None` if `sql` is not a view's.
+#[pyfunction]
+fn _view_probe(sql: &str) -> Option<String> {
+    ddx_ad::view_probe(sql)
+}
+
 /// Does `sql` hold `x NOT IN (subquery)`? DataFusion's Substrait producer
 /// writes its null-aware anti-join as a plain one (ddx issue #104), so a
 /// gradient of such a query would be of a different query. The Rust adapter
@@ -880,6 +897,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(jvp_plan, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(_not_in_subquery, m)?)?;
+    m.add_function(wrap_pyfunction!(_view_probe, m)?)?;
     m.add_class::<BackwardProgram>()?;
     m.add_class::<ForwardProgram>()?;
     m.add_class::<Step>()?;

@@ -607,3 +607,111 @@ def test_a_program_is_kept_again_only_once_its_tables_are_released(ad, ctx):
     # The first call's tables outlived the second's release.
     assert pairs(ctx.sql(first.statements[0])) == [(0, 3.0), (1, 12.0), (2, 0.75)]
     first.release()
+
+
+def _model_view(k):
+    ctes = ["l0 AS (SELECT i, SUM(val) AS v FROM w GROUP BY i)"]
+    for n in range(1, k + 1):
+        ctes.append(
+            f"l{n} AS (SELECT a.i, SUM(a.v * b.v + 0.5 * a.v) AS v "
+            f"FROM l{n - 1} a JOIN l{n - 1} b ON a.i = b.i GROUP BY a.i)"
+        )
+    return ctes
+
+
+def test_a_model_that_is_a_view_has_its_layers_planned_once(ad, ctx):
+    ctes = _model_view(3)
+    ctx.sql(f"CREATE VIEW model AS WITH {', '.join(ctes)} SELECT i, v FROM l3").collect()
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM model) SELECT i, grad(loss, val) FROM w"
+    got = pairs(ad.sql(ctx, statement))
+    # The same objective with the model written in, as CTEs the engine inlines.
+    written = f"WITH {', '.join(ctes)}, loss AS (SELECT SUM(v) AS l FROM l3) SELECT i, grad(loss, val) FROM w"
+    want = pairs(ad.sql(ctx, written))
+    assert [i for i, _ in got] == [i for i, _ in want]
+    assert all(abs(g - w) <= 1e-9 * max(abs(w), 1.0) for (_, g), (_, w) in zip(got, want))
+
+    # The layers read twice are planned on their own: one placeholder each.
+    class Recording(ad.DataFusionBackend):
+        made = []
+
+        def materialize(self, name, plan):
+            Recording.made.append(name)
+            super().materialize(name, plan)
+
+    with ddxdb.rewrite(Recording(ctx), [statement], programs=ddxdb.Programs()):
+        pass
+    assert sum("cte_" in n for n in Recording.made) == 3, Recording.made
+
+
+def test_a_view_without_sql_is_left_to_the_engine(ad, ctx):
+    ctx.register_view("squares", ctx.sql("SELECT i, val * val AS v FROM w"))
+    assert ad.DataFusionBackend(ctx).view_sql("squares") is None
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM squares) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_a_view_in_a_context_without_information_schema_warns(ad):
+    import datafusion
+
+    c = datafusion.SessionContext(datafusion.SessionConfig())
+    c.register_record_batches("w", [table([0, 1, 2], [1.0, -2.0, 0.5]).to_batches()])
+    c.sql("CREATE VIEW squares AS SELECT i, val * val AS v FROM w").collect()
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM squares) SELECT i, grad(loss, val) FROM w"
+    with pytest.warns(UserWarning, match="information_schema"):
+        assert pairs(ad.sql(c, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    # A table is not a view: nothing to warn of.
+    import warnings
+
+    c2 = datafusion.SessionContext(datafusion.SessionConfig())
+    c2.register_record_batches("w", [table([0, 1, 2], [1.0, -2.0, 0.5]).to_batches()])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+        assert pairs(ad.sql(c2, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_a_view_s_name_is_resolved_with_the_session_s_case_rules(ad):
+    # Unquoted names keep their case in this session, so `Model` and
+    # `model` are two views.
+    import datafusion
+
+    config = (
+        datafusion.SessionConfig()
+        .with_information_schema(True)
+        .set("datafusion.sql_parser.enable_ident_normalization", "false")
+    )
+    c = datafusion.SessionContext(config)
+    c.sql("CREATE VIEW Model AS SELECT 1 AS v").collect()
+    c.sql("CREATE VIEW model AS SELECT 2 AS v").collect()
+    backend = ad.DataFusionBackend(c)
+    assert "SELECT 1" in backend.view_sql("Model")
+    assert "SELECT 2" in backend.view_sql("model")
+
+
+def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
+    # DataFusion keeps the plan outer_v was made with, which reads the first
+    # inner_v; its SQL now reads the second.
+    ctx.sql("CREATE VIEW inner_v AS SELECT i, val AS v FROM w").collect()
+    ctx.sql(
+        "CREATE VIEW outer_v AS WITH a AS (SELECT i, v FROM inner_v) "
+        "SELECT a.i, a.v * b.v AS v FROM a JOIN a b ON a.i = b.i"
+    ).collect()
+    backend = ad.DataFusionBackend(ctx)
+    assert backend.view_sql("outer_v") is not None
+    ctx.sql("CREATE OR REPLACE VIEW inner_v AS SELECT i, 3.0 * val AS v FROM w").collect()
+    assert backend.view_sql("outer_v") is None
+    statement = "WITH loss AS (SELECT SUM(v) AS l FROM outer_v) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
+    # `v` in a query is public.v, a table; other.v is a view of that name,
+    # and DataFusion does not read it for `v`.
+    ctx.sql("CREATE SCHEMA other").collect()
+    ctx.sql("CREATE VIEW other.v AS SELECT i, 100.0 * val AS val FROM w").collect()
+    ctx.register_record_batches("v", [table([0, 1, 2], [1.0, 1.0, 1.0]).to_batches()])
+    backend = ad.DataFusionBackend(ctx)
+    assert backend.view_sql("v") is None
+    assert backend.view_sql("other.v") is not None
+    statement = "WITH loss AS (SELECT SUM(v.val * w.val) AS l FROM v JOIN w ON v.i = w.i) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == [(0, 1.0), (1, 1.0), (2, 1.0)]

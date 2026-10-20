@@ -98,6 +98,15 @@ class Backend(Protocol):
         gets nothing kept."""
         ...
 
+    def view_sql(self, name: str) -> Optional[str]:
+        """Optional. The SQL that defines ``name``, as a query writes it, if
+        it names a view whose SQL the engine keeps: a ``CREATE VIEW``
+        statement, or its query. :func:`rewrite` writes such a view into the
+        objective as CTEs, so a model that is a view has the CTEs it reads
+        more than once planned once each. A backend without it, or that
+        returns ``None``, leaves every view to the engine."""
+        ...
+
 
 @dataclass(frozen=True)
 class Rewritten:
