@@ -200,7 +200,8 @@ pub fn union_all(inputs: Vec<Rel>) -> Rel {
 }
 
 /// A plan whose root is `root`, with output columns named `names`.
-pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
+pub fn plan(mut root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
+    condition_joins(&mut root);
     Plan {
         version: Some(substrait::version::version_with_producer("ddx")),
         extension_urns: ext.urns(),
@@ -212,6 +213,75 @@ pub fn plan(root: Rel, names: Vec<String>, ext: &Extensions) -> Plan {
             })),
         }],
         ..Default::default()
+    }
+}
+
+/// `root` with each join but an inner one that has no condition given the
+/// condition `true`, which means the same. DataFusion plans an `EXISTS` or
+/// `IN` whose subquery reads nothing of the outer row as such a semi or
+/// anti join, and its Substrait consumer refuses one with no condition
+/// (ddx issue #171).
+fn condition_joins(root: &mut Rel) {
+    use substrait::proto::expression::subquery::SubqueryType;
+    use substrait::proto::expression::RexType;
+    use substrait::proto::function_argument::ArgType;
+    fn subqueries(e: &mut Expression) {
+        let args = |args: &mut Vec<FunctionArgument>| {
+            for a in args.iter_mut() {
+                if let Some(ArgType::Value(x)) = a.arg_type.as_mut() {
+                    subqueries(x);
+                }
+            }
+        };
+        match e.rex_type.as_mut() {
+            Some(RexType::ScalarFunction(f)) => args(&mut f.arguments),
+            Some(RexType::WindowFunction(f)) => args(&mut f.arguments),
+            Some(RexType::Cast(c)) => c.input.as_deref_mut().into_iter().for_each(subqueries),
+            Some(RexType::IfThen(it)) => {
+                for c in it.ifs.iter_mut() {
+                    c.r#if.iter_mut().chain(c.then.iter_mut()).for_each(subqueries);
+                }
+                it.r#else.as_deref_mut().into_iter().for_each(subqueries);
+            }
+            Some(RexType::SingularOrList(l)) => {
+                l.value.as_deref_mut().into_iter().for_each(subqueries);
+                l.options.iter_mut().for_each(subqueries);
+            }
+            Some(RexType::Subquery(sq)) => match sq.subquery_type.as_mut() {
+                Some(SubqueryType::Scalar(s)) => {
+                    s.input.as_deref_mut().into_iter().for_each(condition_joins)
+                }
+                Some(SubqueryType::InPredicate(s)) => {
+                    s.needles.iter_mut().for_each(subqueries);
+                    s.haystack.as_deref_mut().into_iter().for_each(condition_joins);
+                }
+                Some(SubqueryType::SetPredicate(s)) => {
+                    s.tuples.as_deref_mut().into_iter().for_each(condition_joins)
+                }
+                Some(SubqueryType::SetComparison(s)) => {
+                    s.left.as_deref_mut().into_iter().for_each(subqueries);
+                    s.right.as_deref_mut().into_iter().for_each(condition_joins);
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    }
+    let mut rels = vec![root];
+    while let Some(rel) = rels.pop() {
+        let Some(kind) = rel.rel_type.as_mut() else {
+            continue;
+        };
+        if let RelType::Join(j) = kind {
+            let inner = j.r#type == JoinType::Inner as i32;
+            if j.expression.is_none() && !inner && j.r#type != JoinType::Unspecified as i32 {
+                j.expression = Some(Box::new(crate::expr::lit_bool(true)));
+            }
+        }
+        crate::forward::rel_expressions_mut(kind)
+            .into_iter()
+            .for_each(subqueries);
+        rels.extend(crate::forward::rel_inputs_mut(kind));
     }
 }
 

@@ -693,3 +693,31 @@ async fn a_window_shift_has_the_gradient_of_its_group_by_form() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_subquery_with_no_condition_on_the_outer_row_is_differentiated() {
+    // DataFusion plans each as a semi or anti join with no condition, and
+    // its Substrait consumer refuses such a join (ddx issue #171).
+    let ctx = ctx().await;
+    let want = vec![(0, 2.0), (1, -4.0), (2, 1.0)];
+    for filter in [
+        "EXISTS (SELECT 1 FROM b)",
+        "NOT EXISTS (SELECT 1 FROM b WHERE val > 100)",
+        "1 IN (SELECT 1 FROM b)",
+    ] {
+        let sql = format!(
+            "WITH loss AS (SELECT SUM(val * val) AS l FROM w WHERE {filter}) \
+             SELECT i, grad(loss, val) FROM w"
+        );
+        assert_eq!(pairs(&ctx, &sql).await, want, "{filter}");
+    }
+    // The issue's case: a CTE read inside the subquery.
+    let sql = "WITH r0 AS (SELECT i, val AS v FROM b), \
+               loss AS (SELECT MAX(v) AS l FROM r0 c WHERE EXISTS (SELECT 1 FROM r0)) \
+               SELECT i, grad(loss, val) FROM b";
+    assert_eq!(pairs(&ctx, sql).await, vec![(0, 0.0), (1, 1.0), (2, 0.0)]);
+    // A subquery that keeps no row keeps no row of the loss either.
+    let sql = "WITH loss AS (SELECT SUM(val * val) AS l FROM w WHERE EXISTS \
+               (SELECT 1 FROM b WHERE val > 100)) SELECT i, grad(loss, val) FROM w";
+    assert_eq!(pairs(&ctx, sql).await, vec![(0, 0.0), (1, 0.0), (2, 0.0)]);
+}
