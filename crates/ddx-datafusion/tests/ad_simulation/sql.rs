@@ -96,7 +96,7 @@ fn same(a: Option<f64>, b: Option<f64>, scale: f64, rtol: f64) -> bool {
 
 /// What a statement failed with: a refusal ddx is entitled to (tallied by
 /// message), or anything else (a failure).
-fn failed(label: &str, sql: &str, e: &str, out: &mut Outcome) {
+pub(super) fn failed(label: &str, sql: &str, e: &str, out: &mut Outcome) {
     let refused = [
         "not supported by ddx-ad yet",
         "NotImplemented",

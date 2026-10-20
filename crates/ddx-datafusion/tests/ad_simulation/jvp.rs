@@ -29,12 +29,12 @@ use super::*;
 /// A tangent of the `wrt` tables: for each table, each row's coefficient,
 /// or `None` for a row the tangent table leaves out (tangent 0).
 #[derive(Clone, Debug)]
-struct Tan(BTreeMap<String, Vec<Option<f64>>>);
+pub(super) struct Tan(BTreeMap<String, Vec<Option<f64>>>);
 
 impl Tan {
     /// Coefficients are multiples of 1/64 in [-1, 1], exact in FLOAT too.
     /// With `sparse`, about one row in five is left out.
-    fn random(rng: &mut Rng, case: &Case, sparse: bool) -> Tan {
+    pub(super) fn random(rng: &mut Rng, case: &Case, sparse: bool) -> Tan {
         let mut out = BTreeMap::new();
         for t in &case.wrt {
             let n = case.table(t).vals.len();
@@ -183,13 +183,13 @@ fn deregister_tangents(ctx: &SessionContext, tables: &[InputTable]) {
 
 /// What a run of a jvp program gives: its output's rows, and each
 /// gradient's (for `jvp_program`).
-struct JvpRun {
-    output: Rows,
-    gradients: Vec<Rows>,
+pub(super) struct JvpRun {
+    pub(super) output: Rows,
+    pub(super) gradients: Vec<Rows>,
 }
 
 /// Run `program` along `tan`, read what it computes, and release it.
-async fn run_jvp(
+pub(super) async fn run_jvp(
     ctx: &SessionContext,
     case: &Case,
     program: &ForwardProgram,
