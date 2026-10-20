@@ -670,6 +670,24 @@ def test_a_view_in_a_context_without_information_schema_warns(ad):
         assert pairs(ad.sql(c2, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
+def test_a_view_s_name_is_resolved_with_the_session_s_case_rules(ad):
+    # Unquoted names keep their case in this session, so `Model` and
+    # `model` are two views.
+    import datafusion
+
+    config = (
+        datafusion.SessionConfig()
+        .with_information_schema(True)
+        .set("datafusion.sql_parser.enable_ident_normalization", "false")
+    )
+    c = datafusion.SessionContext(config)
+    c.sql("CREATE VIEW Model AS SELECT 1 AS v").collect()
+    c.sql("CREATE VIEW model AS SELECT 2 AS v").collect()
+    backend = ad.DataFusionBackend(c)
+    assert "SELECT 1" in backend.view_sql("Model")
+    assert "SELECT 2" in backend.view_sql("model")
+
+
 def test_a_view_in_another_schema_is_not_read_for_a_table_of_its_name(ad, ctx):
     # `v` in a query is public.v, a table; other.v is a view of that name,
     # and DataFusion does not read it for `v`.

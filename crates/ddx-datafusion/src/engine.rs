@@ -111,7 +111,17 @@ impl ddx_ad::Backend for DataFusion {
     async fn view_sql(&mut self, name: &str) -> Result<Option<String>> {
         // A name that reads no table, or a table that is not a view (or a
         // view registered from a DataFrame, which has no SQL), has none.
-        let Ok(provider) = self.0.table_provider(name).await else {
+        // The name is resolved as the session's SQL would resolve it: an
+        // unquoted part in lower case only if the session normalizes them.
+        let normalize = self
+            .0
+            .state()
+            .config()
+            .options()
+            .sql_parser
+            .enable_ident_normalization;
+        let reference = TableReference::parse_str_normalized(name, !normalize);
+        let Ok(provider) = self.0.table_provider(reference).await else {
             return Ok(None);
         };
         Ok(provider

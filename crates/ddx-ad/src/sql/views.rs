@@ -39,6 +39,9 @@ use crate::run::Backend;
 /// a backend that does not.
 const DEPTH: usize = 64;
 
+/// What every view's CTE's name starts with.
+const PREFIX: &str = "__ddx_view_";
+
 /// `query` with each view it reads written as CTEs (see the module docs);
 /// `None` if it reads none the engine gives the SQL of.
 pub(super) async fn expand<B: Backend>(backend: &mut B, query: &Query) -> Option<Query> {
@@ -54,10 +57,14 @@ pub(super) async fn expand<B: Backend>(backend: &mut B, query: &Query) -> Option
         written: HashMap::new(),
         ctes: Vec::new(),
         named: 0,
+        clash: false,
     };
     let mut out = query.clone();
     let mut body_names = names(&out);
     body_names.retain(|n| !views.is_cte(n));
+    if body_names.iter().any(reserved) {
+        return None;
+    }
     let mut any = false;
     for name in body_names {
         if let Some(alias) = views.write(backend, &name, 0).await {
@@ -65,7 +72,7 @@ pub(super) async fn expand<B: Backend>(backend: &mut B, query: &Query) -> Option
             any = true;
         }
     }
-    if !any {
+    if !any || views.clash {
         return None;
     }
     let mut ctes = std::mem::take(&mut views.ctes);
@@ -91,6 +98,8 @@ struct Views {
     /// How many views have taken a name: each takes the next as it starts,
     /// before the views it reads take theirs, so no two share one.
     named: usize,
+    /// Whether a view read a table under a name a view's CTE could take.
+    clash: bool,
 }
 
 impl Views {
@@ -109,7 +118,7 @@ impl Views {
     /// defines.
     fn fresh(&mut self) -> String {
         loop {
-            let name = format!("__ddx_view_{}", self.named);
+            let name = format!("{PREFIX}{}", self.named);
             self.named += 1;
             let prefix = format!("{name}_");
             let taken = self.defined.iter().any(|d| {
@@ -143,6 +152,10 @@ impl Views {
         }
         let sql = backend.view_sql(&key).await.ok().flatten()?;
         let (mut query, columns) = definition(&sql)?;
+        if names(&query).iter().any(reserved) {
+            self.clash = true;
+            return None;
+        }
         let alias = self.fresh();
         // Its own CTEs, hoisted beside it under names of their own.
         let mut hoisted = Vec::new();
@@ -287,6 +300,18 @@ fn names<V: Visit>(node: &V) -> Vec<ObjectName> {
     let mut n = Names(Vec::new());
     let _ = node.visit(&mut n);
     n.0
+}
+
+/// Whether `name` is one part that a view's CTE could be named: a table
+/// read so would be read as that CTE.
+fn reserved(name: &ObjectName) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(id)] => id
+            .value
+            .get(..PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX)),
+        _ => false,
+    }
 }
 
 /// Pushes the name of every CTE in what it visits.

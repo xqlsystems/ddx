@@ -447,3 +447,37 @@ async fn a_view_that_reads_its_cte_under_another_spelling_is_left_to_the_engine(
     let (got, _) = grad_of(&ctx, "WITH loss AS (SELECT SUM(v * v) AS l FROM quoted)").await;
     assert_eq!(got, vec![(0, 1.0), (1, -0.5), (2, 1.5)]);
 }
+
+#[tokio::test]
+async fn a_table_named_as_a_view_s_cte_would_be_is_not_shadowed_by_one() {
+    // The objective reads a view and a table whose name a view's CTE would
+    // take: the table is still what it reads.
+    let ctx = w().await;
+    exec(&ctx, &model_view(2)).await;
+    let scale = "(i BIGINT, v DOUBLE) AS VALUES (0, 3.0), (1, 5.0), (2, 7.0)";
+    exec(&ctx, &format!("CREATE TABLE \"__ddx_view_0\" {scale}")).await;
+    exec(&ctx, &format!("CREATE TABLE scale {scale}")).await;
+    let of = |t: &str| {
+        format!("WITH loss AS (SELECT SUM(m.v * t.v) AS l FROM model m JOIN {t} t ON m.i = t.i)")
+    };
+    let (got, _) = grad_of(&ctx, &of("\"__ddx_view_0\"")).await;
+    let (want, _) = grad_of(&ctx, &of("scale")).await;
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn a_view_s_name_is_resolved_with_the_session_s_case_rules() {
+    // Unquoted names keep their case in this session, so `Model` and
+    // `model` are two views, and reading `Model` reads the first.
+    use datafusion::prelude::SessionConfig;
+    let config =
+        SessionConfig::new().set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+    let ctx = SessionContext::new_with_config(config);
+    exec(&ctx, "CREATE VIEW Model AS SELECT 1 AS v").await;
+    exec(&ctx, "CREATE VIEW model AS SELECT 2 AS v").await;
+    let mut backend = DataFusion(ctx.clone());
+    let sql = backend.view_sql("Model").await.unwrap().unwrap();
+    assert!(sql.contains("SELECT 1"), "{sql}");
+    let sql = backend.view_sql("model").await.unwrap().unwrap();
+    assert!(sql.contains("SELECT 2"), "{sql}");
+}

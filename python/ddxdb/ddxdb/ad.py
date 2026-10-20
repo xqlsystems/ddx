@@ -248,16 +248,15 @@ class DataFusionBackend:
         # DataFusion keeps the SQL of a view created from SQL, and lists it in
         # its information schema; a view registered from a DataFrame has none.
         # A name of one or two parts is resolved as DataFusion resolves it, in
-        # the session's default catalog and schema.
-        parts = _name_parts(name)
-        if parts is None or not 1 <= len(parts) <= 3:
-            return None
+        # the session's default catalog and schema, and an unquoted part in
+        # lower case only if the session normalizes them.
         try:
             settings = dict(
                 (r["name"], r["value"])
                 for r in self.ctx.sql(
                     "SELECT name, value FROM information_schema.df_settings WHERE name IN "
-                    "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema')"
+                    "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema', "
+                    "'datafusion.sql_parser.enable_ident_normalization')"
                 )
                 .to_arrow_table()
                 .to_pylist()
@@ -265,7 +264,13 @@ class DataFusionBackend:
         except Exception:
             # The information schema is off: the view's SQL can't be read,
             # and it is left to the engine.
-            _warn_if_view(self.ctx, parts)
+            parts = _name_parts(name)
+            if parts is not None and 1 <= len(parts) <= 3:
+                _warn_if_view(self.ctx, parts)
+            return None
+        normalize = settings["datafusion.sql_parser.enable_ident_normalization"] == "true"
+        parts = _name_parts(name, normalize)
+        if parts is None or not 1 <= len(parts) <= 3:
             return None
         default = [
             settings["datafusion.catalog.default_catalog"],
@@ -332,14 +337,18 @@ _PART = r'"(?:[^"]|"")*"|[^."]+'
 _NAME = re.compile(rf"(?:{_PART})(?:\.(?:{_PART}))*")
 
 
-def _name_parts(name: str) -> Optional[list]:
+def _name_parts(name: str, normalize: bool = True) -> Optional[list]:
     """The parts of a table name as SQL writes it, as DataFusion resolves
-    them: a quoted part as written, an unquoted one in lower case; ``None``
-    if it does not parse."""
+    them: a quoted part as written, an unquoted one in lower case if
+    ``normalize``; ``None`` if it does not parse."""
     if not _NAME.fullmatch(name):
         return None
     return [
-        part[1:-1].replace('""', '"') if part.startswith('"') else part.lower()
+        part[1:-1].replace('""', '"')
+        if part.startswith('"')
+        else part.lower()
+        if normalize
+        else part
         for part in re.findall(_PART, name)
     ]
 
