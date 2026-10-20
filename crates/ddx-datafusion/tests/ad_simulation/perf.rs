@@ -671,7 +671,7 @@ fn share(plan: &Plan, rng: &mut Rng) -> Option<(Plan, usize)> {
         return None;
     };
     let root = root.input.as_mut()?;
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     count(root, &mut counts, true);
     let chosen: BTreeSet<String> = counts
         .into_iter()
@@ -708,7 +708,7 @@ fn share(plan: &Plan, rng: &mut Rng) -> Option<(Plan, usize)> {
 
 /// Each subtree of `rel` but `rel` itself (the root stays put), by its
 /// debug rendering, with how often it appears.
-fn count(rel: &Rel, counts: &mut HashMap<String, usize>, top: bool) {
+fn count(rel: &Rel, counts: &mut BTreeMap<String, usize>, top: bool) {
     if !top {
         *counts.entry(format!("{rel:?}")).or_default() += 1;
     }
