@@ -437,17 +437,26 @@ mod tests {
     #[test]
     fn a_join_but_an_inner_one_with_no_condition_is_given_true_subqueries_included() {
         use substrait::proto::expression::subquery::{InPredicate, Scalar, SubqueryType};
-        use substrait::proto::expression::{RexType, Subquery};
+        use substrait::proto::expression::nested::{self, NestedType};
+        use substrait::proto::expression::{Nested, RexType, Subquery};
         use substrait::proto::function_argument::ArgType;
         let subquery = |t: SubqueryType| Expression {
             rex_type: Some(RexType::Subquery(Box::new(Subquery {
                 subquery_type: Some(t),
             }))),
         };
-        // An `IN` whose needle is itself a subquery over a semi join.
-        let needle = subquery(SubqueryType::Scalar(Box::new(Scalar {
-            input: Some(Box::new(bare_join(JoinType::LeftSemi))),
-        })));
+        // An `IN` whose needle is a struct literal holding a subquery over a
+        // semi join.
+        let needle = Expression {
+            rex_type: Some(RexType::Nested(Nested {
+                nested_type: Some(NestedType::Struct(nested::Struct {
+                    fields: vec![subquery(SubqueryType::Scalar(Box::new(Scalar {
+                        input: Some(Box::new(bare_join(JoinType::LeftSemi))),
+                    })))],
+                })),
+                ..Default::default()
+            })),
+        };
         let in_anti = subquery(SubqueryType::InPredicate(Box::new(InPredicate {
             needles: vec![needle],
             haystack: Some(Box::new(bare_join(JoinType::LeftAnti))),

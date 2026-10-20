@@ -14,6 +14,7 @@ use substrait::proto::expression::reference_segment::{self, StructField};
 use substrait::proto::expression::{
     cast, if_then, FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
 };
+use substrait::proto::expression::nested::NestedType;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::r#type::{Fp64, Kind, Nullability};
 use substrait::proto::{Expression, FunctionArgument, Type};
@@ -439,6 +440,16 @@ pub fn children(e: &Expression) -> Vec<&Expression> {
             }
         }
         RexType::Cast(c) => out.extend(c.input.as_deref()),
+        RexType::Nested(n) => match &n.nested_type {
+            Some(NestedType::Struct(s)) => out.extend(s.fields.iter()),
+            Some(NestedType::List(l)) => out.extend(l.values.iter()),
+            Some(NestedType::Map(m)) => {
+                for kv in &m.key_values {
+                    out.extend(kv.key.iter().chain(kv.value.iter()));
+                }
+            }
+            None => {}
+        },
         _ => {}
     }
     out
@@ -490,6 +501,16 @@ pub(crate) fn rex_children_mut(rex: &mut RexType) -> Vec<&mut Expression> {
             }
         }
         RexType::Cast(c) => out.extend(c.input.as_deref_mut()),
+        RexType::Nested(n) => match n.nested_type.as_mut() {
+            Some(NestedType::Struct(s)) => out.extend(s.fields.iter_mut()),
+            Some(NestedType::List(l)) => out.extend(l.values.iter_mut()),
+            Some(NestedType::Map(m)) => {
+                for kv in m.key_values.iter_mut() {
+                    out.extend(kv.key.iter_mut().chain(kv.value.iter_mut()));
+                }
+            }
+            None => {}
+        },
         _ => {}
     }
     out
