@@ -438,6 +438,63 @@ async fn forward_mode_agrees_with_grad() {
     );
 }
 
+/// Sums of `s` by `i` that tie in exact arithmetic but group 2's rounds two
+/// ulps low (#179). Reverse mode shares a MAX among rows within a few ulps
+/// of it where the argument is a sum, whose last bits change from run to
+/// run; forward mode must count the same rows, or jvp along a tangent on
+/// group 2 is 0 where ⟨∇L, t⟩ is 2/3 of it.
+#[tokio::test]
+async fn forward_mode_agrees_with_grad_at_a_near_tie_of_sums() {
+    let s = Table {
+        name: "s",
+        columns: vec![("i", "BIGINT"), ("j", "BIGINT"), ("val", "DOUBLE")],
+        rows: vec![
+            vec![0.0, 0.0, 1.25],
+            vec![0.0, 1.0, 1.5],
+            vec![1.0, 0.0, 2.0],
+            vec![1.0, 1.0, 0.75],
+            vec![2.0, 0.0, 1.7499999999999991],
+            vec![2.0, 1.0, 1.0],
+        ],
+    };
+    // Two ulps (2^-51 each, at 2.75) below the other groups' sums.
+    assert_eq!(1.7499999999999991_f64 + 1.0, 2.75 - 2.0 * 2f64.powi(-51));
+    let sums = "WITH r AS (SELECT i, SUM(val) AS v FROM s GROUP BY i)";
+    for loss in [
+        format!("{sums} SELECT MAX(v) AS loss FROM r"),
+        format!("{sums} SELECT SUM(m) AS loss FROM (SELECT MAX(v) OVER () AS m FROM r)"),
+    ] {
+        let ctx = ctx();
+        let tables = [s.clone()];
+        let wrt = [wrt("s", "val")];
+        let (_, out) = jvp_of(&ctx, &loss, &tables, &wrt).await;
+        let dot = grad_dot(&ctx, &loss, &tables, &wrt).await.unwrap();
+        let jvp = out[0][1];
+        assert!(
+            (jvp - dot).abs() <= 1e-12 * dot.abs().max(1.0),
+            "{loss}: jvp {jvp} vs ⟨∇L, t⟩ {dot}"
+        );
+    }
+}
+
+/// A table's values a few ulps apart do not tie, in either mode: the
+/// tolerance is only for values that change from run to run.
+#[tokio::test]
+async fn a_max_of_table_values_a_few_ulps_apart_is_not_a_tie() {
+    let ctx = ctx();
+    let near = Table {
+        name: "p",
+        columns: vec![("i", "BIGINT"), ("val", "DOUBLE")],
+        rows: vec![vec![0.0, 1.0], vec![1.0, 1.0 + 2.0 * f64::EPSILON]],
+    };
+    let loss = "SELECT MAX(val) AS m FROM p";
+    let wrt = [wrt("p", "val")];
+    let (_, out) = jvp_of(&ctx, loss, std::slice::from_ref(&near), &wrt).await;
+    assert_eq!(out[0][1], direction(1, 0));
+    let dot = grad_dot(&ctx, loss, &[near], &wrt).await.unwrap();
+    assert_eq!(dot, direction(1, 0));
+}
+
 /// Both modes read one linear form per reduction ([`ddx_ad`]'s `reduce`):
 /// each aggregate or window function is differentiated by both or refused
 /// by both, and where both differentiate it they agree, ⟨∇L, t⟩ = J t.

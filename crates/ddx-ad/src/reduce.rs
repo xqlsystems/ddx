@@ -48,7 +48,8 @@ use substrait::proto::function_argument::ArgType;
 use substrait::proto::{Expression, FunctionArgument};
 
 use crate::error::{AdError, Result};
-use crate::functions::{Function, Functions};
+use crate::expr::{call, lit_f64};
+use crate::functions::{Extensions, Function, Functions};
 
 /// A reduction's tangent as a linear form in its argument's tangents (see
 /// the module docs).
@@ -123,6 +124,54 @@ pub(crate) fn whole_partition(w: &WindowFunction) -> bool {
             .is_none_or(|b| matches!(b.kind, None | Some(Kind::Unbounded(_))))
     };
     unbounded(&w.lower_bound) && unbounded(&w.upper_bound)
+}
+
+/// Does a row's argument `arg` attain its group's extreme `extreme`? Equal
+/// to it, or, when `tolerant` and the extreme is finite, within 8 ulps of
+/// it. An argument computed by a sum or a mean (`tolerant`) can differ in
+/// its last bits from run to run, since a grouped sum over several
+/// partitions adds in arrival order, so two groups that tie in exact
+/// arithmetic would give the whole tangent to whichever rounded higher on
+/// that run. Within the tolerance they share it, as at an exact tie, the
+/// same way every run. An argument computed from table values alone is the
+/// same every run, and two of its values a few ulps apart do not tie
+/// (MAX(1, 1 + 2 ulps) has gradient (0, 1), as jax.grad gives).
+///
+/// Forward and reverse mode both count rows with this test, so `jvp` along
+/// `t` is ⟨∇L, t⟩ at a near-tie too (#179).
+pub(crate) fn attains(
+    ext: &mut Extensions,
+    arg: Expression,
+    extreme: Expression,
+    tolerant: bool,
+) -> Expression {
+    let equal = ext.anchor(Function::Equal);
+    if !tolerant {
+        return call(equal, vec![arg, extreme]);
+    }
+    let or = ext.anchor(Function::Or);
+    let and = ext.anchor(Function::And);
+    let lte = ext.anchor(Function::Lte);
+    let abs = ext.anchor(Function::Abs);
+    let subtract = ext.anchor(Function::Subtract);
+    let multiply = ext.anchor(Function::Multiply);
+    let size = call(abs, vec![extreme.clone()]);
+    let finite = call(lte, vec![size.clone(), lit_f64(f64::MAX)]);
+    let gap = call(
+        abs,
+        vec![call(subtract, vec![arg.clone(), extreme.clone()])],
+    );
+    let close = call(
+        lte,
+        vec![gap, call(multiply, vec![lit_f64(8.0 * f64::EPSILON), size])],
+    );
+    call(
+        or,
+        vec![
+            call(equal, vec![arg, extreme]),
+            call(and, vec![finite, close]),
+        ],
+    )
 }
 
 /// The refusal of an aggregate `name` with no rule.

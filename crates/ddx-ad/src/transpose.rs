@@ -531,41 +531,11 @@ impl<'a> Transposer<'a> {
     }
 
     /// Does the row's argument (column `arg`) attain the group's extreme
-    /// (column `extreme`)? Equal to it, or, where it is finite, within a few
-    /// ulps of it: the extreme and the arguments are recomputed, and two
-    /// groups that tie in exact arithmetic can differ in the last bit (a sum
-    /// over several partitions adds in arrival order), which would give the
-    /// whole cotangent to whichever rounded higher on that run. Within the
-    /// tolerance they share it, as at an exact tie, the same way every run.
-    /// Only an argument that can jitter gets the tolerance (see [`jitters`]):
-    /// one computed from table values alone is the same every run, and two
-    /// of its values a few ulps apart do not tie (MAX(1, 1 + 2 ulps) has
-    /// gradient (0, 1), as jax.grad gives).
+    /// (column `extreme`)? See [`crate::reduce::attains`]. The extreme and
+    /// the arguments are recomputed, which is why an argument that can
+    /// jitter (see [`jitters`]) gets the tolerance.
     fn attains(&mut self, arg: usize, extreme: usize, tolerant: bool) -> Expression {
-        let equal = self.ext.anchor(Function::Equal);
-        if !tolerant {
-            return call(equal, vec![field(arg), field(extreme)]);
-        }
-        let or = self.ext.anchor(Function::Or);
-        let and = self.ext.anchor(Function::And);
-        let lte = self.ext.anchor(Function::Lte);
-        let abs = self.ext.anchor(Function::Abs);
-        let subtract = self.ext.anchor(Function::Subtract);
-        let multiply = self.ext.anchor(Function::Multiply);
-        let size = call(abs, vec![field(extreme)]);
-        let finite = call(lte, vec![size.clone(), lit_f64(f64::MAX)]);
-        let gap = call(abs, vec![call(subtract, vec![field(arg), field(extreme)])]);
-        let close = call(
-            lte,
-            vec![gap, call(multiply, vec![lit_f64(8.0 * f64::EPSILON), size])],
-        );
-        call(
-            or,
-            vec![
-                call(equal, vec![field(arg), field(extreme)]),
-                call(and, vec![finite, close]),
-            ],
-        )
+        crate::reduce::attains(&mut self.ext, field(arg), field(extreme), tolerant)
     }
 
     /// Join `left` (whose columns before `left_width` are a region's) to
