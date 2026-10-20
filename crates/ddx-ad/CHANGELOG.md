@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.2...ddx-ad-v0.2.3) - 2026-10-20
+
+### Changed
+
+- Faster gradients of causal attention. The contraction rule now covers a join filtered by its grouping keys (a causal mask) and a product of several joined inputs, as `jax.grad` transposes attention. At 256 tokens the gradient's steps take 283 ms instead of 1,119 ms ([#162](https://github.com/xqlsystems/ddx/pull/162))
+- `rewrite` keeps the programs it builds between calls, in a `Programs` the caller holds, so a training loop builds its gradient program once instead of on every step. A program is found again by its query and `wrt`, and by the new optional `Backend::plan_key`, which changes whenever the engine's plan could ([#164](https://github.com/xqlsystems/ddx/pull/164))
+- A CTE read more than once is differentiated once. Repeated aggregates are found by structural id instead of by encoding their subtrees (76 ms instead of 394 ms for 2,048 copies) ([#165](https://github.com/xqlsystems/ddx/pull/165)); relations shared through `ReferenceRel` are lowered once in reverse mode ([#166](https://github.com/xqlsystems/ddx/pull/166)) and in forward mode and composition ([#167](https://github.com/xqlsystems/ddx/pull/167)); `rewrite` plans each CTE an objective reads more than once on its own ([#168](https://github.com/xqlsystems/ddx/pull/168)), including the CTEs of a view it reads, through the new optional `Backend::view_sql` ([#169](https://github.com/xqlsystems/ddx/pull/169))
+- Every walk over a plan is now written once, as optics, so the walks agree on what a relation's inputs and expressions are; building a program is 2–15% faster ([#177](https://github.com/xqlsystems/ddx/pull/177))
+
+### Fixed
+
+- `jvp` treats values within a few ulps of a `MAX` or `MIN` as tied where `grad` does (an argument computed by a sum or a mean), so `jvp` along `t` equals ⟨∇L, t⟩ at a near-tie too ([#180](https://github.com/xqlsystems/ddx/pull/180))
+- A semi or anti join with no condition, which DataFusion plans for an uncorrelated `EXISTS` or `IN`, is written with the condition `true`, which DataFusion's Substrait consumer accepts ([#174](https://github.com/xqlsystems/ddx/pull/174))
+
 ## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.1...ddx-ad-v0.2.2) - 2026-10-18
 
 ### Changed

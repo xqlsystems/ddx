@@ -9,6 +9,18 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.2...ddx-datafusion-v0.2.3) - 2026-10-20
+
+### Changed
+
+- Implements `Backend::plan_key`, the plan before optimization with its schemas, so `rewrite` reuses a program while the plan it was built from still holds ([#164](https://github.com/xqlsystems/ddx/pull/164)), and `Backend::view_sql`, a view's definition, so a view's CTEs are planned once ([#169](https://github.com/xqlsystems/ddx/pull/169))
+- ddx-ad 0.2.3's faster gradients: causal attention's contractions ([#162](https://github.com/xqlsystems/ddx/pull/162)), programs kept between calls ([#164](https://github.com/xqlsystems/ddx/pull/164)), CTEs read more than once differentiated once ([#165](https://github.com/xqlsystems/ddx/pull/165)–[#169](https://github.com/xqlsystems/ddx/pull/169)), and plan walks written once ([#177](https://github.com/xqlsystems/ddx/pull/177))
+
+### Fixed
+
+- A query that reads a view made over a table registered again since is refused: DataFusion's view still reads the old table, while ddx would read the new one ([#175](https://github.com/xqlsystems/ddx/pull/175))
+- ddx-ad 0.2.3's fixes: `jvp` at a near-tie of `MAX` or `MIN` ([#180](https://github.com/xqlsystems/ddx/pull/180)), and a semi or anti join with no condition ([#174](https://github.com/xqlsystems/ddx/pull/174))
+
 ## [0.2.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.1...ddx-datafusion-v0.2.2) - 2026-10-18
 
 ### Changed
