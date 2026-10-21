@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.3...ddx-ad-v0.2.4) - 2026-10-21
+
+### Other
+
+- *(deps)* upgrade DataFusion to 55 ([#185](https://github.com/xqlsystems/ddx/pull/185))
+
 ## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.2...ddx-ad-v0.2.3) - 2026-10-20
 
 ### Changed
