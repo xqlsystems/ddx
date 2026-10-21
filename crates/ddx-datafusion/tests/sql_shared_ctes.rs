@@ -483,6 +483,21 @@ async fn a_view_s_name_is_resolved_with_the_session_s_case_rules() {
 }
 
 #[tokio::test]
+async fn a_view_whose_sql_needs_coercion_has_its_sql_given() {
+    // DataFusion keeps `val * CAST(2 AS DOUBLE)` for this view; its SQL
+    // plans as `val * 2` until coerced, and still means the same.
+    let ctx = w().await;
+    exec(
+        &ctx,
+        "CREATE VIEW m AS SELECT i, val * 2 AS v FROM w WHERE i > 0",
+    )
+    .await;
+    let mut backend = DataFusion(ctx.clone());
+    let sql = backend.view_sql("m").await.unwrap();
+    assert!(sql.is_some_and(|s| s.contains("val * 2")));
+}
+
+#[tokio::test]
 async fn a_view_that_reads_a_redefined_view_is_left_to_the_engine() {
     // DataFusion keeps the plan `outer_v` was made with, which reads the
     // first `inner_v`; its SQL now reads the second. The gradient is the

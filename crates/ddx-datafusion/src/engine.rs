@@ -12,11 +12,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+use datafusion::optimizer::Analyzer;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -148,6 +151,16 @@ impl ddx_ad::Backend for DataFusion {
             return Ok(None);
         };
         let Ok(now) = self.0.state().create_logical_plan(&probe).await else {
+            return Ok(None);
+        };
+        // Coerced as DataFusion coerces the plan it keeps for a view (its
+        // `create_view`: the type-coercion rule alone, default options), so
+        // `val * 2` over a DOUBLE plans alike both times.
+        let Ok(now) = Analyzer::with_rules(vec![Arc::new(TypeCoercion::new())]).execute_and_check(
+            now,
+            &ConfigOptions::default(),
+            |_, _| {},
+        ) else {
             return Ok(None);
         };
         // Under the projection and alias of `SELECT * FROM (…) AS …`.
