@@ -40,19 +40,19 @@ sqlparser = { version = "=0.62.0", features = ["visitor"] }
 # built against. A bump is a deliberate change: update this line,
 # `datafusion-substrait` below, and the Python pins (`python/ddxdb/pyproject.toml`,
 # `tests/pyproject.toml`, and their lockfiles); see CONTRIBUTING.md.
-datafusion = { version = "=54.1.0" }
+datafusion = { version = "=55.2.0" }
 
 # The plan type ddx-ad differentiates. Pinned exactly, for the same reason as
 # `sqlparser`: `ddx-ad`'s public API takes and returns `substrait::proto` types,
 # and an adapter hands it the plan its engine produced. `datafusion-substrait`
-# 54.1 depends on `substrait` 0.63, so that is the version here; if the two
+# 55.2 depends on `substrait` 0.63, so that is the version here; if the two
 # diverged, `substrait::proto::Plan` would be two unrelated Rust types and the
 # adapter would stop compiling.
 substrait = { version = "=0.63.0" }
 # DataFusion's Substrait producer and consumer, for the adapter. Pinned
 # exactly, to the same release as `datafusion`; its `substrait` requirement is
 # what the pin above follows.
-datafusion-substrait = { version = "=54.1.0" }
+datafusion-substrait = { version = "=55.2.0" }
 # The protobuf runtime `substrait`'s types are generated for. ddx-ad encodes
 # plans as bytes for hosts that hold them so, and relations to compare them;
 # the version is whatever `substrait` uses.
