@@ -144,8 +144,11 @@ async fn register_decoy(
     };
     let table =
         MemTable::try_new(first.schema(), vec![batches.clone()]).map_err(|e| e.to_string())?;
-    ctx.register_table(datafusion::sql::TableReference::bare(name), Arc::new(table))
-        .map_err(|e| e.to_string())?;
+    ctx.register_table(
+        datafusion::common::TableReference::bare(name),
+        Arc::new(table),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

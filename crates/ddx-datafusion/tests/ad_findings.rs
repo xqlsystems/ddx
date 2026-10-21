@@ -345,7 +345,7 @@ fn ctx_with_only(rules: &[&str]) -> SessionContext {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54 (#99): a sort beneath a limit is dropped under a join"]
+#[ignore = "upstream DataFusion 54, 55 (#99): a sort beneath a limit is dropped under a join"]
 async fn upstream_a_limit_keeps_its_sort_under_a_join() {
     // Without push_down_limit to fuse the limit into the sort, the physical
     // plan loses the sort once the projection above it drops the sort key,
@@ -373,7 +373,7 @@ async fn upstream_a_limit_keeps_its_sort_under_a_join() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54 (#100): a union of aggregates over windows cannot be interleaved"]
+#[ignore = "upstream DataFusion 54, 55 (#100): a union of aggregates over windows cannot be interleaved"]
 async fn upstream_a_union_of_aggregates_over_windows_plans() {
     // With one target partition, EnforceSorting fails its own assertion
     // ("Can not create InterleaveExec: new children can not be
@@ -428,7 +428,7 @@ async fn upstream_a_union_of_aggregates_over_windows_plans() {
 }
 
 #[tokio::test]
-#[ignore = "upstream DataFusion 54 (#101): a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
+#[ignore = "upstream DataFusion 54, 55 (#101): a grouped MAX skips NaN, a window or ungrouped MAX returns it"]
 async fn upstream_max_treats_nan_alike_grouped_or_not() {
     // The same values, the same MAX: grouped, it skips the NaN and gives
     // 0.9; as a window over the same group, and ungrouped, it gives NaN. A
@@ -788,49 +788,55 @@ async fn a_near_tie_over_constant_table_values_goes_to_the_larger() {
     assert_eq!(got, vec![(0, Some(0.0)), (1, Some(b))]);
 }
 
+/// Upstream DataFusion 54 (#103), fixed in 55: with the logical
+/// `push_down_filter` rule off, the physical planner pushed a filter above
+/// an anti-join into the join's right input, so rows the query excludes came
+/// back. The round-three soak reached it as a silently wrong gradient. ddx
+/// isn't involved; this guards the pin against a regression.
 #[tokio::test]
-#[ignore = "upstream DataFusion 54 (#103, fixed in 55): a filter above an anti-join is pushed into its right side"]
 async fn upstream_a_filter_above_an_anti_join_keeps_its_rows_out() {
-    // From the round-three soak (seed 3000134, an optimizer variant). With
-    // push_down_filter off, `j <> 2` stays above the anti-join NOT IN makes,
-    // and the gradient reached b(2), a row the query excludes; the loss was
-    // unchanged, the gradient silently wrong. ddx's recomputed region is
-    // right: DataFusion 54's physical filter pushdown moves the filter into
-    // the anti-join's right input, which plain SQL shows without ddx (#103).
-    // Fixed in DataFusion 55; ddx stays on 54 with datafusion-python.
-    let mut got = Vec::new();
-    for drop in [None, Some("push_down_filter")] {
-        let ctx = SessionContext::new();
-        if let Some(rule) = drop {
-            assert!(ctx.remove_optimizer_rule(rule));
-        }
-        exec(
-            &ctx,
-            "CREATE TABLE b (j BIGINT, val DOUBLE) AS VALUES (0, -0.1), (1, 0.8), (2, 0.5), (90, 0.1)",
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::optimizer::Optimizer;
+    let rules = Optimizer::new()
+        .rules
+        .into_iter()
+        .filter(|r| r.name() != "push_down_filter")
+        .collect();
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    exec(
+        &ctx,
+        "CREATE TABLE b (j BIGINT, val DOUBLE) AS VALUES (0, -0.1), (1, 0.8), (2, 0.5), (90, 0.1)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CREATE TABLE y (j BIGINT, val DOUBLE) AS VALUES (0, 0.4), (2, 0.9), (1, -0.2)",
+    )
+    .await;
+    let batches = ctx
+        .sql(
+            "SELECT j FROM (SELECT j FROM b WHERE NOT EXISTS \
+             (SELECT 1 FROM y WHERE y.j = b.j AND y.val > 0.35)) r WHERE j <> 2 ORDER BY j",
         )
-        .await;
-        exec(
-            &ctx,
-            "CREATE TABLE y (j BIGINT, val DOUBLE) AS VALUES (0, 0.4), (2, 0.9), (1, -0.2)",
-        )
-        .await;
-        got.push(
-            grad(
-                &ctx,
-                "WITH r AS (SELECT j, val AS v FROM b WHERE j NOT IN (SELECT j FROM y WHERE val > 0.35)), \
-                      f AS (SELECT * FROM r WHERE j <> 2), \
-                      m AS (SELECT MAX(v) AS m FROM f), \
-                      e AS (SELECT f.j, exp(f.v - m.m) AS e FROM f CROSS JOIN m), \
-                      s AS (SELECT SUM(e) AS s FROM e) \
-                 SELECT SUM(e.e / s.s * e.e / s.s) AS loss FROM e CROSS JOIN s",
-                "b",
-            )
-            .await,
-        );
-    }
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let got: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+        .collect();
     assert_eq!(
-        got[1], got[0],
-        "with push_down_filter off, the gradient changed"
+        got,
+        vec![1, 90],
+        "the filter `j <> 2` moved below the anti-join"
     );
 }
 

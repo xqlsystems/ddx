@@ -1654,9 +1654,9 @@ breaking release of `ddx-core`; and if the pins ever must diverge, degrade
 the bridge to a string round-trip rather than break it `[G2]`.) The pin now
 only keeps the build to one `sqlparser`.
 
-**`datafusion` is pinned exactly too, always** (`=54.1.0`, with
-`datafusion-substrait`; `==54.0.0` for the Python package, the PyPI release of the
-same line). `ddx-datafusion`'s public API is DataFusion's types, a user's
+**`datafusion` is pinned exactly too, always** (`=55.2.0`, with
+`datafusion-substrait`; `==55.0.0` for the Python package, the PyPI release
+built on DataFusion 55.2.0). `ddx-datafusion`'s public API is DataFusion's types, a user's
 `SessionContext` goes in and a `DataFrame` comes out, and v2 reads and writes
 Substrait plans of the version DataFusion's producer writes. A caller therefore
 links the DataFusion ddx was tested against; a range would promise a combination

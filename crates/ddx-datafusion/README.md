@@ -43,7 +43,8 @@ consumes, so the two must resolve the same `substrait`, and
 
 | `ddx-datafusion` | `datafusion` | `substrait` |
 |---|---|---|
-| 0.1 | 54 | 0.63 |
+| 0.1, 0.2 | 54 | 0.63 |
+| 0.3 | 55 | 0.63 |
 
 ## Status
 

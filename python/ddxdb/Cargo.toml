@@ -6,7 +6,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/xqlsystems/ddx"
 authors = ["Alexander Merose <al@merose.com>"]
-rust-version = "1.88"
+rust-version = "1.94"
 # The wheel is published to PyPI by maturin, not to crates.io by release-plz.
 publish = false
 

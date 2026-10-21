@@ -33,11 +33,11 @@ dependencies = []
 
 # `datafusion` is pinned exactly, always: `ddxdb.ad` exchanges Substrait plans
 # with DataFusion's bindings, and ddx-ad pins `substrait` to the version
-# DataFusion 54 uses. This is the PyPI release (it bundles DataFusion 54.0.0);
-# the Rust crates use 54.1.0. A bump is a deliberate change (see CONTRIBUTING.md).
+# DataFusion 55 uses. This is the PyPI release (it bundles DataFusion 55.2.0,
+# as the Rust crates use). A bump is a deliberate change (see CONTRIBUTING.md).
 [project.optional-dependencies]
-datafusion = ["datafusion==54.0.0"]
-test = ["pytest>=7", "datafusion==54.0.0"]
+datafusion = ["datafusion==55.0.0"]
+test = ["pytest>=7", "datafusion==55.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/xqlsystems/ddx"

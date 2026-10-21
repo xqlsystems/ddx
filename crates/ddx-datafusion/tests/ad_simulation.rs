@@ -2977,9 +2977,9 @@ async fn name_checks(
             let copy =
                 MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
             let table_ref = if kind == "schema" {
-                datafusion::sql::TableReference::parse_str(&register)
+                datafusion::common::TableReference::parse_str(&register)
             } else {
-                datafusion::sql::TableReference::bare(register.clone())
+                datafusion::common::TableReference::bare(register.clone())
             };
             ctx.register_table(table_ref, Arc::new(copy))
                 .map_err(|e| e.to_string())?;
@@ -3299,7 +3299,7 @@ async fn twin_checks(
         let table =
             MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
         ctx.register_table(
-            datafusion::sql::TableReference::parse_str(&format!("{schema}.{t}")),
+            datafusion::common::TableReference::parse_str(&format!("{schema}.{t}")),
             Arc::new(table),
         )
         .map_err(|e| e.to_string())?;

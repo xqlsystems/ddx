@@ -38,8 +38,8 @@ The guiding principles shape almost every review comment:
 ## Getting set up
 
 You need a Rust toolchain. The **minimum supported Rust version (MSRV) is
-1.88** — this is enforced in CI and declared in `Cargo.toml`. (The floor comes
-from a transitive build dependency; `ddx`'s own code needs far less.)
+1.94** — this is enforced in CI and declared in `Cargo.toml`. (The floor comes
+from DataFusion 55; `ddx`'s own code needs far less.)
 
 `ddx-ad` also needs `protoc`, the Protocol Buffers compiler: the `substrait`
 crate generates its Rust types from `.proto` files at build time. Install it
@@ -183,8 +183,8 @@ The differentiation cores are deliberately minimal so any engine can drive them:
   the adapter hands `ddx-ad` the engine's own plan type, and two versions would
   be two unrelated Rust types.
 - **`datafusion` and `datafusion-substrait` are pinned exactly, always**
-  (`=54.1.0`), and so is the Python `datafusion` (`==54.0.0`, the PyPI release;
-  it bundles DataFusion 54.0.0) in `python/ddxdb/pyproject.toml` and
+  (`=55.2.0`), and so is the Python `datafusion` (`==55.0.0`, the PyPI release;
+  it bundles DataFusion 55.2.0) in `python/ddxdb/pyproject.toml` and
   `tests/pyproject.toml`. `ddx-datafusion`'s API is DataFusion's own types, so a
   caller must link the version ddx was built and tested against. A bump is one
   deliberate change: the workspace `Cargo.toml`, both `pyproject.toml` files and
