@@ -67,6 +67,12 @@ impl Printer {
     }
 
     fn select(&mut self, s: &Select) {
+        self.select_named(s, "c");
+    }
+
+    /// `s`, its columns named `{prefix}0`, `{prefix}1`, … unless it has
+    /// names of its own.
+    fn select_named(&mut self, s: &Select, prefix: &str) {
         self.sql.push_str("SELECT ");
         if s.columns.is_empty() {
             // SQL has no empty select list: a relation of no columns gives
@@ -84,7 +90,7 @@ impl Printer {
                     ident(&mut self.sql, &names[i]);
                 }
                 None => {
-                    write!(self.sql, " AS c{i}").ok();
+                    write!(self.sql, " AS {prefix}{i}").ok();
                 }
             }
         }
@@ -187,10 +193,7 @@ impl Printer {
                     SetOp::IntersectAll => " INTERSECT ALL ",
                 };
                 self.sql.push('(');
-                self.each(inputs, op, |p, input| {
-                    p.sql.push_str("SELECT * FROM ");
-                    p.from(input);
-                });
+                self.each(inputs, op, |p, input| p.select(input));
                 self.sql.push(')');
                 self.alias(*alias);
             }
@@ -209,10 +212,13 @@ impl Printer {
         });
     }
 
-    /// A subquery's select, parenthesized.
+    /// An expression's subquery, parenthesized. Its columns are named
+    /// `__ddx_v0`, …, which no column it reads is: DataFusion 55's
+    /// decorrelation fails on a subquery column named like one it reads
+    /// (`c0` over `t3.c0`), as an ambiguous name.
     fn parenthesized(&mut self, q: &Select) {
         self.sql.push('(');
-        self.select(q);
+        self.select_named(q, "__ddx_v");
         self.sql.push(')');
     }
 

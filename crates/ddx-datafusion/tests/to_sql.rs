@@ -32,43 +32,72 @@ async fn fixture() -> SessionContext {
     ctx
 }
 
-/// The rows of `sql`'s result, one line each, sorted unless `ordered`.
-async fn rows(ctx: &SessionContext, sql: &str, ordered: bool) -> Vec<String> {
-    let batches = ctx
-        .sql(sql)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"))
-        .collect()
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+/// The column names of `sql`'s result, and its rows, one line each, sorted
+/// unless `ordered`.
+async fn rows(ctx: &SessionContext, sql: &str, ordered: bool) -> (Vec<String>, Vec<String>) {
+    let df = ctx.sql(sql).await.unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let names = df
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let batches = df.collect().await.unwrap_or_else(|e| panic!("{e}\n{sql}"));
     let text = pretty_format_batches(&batches).unwrap().to_string();
-    // Drop the header: the column names are the root's, compared below.
+    // The header is compared as `names`.
     let mut lines: Vec<String> = text.lines().skip(3).map(str::to_string).collect();
     if !ordered {
         lines.sort();
     }
-    lines
+    (names, lines)
 }
 
-/// `sql`, planned by DataFusion and written back as SQL by `to_sql`, gives
-/// the rows `sql` does, in order if `ordered`.
+/// `sql`, planned by DataFusion, optimized and not, and written back as SQL
+/// by `to_sql`, gives the columns and rows `sql` does, in order if
+/// `ordered`.
 async fn round_trips(ctx: &SessionContext, sql: &str, ordered: bool) {
-    let plan = common::substrait_of(ctx, sql, true).await;
-    let written = to_sql(&plan, Dialect::DataFusion).unwrap();
-    assert_eq!(
-        rows(ctx, &written, ordered).await,
-        rows(ctx, sql, ordered).await,
-        "\n{sql}\nwritten as\n{written}"
-    );
-    // And with every subtree read twice shared, as a producer that shares a
-    // CTE writes it: one CTE read wherever it is shared.
-    let shared = common::shared(&plan);
-    let written = to_sql(&shared, Dialect::DataFusion).unwrap();
-    assert_eq!(
-        rows(ctx, &written, ordered).await,
-        rows(ctx, sql, ordered).await,
-        "\n{sql}\nshared, written as\n{written}"
-    );
+    round_trips_as(ctx, sql, ordered, &[true, false]).await;
+}
+
+/// [`round_trips`], for plans optimized as `optimized` says. DataFusion's
+/// producer cannot write some unoptimized plans (a correlated subquery's
+/// outer reference), which are skipped.
+async fn round_trips_as(ctx: &SessionContext, sql: &str, ordered: bool, optimized: &[bool]) {
+    let want = rows(ctx, sql, ordered).await;
+    for &optimized in optimized {
+        let df = ctx.sql(sql).await.unwrap();
+        let lp = if optimized {
+            df.into_optimized_plan().unwrap()
+        } else {
+            df.into_unoptimized_plan()
+        };
+        let plan = match datafusion_substrait::logical_plan::producer::to_substrait_plan(
+            &lp,
+            &ctx.state(),
+        ) {
+            Ok(plan) => *plan,
+            Err(e) if !optimized => {
+                eprintln!("skipped: DataFusion cannot write the unoptimized plan of {sql}: {e}");
+                continue;
+            }
+            Err(e) => panic!("{e}\n{sql}"),
+        };
+        let written = to_sql(&plan, Dialect::DataFusion).unwrap();
+        assert_eq!(
+            rows(ctx, &written, ordered).await,
+            want,
+            "\n{sql}\n(optimized: {optimized}) written as\n{written}"
+        );
+        // And with every subtree read twice shared, as a producer that
+        // shares a CTE writes it: one CTE read wherever it is shared.
+        let shared = common::shared(&plan);
+        let written = to_sql(&shared, Dialect::DataFusion).unwrap();
+        assert_eq!(
+            rows(ctx, &written, ordered).await,
+            want,
+            "\n{sql}\n(optimized: {optimized}) shared, written as\n{written}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -155,13 +184,22 @@ async fn windows_with_their_frames() {
         "SELECT k, sum(x) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM t",
         "SELECT k, max(x) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING \
          AND CURRENT ROW) AS m FROM t",
-        "SELECT k, count(*) OVER (ORDER BY n RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c FROM t",
         "SELECT k, row_number() OVER (PARTITION BY g ORDER BY x DESC) AS r, \
          rank() OVER (ORDER BY g) AS rk FROM t",
         "SELECT k, avg(x) OVER () AS a FROM t",
     ] {
         round_trips(&ctx, sql, false).await;
     }
+    // Optimized only: unoptimized, the offsets are not yet coerced to an
+    // integer type, and DataFusion's producer writes such an offset as
+    // unbounded, so its plan is not the query.
+    round_trips_as(
+        &ctx,
+        "SELECT k, count(*) OVER (ORDER BY n RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c FROM t",
+        false,
+        &[true],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -235,4 +273,116 @@ async fn each_dialect_spells_sign_and_integer_division_its_own_way() {
         duckdb.contains("sign(") && duckdb.contains(" // "),
         "{duckdb}"
     );
+}
+
+#[tokio::test]
+async fn an_order_is_kept_through_the_relations_that_keep_it() {
+    // A sort under a projection (one that drops its key, too), and a fetch
+    // above them, which picks rows in that order. Found by fuzzing.
+    let ctx = fixture().await;
+    for sql in [
+        "SELECT k + 1 AS y FROM t ORDER BY x",
+        "SELECT o1 FROM (SELECT -k AS o0, g AS o1 FROM t) s ORDER BY o0, o1 LIMIT 1",
+        "SELECT k FROM (SELECT k, x FROM t WHERE k > 1 ORDER BY x DESC) s WHERE k < 5 LIMIT 2",
+        "SELECT y FROM (SELECT k * 2 AS y FROM t ORDER BY x * k LIMIT 3) s ORDER BY y DESC",
+    ] {
+        round_trips(&ctx, sql, true).await;
+    }
+}
+
+#[tokio::test]
+async fn a_grouping_key_listed_twice_is_one_column() {
+    // Unoptimized, DataFusion lists `g` once and refers to it twice; its
+    // output has it once. Found by fuzzing.
+    let ctx = fixture().await;
+    round_trips(
+        &ctx,
+        "SELECT g AS a, g AS b, count(*) AS n, avg(x) AS m FROM t GROUP BY g, g",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_mark_join_runs() {
+    // An EXISTS under an OR is a mark join, whose column DataFusion 55
+    // cannot compute as `EXISTS (…)`. Found by fuzzing.
+    let ctx = fixture().await;
+    for sql in [
+        "SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k) OR x > 1",
+        "SELECT k FROM t WHERE k IN (SELECT k FROM u) OR n IS NULL",
+    ] {
+        round_trips(&ctx, sql, false).await;
+    }
+}
+
+#[tokio::test]
+async fn a_virtual_table_of_rows_with_no_columns_keeps_its_rows() {
+    use ddx_ad::substrait::proto::expression::nested::Struct as Row;
+    use ddx_ad::substrait::proto::read_rel::{ReadType, VirtualTable};
+    use ddx_ad::substrait::proto::{rel::RelType, NamedStruct, ReadRel, Rel};
+    // `SELECT count(*)` over three rows of nothing: the plan of a count
+    // over VALUES whose columns were all pruned, with its read replaced.
+    let ctx = fixture().await;
+    let mut plan = common::substrait_of(&ctx, "SELECT count(*) AS n FROM t", true).await;
+    let rows = Rel {
+        rel_type: Some(RelType::Read(Box::new(ReadRel {
+            base_schema: Some(NamedStruct {
+                names: vec![],
+                r#struct: Some(Default::default()),
+            }),
+            read_type: Some(ReadType::VirtualTable(VirtualTable {
+                expressions: vec![Row { fields: vec![] }; 3],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    };
+    let mut replaced = false;
+    for rel in ddx_ad_reads(&mut plan) {
+        *rel = rows.clone();
+        replaced = true;
+    }
+    assert!(replaced);
+    let written = to_sql(&plan, Dialect::DataFusion).unwrap();
+    assert_eq!(
+        rows_of(&ctx, &written).await,
+        vec!["+---+".to_string(), "| 3 |".to_string()],
+        "{written}"
+    );
+}
+
+/// The reads of `plan`, to replace.
+fn ddx_ad_reads(
+    plan: &mut ddx_ad::substrait::proto::Plan,
+) -> Vec<&mut ddx_ad::substrait::proto::Rel> {
+    use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
+    use ddx_ad::substrait::proto::rel::RelType;
+    fn walk<'a>(
+        rel: &'a mut ddx_ad::substrait::proto::Rel,
+        out: &mut Vec<&'a mut ddx_ad::substrait::proto::Rel>,
+    ) {
+        if matches!(rel.rel_type, Some(RelType::Read(_))) {
+            out.push(rel);
+            return;
+        }
+        if let Some(kind) = rel.rel_type.as_mut() {
+            for input in common::inputs_mut(kind) {
+                walk(input, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in &mut plan.relations {
+        if let Some(PlanRelType::Root(root)) = &mut r.rel_type {
+            if let Some(input) = root.input.as_mut() {
+                walk(input, &mut out);
+            }
+        }
+    }
+    out
+}
+
+async fn rows_of(ctx: &SessionContext, sql: &str) -> Vec<String> {
+    rows(ctx, sql, false).await.1
 }

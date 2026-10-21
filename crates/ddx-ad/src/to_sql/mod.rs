@@ -20,9 +20,14 @@
 //! - **Reading is a fold over the plan, bottom up** (a catamorphism,
 //!   [`crate::optics::cata`]): each relation's SQL is made from its inputs'
 //!   finished SQL, by one case per kind of relation, and the fold keeps a
-//!   stack rather than recursing, so a plan of any depth is read. A fetch
-//!   over a sort reads its sort's input in the sort's place, since an
-//!   `ORDER BY` in a subquery does not order the query reading it.
+//!   stack rather than recursing, so a plan of any depth is read.
+//! - **The order rows come in travels with them.** A sort sets it, and a
+//!   projection, filter or fetch keeps it, as Substrait's do; but SQL
+//!   orders only the rows of the query an `ORDER BY` is in, not a query
+//!   reading it. So each relation's order is kept as keys among its columns
+//!   (a key its projection drops is passed on as an extra column), and the
+//!   query that needs it writes it again: one that picks rows with
+//!   `LIMIT`, and the whole query.
 //! - **A field reference is resolved in an environment** of the columns its
 //!   relation reads, chained to the columns of each relation a subquery is
 //!   inside: Substrait's `steps_out` counts links of that chain outward (a
@@ -61,12 +66,25 @@
 //!   `EXISTS`, which every engine reads the same way.
 //!
 //! Anything else (an extension relation, a grouping set, an interval
-//! literal) is refused with [`AdError::NotImplemented`].
+//! literal) is refused with [`AdError::NotImplemented`]. A plan that does
+//! not hold together (a reference past its relations, a shared relation
+//! that reads itself) is refused with [`AdError::InvalidPlan`].
+//!
+//! # What a plan leaves to its engine
+//!
+//! Substrait does not say everything: how a cast of a float to an integer
+//! rounds, whether integer overflow wraps, where NaN sorts. A plan means
+//! what the engine that planned it does there, so write it in that engine's
+//! dialect, as ddx does (DuckDB plans what DuckDB runs). The same plan run
+//! on another engine can differ where the two do.
+//!
+//! The names `to_sql` makes up begin `__ddx_` (its CTEs are `__ddx_q0`, …),
+//! which ddx reserves: a table of such a name is shadowed by a CTE.
 
 mod ir;
 mod print;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use substrait::proto::aggregate_function::AggregationInvocation;
 use substrait::proto::expression::field_reference::{ReferenceType, RootType};
@@ -140,6 +158,7 @@ pub fn to_sql(plan: &Plan, dialect: Dialect) -> Result<String> {
         aliases: 0,
         ctes: Vec::new(),
         shared: HashMap::new(),
+        reading: HashSet::new(),
     };
     let source = reader.relation(input, None, Placement::Cte)?;
     let mut body = reader.select_of(source);
@@ -168,11 +187,41 @@ enum Placement {
     InPlace,
 }
 
-/// A relation read so far: a `SELECT` its reader places, or a CTE already
-/// written (a shared relation's).
-enum Source {
+/// A relation read so far, with columns `c0`, `c1`, …: the first `width`
+/// its own, and any after them only keys of the order its rows come in.
+struct Source {
+    origin: Origin,
+    width: usize,
+    /// The order its rows come in, if a sort below it set one and every
+    /// relation since kept it (Substrait's projections, filters and fetches
+    /// do; nothing else does). SQL orders only the rows of the query an
+    /// `ORDER BY` is in, so the query that needs the order (one that picks
+    /// rows with `LIMIT`, or the whole query's) writes it again from these
+    /// keys, which a projection that dropped them still passes on.
+    order: Vec<Sorted>,
+}
+
+/// Where a [`Source`]'s rows are: a `SELECT` its reader places, or a CTE
+/// already written (a shared relation's).
+enum Origin {
     Select(Box<Select>),
-    Cte { index: usize, width: usize },
+    Cte(usize),
+}
+
+/// A key of the order a relation's rows come in: one of its columns.
+#[derive(Clone)]
+struct Sorted {
+    column: usize,
+    descending: bool,
+    nulls_first: bool,
+}
+
+/// A [`Source`] placed under an alias: its `FROM` item, its own columns,
+/// and the order its rows come in, read through the alias.
+struct Placed {
+    from: From,
+    columns: Vec<Expr>,
+    order: Vec<Order>,
 }
 
 /// The columns an expression may read: its relation's input columns, and,
@@ -213,9 +262,11 @@ struct Reader<'p> {
     functions: &'p Functions,
     aliases: usize,
     ctes: Vec<Select>,
-    /// The CTE (its index and width) of each shared relation read so far,
-    /// by its position in the plan's relations.
-    shared: HashMap<i32, (usize, usize)>,
+    /// The CTE of each shared relation read so far (its index, width and
+    /// order), by its position in the plan's relations.
+    shared: HashMap<i32, (usize, usize, Vec<Sorted>)>,
+    /// The shared relations being read, to refuse one that reads itself.
+    reading: HashSet<i32>,
 }
 
 impl Reader<'_> {
@@ -231,42 +282,72 @@ impl Reader<'_> {
         })
     }
 
-    /// `source` placed and read under a new alias: the `FROM` item and the
-    /// columns it gives.
-    fn place(&mut self, source: Source, placement: Placement) -> (From, Vec<Expr>) {
-        let alias = self.alias();
-        let (from, width) = match source {
-            Source::Cte { index, width } => (From::Cte { index, alias }, width),
-            Source::Select(select) => {
-                let width = select.columns.len();
-                match placement {
-                    Placement::Cte => {
-                        self.ctes.push(*select);
-                        let index = self.ctes.len() - 1;
-                        (From::Cte { index, alias }, width)
-                    }
-                    Placement::InPlace => (
-                        From::Subquery {
-                            query: select,
-                            alias,
-                        },
-                        width,
-                    ),
-                }
-            }
-        };
-        (from, positions(alias, width))
+    /// `select` as a new CTE: its index. Its `ORDER BY` goes unless it
+    /// picks rows: a CTE's order is not its reader's.
+    fn name(&mut self, mut select: Box<Select>) -> usize {
+        if select.limit.is_none() && select.offset.is_none() {
+            select.order_by.clear();
+        }
+        self.ctes.push(*select);
+        self.ctes.len() - 1
     }
 
-    /// `source` as a `SELECT`: itself, or one reading its CTE.
+    /// `source` placed and read under a new alias.
+    fn place(&mut self, source: Source, placement: Placement) -> Placed {
+        let alias = self.alias();
+        let from = match source.origin {
+            Origin::Cte(index) => From::Cte { index, alias },
+            Origin::Select(select) => match placement {
+                Placement::Cte => From::Cte {
+                    index: self.name(select),
+                    alias,
+                },
+                Placement::InPlace => {
+                    let mut query = select;
+                    if query.limit.is_none() && query.offset.is_none() {
+                        query.order_by.clear();
+                    }
+                    From::Subquery { query, alias }
+                }
+            },
+        };
+        let column = |i| Expr::Column {
+            table: alias,
+            column: Column::Position(i),
+        };
+        Placed {
+            from,
+            columns: (0..source.width).map(column).collect(),
+            order: source
+                .order
+                .iter()
+                .map(|s| Order {
+                    expr: column(s.column),
+                    descending: s.descending,
+                    nulls_first: s.nulls_first,
+                })
+                .collect(),
+        }
+    }
+
+    /// `source` as a `SELECT` of its own columns, in its order: the whole
+    /// query's, or a subquery's.
     fn select_of(&mut self, source: Source) -> Select {
-        match source {
-            Source::Select(select) => *select,
-            Source::Cte { index, width } => {
-                let alias = self.alias();
+        match source.origin {
+            Origin::Select(mut select) => {
+                select.columns.truncate(source.width);
+                *select
+            }
+            Origin::Cte(_) => {
+                let Placed {
+                    from,
+                    columns,
+                    order,
+                } = self.place(source, Placement::Cte);
                 Select {
-                    columns: positions(alias, width),
-                    from: From::Cte { index, alias },
+                    columns,
+                    from,
+                    order_by: order,
                     ..Select::default()
                 }
             }
@@ -290,24 +371,34 @@ impl Reader<'_> {
             let source = read.next().expect("`inputs` names each input a node reads");
             reader.place(source, placement)
         };
+        let none = Vec::new;
         let env = |columns: &[Expr]| Env {
             columns: columns.to_vec(),
             outer,
         };
-        let (select, common) = match kind {
-            RelType::Read(r) => (self.read(r, outer)?, r.common.as_ref()),
+        // Each relation's SELECT, its emit, and the order its rows come in.
+        let (select, common, order) = match kind {
+            RelType::Read(r) => (self.read(r, outer)?, r.common.as_ref(), none()),
             RelType::Project(p) => {
-                let (from, columns) = next(self);
+                let Placed {
+                    from,
+                    columns,
+                    order,
+                } = next(self);
                 let computed = self.exprs(&p.expressions, &env(&columns))?;
                 let select = Select {
                     columns: columns.into_iter().chain(computed).collect(),
                     from,
                     ..Select::default()
                 };
-                (select, p.common.as_ref())
+                (select, p.common.as_ref(), order)
             }
             RelType::Filter(f) => {
-                let (from, columns) = next(self);
+                let Placed {
+                    from,
+                    columns,
+                    order,
+                } = next(self);
                 let condition = required(f.condition.as_deref(), "a filter's condition")?;
                 let condition = self.expr(condition, &env(&columns))?;
                 let select = Select {
@@ -316,7 +407,7 @@ impl Reader<'_> {
                     filter: vec![condition],
                     ..Select::default()
                 };
-                (select, f.common.as_ref())
+                (select, f.common.as_ref(), order)
             }
             RelType::Join(j) => {
                 let left = next(self);
@@ -330,11 +421,19 @@ impl Reader<'_> {
                     kind,
                     outer,
                 )?;
-                (select, j.common.as_ref())
+                (select, j.common.as_ref(), none())
             }
             RelType::Cross(c) => {
-                let (left, mut columns) = next(self);
-                let (right, right_columns) = next(self);
+                let Placed {
+                    from: left,
+                    mut columns,
+                    ..
+                } = next(self);
+                let Placed {
+                    from: right,
+                    columns: right_columns,
+                    ..
+                } = next(self);
                 columns.extend(right_columns);
                 let from = From::Join {
                     left: Box::new(left),
@@ -347,41 +446,39 @@ impl Reader<'_> {
                     from,
                     ..Select::default()
                 };
-                (select, c.common.as_ref())
+                (select, c.common.as_ref(), none())
             }
             RelType::Aggregate(a) => {
                 let input = next(self);
-                (self.aggregate(a, input, outer)?, a.common.as_ref())
+                (self.aggregate(a, input, outer)?, a.common.as_ref(), none())
             }
             RelType::Sort(s) => {
-                let (from, columns) = next(self);
-                let order_by = self.orders(&s.sorts, &env(&columns))?;
+                let Placed { from, columns, .. } = next(self);
+                let order = self.orders(&s.sorts, &env(&columns))?;
                 let select = Select {
                     columns,
                     from,
-                    order_by,
                     ..Select::default()
                 };
-                (select, s.common.as_ref())
+                (select, s.common.as_ref(), order)
             }
             RelType::Fetch(f) => {
-                let (from, columns) = next(self);
-                // Read past an unemitted sort ([`inputs`]): its ORDER BY is
-                // this query's.
-                let order_by = match sort_under(f) {
-                    Some(sorts) => self.orders(sorts, &env(&columns))?,
-                    None => Vec::new(),
-                };
+                // It picks rows in the order its input's come in, which the
+                // ORDER BY that `finish` writes from `order` keeps.
+                let Placed {
+                    from,
+                    columns,
+                    order,
+                } = next(self);
                 let (offset, limit) = fetch(f)?;
                 let select = Select {
                     columns,
                     from,
-                    order_by,
                     offset,
                     limit,
                     ..Select::default()
                 };
-                (select, f.common.as_ref())
+                (select, f.common.as_ref(), order)
             }
             RelType::Set(s) => {
                 let op = match SubstraitSetOp::try_from(s.op).unwrap_or(SubstraitSetOp::Unspecified)
@@ -402,13 +499,17 @@ impl Reader<'_> {
                 let mut width = None;
                 let mut inputs = Vec::new();
                 for _ in &s.inputs {
-                    let (from, columns) = next(self);
+                    let Placed { from, columns, .. } = next(self);
                     if *width.get_or_insert(columns.len()) != columns.len() {
                         return Err(AdError::InvalidPlan(
                             "a set operation's inputs have different widths".into(),
                         ));
                     }
-                    inputs.push(from);
+                    inputs.push(Select {
+                        columns,
+                        from,
+                        ..Select::default()
+                    });
                 }
                 let width = width
                     .ok_or_else(|| AdError::InvalidPlan("a set operation has no inputs".into()))?;
@@ -418,10 +519,10 @@ impl Reader<'_> {
                     from: From::Set { op, inputs, alias },
                     ..Select::default()
                 };
-                (select, s.common.as_ref())
+                (select, s.common.as_ref(), none())
             }
             RelType::Window(w) => {
-                let (from, columns) = next(self);
+                let Placed { from, columns, .. } = next(self);
                 let env = env(&columns);
                 let partition_by = self.exprs(&w.partition_expressions, &env)?;
                 let order_by = self.orders(&w.sorts, &env)?;
@@ -446,7 +547,7 @@ impl Reader<'_> {
                     from,
                     ..Select::default()
                 };
-                (select, w.common.as_ref())
+                (select, w.common.as_ref(), none())
             }
             RelType::Reference(r) => return self.reference(r.subtree_ordinal, outer, placement),
             other => {
@@ -456,7 +557,17 @@ impl Reader<'_> {
                 )))
             }
         };
-        Ok(Source::Select(Box::new(emitted(select, common)?)))
+        let mut select = emitted(select, common)?;
+        let width = select.columns.len();
+        // Written as this query's ORDER BY, which orders its rows if it is
+        // the whole query or picks rows; and kept as columns for a reader.
+        select.order_by = order.clone();
+        let order = carry(&mut select, order);
+        Ok(Source {
+            origin: Origin::Select(Box::new(select)),
+            width,
+            order,
+        })
     }
 
     /// The shared relation at `ordinal` of the plan's relations: one CTE,
@@ -468,8 +579,12 @@ impl Reader<'_> {
         placement: Placement,
     ) -> Result<Source> {
         if placement == Placement::Cte {
-            if let Some(&(index, width)) = self.shared.get(&ordinal) {
-                return Ok(Source::Cte { index, width });
+            if let Some((index, width, order)) = self.shared.get(&ordinal) {
+                return Ok(Source {
+                    origin: Origin::Cte(*index),
+                    width: *width,
+                    order: order.clone(),
+                });
             }
         }
         let plan = self.plan;
@@ -486,22 +601,31 @@ impl Reader<'_> {
                     "a reference names relation {ordinal}, which the plan does not have"
                 ))
             })?;
-        // Shared relations nest shallowly, so this recursion is bounded by
-        // how many shared relations read each other, not by depth.
-        let source = self.relation(rel, outer, placement)?;
+        // A relation that reads itself, directly or through others, has no
+        // SQL: refused, rather than read until the stack runs out. Shared
+        // relations nest shallowly otherwise, so this recursion is bounded
+        // by how many read each other, not by depth.
+        if !self.reading.insert(ordinal) {
+            return Err(AdError::InvalidPlan(format!(
+                "shared relation {ordinal} reads itself"
+            )));
+        }
+        let source = self.relation(rel, outer, placement);
+        self.reading.remove(&ordinal);
+        let source = source?;
         if placement == Placement::InPlace {
             return Ok(source);
         }
-        let (index, width) = match source {
-            Source::Cte { index, width } => (index, width),
-            Source::Select(select) => {
-                let width = select.columns.len();
-                self.ctes.push(*select);
-                (self.ctes.len() - 1, width)
-            }
+        let index = match source.origin {
+            Origin::Cte(index) => index,
+            Origin::Select(select) => self.name(select),
         };
-        self.shared.insert(ordinal, (index, width));
-        Ok(Source::Cte { index, width })
+        self.shared
+            .insert(ordinal, (index, source.width, source.order.clone()));
+        Ok(Source {
+            origin: Origin::Cte(index),
+            ..source
+        })
     }
 
     fn read(&mut self, read: &ReadRel, outer: Option<&Env>) -> Result<Select> {
@@ -566,24 +690,25 @@ impl Reader<'_> {
                     ty,
                     fallible: false,
                 };
-                let from = if rows.is_empty() || types.is_empty() {
-                    // VALUES can write neither no rows nor no columns: one
-                    // row of typed NULLs, kept only if there are rows.
+                let from = if rows.is_empty() {
+                    // VALUES cannot write no rows: one row of typed NULLs,
+                    // filtered out.
                     let nulls = types
                         .iter()
                         .map(|t| typed(Expr::Literal(Literal::Null(*t)), *t))
                         .collect();
-                    let filter = if rows.is_empty() {
-                        vec![Expr::Literal(Literal::Bool(false))]
-                    } else {
-                        Vec::new()
-                    };
                     let query = Box::new(Select {
                         columns: nulls,
-                        filter,
+                        filter: vec![Expr::Literal(Literal::Bool(false))],
                         ..Select::default()
                     });
                     From::Subquery { query, alias }
+                } else if types.is_empty() {
+                    // Nor no columns: a placeholder in each row, which
+                    // nothing reads, keeps the row count.
+                    let one = || vec![Expr::Literal(Literal::Int(1, Type::Integer))];
+                    let rows = rows.iter().map(|_| one()).collect();
+                    From::Values { rows, alias }
                 } else {
                     let rows = rows
                         .into_iter()
@@ -653,8 +778,16 @@ impl Reader<'_> {
 
     fn join(
         &mut self,
-        (left, left_columns): (From, Vec<Expr>),
-        (right, right_columns): (From, Vec<Expr>),
+        Placed {
+            from: left,
+            columns: left_columns,
+            ..
+        }: Placed,
+        Placed {
+            from: right,
+            columns: right_columns,
+            ..
+        }: Placed,
         condition: Option<&Expression>,
         post: Option<&Expression>,
         kind: JoinType,
@@ -693,10 +826,8 @@ impl Reader<'_> {
                 kind.as_str_name()
             )));
         }
-        // A join that keeps one side's rows: an EXISTS over the other side.
-        // Its select has no columns (printed as one, `__ddx_unit`): a column
-        // named `c0`, like those it reads, makes DataFusion 55's
-        // decorrelation fail on an ambiguous name.
+        // A join that keeps one side's rows: an EXISTS over the other side,
+        // whose select needs no columns.
         let exists = |other: From| {
             Expr::Exists(Box::new(Select {
                 columns: Vec::new(),
@@ -705,14 +836,34 @@ impl Reader<'_> {
                 ..Select::default()
             }))
         };
+        // A mark join's column: whether a row has a match. As a count, not
+        // `EXISTS`: DataFusion 55 cannot run an `EXISTS` as a column.
+        let matched = |other: From| Expr::Op {
+            op: Op::Gt,
+            args: vec![
+                Expr::Scalar(Box::new(Select {
+                    columns: vec![Expr::Call(Call {
+                        function: "count",
+                        args: Vec::new(),
+                        distinct: false,
+                        order_by: Vec::new(),
+                        filter: None,
+                    })],
+                    from: other,
+                    filter: on.clone().into_iter().collect(),
+                    ..Select::default()
+                })),
+                Expr::Literal(Literal::Int(0, Type::BigInt)),
+            ],
+        };
         let not = |e: Expr| Expr::Not(Box::new(e));
         let (from, mut columns, test, mark) = match kind {
             JoinType::LeftSemi => (left, left_columns, exists(right), false),
             JoinType::LeftAnti => (left, left_columns, not(exists(right)), false),
             JoinType::RightSemi => (right, right_columns, exists(left), false),
             JoinType::RightAnti => (right, right_columns, not(exists(left)), false),
-            JoinType::LeftMark => (left, left_columns, exists(right), true),
-            JoinType::RightMark => (right, right_columns, exists(left), true),
+            JoinType::LeftMark => (left, left_columns, matched(right), true),
+            JoinType::RightMark => (right, right_columns, matched(left), true),
             other => {
                 return Err(AdError::NotImplemented(format!(
                     "writing a {} join as SQL",
@@ -738,7 +889,7 @@ impl Reader<'_> {
     fn aggregate(
         &mut self,
         a: &AggregateRel,
-        (from, columns): (From, Vec<Expr>),
+        Placed { from, columns, .. }: Placed,
         outer: Option<&Env>,
     ) -> Result<Select> {
         if a.groupings.len() > 1 {
@@ -767,7 +918,15 @@ impl Reader<'_> {
             .into_iter()
             .map(|k| self.expr(k, &env))
             .collect::<Result<Vec<_>>>()?;
-        let mut out = keys.clone();
+        // Its output has each distinct key once, as DataFusion's aggregate
+        // has: `GROUP BY g, g` gives one `g` (DataFusion writes both).
+        let mut distinct: Vec<Expr> = Vec::new();
+        for k in &keys {
+            if !distinct.contains(k) {
+                distinct.push(k.clone());
+            }
+        }
+        let mut out = distinct;
         for m in &a.measures {
             let f = required(m.measure.as_ref(), "a measure's function")?;
             let call = Call {
@@ -1157,10 +1316,8 @@ impl Reader<'_> {
     }
 }
 
-/// The relations whose SQL a relation is made from, in order: its inputs,
-/// except that a fetch over a sort with no emit is made from the sort's
-/// input, and reads the sort itself (see [`Reader::node`]); and a shared
-/// relation is read by [`Reader::reference`], not as an input.
+/// The relations whose SQL a relation is made from, in order: its inputs.
+/// A shared relation is read by [`Reader::reference`], not as an input.
 fn inputs<'r>(rel: &'r Rel, found: &mut Vec<&'r Rel>) -> Result<()> {
     let one = |input: &'r Option<Box<Rel>>| required(input.as_deref(), "a relation's input");
     match &rel.rel_type {
@@ -1169,13 +1326,7 @@ fn inputs<'r>(rel: &'r Rel, found: &mut Vec<&'r Rel>) -> Result<()> {
         Some(RelType::Sort(s)) => found.push(one(&s.input)?),
         Some(RelType::Aggregate(a)) => found.push(one(&a.input)?),
         Some(RelType::Window(w)) => found.push(one(&w.input)?),
-        Some(RelType::Fetch(f)) => {
-            let input = one(&f.input)?;
-            match &input.rel_type {
-                Some(RelType::Sort(s)) if sort_under(f).is_some() => found.push(one(&s.input)?),
-                _ => found.push(input),
-            }
-        }
+        Some(RelType::Fetch(f)) => found.push(one(&f.input)?),
         Some(RelType::Join(j)) => {
             found.push(one(&j.left)?);
             found.push(one(&j.right)?);
@@ -1190,15 +1341,6 @@ fn inputs<'r>(rel: &'r Rel, found: &mut Vec<&'r Rel>) -> Result<()> {
         _ => {}
     }
     Ok(())
-}
-
-/// The sorts of the sort directly under `fetch`, if it has no emit: the
-/// fetch's own ORDER BY.
-fn sort_under(fetch: &FetchRel) -> Option<&[SortField]> {
-    match fetch.input.as_deref().and_then(|i| i.rel_type.as_ref()) {
-        Some(RelType::Sort(s)) if emit_of(s.common.as_ref()).is_none() => Some(&s.sorts),
-        _ => None,
-    }
 }
 
 /// A fetch's `OFFSET` and `LIMIT`, if it has them. The deprecated integer
@@ -1261,11 +1403,27 @@ fn emitted(mut select: Select, common: Option<&RelCommon>) -> Result<Select> {
     Ok(select)
 }
 
-fn emit_of(common: Option<&RelCommon>) -> Option<&[i32]> {
-    match common.and_then(|c| c.emit_kind.as_ref()) {
-        Some(EmitKind::Emit(e)) => Some(&e.output_mapping),
-        _ => None,
-    }
+/// `order`, keys over `select`'s `FROM` item, as positions of `select`'s
+/// columns: each key one of its columns, or appended after them, a column
+/// only a reader that writes the order reads.
+fn carry(select: &mut Select, order: Vec<Order>) -> Vec<Sorted> {
+    order
+        .into_iter()
+        .map(|o| {
+            let column = match select.columns.iter().position(|c| *c == o.expr) {
+                Some(i) => i,
+                None => {
+                    select.columns.push(o.expr);
+                    select.columns.len() - 1
+                }
+            };
+            Sorted {
+                column,
+                descending: o.descending,
+                nulls_first: o.nulls_first,
+            }
+        })
+        .collect()
 }
 
 /// The columns `c0` to `c{width - 1}` of the item read under `alias`.
@@ -1594,5 +1752,40 @@ mod tests {
         ));
         assert!(inner.field(2, 0).is_err());
         assert!(inner.field(0, 1).is_err());
+    }
+
+    #[test]
+    fn a_shared_relation_that_reads_itself_is_refused() {
+        use substrait::proto::{PlanRel, ReferenceRel, RelRoot};
+        let reference = |ordinal| Rel {
+            rel_type: Some(RelType::Reference(ReferenceRel {
+                subtree_ordinal: ordinal,
+            })),
+        };
+        // Relation 0 reads relation 1, which reads relation 0.
+        let plan = Plan {
+            relations: vec![
+                PlanRel {
+                    rel_type: Some(PlanRelType::Rel(reference(1))),
+                },
+                PlanRel {
+                    rel_type: Some(PlanRelType::Rel(reference(0))),
+                },
+                PlanRel {
+                    rel_type: Some(PlanRelType::Root(RelRoot {
+                        input: Some(reference(0)),
+                        names: vec![],
+                    })),
+                },
+            ],
+            ..Default::default()
+        };
+        for dialect in [Dialect::DataFusion, Dialect::DuckDb] {
+            let err = to_sql(&plan, dialect).unwrap_err();
+            assert!(
+                matches!(&err, AdError::InvalidPlan(m) if m.contains("reads itself")),
+                "{err}"
+            );
+        }
     }
 }

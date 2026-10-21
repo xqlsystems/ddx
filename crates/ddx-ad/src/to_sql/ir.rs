@@ -21,7 +21,7 @@ pub(super) struct Query {
 
 /// One `SELECT`. Its columns are named by position (`c0`, `c1`, …), or by
 /// `names` at the root.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(super) struct Select {
     pub columns: Vec<Expr>,
     pub names: Option<Vec<String>>,
@@ -39,7 +39,7 @@ pub(super) struct Select {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Alias(pub usize);
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(super) enum From {
     /// No `FROM` clause: one row.
     #[default]
@@ -59,10 +59,10 @@ pub(super) enum From {
         /// `None` only for a cross join.
         on: Option<Expr>,
     },
-    /// A set operation over `inputs`, each read whole (`SELECT *`).
+    /// A set operation over `inputs`, whose columns line up by position.
     Set {
         op: SetOp,
-        inputs: Vec<From>,
+        inputs: Vec<Select>,
         alias: Alias,
     },
 }
@@ -86,7 +86,7 @@ pub(super) enum SetOp {
     IntersectAll,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum Expr {
     /// Column `column` of the `FROM` item read under `table`.
     Column {
@@ -158,7 +158,7 @@ pub(super) enum Column {
     Named(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Call {
     /// ddx's canonical name: one the printer has a spelling of.
     pub function: &'static str,
@@ -202,7 +202,7 @@ pub(super) enum IsTest {
     NotFalse,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Order {
     pub expr: Expr,
     pub descending: bool,
