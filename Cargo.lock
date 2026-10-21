@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-datafusion"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "datafusion",

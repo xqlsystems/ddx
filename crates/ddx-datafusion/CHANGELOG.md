@@ -9,6 +9,17 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.3...ddx-datafusion-v0.3.0) - 2026-10-21
+
+### Changed
+
+- **Breaking:** built on DataFusion 55.2.0 instead of 54.1.0. The API takes and returns DataFusion's own types, so an application must move to DataFusion 55 with it. 0.2.x stays the DataFusion 54 line ([#185](https://github.com/xqlsystems/ddx/pull/185))
+- **Breaking:** the minimum supported Rust version is 1.94, DataFusion 55's ([#185](https://github.com/xqlsystems/ddx/pull/185))
+
+### Fixed
+
+- A filter above a `NOT EXISTS` no longer lets through rows the anti join should drop. This was a DataFusion bug, fixed in 55 ([#103](https://github.com/xqlsystems/ddx/issues/103))
+
 ## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.2...ddx-datafusion-v0.2.3) - 2026-10-20
 
 ### Changed
