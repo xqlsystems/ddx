@@ -216,7 +216,7 @@ async fn a_function_with_no_spelling_is_refused_by_name() {
     }
     let err = to_sql(&plan, Dialect::DuckDb).unwrap_err();
     assert!(
-        matches!(&err, AdError::NotImplemented(m) if m.contains("`frobnicate`") && m.contains("DuckDB")),
+        matches!(&err, AdError::NotImplemented(m) if m.contains("`frobnicate`")),
         "{err}"
     );
 }

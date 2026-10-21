@@ -750,6 +750,49 @@ impl Setter<Rel, Rel> for Deep {
     }
 }
 
+// ------------------------------------------------------------------- folds
+
+/// Fold a tree bottom up, without recursion (Haskell's `cata`): `alg` is
+/// given each node and its children's results, in order, and gives the
+/// node's result. `children` pushes the nodes whose results `alg` needs, in
+/// order: usually a node's inputs, but a node may name a grandchild in a
+/// child's place and read that child itself (Haskell's `para`).
+///
+/// Like the walks above, it keeps a stack rather than recursing, since a
+/// plan's relations may chain deeper than the call stack allows. Each node
+/// is entered (its children pushed) and later left (`alg` called on the
+/// results its children left), in post-order, left to right.
+pub(crate) fn cata<'whole, Node: ?Sized, Out, Error>(
+    root: &'whole Node,
+    mut children: impl FnMut(&'whole Node, &mut Vec<&'whole Node>) -> Result<(), Error>,
+    mut alg: impl FnMut(&'whole Node, Vec<Out>) -> Result<Out, Error>,
+) -> Result<Out, Error> {
+    enum Step<'whole, Node: ?Sized> {
+        Enter(&'whole Node),
+        Leave(&'whole Node, usize),
+    }
+    let mut to_visit = vec![Step::Enter(root)];
+    let mut found = Vec::new();
+    let mut results: Vec<Out> = Vec::new();
+    while let Some(step) = to_visit.pop() {
+        match step {
+            Step::Enter(node) => {
+                found.clear();
+                children(node, &mut found)?;
+                to_visit.push(Step::Leave(node, found.len()));
+                to_visit.extend(found.drain(..).rev().map(Step::Enter));
+            }
+            Step::Leave(node, count) => {
+                let own = results.split_off(results.len() - count);
+                results.push(alg(node, own)?);
+            }
+        }
+    }
+    Ok(results
+        .pop()
+        .expect("the root's result is the last one left"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,5 +974,46 @@ mod tests {
             .then(Rex)
             .then(AsField);
         assert_eq!(fields.to_vec(&rel).len(), 3);
+    }
+
+    #[test]
+    fn cata_folds_bottom_up_in_order_without_recursing() {
+        // A chain a million nodes deep, each with a leaf beside it: far
+        // deeper than recursion could go.
+        struct Node {
+            label: u64,
+            children: Vec<usize>,
+        }
+        let depth = 1_000_000;
+        let mut arena: Vec<Node> = Vec::new();
+        for i in 0..depth {
+            let leaf = arena.len();
+            arena.push(Node {
+                label: 1,
+                children: vec![],
+            });
+            let below = if i == 0 { vec![] } else { vec![leaf - 1] };
+            arena.push(Node {
+                label: 0,
+                children: below.into_iter().chain([leaf]).collect(),
+            });
+        }
+        let root = &arena[arena.len() - 1];
+        let mut order = Vec::new();
+        let leaves: Result<u64, ()> = cata(
+            root,
+            |n, found| {
+                found.extend(n.children.iter().map(|&i| &arena[i]));
+                Ok(())
+            },
+            |n, below| {
+                order.push(n.label);
+                Ok(n.label + below.iter().sum::<u64>())
+            },
+        );
+        assert_eq!(leaves, Ok(depth as u64));
+        // Post-order, left to right: the deepest node first, then its leaf.
+        assert_eq!(&order[..3], &[1, 0, 1]);
+        assert_eq!(order.last(), Some(&0));
     }
 }

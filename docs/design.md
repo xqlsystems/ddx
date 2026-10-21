@@ -772,7 +772,13 @@ and DuckDB have and Polars and most databases behind ADBC or Flight SQL do
 not. How to plan for those is deferred until one is needed (§9).
 
 **The SQL writer, `to_sql` (built).** `ddx_ad::to_sql(plan, dialect)` writes
-a bound plan as one query. Each relation is a CTE whose columns are named by
+a bound plan as one query, in two parts. It reads the plan into a typed SQL
+tree that says what the plan means, by a bottom-up fold over the relations
+(a catamorphism, `optics::cata`, which keeps a stack rather than recursing),
+with each field reference resolved in an environment of the columns its
+relation and any enclosing ones read (Substrait's `steps_out` is a de Bruijn
+index into it). Then a printer, the only part that knows a dialect, spells
+the tree. Each relation is a CTE whose columns are named by
 position (`c0`, `c1`, …), so a deep program is a long `WITH` clause rather
 than nested subqueries an engine's SQL planner would recurse through, and a
 relation the plan shares is one CTE read wherever it is shared. A relation
