@@ -769,9 +769,25 @@ those primitives, with DuckDB its first instance and xarray-sql's per-engine
 register adapters the natural place for each engine's glue. Planning is the
 half that isn't universal: it needs a Substrait producer, which DataFusion
 and DuckDB have and Polars and most databases behind ADBC or Flight SQL do
-not. How to plan for those is deferred until one is needed (§9). The writer is a correctness surface of its
-own; its oracle is every program the DataFusion tests build, run both as
-Substrait and as the SQL it writes. This is planned, not built: §8's M5.
+not. How to plan for those is deferred until one is needed (§9).
+
+**The SQL writer, `to_sql` (built).** `ddx_ad::to_sql(plan, dialect)` writes
+a bound plan as one query. Each relation is a CTE whose columns are named by
+position (`c0`, `c1`, …), so a deep program is a long `WITH` clause rather
+than nested subqueries an engine's SQL planner would recurse through, and a
+relation the plan shares is one CTE read wherever it is shared. A relation
+inside a subquery expression is written in place, since it may read the
+enclosing query's columns. The plan's meaning is written out rather than left
+to the dialect: every literal carries its type, a `divide` of integers is the
+dialect's integer division (DuckDB's `/` of integers is a `DOUBLE`), and a
+window's frame is always written, since SQL's default frame for an ordered
+window ends at the current row and Substrait's at the end of the partition.
+A function is written in the dialect's spelling (`sign` is DataFusion's
+`signum`), and one with no known spelling is refused by name. The writer is a
+correctness surface of its own; its oracle is every program the DataFusion
+tests build, run both as Substrait and as the SQL it writes (CI's "steps as
+SQL" job), plus round trips of queries DataFusion plans and optimizes. The
+backend that runs it on DuckDB is §8's M5, still to build.
 
 A host that holds plans as protobuf bytes, as most of the Substrait ecosystem
 does, needs no `substrait` crate of its own: `decode_plan` takes the bytes and

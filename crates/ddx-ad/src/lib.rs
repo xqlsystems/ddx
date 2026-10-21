@@ -98,6 +98,7 @@ mod run;
 mod sql;
 mod tables;
 mod tangent;
+mod to_sql;
 mod transpose;
 internal! {
     mod emit;
@@ -118,6 +119,7 @@ pub use relation::ColumnRef;
 pub use run::{run, Backend, Program, RunError};
 pub use sql::{rewrite, view_probe, Programs, Rewritten};
 pub use tables::{InputTable, Of, OutputTable, Tangent};
+pub use to_sql::{to_sql, Dialect};
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use {
