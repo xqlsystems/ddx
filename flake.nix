@@ -19,7 +19,7 @@
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
-            # Rust. nixpkgs' toolchain is newer than the 1.88 MSRV in Cargo.toml.
+            # Rust. nixpkgs' toolchain is newer than the 1.94 MSRV in Cargo.toml.
             cargo
             rustc
             clippy

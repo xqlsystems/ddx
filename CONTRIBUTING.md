@@ -38,8 +38,8 @@ The guiding principles shape almost every review comment:
 ## Getting set up
 
 You need a Rust toolchain. The **minimum supported Rust version (MSRV) is
-1.88** — this is enforced in CI and declared in `Cargo.toml`. (The floor comes
-from a transitive build dependency; `ddx`'s own code needs far less.)
+1.94** — this is enforced in CI and declared in `Cargo.toml`. (The floor comes
+from DataFusion 55; `ddx`'s own code needs far less.)
 
 `ddx-ad` also needs `protoc`, the Protocol Buffers compiler: the `substrait`
 crate generates its Rust types from `.proto` files at build time. Install it

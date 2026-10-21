@@ -23,8 +23,8 @@ use crate::Program;
 pub(super) trait Built: Program + Differentiable + Send {
     /// It, as a [`Differentiable`], made from the concrete type. Not
     /// `self as &dyn Differentiable`, an upcast of one trait object to
-    /// another (stable since Rust 1.86): built with Rust 1.88, the oldest
-    /// ddx supports, a program composed from the upcast object read invalid
+    /// another (stable since Rust 1.86): built with Rust 1.88, then the oldest
+    /// ddx supported, a program composed from the upcast object read invalid
     /// memory, and newer compilers did not.
     fn differentiable(&self) -> &dyn Differentiable;
 }
