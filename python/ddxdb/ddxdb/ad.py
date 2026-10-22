@@ -493,6 +493,11 @@ def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
     ctx.register_record_batches(name, [batches])
 
 
+def _duckdb(con) -> bool:
+    """Whether ``con`` is a DuckDB connection, without importing DuckDB."""
+    return type(con).__name__ == "DuckDBPyConnection"
+
+
 def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     """Run ``statement``, in which, as columns of a ``SELECT``, ``grad(loss,
     column)`` is the gradient at each row of the loss the CTE ``loss``
@@ -508,6 +513,9 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     A loss defined in a ``WITH RECURSIVE`` clause is refused. ``dialect``
     is how the statement is parsed to find the calls: a dialect name
     ``sqlparser`` knows, or ``"datafusion"``.
+
+    ``ctx`` may be a DuckDB connection instead, which :func:`ddxdb.duckdb.sql`
+    runs on, in DuckDB's dialect.
     """
     return sql_all(ctx, [statement], dialect=dialect)[0]
 
@@ -529,6 +537,10 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     on the tables' values, and is built again when one of those changes. One
     caveat: DataFusion's optimizer folds ``now()`` into a literal, so a
     program whose query reads it keeps the time of the call that built it."""
+    if _duckdb(ctx):
+        from . import duckdb as on_duckdb
+
+        return on_duckdb.sql_all(ctx, statements)
     # Which programs to run, how each is built and run, and how each
     # statement reads them are ddx-ad's (ddx_ad::rewrite); DataFusion plans and
     # runs.

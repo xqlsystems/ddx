@@ -375,7 +375,7 @@ impl Forward {
     /// `namespace` rather than a fresh one.
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
         let functions = Functions::from_plan(plan)?;
-        let (root, output_names) = root_of(plan)?;
+        let (root, output_names) = checked_root(plan)?;
         let order = shared_relations(root, &plan.relations)?;
         if wrt.is_empty() {
             return Err(AdError::UnknownWrt(
@@ -427,6 +427,28 @@ pub(crate) fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
         .as_ref()
         .ok_or_else(|| AdError::InvalidPlan("the root relation is empty".into()))?;
     Ok((rel, root.names.clone()))
+}
+
+/// [`root_of`] a plan a producer wrote, refused if the root names a
+/// different number of columns than its relation has: such a plan cannot
+/// say which column is which. DuckDB 1.5's Substrait producer writes one for
+/// any query whose output repeats a column (`SELECT val AS a, val AS b`): it
+/// drops the repeat and keeps both names.
+pub(crate) fn checked_root(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
+    let (root, names) = root_of(plan)?;
+    if let Ok(w) = width(root) {
+        if w != names.len() {
+            return Err(AdError::InvalidPlan(format!(
+                "the plan's root names {} columns ({}), but its relation has {w}: the \
+                 producer dropped a column (DuckDB's drops one that repeats another; \
+                 write each output once), or the output has nested columns, which ddx \
+                 does not differentiate",
+                names.len(),
+                names.join(", ")
+            )));
+        }
+    }
+    Ok((root, names))
 }
 
 /// The relation at `ordinal` of `relations`, which a `ReferenceRel` names.

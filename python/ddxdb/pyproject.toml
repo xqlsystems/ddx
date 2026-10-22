@@ -35,9 +35,14 @@ dependencies = []
 # with DataFusion's bindings, and ddx-ad pins `substrait` to the version
 # DataFusion 55 uses. This is the PyPI release (it bundles DataFusion 55.2.0,
 # as the Rust crates use). A bump is a deliberate change (see CONTRIBUTING.md).
+#
+# `duckdb` is pinned exactly too: `ddxdb.duckdb` plans with DuckDB's community
+# `substrait` extension, which is built for one DuckDB release, and its
+# producer's quirks (#149) are DuckDB's own.
 [project.optional-dependencies]
 datafusion = ["datafusion==55.0.0"]
-test = ["pytest>=7", "datafusion==55.0.0"]
+duckdb = ["duckdb==1.5.5", "pyarrow"]
+test = ["pytest>=7", "datafusion==55.0.0", "duckdb==1.5.5", "pyarrow"]
 
 [project.urls]
 Homepage = "https://github.com/xqlsystems/ddx"

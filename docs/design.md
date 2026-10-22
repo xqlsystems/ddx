@@ -1810,7 +1810,16 @@ breadth, not de-risking.
   each other and against JAX. *Exit:* xarray-sql's ML demos differentiate on
   their DuckDB host, checked against JAX as on DataFusion. (The first plan, a
   community extension whose `ddx('<sql>')` table function ran v1's rewrite,
-  went with v1; §3.4 is its record.)
+  went with v1; §3.4 is its record.) **Built so far:** `to_sql` (#189), and
+  `ddxdb.duckdb`'s backend (#148), which plans on the mirror and runs every
+  step as SQL on the caller's connection; `grad`, `vjp` and `jvp` in SQL give
+  the DataFusion tests' values over tables, temporary tables, views,
+  registered Arrow data and the open transaction. It is DuckDB's own rather
+  than generic over SQL engines, until a second engine needs the generic one.
+  Found in DuckDB 1.5's producer: it drops an output column that repeats
+  another (ddx refuses such a plan, and writes a `jvp`'s repeated expression
+  once), and it plans an uncorrelated `EXISTS` as a cross join with a
+  `LIMIT 1`, which ddx-ad refuses for now (#149).
 - **M6 — Math roadmap & hardening.** Extend the scalar rules (§3.6's
   roadmap), a dialect name table (which M5's `to_sql` starts), docs. Plus:
   the expression-swell size/latency benchmark (§3.7), and the
