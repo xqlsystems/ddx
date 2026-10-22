@@ -1626,10 +1626,11 @@ fn literal(l: &SubstraitLiteral) -> Result<Literal> {
                 d.value.as_slice().try_into().map_err(|_| {
                     AdError::InvalidPlan("a decimal literal is not 16 bytes".into())
                 })?;
+            let (precision, scale) = decimal(d.precision, d.scale)?;
             Literal::Decimal {
                 value: i128::from_le_bytes(bytes),
-                precision: d.precision,
-                scale: decimal_scale(d.scale)?,
+                precision,
+                scale,
             }
         }
         LiteralType::Null(t) => Literal::Null(ty(t)?),
@@ -1659,10 +1660,10 @@ fn ty(t: &SubstraitType) -> Result<Type> {
         Kind::PrecisionTimestamp(p) => Type::Timestamp {
             precision: timestamp_precision(p.precision)?,
         },
-        Kind::Decimal(d) => Type::Decimal {
-            precision: d.precision,
-            scale: decimal_scale(d.scale)?,
-        },
+        Kind::Decimal(d) => {
+            let (precision, scale) = decimal(d.precision, d.scale)?;
+            Type::Decimal { precision, scale }
+        }
         Kind::Binary(_) => Type::Binary,
         _ => {
             return Err(AdError::NotImplemented(
@@ -1684,15 +1685,21 @@ fn timestamp_precision(precision: i32) -> Result<i32> {
     }
 }
 
-/// A decimal's scale. A negative one (a multiple of a power of ten) has no
-/// SQL type in either dialect.
-fn decimal_scale(scale: i32) -> Result<i32> {
+/// A decimal's precision and scale, which Substrait bounds by
+/// 1 ≤ precision ≤ 38 and 0 ≤ scale ≤ precision. A negative scale (a
+/// multiple of a power of ten) has no SQL type in either dialect.
+fn decimal(precision: i32, scale: i32) -> Result<(i32, i32)> {
     if scale < 0 {
         return Err(AdError::NotImplemented(format!(
             "writing a decimal of negative scale {scale} as SQL"
         )));
     }
-    Ok(scale)
+    if !(1..=38).contains(&precision) || scale > precision {
+        return Err(AdError::InvalidPlan(format!(
+            "a decimal of precision {precision} and scale {scale}, outside Substrait's 1 to 38 and 0 to the precision"
+        )));
+    }
+    Ok((precision, scale))
 }
 
 fn is_integer(t: &SubstraitType) -> bool {
@@ -1829,6 +1836,13 @@ mod tests {
                 Err(AdError::NotImplemented(_))
             ));
         }
-        assert!(matches!(decimal_scale(-2), Err(AdError::NotImplemented(_))));
+        assert!(matches!(decimal(10, -2), Err(AdError::NotImplemented(_))));
+        assert_eq!(decimal(38, 38), Ok((38, 38)));
+        for (precision, scale) in [(0, 0), (39, 2), (10, 11), (10, i32::MAX)] {
+            assert!(
+                matches!(decimal(precision, scale), Err(AdError::InvalidPlan(_))),
+                "{precision}, {scale}"
+            );
+        }
     }
 }
