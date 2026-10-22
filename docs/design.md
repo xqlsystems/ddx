@@ -777,7 +777,7 @@ tree that says what the plan means, by a bottom-up fold over the relations
 (a catamorphism, `optics::cata`, which keeps a stack rather than recursing),
 with each field reference resolved in an environment of the columns its
 relation and any enclosing ones read (Substrait's `steps_out` is a de Bruijn
-index into it). Then a printer, the only part that knows a dialect, spells
+index into it). Then a printer, the only part that knows a dialect, writes
 the tree. Each relation is a CTE whose columns are named by
 position (`c0`, `c1`, …), so a deep program is a long `WITH` clause rather
 than nested subqueries an engine's SQL planner would recurse through, and a
@@ -788,8 +788,9 @@ to the dialect: every literal carries its type, a `divide` of integers is the
 dialect's integer division (DuckDB's `/` of integers is a `DOUBLE`), and a
 window's frame is always written, since SQL's default frame for an ordered
 window ends at the current row and Substrait's at the end of the partition.
-A function is written in the dialect's spelling (`sign` is DataFusion's
-`signum`), and one with no known spelling is refused by name. The writer is a
+A function is written under the dialect's name for it (`sign` is
+DataFusion's `signum`), and one whose name ddx does not know is refused by
+name. The writer is a
 correctness surface of its own; its oracle is every program the DataFusion
 tests build, run both as Substrait and as the SQL it writes (CI's "steps as
 SQL" job), plus round trips of queries DataFusion plans and optimizes. The

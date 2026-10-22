@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! A [`Query`] spelled in one dialect: the only place a dialect matters.
+//! A [`Query`] written in one dialect: the only place a dialect matters.
 //!
 //! Every compound expression is parenthesized, so no dialect's precedence
 //! rules come into it; every identifier the plan names is quoted, and every
@@ -35,9 +35,8 @@ pub(super) fn query(query: &Query, dialect: Dialect) -> String {
     p.sql
 }
 
-/// The spelling of the canonical function `function` in `dialect`. The
-/// names [`super::spelled`] gives are spelled the same in every dialect but
-/// these.
+/// The name of the canonical function `function` in `dialect`. The names
+/// [`super::syntax`] gives are the same in every dialect but these.
 pub(super) fn function(function: &'static str, dialect: Dialect) -> &'static str {
     match (function, dialect) {
         ("sign", Dialect::DataFusion) => "signum",
@@ -76,8 +75,14 @@ impl Printer {
         self.sql.push_str("SELECT ");
         if s.columns.is_empty() {
             // SQL has no empty select list: a relation of no columns gives
-            // one, which nothing reads.
-            self.sql.push_str("1 AS __ddx_unit");
+            // one, which nothing reads. An aggregate of no keys and no
+            // measures still gives one row, as `count(*)` does.
+            self.sql
+                .push_str(if s.group_by.as_ref().is_some_and(Vec::is_empty) {
+                    "count(*) AS __ddx_unit"
+                } else {
+                    "1 AS __ddx_unit"
+                });
         }
         for (i, c) in s.columns.iter().enumerate() {
             if i > 0 {
@@ -454,12 +459,11 @@ impl Printer {
                 write!(self.sql, "CAST('{}' AS DATE)", date(*days)).ok();
             }
             Literal::Timestamp { value, precision } => {
-                write!(
-                    self.sql,
-                    "CAST('{}' AS TIMESTAMP)",
-                    timestamp(*value, *precision)
-                )
-                .ok();
+                write!(self.sql, "CAST('{}' AS ", timestamp(*value, *precision)).ok();
+                self.ty(Type::Timestamp {
+                    precision: *precision,
+                });
+                self.sql.push(')');
             }
             Literal::Decimal {
                 value,
@@ -492,7 +496,19 @@ impl Printer {
             Type::Double => self.sql.push_str("DOUBLE"),
             Type::Varchar => self.sql.push_str("VARCHAR"),
             Type::Date => self.sql.push_str("DATE"),
-            Type::Timestamp => self.sql.push_str("TIMESTAMP"),
+            // DataFusion's plain TIMESTAMP is nanoseconds, DuckDB's
+            // microseconds: each precision written as its own type.
+            Type::Timestamp { precision } => match self.dialect {
+                Dialect::DataFusion => {
+                    write!(self.sql, "TIMESTAMP({precision})").ok();
+                }
+                Dialect::DuckDb => self.sql.push_str(match precision {
+                    0 => "TIMESTAMP_S",
+                    3 => "TIMESTAMP_MS",
+                    9 => "TIMESTAMP_NS",
+                    _ => "TIMESTAMP",
+                }),
+            },
             Type::Decimal { precision, scale } => {
                 write!(self.sql, "DECIMAL({precision}, {scale})").ok();
             }
@@ -517,11 +533,11 @@ fn string(sql: &mut String, s: &str) {
     sql.push('\'');
 }
 
-/// `value` with `scale` digits after the point.
+/// `value` with `scale` (≥ 0) digits after the point.
 fn decimal(value: i128, scale: i32) -> String {
     let negative = value < 0;
     let digits = value.unsigned_abs().to_string();
-    let scale = scale.max(0) as usize;
+    let scale = scale as usize;
     let digits = if digits.len() <= scale {
         format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
     } else {
@@ -555,9 +571,9 @@ fn date(days: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// A timestamp `value` units of 10^-`precision` seconds after the epoch.
+/// A timestamp `value` units of 10^-`precision` seconds after the epoch,
+/// `precision` one of 0, 3, 6 and 9.
 fn timestamp(value: i64, precision: i32) -> String {
-    let precision = precision.clamp(0, 9);
     let per_second = 10_i64.pow(precision as u32);
     let seconds = value.div_euclid(per_second);
     let fraction = value.rem_euclid(per_second);
@@ -629,6 +645,46 @@ mod tests {
         sql.push(' ');
         string(&mut sql, "it's");
         assert_eq!(sql, "\"a\"\"b\" 'it''s'");
+    }
+
+    #[test]
+    fn each_timestamp_precision_is_its_own_type() {
+        let print = |dialect, precision| {
+            let mut p = Printer {
+                dialect,
+                sql: String::new(),
+            };
+            p.literal(&Literal::Timestamp {
+                value: 1,
+                precision,
+            });
+            p.sql
+        };
+        assert_eq!(
+            print(Dialect::DuckDb, 9),
+            "CAST('1970-01-01 00:00:00.000000001' AS TIMESTAMP_NS)"
+        );
+        assert_eq!(
+            print(Dialect::DataFusion, 6),
+            "CAST('1970-01-01 00:00:00.000001' AS TIMESTAMP(6))"
+        );
+        assert_eq!(
+            print(Dialect::DuckDb, 0),
+            "CAST('1970-01-01 00:00:01' AS TIMESTAMP_S)"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_of_nothing_is_one_row() {
+        let mut p = Printer {
+            dialect: Dialect::DuckDb,
+            sql: String::new(),
+        };
+        p.select(&Select {
+            group_by: Some(Vec::new()),
+            ..Select::default()
+        });
+        assert_eq!(p.sql, "SELECT count(*) AS __ddx_unit");
     }
 
     #[test]

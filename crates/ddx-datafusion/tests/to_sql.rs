@@ -244,7 +244,7 @@ async fn a_column_named_like_a_keyword_or_with_a_quote_is_quoted() {
 }
 
 #[tokio::test]
-async fn a_function_with_no_spelling_is_refused_by_name() {
+async fn an_unknown_function_is_refused_by_name() {
     let ctx = fixture().await;
     let mut plan = common::substrait_of(&ctx, "SELECT abs(x) FROM t", true).await;
     for decl in &mut plan.extensions {
@@ -260,7 +260,7 @@ async fn a_function_with_no_spelling_is_refused_by_name() {
 }
 
 #[tokio::test]
-async fn each_dialect_spells_sign_and_integer_division_its_own_way() {
+async fn each_dialect_names_sign_and_writes_integer_division_its_own_way() {
     let ctx = fixture().await;
     let plan = common::substrait_of(&ctx, "SELECT signum(x), n / 2 FROM t", true).await;
     let datafusion = to_sql(&plan, Dialect::DataFusion).unwrap();
@@ -385,4 +385,40 @@ fn ddx_ad_reads(
 
 async fn rows_of(ctx: &SessionContext, sql: &str) -> Vec<String> {
     rows(ctx, sql, false).await.1
+}
+
+#[tokio::test]
+async fn a_timestamp_keeps_its_precision() {
+    // DataFusion's plain TIMESTAMP is nanoseconds: a microsecond literal
+    // written as one would change the column's type.
+    let ctx = fixture().await;
+    for sql in [
+        "SELECT CAST('2024-01-01 00:00:00.123456789' AS TIMESTAMP(0)) AS s, \
+         CAST('2024-01-01 00:00:00.123456789' AS TIMESTAMP(3)) AS ms, \
+         CAST('2024-01-01 00:00:00.123456789' AS TIMESTAMP(6)) AS us, \
+         CAST('2024-01-01 00:00:00.123456789' AS TIMESTAMP(9)) AS ns",
+        "SELECT k, CAST(CAST(k AS TIMESTAMP(9)) AS TIMESTAMP(6)) AS t FROM t",
+    ] {
+        round_trips(&ctx, sql, false).await;
+        let plan = common::substrait_of(&ctx, sql, true).await;
+        let written = to_sql(&plan, Dialect::DataFusion).unwrap();
+        let types = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let df = ctx.sql(&sql).await.unwrap();
+                let types: Vec<String> = df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.data_type().to_string())
+                    .collect();
+                types
+            }
+        };
+        assert_eq!(
+            types(written.clone()).await,
+            types(sql.to_string()).await,
+            "{written}"
+        );
+    }
 }

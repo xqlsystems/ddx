@@ -2,11 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! SQL as a typed tree: what a query means, before a dialect spells it.
+//! SQL as a typed tree: what a query means, before a dialect writes it.
 //!
 //! [`super::to_sql`] reads a Substrait plan into this tree, and
-//! [`super::print`] spells the tree in one dialect. The tree says what the
-//! plan means and nothing about spelling: a `divide` knows whether it is
+//! [`super::print`] writes the tree in one dialect. The tree says what the
+//! plan means and nothing about how a dialect writes it: a `divide` knows whether it is
 //! integer division, a literal knows its type, a window its frame, and a
 //! function is named by ddx's canonical name. Every choice a dialect makes
 //! (`//` or `/`, `signum` or `sign`, `BLOB` or `BYTEA`, where parentheses
@@ -160,7 +160,7 @@ pub(super) enum Column {
 
 #[derive(Clone, PartialEq)]
 pub(super) struct Call {
-    /// ddx's canonical name: one the printer has a spelling of.
+    /// ddx's canonical name: one the printer knows each dialect's name for.
     pub function: &'static str,
     pub args: Vec<Expr>,
     pub distinct: bool,
@@ -242,7 +242,8 @@ pub(super) enum Literal {
     String(String),
     /// Days since 1970-01-01.
     Date(i64),
-    /// `value` units of 10^-`precision` seconds since the epoch.
+    /// `value` units of 10^-`precision` seconds since the epoch, of
+    /// [`Type::Timestamp`] of that precision.
     Timestamp {
         value: i64,
         precision: i32,
@@ -267,7 +268,14 @@ pub(super) enum Type {
     Double,
     Varchar,
     Date,
-    Timestamp,
-    Decimal { precision: i32, scale: i32 },
+    /// Of 10^-`precision` seconds: 0, 3, 6 or 9.
+    Timestamp {
+        precision: i32,
+    },
+    /// Of `scale` digits after the point, `scale` ≥ 0.
+    Decimal {
+        precision: i32,
+        scale: i32,
+    },
     Binary,
 }

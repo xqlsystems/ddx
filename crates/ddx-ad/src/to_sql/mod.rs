@@ -12,7 +12,7 @@
 //! same plan written as SQL runs on the caller's own connection, where
 //! windows are ordinary SQL. [`to_sql`] writes it.
 //!
-//! # In two parts: what a plan means, then how a dialect spells it
+//! # In two parts: what a plan means, then how a dialect writes it
 //!
 //! [`to_sql`] reads the plan into a typed SQL tree ([`ir`]), then prints the
 //! tree in one dialect ([`print`](mod@print)).
@@ -61,7 +61,7 @@
 //!   frame for an ordered window ends at the current row, and Substrait's
 //!   at the end of the partition.
 //! - **A function is named by its normalized name**, and one ddx knows no
-//!   spelling of is refused, naming it, rather than written as a guess.
+//!   name of is refused, naming it, rather than written as a guess.
 //! - **A join that keeps one side's rows** (semi, anti, mark) is a correlated
 //!   `EXISTS`, which every engine reads the same way.
 //!
@@ -169,6 +169,10 @@ pub fn to_sql(plan: &Plan, dialect: Dialect) -> Result<String> {
             body.columns.len()
         )));
     }
+    // A query of no columns, such as a program's check (which asks only
+    // whether any row comes back), gets one placeholder column,
+    // `__ddx_unit`, since SQL has no query of no columns: its rows are the
+    // plan's, and nothing reads the column.
     body.names = Some(root.names.clone());
     let query = Query {
         ctes: reader.ctes,
@@ -1227,9 +1231,9 @@ impl Reader<'_> {
     /// written as a call (an aggregate or a window function).
     fn call_name(&self, anchor: u32) -> Result<&'static str> {
         let name = self.functions.name(anchor)?;
-        match spelled(name) {
-            Some(Spelled::Call(f)) => Ok(f),
-            _ => Err(no_spelling(name)),
+        match syntax(name) {
+            Some(Syntax::Function(f)) => Ok(f),
+            _ => Err(unknown_function(name)),
         }
     }
 
@@ -1237,15 +1241,15 @@ impl Reader<'_> {
     /// integer, which makes a `divide` integer division.
     fn scalar(&self, anchor: u32, mut args: Vec<Expr>, integer: bool) -> Result<Expr> {
         let name = self.functions.name(anchor)?;
-        let spelled = spelled(name).ok_or_else(|| no_spelling(name))?;
+        let syntax = syntax(name).ok_or_else(|| unknown_function(name))?;
         let one = |args: &mut Vec<Expr>| match args.len() {
             1 => Ok(Box::new(args.remove(0))),
             n => Err(AdError::InvalidPlan(format!(
                 "`{name}` takes one argument, not {n}"
             ))),
         };
-        Ok(match spelled {
-            Spelled::Op(op) => {
+        Ok(match syntax {
+            Syntax::Operator(op) => {
                 if args.len() < 2 {
                     return Err(AdError::InvalidPlan(format!(
                         "`{name}` takes two arguments or more, not {}",
@@ -1258,14 +1262,14 @@ impl Reader<'_> {
                 };
                 Expr::Op { op, args }
             }
-            Spelled::Not => Expr::Not(one(&mut args)?),
-            Spelled::Negate => Expr::Negate(one(&mut args)?),
-            Spelled::Is(test) => Expr::Is {
+            Syntax::Not => Expr::Not(one(&mut args)?),
+            Syntax::Negate => Expr::Negate(one(&mut args)?),
+            Syntax::Is(test) => Expr::Is {
                 expr: one(&mut args)?,
                 test,
             },
-            Spelled::Identity => *one(&mut args)?,
-            Spelled::Call(function) => Expr::Call(Call {
+            Syntax::Identity => *one(&mut args)?,
+            Syntax::Function(function) => Expr::Call(Call {
                 function,
                 args,
                 distinct: false,
@@ -1493,39 +1497,39 @@ fn bound(b: Option<&SubstraitBound>, lower: bool) -> Bound {
     }
 }
 
-/// How a function is written.
-enum Spelled {
-    Op(Op),
+/// How a function is written in SQL: as an operator, or a call.
+enum Syntax {
+    Operator(Op),
     Not,
     Negate,
     Is(IsTest),
     /// The function's argument itself: ddx's stop-gradient, the identity
     /// at run time.
     Identity,
-    /// A call, by its canonical name.
-    Call(&'static str),
+    /// A function call, by its canonical name.
+    Function(&'static str),
 }
 
 /// How the function with the normalized name `name` is written, or `None`
-/// if ddx knows no spelling of it.
-fn spelled(name: &str) -> Option<Spelled> {
-    use Spelled::*;
+/// if ddx does not know it.
+fn syntax(name: &str) -> Option<Syntax> {
+    use Syntax::*;
     Some(match name {
-        "add" => Op(ir::Op::Add),
-        "subtract" => Op(ir::Op::Subtract),
-        "multiply" => Op(ir::Op::Multiply),
-        "divide" => Op(ir::Op::Divide { integer: false }),
-        "modulus" | "mod" => Op(ir::Op::Modulus),
-        "equal" => Op(ir::Op::Eq),
-        "not_equal" => Op(ir::Op::NotEq),
-        "lt" => Op(ir::Op::Lt),
-        "lte" => Op(ir::Op::Lte),
-        "gt" => Op(ir::Op::Gt),
-        "gte" => Op(ir::Op::Gte),
-        "and" => Op(ir::Op::And),
-        "or" => Op(ir::Op::Or),
-        "is_distinct_from" => Op(ir::Op::IsDistinctFrom),
-        "is_not_distinct_from" => Op(ir::Op::IsNotDistinctFrom),
+        "add" => Operator(ir::Op::Add),
+        "subtract" => Operator(ir::Op::Subtract),
+        "multiply" => Operator(ir::Op::Multiply),
+        "divide" => Operator(ir::Op::Divide { integer: false }),
+        "modulus" | "mod" => Operator(ir::Op::Modulus),
+        "equal" => Operator(ir::Op::Eq),
+        "not_equal" => Operator(ir::Op::NotEq),
+        "lt" => Operator(ir::Op::Lt),
+        "lte" => Operator(ir::Op::Lte),
+        "gt" => Operator(ir::Op::Gt),
+        "gte" => Operator(ir::Op::Gte),
+        "and" => Operator(ir::Op::And),
+        "or" => Operator(ir::Op::Or),
+        "is_distinct_from" => Operator(ir::Op::IsDistinctFrom),
+        "is_not_distinct_from" => Operator(ir::Op::IsNotDistinctFrom),
         "not" => Not,
         "negate" | "negative" => Negate,
         "is_null" => Is(IsTest::Null),
@@ -1535,13 +1539,13 @@ fn spelled(name: &str) -> Option<Spelled> {
         "is_not_true" => Is(IsTest::NotTrue),
         "is_not_false" => Is(IsTest::NotFalse),
         STOP_GRADIENT => Identity,
-        "isnan" | "is_nan" => Call("isnan"),
-        "sign" | "signum" => Call("sign"),
-        _ => return call_name(name).map(Call),
+        "isnan" | "is_nan" => Function("isnan"),
+        "sign" | "signum" => Function("sign"),
+        _ => return call_name(name).map(Function),
     })
 }
 
-/// Scalar functions every dialect spells alike, by their canonical names.
+/// Scalar functions named alike in every dialect, by their canonical names.
 const SCALARS: &[&str] = &[
     "abs", "sqrt", "cbrt", "exp", "ln", "log10", "log2", "power", "sin", "cos", "tan", "asin",
     "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "floor", "ceil",
@@ -1549,7 +1553,7 @@ const SCALARS: &[&str] = &[
     "random",
 ];
 
-/// Aggregate functions every dialect spells alike.
+/// Aggregate functions named alike in every dialect.
 const AGGREGATES: &[&str] = &[
     "sum",
     "count",
@@ -1565,7 +1569,7 @@ const AGGREGATES: &[&str] = &[
     "bool_or",
 ];
 
-/// Window functions every dialect spells alike.
+/// Window functions named alike in every dialect.
 const WINDOWS: &[&str] = &[
     "row_number",
     "rank",
@@ -1580,7 +1584,7 @@ const WINDOWS: &[&str] = &[
     "nth_value",
 ];
 
-/// The canonical name of a function every dialect spells alike.
+/// The canonical name of a function named alike in every dialect.
 fn call_name(name: &str) -> Option<&'static str> {
     [SCALARS, AGGREGATES, WINDOWS]
         .into_iter()
@@ -1589,9 +1593,9 @@ fn call_name(name: &str) -> Option<&'static str> {
         .find(|&f| f == name)
 }
 
-fn no_spelling(name: &str) -> AdError {
+fn unknown_function(name: &str) -> AdError {
     AdError::NotImplemented(format!(
-        "writing the function `{name}` as SQL: ddx knows no spelling of it"
+        "writing the function `{name}` as SQL: ddx does not know its name in SQL"
     ))
 }
 
@@ -1615,7 +1619,7 @@ fn literal(l: &SubstraitLiteral) -> Result<Literal> {
         },
         LiteralType::PrecisionTimestamp(p) => Literal::Timestamp {
             value: p.value,
-            precision: p.precision,
+            precision: timestamp_precision(p.precision)?,
         },
         LiteralType::Decimal(d) => {
             let bytes: [u8; 16] =
@@ -1625,7 +1629,7 @@ fn literal(l: &SubstraitLiteral) -> Result<Literal> {
             Literal::Decimal {
                 value: i128::from_le_bytes(bytes),
                 precision: d.precision,
-                scale: d.scale,
+                scale: decimal_scale(d.scale)?,
             }
         }
         LiteralType::Null(t) => Literal::Null(ty(t)?),
@@ -1651,11 +1655,13 @@ fn ty(t: &SubstraitType) -> Result<Type> {
         Kind::String(_) | Kind::Varchar(_) | Kind::FixedChar(_) => Type::Varchar,
         Kind::Date(_) => Type::Date,
         #[allow(deprecated)]
-        Kind::Timestamp(_) => Type::Timestamp,
-        Kind::PrecisionTimestamp(_) => Type::Timestamp,
+        Kind::Timestamp(_) => Type::Timestamp { precision: 6 },
+        Kind::PrecisionTimestamp(p) => Type::Timestamp {
+            precision: timestamp_precision(p.precision)?,
+        },
         Kind::Decimal(d) => Type::Decimal {
             precision: d.precision,
-            scale: d.scale,
+            scale: decimal_scale(d.scale)?,
         },
         Kind::Binary(_) => Type::Binary,
         _ => {
@@ -1664,6 +1670,29 @@ fn ty(t: &SubstraitType) -> Result<Type> {
             ))
         }
     })
+}
+
+/// A timestamp's precision, which SQL types write only as seconds,
+/// milliseconds, microseconds or nanoseconds; Substrait's go to
+/// picoseconds.
+fn timestamp_precision(precision: i32) -> Result<i32> {
+    match precision {
+        0 | 3 | 6 | 9 => Ok(precision),
+        _ => Err(AdError::NotImplemented(format!(
+            "writing a timestamp of precision {precision} as SQL: only 0, 3, 6 and 9 have SQL types"
+        ))),
+    }
+}
+
+/// A decimal's scale. A negative one (a multiple of a power of ten) has no
+/// SQL type in either dialect.
+fn decimal_scale(scale: i32) -> Result<i32> {
+    if scale < 0 {
+        return Err(AdError::NotImplemented(format!(
+            "writing a decimal of negative scale {scale} as SQL"
+        )));
+    }
+    Ok(scale)
 }
 
 fn is_integer(t: &SubstraitType) -> bool {
@@ -1714,12 +1743,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_canonical_name_is_one_ddx_spells() {
-        assert!(spelled("frobnicate").is_none());
+    fn every_canonical_name_is_one_ddx_writes() {
+        assert!(syntax("frobnicate").is_none());
         for name in ["sign", "signum", "isnan", "is_nan", "sum", "row_number"] {
-            assert!(matches!(spelled(name), Some(Spelled::Call(_))), "{name}");
+            assert!(matches!(syntax(name), Some(Syntax::Function(_))), "{name}");
         }
-        assert!(matches!(spelled(STOP_GRADIENT), Some(Spelled::Identity)));
+        assert!(matches!(syntax(STOP_GRADIENT), Some(Syntax::Identity)));
     }
 
     #[test]
@@ -1787,5 +1816,19 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn what_sql_has_no_type_for_is_refused() {
+        for precision in [0, 3, 6, 9] {
+            assert_eq!(timestamp_precision(precision), Ok(precision));
+        }
+        for precision in [1, 12] {
+            assert!(matches!(
+                timestamp_precision(precision),
+                Err(AdError::NotImplemented(_))
+            ));
+        }
+        assert!(matches!(decimal_scale(-2), Err(AdError::NotImplemented(_))));
     }
 }
