@@ -20,6 +20,8 @@ rust-version.workspace = true
 ddx-core = { workspace = true }
 prost = { workspace = true }
 substrait = { workspace = true }
+# `to_sql`'s SQL tree and its per-dialect generators. Pinned exactly: 0.x.
+polyglot-sql = { version = "=0.13.3", default-features = false, features = ["generate", "builder", "transpile", "dialect-duckdb", "dialect-datafusion"] }
 
 [features]
 # The plan-reading and plan-writing modules (`forward`, `emit`, `expr`,
