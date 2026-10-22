@@ -20,8 +20,18 @@ rust-version.workspace = true
 ddx-core = { workspace = true }
 prost = { workspace = true }
 substrait = { workspace = true }
+# `to_sql`'s SQL generators, behind `to-sql`: it adds most of a minute to a
+# build. Pinned exactly, being 0.x, and never in the public API.
+polyglot-sql = { version = "=0.13.3", default-features = false, features = ["generate", "stacker", "dialect-duckdb", "dialect-datafusion"], optional = true }
 
 [features]
 # The plan-reading and plan-writing modules (`forward`, `emit`, `expr`,
 # `relation`), public for this workspace's tests only; not a stable API.
 internals = []
+# `to_sql`, which writes a plan as SQL for engines whose Substrait consumer
+# cannot run ddx's programs (DuckDB's).
+to-sql = ["dep:polyglot-sql"]
+
+[package.metadata.docs.rs]
+# Document `to_sql`, which is behind a feature.
+features = ["to-sql"]

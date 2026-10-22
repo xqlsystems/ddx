@@ -777,8 +777,11 @@ tree that says what the plan means, by a bottom-up fold over the relations
 (a catamorphism, `optics::cata`, which keeps a stack rather than recursing),
 with each field reference resolved in an environment of the columns its
 relation and any enclosing ones read (Substrait's `steps_out` is a de Bruijn
-index into it). Then a printer, the only part that knows a dialect, writes
-the tree. Each relation is a CTE whose columns are named by
+index into it). Then the tree is lowered to [polyglot-sql](https://github.com/tobilg/polyglot)'s
+(a Rust reimplementation of SQLGlot), whose generators write it in the
+dialect: quoting, escaping and keywords are polyglot's to keep, and ddx's
+lowering is the only code that knows polyglot. It is behind `ddx-ad`'s
+`to-sql` feature, since polyglot adds most of a minute to a build. Each relation is a CTE whose columns are named by
 position (`c0`, `c1`, …), so a deep program is a long `WITH` clause rather
 than nested subqueries an engine's SQL planner would recurse through, and a
 relation the plan shares is one CTE read wherever it is shared. A relation

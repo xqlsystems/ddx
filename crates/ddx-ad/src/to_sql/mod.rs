@@ -14,8 +14,11 @@
 //!
 //! # In two parts: what a plan means, then how a dialect writes it
 //!
-//! [`to_sql`] reads the plan into a typed SQL tree ([`ir`]), then prints the
-//! tree in one dialect ([`print`](mod@print)).
+//! [`to_sql`] reads the plan into a typed SQL tree ([`ir`]), then writes the
+//! tree in one dialect ([`lower`]) with [polyglot-sql]'s generators, so the
+//! dialects' syntax, quoting and escaping are polyglot's to keep, not ddx's.
+//!
+//! [polyglot-sql]: https://github.com/tobilg/polyglot
 //!
 //! - **Reading is a fold over the plan, bottom up** (a catamorphism,
 //!   [`crate::optics::cata`]): each relation's SQL is made from its inputs'
@@ -34,7 +37,7 @@
 //!   de Bruijn index), and a reference past either end is refused.
 //! - **The tree says what the plan means**: a `divide` knows whether it is
 //!   integer division, a literal its type, a window its frame, a function
-//!   its canonical name. Reading needs no dialect, and printing makes every
+//!   its canonical name. Reading needs no dialect; writing makes every
 //!   choice a dialect makes (`//` or `/`, `signum` or `sign`, `BLOB` or
 //!   `BYTEA`), parenthesizing every compound expression so that no
 //!   dialect's precedence comes into it.
@@ -82,7 +85,7 @@
 //! which ddx reserves: a table of such a name is shadowed by a CTE.
 
 mod ir;
-mod print;
+mod lower;
 
 use std::collections::{HashMap, HashSet};
 
@@ -133,6 +136,8 @@ pub enum Dialect {
 /// `plan` as one SQL query in `dialect`, its columns named as the plan's
 /// root names them.
 ///
+/// With the `to-sql` feature, which brings in polyglot-sql's generators.
+///
 /// The plan's reads must be bound (each with its `base_schema`), as a
 /// program's steps are when [`crate::run`](fn@crate::run) hands them to a [`crate::Backend`].
 /// A table is read by the names the plan gives it, quoted, so the query
@@ -178,7 +183,7 @@ pub fn to_sql(plan: &Plan, dialect: Dialect) -> Result<String> {
         ctes: reader.ctes,
         body,
     };
-    Ok(print::query(&query, dialect))
+    lower::query(&query, dialect)
 }
 
 /// Where a relation's reader puts the `SELECT` it reads.

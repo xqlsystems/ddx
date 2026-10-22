@@ -29,8 +29,9 @@ tokio = { version = "1", features = ["rt"] }
 
 [features]
 # Step-level access to a program's run (`ddx_datafusion::engine`), for ddx's
-# own tests and benchmarks. Not part of the API.
-internals = []
+# own tests and benchmarks, with every step run as `to_sql`'s SQL under
+# `DDX_STEPS_AS_SQL=1`. Not part of the API.
+internals = ["ddx-ad/to-sql"]
 
 [dev-dependencies]
 # The tests reach the step-level engine (`ddx_datafusion::engine`).

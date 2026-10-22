@@ -262,6 +262,7 @@ async fn bound(ctx: &SessionContext, plan: &Plan) -> Result<Plan> {
 /// the test switch [`steps_as_sql`] on, run as the SQL `ddx_ad::to_sql`
 /// writes for it.
 async fn dataframe(ctx: &SessionContext, plan: &Plan) -> Result<DataFrame> {
+    #[cfg(feature = "internals")]
     if steps_as_sql() {
         let sql = ddx_ad::to_sql(&bound(ctx, plan).await?, ddx_ad::Dialect::DataFusion)
             .map_err(to_df_err)?;
@@ -276,14 +277,10 @@ async fn dataframe(ctx: &SessionContext, plan: &Plan) -> Result<DataFrame> {
 /// run the whole suite both ways, so every program they build checks
 /// `ddx_ad::to_sql`, which engines without a usable Substrait consumer
 /// (DuckDB's) run, against DataFusion's consumer.
+#[cfg(feature = "internals")]
 fn steps_as_sql() -> bool {
-    #[cfg(feature = "internals")]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("DDX_STEPS_AS_SQL").is_some_and(|v| v == "1"))
-    }
-    #[cfg(not(feature = "internals"))]
-    false
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DDX_STEPS_AS_SQL").is_some_and(|v| v == "1"))
 }
 
 /// DataFusion's Substrait consumer, but a projection's computed columns are

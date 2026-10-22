@@ -762,6 +762,7 @@ impl Setter<Rel, Rel> for Deep {
 /// plan's relations may chain deeper than the call stack allows. Each node
 /// is entered (its children pushed) and later left (`alg` called on the
 /// results its children left), in post-order, left to right.
+#[cfg_attr(not(feature = "to-sql"), allow(dead_code))]
 pub(crate) fn cata<'whole, Node: ?Sized, Out, Error>(
     root: &'whole Node,
     mut children: impl FnMut(&'whole Node, &mut Vec<&'whole Node>) -> Result<(), Error>,

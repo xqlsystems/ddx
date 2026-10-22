@@ -263,8 +263,10 @@ async fn an_unknown_function_is_refused_by_name() {
 async fn each_dialect_names_sign_and_writes_integer_division_its_own_way() {
     let ctx = fixture().await;
     let plan = common::substrait_of(&ctx, "SELECT signum(x), n / 2 FROM t", true).await;
-    let datafusion = to_sql(&plan, Dialect::DataFusion).unwrap();
-    let duckdb = to_sql(&plan, Dialect::DuckDb).unwrap();
+    // Function names compared case-blind: a dialect's generator may write
+    // them in upper case.
+    let datafusion = to_sql(&plan, Dialect::DataFusion).unwrap().to_lowercase();
+    let duckdb = to_sql(&plan, Dialect::DuckDb).unwrap().to_lowercase();
     assert!(
         datafusion.contains("signum(") && datafusion.contains(" / "),
         "{datafusion}"
