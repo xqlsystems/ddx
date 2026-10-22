@@ -91,6 +91,27 @@ jobs:
       - name: doctests
         run: cargo test --workspace --doc
 
+  # The DataFusion suite again, with every step and check run as the SQL
+  # `ddx_ad::to_sql` writes instead of through DataFusion's Substrait
+  # consumer. Engines whose consumer cannot run ddx's programs (DuckDB's) run
+  # that SQL, so every program the suite builds checks it against the
+  # consumer, row for row.
+  steps-as-sql:
+    name: tests, steps as SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: tests
+        env:
+          DDX_STEPS_AS_SQL: "1"
+        run: cargo test -p ddx-datafusion --no-fail-fast
+
   # The Python wheel is its own Cargo workspace (pyo3 links libpython, which the
   # Rust jobs above have no reason to need), so it gets its own job rather than
   # riding along with `cargo test --workspace`.

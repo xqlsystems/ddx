@@ -174,9 +174,7 @@ pub async fn register(ctx: &SessionContext, name: &str, df: DataFrame) -> Result
 /// Does `plan` (a check) return any row? The returns-rows primitive of
 /// [`ddx_ad::Backend`].
 pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
-    let lp = logical_plan(ctx, plan).await?;
-    let rows: usize = ctx
-        .execute_logical_plan(lp)
+    let rows: usize = dataframe(ctx, plan)
         .await?
         .limit(0, Some(1))?
         .collect()
@@ -207,8 +205,7 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
 /// Run `plan` and register its rows as the table `name`, replacing one: the
 /// materialize primitive of [`ddx_ad::Backend`].
 pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Result<()> {
-    let lp = logical_plan(ctx, plan).await?;
-    let df = ctx.execute_logical_plan(lp).await?;
+    let df = dataframe(ctx, plan).await?;
     // The schema of the plan that runs, not the logical one: a step read
     // from an unanalyzed plan can be typed before type coercion (a CASE
     // between BIGINT and DOUBLE branches), and the table must declare the
@@ -235,16 +232,7 @@ pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Resul
 /// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
 /// names mean nothing to ddx, whose plans refer to columns by position.
 pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
-    let unbound = ddx_ad::Unbound::from_plan(plan.clone());
-    let mut schemas = HashMap::new();
-    for name in unbound.reads() {
-        let schema = table_schema(ctx, &name).await?;
-        schemas.insert(name, schema);
-    }
-    let plan = unbound
-        .bind(&mut |name| schemas.get(name).cloned())
-        .map_err(to_df_err)?
-        .into_plan();
+    let plan = bound(ctx, plan).await?;
     let state = ctx.state();
     let extensions = Extensions::try_from(&plan.extensions)?;
     let consumer = ShortNames {
@@ -253,6 +241,49 @@ pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPl
         next: AtomicUsize::new(0),
     };
     from_substrait_plan_with_consumer(&consumer, &plan).await
+}
+
+/// `plan` with its reads of earlier steps bound to the tables registered on
+/// `ctx`.
+async fn bound(ctx: &SessionContext, plan: &Plan) -> Result<Plan> {
+    let unbound = ddx_ad::Unbound::from_plan(plan.clone());
+    let mut schemas = HashMap::new();
+    for name in unbound.reads() {
+        let schema = table_schema(ctx, &name).await?;
+        schemas.insert(name, schema);
+    }
+    Ok(unbound
+        .bind(&mut |name| schemas.get(name).cloned())
+        .map_err(to_df_err)?
+        .into_plan())
+}
+
+/// One of a program's plans, ready to run: consumed as Substrait, or, with
+/// the test switch [`steps_as_sql`] on, run as the SQL `ddx_ad::to_sql`
+/// writes for it.
+async fn dataframe(ctx: &SessionContext, plan: &Plan) -> Result<DataFrame> {
+    if steps_as_sql() {
+        let sql = ddx_ad::to_sql(&bound(ctx, plan).await?, ddx_ad::Dialect::DataFusion)
+            .map_err(to_df_err)?;
+        return ctx.sql(&sql).await;
+    }
+    let lp = logical_plan(ctx, plan).await?;
+    ctx.execute_logical_plan(lp).await
+}
+
+/// Whether every step and check runs as SQL rather than Substrait: set by
+/// `DDX_STEPS_AS_SQL=1`, read only with the `internals` feature. ddx's tests
+/// run the whole suite both ways, so every program they build checks
+/// `ddx_ad::to_sql`, which engines without a usable Substrait consumer
+/// (DuckDB's) run, against DataFusion's consumer.
+fn steps_as_sql() -> bool {
+    #[cfg(feature = "internals")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DDX_STEPS_AS_SQL").is_some_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "internals"))]
+    false
 }
 
 /// DataFusion's Substrait consumer, but a projection's computed columns are
