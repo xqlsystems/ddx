@@ -349,3 +349,12 @@ def test_ad_sql_takes_a_duckdb_connection(con):
     from ddxdb import ad
 
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+
+
+def test_ad_sql_refuses_another_dialect_on_a_duckdb_connection(con):
+    pytest.importorskip("datafusion")
+    from ddxdb import ad
+
+    assert pairs(ad.sql(con, GRAD, dialect="duckdb")) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    with pytest.raises(ValueError, match="DuckDB's dialect"):
+        ad.sql(con, GRAD, dialect="sqlparser")
