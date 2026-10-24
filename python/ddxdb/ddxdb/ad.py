@@ -329,9 +329,21 @@ class DataFusionBackend:
 
 
 def _plan_under_alias(ctx: SessionContext, sql: str) -> str:
-    """The plan of ``sql``, a ``SELECT *`` from one aliased relation, under
-    the projection and alias it puts on top: what that relation reads."""
-    return ctx.sql(sql).logical_plan().inputs()[0].inputs()[0].display_indent_schema()
+    """The optimized plan of ``sql``, a ``SELECT *`` from one aliased
+    relation, under the alias: what that relation reads.
+
+    Optimized, because DataFusion coerces the plan it keeps for a view
+    (``val * 2`` over a DOUBLE becomes ``val * CAST(2 AS DOUBLE)``) and
+    Python can't coerce the probe's plan alone; optimizing coerces both
+    alike. The ``SELECT *`` projection above the alias may be optimized
+    away, so the plan is read from below the first alias."""
+    plan = ctx.sql(sql).optimized_logical_plan()
+    while plan.to_variant().__class__.__name__ != "SubqueryAlias":
+        inputs = plan.inputs()
+        if len(inputs) != 1:
+            raise ValueError("not a SELECT * from one aliased relation")
+        plan = inputs[0]
+    return plan.inputs()[0].display_indent_schema()
 
 
 def _qualified(parts: list, defaults: list) -> list:

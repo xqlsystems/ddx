@@ -688,6 +688,13 @@ def test_a_view_s_name_is_resolved_with_the_session_s_case_rules(ad):
     assert "SELECT 2" in backend.view_sql("model")
 
 
+def test_a_view_whose_sql_needs_coercion_has_its_sql_given(ad, ctx):
+    # DataFusion keeps `val * CAST(2 AS DOUBLE)` for this view; its SQL
+    # plans as `val * 2` until coerced, and still means the same.
+    ctx.sql("CREATE VIEW m AS SELECT i, val * 2 AS v FROM w WHERE i > 0").collect()
+    assert "val * 2" in ad.DataFusionBackend(ctx).view_sql("m")
+
+
 def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
     # DataFusion keeps the plan outer_v was made with, which reads the first
     # inner_v; its SQL now reads the second.
