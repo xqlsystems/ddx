@@ -86,9 +86,13 @@ source = { directory = "../python/ddxdb" }
 requires-dist = [
     { name = "datafusion", marker = "extra == 'datafusion'", specifier = "==55.0.0" },
     { name = "datafusion", marker = "extra == 'test'", specifier = "==55.0.0" },
+    { name = "duckdb", marker = "extra == 'duckdb'", specifier = "==1.5.5" },
+    { name = "duckdb", marker = "extra == 'test'", specifier = "==1.5.5" },
+    { name = "pyarrow", marker = "extra == 'duckdb'" },
+    { name = "pyarrow", marker = "extra == 'test'" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
 ]
-provides-extras = ["datafusion", "test"]
+provides-extras = ["datafusion", "duckdb", "test"]
 
 [[package]]
 name = "exceptiongroup"

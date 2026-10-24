@@ -64,6 +64,31 @@ def _ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _literal(value: str) -> str:
+    """``value`` as a quoted DuckDB string."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+#: The settings that change what a query means, which the planner copies
+#: from the caller's connection so it plans the query the caller would run.
+_SETTINGS = (
+    "Calendar",
+    "TimeZone",
+    "default_collation",
+    "default_null_order",
+    "default_order",
+    "disable_timestamptz_casts",
+    "ieee_floating_point_ops",
+    "integer_division",
+    "lambda_syntax",
+    "old_implicit_casting",
+    "order_by_non_integer_literal",
+    "preserve_identifier_case",
+    "scalar_subquery_error_on_multiple_rows",
+    "search_path",
+)
+
+
 def _load_substrait(con: "duckdb.DuckDBPyConnection") -> None:
     """Load the community ``substrait`` extension on ``con``, installing it
     first if it is not."""
@@ -94,6 +119,7 @@ class DuckDBBackend:
         # copied, so an unchanged catalog is not copied again.
         self._mirrored: dict = {}
         self._attached = {"memory"}
+        self._settings: tuple = ()
 
     @property
     def con(self) -> "duckdb.DuckDBPyConnection":
@@ -193,7 +219,9 @@ class DuckDBBackend:
                 else:
                     views.append((key, what))
             # A view may read another, so each is made once those it reads
-            # are: as many rounds as it takes.
+            # are: as many rounds as it takes. One that still fails (it reads
+            # what is gone, say) is left out, for a plan that reads it to
+            # refuse, and is tried again by the next call.
             while views:
                 failed = []
                 for key, sql in views:
@@ -202,12 +230,23 @@ class DuckDBBackend:
                     except duckdb.Error:
                         failed.append((key, sql))
                 if len(failed) == len(views):
-                    names = ", ".join(".".join(k) for k, _ in failed)
-                    raise duckdb.Error(f"ddxdb could not copy the views {names} to plan with")
+                    break
                 views = failed
-            self._mirrored = catalog
-        self._path((self._database, self._schema, ""))
+            self._mirrored = {k: v for k, v in catalog.items() if (k, v[1]) not in views}
+        for db, schema in self.con.execute("SELECT database_name, schema_name FROM duckdb_schemas()").fetchall():
+            if db not in ("system", "temp"):
+                self._path((db, schema, ""))
         self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
+        settings = tuple(
+            self.con.execute(
+                "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
+                [list(_SETTINGS)],
+            ).fetchall()
+        )
+        if settings != self._settings:
+            for name, value in settings:
+                self._planner.execute(f"SET {name} = {_literal(value)}")
+            self._settings = settings
         return catalog
 
     def _plan(self, sql: str, catalog: dict) -> bytes:
@@ -245,10 +284,10 @@ class DuckDBBackend:
 
     def plan_key(self, sql: str) -> Optional[str]:
         # The plan depends on the query, the schemas and view definitions it
-        # reads, which the catalog holds, and where names are searched; not
-        # on any values.
+        # reads, which the catalog holds, where names are searched and the
+        # settings that change what a query means; not on any values.
         catalog = self._sync()
-        return repr((sql, self._database, self._schema, sorted(catalog.items())))
+        return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items())))
 
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")

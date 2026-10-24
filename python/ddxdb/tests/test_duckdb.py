@@ -303,6 +303,25 @@ def test_a_redefined_view_gets_its_program_built_again(ad, con):
     assert pairs(ad.sql(con, loss)) == [(0, 18.0), (1, -36.0), (2, 9.0)]
 
 
+def test_the_planner_plans_under_the_connection_s_settings(ad, con):
+    # With integer_division, i / 2 is integer division: ∂l/∂val = i // 2.
+    loss = "WITH loss AS (SELECT SUM(val * (i / 2)) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(con, loss)) == [(0, 0.0), (1, 0.5), (2, 1.0)]
+    con.execute("SET integer_division = true")
+    assert pairs(ad.sql(con, loss)) == [(0, 0.0), (1, 0.0), (2, 1.0)]
+
+
+def test_a_view_that_cannot_be_copied_is_tried_again(ad, con):
+    con.execute("CREATE TABLE t AS SELECT * FROM w")
+    con.execute("CREATE VIEW m AS SELECT i, val FROM t")
+    con.execute("DROP TABLE t")
+    # m reads what is gone, which a loss not reading m never sees.
+    assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    con.execute("CREATE TABLE t AS SELECT * FROM w")
+    loss = "WITH loss AS (SELECT SUM(val * val) AS l FROM m) SELECT i, grad(loss, val) FROM t"
+    assert pairs(ad.sql(con, loss)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
 # Refusals.
 
 
@@ -315,6 +334,13 @@ def test_a_repeated_column_is_refused_with_a_reason(ad, con):
             """WITH v AS (SELECT i, 1.0 AS val FROM w)
                SELECT jvp(SUM(val), w.val, v) AS t, SUM(val) AS a, SUM(val) AS b FROM w""",
         )
+    assert ddx_tables(con) == []
+
+
+def test_a_floor_division_of_floats_is_refused(ad, con):
+    # DuckDB's `//` of floats floors; ddx writes only the integer one.
+    with pytest.raises(Exception, match="`//`"):
+        ad.sql(con, "WITH loss AS (SELECT SUM(val * (val // 2.0)) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert ddx_tables(con) == []
 
 
