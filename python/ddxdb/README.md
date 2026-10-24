@@ -90,18 +90,6 @@ SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
 """)
 ```
 
-A loss reads whatever the connection's own queries read: tables, temporary
-tables, views, Arrow data registered with `con.register` (as xarray-sql
-registers a Dataset), and tables made in its open transaction. DuckDB plans
-the loss, with its community `substrait` extension, which ddxdb installs on
-first use. ddx writes each step of the program as DuckDB SQL and runs it on
-the connection, so windows, which DuckDB's Substrait consumer refuses, are
-ordinary SQL. Results are copied into memory, since the program's tables are
-dropped once the statements run.
-
-DuckDB types a literal like `1.5` as `DECIMAL`. A gradient is taken only with
-respect to floating-point columns, so store parameters as `DOUBLE`.
-
 ## Programs, and how they compose
 
 `ddxdb.ad.grad`, `vjp` and `jvp` give the programs underneath, and each takes

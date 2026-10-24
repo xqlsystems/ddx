@@ -54,7 +54,7 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
 from . import Programs, rewrite
-from ._ddxdb import to_sql
+from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
 __all__ = ["DuckDBBackend", "sql", "sql_all"]
 
@@ -78,107 +78,177 @@ class DuckDBBackend:
     """A DuckDB connection as a :class:`ddxdb.Backend`: plans with DuckDB's
     Substrait producer on a schema-only mirror of the connection's catalog,
     and runs every step as SQL on the connection itself (see the module
-    docs)."""
+    docs). It holds the connection weakly, so it never keeps one open.
+
+    DuckDB's producer writes each table a plan reads by its name alone,
+    without its schema or database (``s.t`` is ``t``), and the step's SQL
+    reads it by that name on the connection. So a loss is refused when a
+    table it reads shares its name with another object in the catalog,
+    rather than read as whichever the name finds."""
 
     def __init__(self, con: "duckdb.DuckDBPyConnection"):
-        self.con = con
+        self._con = weakref.ref(con)
         self._planner = duckdb.connect()
         _load_substrait(self._planner)
         # What the planner mirrors: each object's columns or view SQL, as last
         # copied, so an unchanged catalog is not copied again.
         self._mirrored: dict = {}
+        self._attached = {"memory"}
+
+    @property
+    def con(self) -> "duckdb.DuckDBPyConnection":
+        con = self._con()
+        if con is None:
+            raise RuntimeError("the DuckDB connection this backend ran on is gone")
+        return con
 
     # The caller's catalog, and the planner's copy of it.
 
     def _catalog(self) -> dict:
         """Each object on the caller's connection a query can read, but ddx's
-        own: its name, and either ``("table", columns)``, with columns as
-        ``(name, type)``, or ``("view", sql)``. Registered Arrow data is a
+        own, by ``(database, schema, name)``: either ``("table", columns)``,
+        with columns as ``(name, type)``, or ``("view", sql)``. Temporary
+        objects are in the database ``temp``. Registered Arrow data is a
         view with no SQL, and is a table here."""
         columns: dict = {}
-        for table, column, ty in self.con.execute(
-            "SELECT table_name, column_name, data_type FROM duckdb_columns() "
-            "WHERE NOT internal ORDER BY table_name, column_index"
+        for db, schema, table, column, ty in self.con.execute(
+            "SELECT database_name, schema_name, table_name, column_name, data_type "
+            "FROM duckdb_columns() WHERE NOT internal "
+            "ORDER BY database_name, schema_name, table_name, column_index"
         ).fetchall():
-            columns.setdefault(table, []).append((column, ty))
-        views = dict(
-            self.con.execute(
-                "SELECT view_name, sql FROM duckdb_views() WHERE NOT internal"
+            columns.setdefault((db, schema, table), []).append((column, ty))
+        views = {
+            (db, schema, name): sql
+            for db, schema, name, sql in self.con.execute(
+                "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() WHERE NOT internal"
             ).fetchall()
-        )
+        }
         catalog = {}
-        for name, cols in columns.items():
-            if name.startswith("__ddx_"):
+        for key, cols in columns.items():
+            if key[2].startswith("__ddx_"):
                 continue
-            sql = views.get(name)
-            catalog[name] = ("view", sql) if sql else ("table", tuple(cols))
+            sql = views.get(key)
+            catalog[key] = ("view", sql) if sql else ("table", tuple(cols))
         return catalog
 
-    def _drop_mirrored(self, name: str) -> None:
-        """Drop the planner's object ``name``, a table or a view: DuckDB
+    def _path(self, key) -> str:
+        """The planner's name for the object at ``key``, making its schema and
+        database if they are missing."""
+        db, schema, name = key
+        if db != "temp" and db not in self._attached:
+            self._planner.execute(f"ATTACH ':memory:' AS {_ident(db)}")
+            self._attached.add(db)
+        if db != "temp" and schema != "main":
+            self._planner.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(db)}.{_ident(schema)}")
+        return ".".join(_ident(p) for p in key)
+
+    def _drop_mirrored(self, key) -> None:
+        """Drop the planner's object at ``key``, a table or a view: DuckDB
         drops each only as what it is."""
+        db, schema, name = key
         kinds = self._planner.execute(
-            "SELECT table_type FROM information_schema.tables WHERE table_name = ?", [name]
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ?",
+            [db, schema, name],
         ).fetchall()
         for (kind,) in kinds:
             what = "VIEW" if kind == "VIEW" else "TABLE"
-            self._planner.execute(f"DROP {what} IF EXISTS {_ident(name)}")
+            self._planner.execute(f"DROP {what} IF EXISTS {self._path(key)}")
 
-    def _mirror_table(self, name: str, columns) -> None:
+    def _mirror_table(self, key, columns) -> None:
         cols = ", ".join(f"{_ident(c)} {ty}" for c, ty in columns)
-        self._drop_mirrored(name)
-        self._planner.execute(f"CREATE TABLE {_ident(name)} ({cols})")
+        self._drop_mirrored(key)
+        temp = "TEMP " if key[0] == "temp" else ""
+        name = _ident(key[2]) if temp else self._path(key)
+        self._planner.execute(f"CREATE {temp}TABLE {name} ({cols})")
+
+    def _mirror_view(self, key, sql) -> None:
+        # A view's SQL names it alone, so it is made from its own schema.
+        self._drop_mirrored(key)
+        db, schema, _ = key
+        if db != "temp":
+            self._path(key)
+            self._planner.execute(f"USE {_ident(db)}.{_ident(schema)}")
+        try:
+            self._planner.execute(sql)
+        finally:
+            self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
 
     def _sync(self) -> dict:
-        """Make the planner's catalog mirror the caller's, and return the
-        caller's."""
+        """Make the planner's catalog mirror the caller's, searched as the
+        caller's is, and return the caller's."""
+        self._database, self._schema = self.con.execute(
+            "SELECT current_database(), current_schema()"
+        ).fetchone()
         catalog = self._catalog()
-        if catalog == self._mirrored:
-            return catalog
-        for name in self._mirrored.keys() - catalog.keys():
-            self._drop_mirrored(name)
-        views = []
-        for name, (kind, what) in catalog.items():
-            if self._mirrored.get(name) == (kind, what):
-                continue
-            if kind == "table":
-                self._mirror_table(name, what)
-            else:
-                views.append((name, what))
-        # A view may read another, so each is created once those it reads
-        # are: as many rounds as it takes.
-        while views:
-            failed = []
-            for name, sql in views:
-                try:
-                    self._drop_mirrored(name)
-                    self._planner.execute(sql)
-                except duckdb.Error:
-                    failed.append((name, sql))
-            if len(failed) == len(views):
-                names = ", ".join(n for n, _ in failed)
-                raise duckdb.Error(f"ddxdb could not copy the views {names} to plan with")
-            views = failed
-        self._mirrored = catalog
+        if catalog != self._mirrored:
+            for key in self._mirrored.keys() - catalog.keys():
+                self._drop_mirrored(key)
+            views = []
+            for key, (kind, what) in catalog.items():
+                if self._mirrored.get(key) == (kind, what):
+                    continue
+                if kind == "table":
+                    self._mirror_table(key, what)
+                else:
+                    views.append((key, what))
+            # A view may read another, so each is made once those it reads
+            # are: as many rounds as it takes.
+            while views:
+                failed = []
+                for key, sql in views:
+                    try:
+                        self._mirror_view(key, sql)
+                    except duckdb.Error:
+                        failed.append((key, sql))
+                if len(failed) == len(views):
+                    names = ", ".join(".".join(k) for k, _ in failed)
+                    raise duckdb.Error(f"ddxdb could not copy the views {names} to plan with")
+                views = failed
+            self._mirrored = catalog
+        self._path((self._database, self._schema, ""))
+        self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
         return catalog
 
-    def _plan(self, sql: str) -> bytes:
-        return bytes(self._planner.execute("SELECT * FROM get_substrait(?)", [sql]).fetchone()[0])
+    def _plan(self, sql: str, catalog: dict) -> bytes:
+        """DuckDB's plan of ``sql``, each table it reads named as the caller's
+        connection finds it. The producer writes a table by its name alone,
+        so a name is taken as the only object of that name in the catalog,
+        and refused if there are two."""
+        plan = bytes(self._planner.execute("SELECT * FROM get_substrait(?)", [sql]).fetchone()[0])
+        renamed = {}
+        for name in set(_tables_read(plan)):
+            same = sorted(k for k in catalog if k[2] == name)
+            if len(same) > 1:
+                paths = ", ".join(".".join(k) for k in same)
+                raise UnsupportedExpression(
+                    f"`{name}` names {len(same)} objects ({paths}). DuckDB's Substrait producer "
+                    "writes a table by its name alone, without its schema or database, so on "
+                    "DuckDB ddx needs each table a loss reads to have a name of its own"
+                )
+            if not same:
+                continue
+            db, schema, _ = same[0]
+            if db == "temp" or (db, schema) == (self._database, self._schema):
+                continue  # The name alone finds it.
+            renamed[name] = [schema, name] if db == self._database else [db, schema, name]
+        return _rename_tables(plan, renamed) if renamed else plan
 
     # The Backend protocol.
 
     def select_all(self, name: str) -> bytes:
-        self._sync()
-        return self._plan(f"SELECT * FROM {_ident(name)}")
+        catalog = self._sync()
+        return self._plan(f"SELECT * FROM {_ident(name)}", catalog)
 
     def plan_sql(self, sql: str) -> bytes:
-        self._sync()
-        return self._plan(sql)
+        return self._plan(sql, self._sync())
 
     def plan_key(self, sql: str) -> Optional[str]:
-        # The plan depends on the query and on the schemas and view
-        # definitions it reads, which the catalog holds; not on any values.
-        return repr((sql, sorted(self._sync().items())))
+        # The plan depends on the query, the schemas and view definitions it
+        # reads, which the catalog holds, and where names are searched; not
+        # on any values.
+        catalog = self._sync()
+        return repr((sql, self._database, self._schema, sorted(catalog.items())))
 
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")
@@ -188,12 +258,12 @@ class DuckDBBackend:
         query = to_sql(plan, "duckdb")
         self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {query}")
         # Later steps read it: an empty copy for the planner.
-        columns = self.con.execute(f"DESCRIBE {_ident(name)}").fetchall()
-        self._mirror_table(name, [(c[0], c[1]) for c in columns])
+        columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
+        self._mirror_table(("temp", "main", name), [(c[0], c[1]) for c in columns])
 
     def drop_table(self, name: str) -> None:
-        self.con.execute(f"DROP TABLE IF EXISTS {_ident(name)}")
-        self._drop_mirrored(name)
+        self.con.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
+        self._drop_mirrored(("temp", "main", name))
 
 
 #: The programs :func:`sql_all` keeps for each connection, gone with it.

@@ -422,6 +422,17 @@ fn a_tangent_is_a_column_of_its_select_s_rows() {
 }
 
 #[test]
+fn a_repeated_jvp_is_kept_under_a_positional_group_by() {
+    // `GROUP BY 1` names a column by position: taking out the repeat would
+    // move the columns after it.
+    let sql = "WITH dw AS (SELECT i, 0.5 AS val FROM w) \
+               SELECT n, SUM(val) AS l, jvp(SUM(val), w.val, dw) AS dl FROM w GROUP BY 1";
+    let found = find(sql);
+    let f = found.calls[0].derivative.of().to_string();
+    assert!(f.contains("SUM(val) AS \"__ddx_jvp_0\""), "{f}");
+}
+
+#[test]
 fn a_query_carries_only_the_ctes_it_reads() {
     // The second jvp's SELECT reads f, not j: j's call is not its.
     let sql = "WITH f AS (SELECT SUM(a * b) AS l FROM w), v AS (SELECT 1 AS a), \

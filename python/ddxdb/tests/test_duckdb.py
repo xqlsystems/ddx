@@ -214,6 +214,52 @@ def test_nothing_is_left_behind_on_either_connection(ad, con):
     assert left.fetchall() == []
 
 
+def test_a_loss_reads_a_table_in_another_schema_or_database(ad, con):
+    con.execute("CREATE SCHEMA s")
+    con.execute("CREATE TABLE s.p AS SELECT * FROM (VALUES (0, 2.0::DOUBLE), (1, 4.0)) v(i, val)")
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("CREATE TABLE other.main.q AS SELECT * FROM (VALUES (0, 3.0::DOUBLE), (1, 5.0)) v(i, val)")
+    rel = ad.sql(
+        con,
+        "WITH loss AS (SELECT SUM(w.val * p.val * q.val) AS l "
+        "FROM w JOIN s.p ON w.i = p.i JOIN other.q ON p.i = q.i) "
+        "SELECT i, grad(loss, val) FROM w",
+    )
+    # ∂l/∂w = p·q where w has rows in both, 0 elsewhere.
+    assert pairs(rel) == [(0, 6.0), (1, 20.0), (2, 0.0)]
+
+
+def test_a_gradient_is_taken_over_a_table_in_another_schema(ad, con):
+    con.execute("CREATE SCHEMA s")
+    con.execute("CREATE TABLE s.p AS SELECT * FROM (VALUES (0, 2.0::DOUBLE), (1, 4.0)) v(i, val)")
+    rel = ad.sql(con, "WITH loss AS (SELECT SUM(val * val) AS l FROM s.p) SELECT i, grad(loss, val) FROM s.p")
+    assert pairs(rel) == [(0, 4.0), (1, 8.0)]
+
+
+def test_a_name_two_objects_share_is_refused(ad, con):
+    # DuckDB's producer writes `s.w` as `w`, which would read the other `w`.
+    import ddxdb
+
+    con.execute("CREATE SCHEMA s")
+    con.execute("CREATE TABLE s.w AS SELECT * FROM (VALUES (0, 9.0::DOUBLE)) v(i, val)")
+    with pytest.raises(ddxdb.UnsupportedExpression, match="names 2 objects"):
+        ad.sql(con, "WITH loss AS (SELECT SUM(val * val) AS l FROM s.w) SELECT i, grad(loss, val) FROM s.w")
+    assert ddx_tables(con) == []
+
+
+def test_the_backend_holds_the_connection_weakly(ad):
+    import gc
+    import weakref
+
+    c = duckdb.connect()
+    c.register("w", table([0], [1.0]))
+    ad.sql(c, GRAD)
+    held = weakref.ref(c)
+    del c
+    gc.collect()
+    assert held() is None
+
+
 # A training loop builds its program once.
 
 

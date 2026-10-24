@@ -134,6 +134,26 @@ fn to_sql(plan: &[u8], dialect: &str) -> PyResult<String> {
     ddx_ad::to_sql(&decode(plan)?, dialect).map_err(ad_to_py_err)
 }
 
+/// The name of every table `plan` (serialized Substrait) reads, its parts
+/// joined by `.`: `ddx_ad::tables_read`.
+#[pyfunction]
+fn _tables_read(plan: &[u8]) -> PyResult<Vec<String>> {
+    Ok(ddx_ad::tables_read(&decode(plan)?))
+}
+
+/// `plan` (serialized Substrait) with each table read whose name is a key of
+/// `names` named by its value instead: `ddx_ad::rename_tables`.
+#[pyfunction]
+fn _rename_tables<'py>(
+    py: Python<'py>,
+    plan: &[u8],
+    names: std::collections::HashMap<String, Vec<String>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut plan = decode(plan)?;
+    ddx_ad::rename_tables(&mut plan, &mut |t| names.get(&t.join(".")).cloned());
+    Ok(bytes(py, &plan))
+}
+
 fn bytes<'py>(py: Python<'py>, plan: &Plan) -> Bound<'py, PyBytes> {
     PyBytes::new(py, &plan.encode_to_vec())
 }
@@ -911,6 +931,8 @@ fn base_schema(plan: &Plan) -> Option<NamedStruct> {
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
     m.add_function(wrap_pyfunction!(to_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(_tables_read, m)?)?;
+    m.add_function(wrap_pyfunction!(_rename_tables, m)?)?;
     m.add_function(wrap_pyfunction!(grad_plan, m)?)?;
     m.add_function(wrap_pyfunction!(vjp_plan, m)?)?;
     m.add_function(wrap_pyfunction!(jvp_plan, m)?)?;

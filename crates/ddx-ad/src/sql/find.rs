@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
-    With,
+    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Value,
+    ValueWithSpan, Visit, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::Dialect;
 use ddx_core::sqlparser::parser::Parser;
@@ -642,6 +642,21 @@ fn write_repeats_once(f: &mut Select) -> HashMap<String, Reuse> {
         )
     }) {
         return reuses;
+    }
+    // Nor with `GROUP BY 3`, which names a column by its position.
+    if let GroupByExpr::Expressions(keys, _) = &f.group_by {
+        let positional = |k: &Expr| {
+            matches!(
+                k,
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(..),
+                    ..
+                })
+            )
+        };
+        if keys.iter().any(positional) {
+            return reuses;
+        }
     }
     let expr = |item: &SelectItem| match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e.clone()),
