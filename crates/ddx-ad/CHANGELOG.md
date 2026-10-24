@@ -11,12 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(ddxdb)* grad, vjp and jvp in SQL on DuckDB ([#192](https://github.com/xqlsystems/ddx/pull/192))
-- *(ddx-ad)* write a program's steps as SQL (to_sql) ([#189](https://github.com/xqlsystems/ddx/pull/189))
+- `to_sql` writes a step's Substrait plan as SQL, in DataFusion's or DuckDB's dialect (`Dialect`), so an engine can run ddx's programs without a Substrait consumer. A plan it can't write exactly is refused ([#189](https://github.com/xqlsystems/ddx/pull/189))
+- `tables_read` and `rename_tables`: the tables a plan reads, and a way to rename them, for an engine whose producer writes a table without its schema ([#192](https://github.com/xqlsystems/ddx/pull/192))
 
-### Other
+### Changed
 
-- *(deps)* upgrade DataFusion to 55 ([#185](https://github.com/xqlsystems/ddx/pull/185))
+- The minimum supported Rust version is 1.94, DataFusion 55's ([#185](https://github.com/xqlsystems/ddx/pull/185))
+- The `jvp` rewrite writes an expression repeated in its `SELECT` once, since DuckDB's Substrait producer drops a repeated output column ([#192](https://github.com/xqlsystems/ddx/pull/192))
+
+### Fixed
+
+- A plan whose root names don't match its output columns is refused with the reason, instead of panicking ([#192](https://github.com/xqlsystems/ddx/pull/192))
 
 ## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.2...ddx-ad-v0.2.3) - 2026-10-20
 
