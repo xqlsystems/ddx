@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.3...ddx-ad-v0.2.4) - 2026-10-24
+
+### Added
+
+- *(ddxdb)* grad, vjp and jvp in SQL on DuckDB ([#192](https://github.com/xqlsystems/ddx/pull/192))
+- *(ddx-ad)* write a program's steps as SQL (to_sql) ([#189](https://github.com/xqlsystems/ddx/pull/189))
+
+### Other
+
+- *(deps)* upgrade DataFusion to 55 ([#185](https://github.com/xqlsystems/ddx/pull/185))
+
 ## [0.2.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.2...ddx-ad-v0.2.3) - 2026-10-20
 
 ### Changed
