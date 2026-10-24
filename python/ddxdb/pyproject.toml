@@ -41,8 +41,8 @@ dependencies = []
 # producer's quirks (#149) are DuckDB's own.
 [project.optional-dependencies]
 datafusion = ["datafusion==55.0.0"]
-duckdb = ["duckdb==1.5.5", "pyarrow"]
-test = ["pytest>=7", "datafusion==55.0.0", "duckdb==1.5.5", "pyarrow"]
+duckdb = ["duckdb==1.5.6", "pyarrow"]
+test = ["pytest>=7", "datafusion==55.0.0", "duckdb==1.5.6", "pyarrow"]
 
 [project.urls]
 Homepage = "https://github.com/xqlsystems/ddx"
