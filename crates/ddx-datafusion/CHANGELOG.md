@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.0...ddx-datafusion-v0.3.1) - 2026-10-24
+
+### Changed
+
+- ddx-ad 0.2.4: `to_sql`, and a plan whose root names don't match its output columns is refused instead of panicking ([#189](https://github.com/xqlsystems/ddx/pull/189), [#192](https://github.com/xqlsystems/ddx/pull/192))
+
+### Fixed
+
+- `view_sql` gives a view's SQL when the view needs type coercion (`val * 2` over a DOUBLE `val`). Such a view was left to the engine, so its CTEs read more than once were differentiated once per read ([#190](https://github.com/xqlsystems/ddx/pull/190))
+
 ## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.2.3...ddx-datafusion-v0.3.0) - 2026-10-21
 
 ### Changed
