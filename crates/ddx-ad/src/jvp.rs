@@ -35,7 +35,7 @@ use crate::compose::{dag_steps, Differentiable, Parts, Subject};
 use crate::emit::{plan as plan_of, project_emit, read_step};
 use crate::error::{AdError, Result};
 use crate::expr::field;
-use crate::forward::{check_every_wrt_was_read, inline_references, root_of, wrt_table};
+use crate::forward::{check_every_wrt_was_read, checked_root, inline_references, wrt_table};
 use crate::functions::{Extensions, Functions};
 use crate::program::{
     dims_check, readable, repeated_keys, Check, ForwardProgram, Options, Step, Unbound,
@@ -255,7 +255,7 @@ fn dual_plan(
     ext: Extensions,
     sources: &mut Sources,
 ) -> Result<DualPlan> {
-    let (root, names) = root_of(plan)?;
+    let (root, names) = checked_root(plan)?;
     let root = inline_references(root, &plan.relations)?;
     let mut source = |n: &[String], s: Option<&NamedStruct>| sources.source(n, s);
     let mut dz = Dualizer::with_extensions(ddx, functions, ext, &mut source);

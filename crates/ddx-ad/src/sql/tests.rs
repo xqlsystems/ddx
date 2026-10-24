@@ -37,10 +37,25 @@ fn filter_of(sql: &str) -> Option<String> {
 /// `v`: `l` and two jvps' expressions, of which `l` and the first have
 /// tangents.
 fn rewritten(calls: &Calls) -> String {
-    let value = OutputTable {
+    // A jvp call whose expression repeats a column has none of its own in
+    // the value, as its query writes the expression once.
+    let reused: Vec<&str> = calls
+        .calls
+        .iter()
+        .filter_map(|c| match &c.site {
+            Site::Tangent {
+                hidden,
+                reuse: Some(_),
+                ..
+            } => Some(hidden.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut value = OutputTable {
         step: "v".into(),
         of: crate::tables::Of::Output,
         columns: vec![
+            "n".into(),
             "l".into(),
             "__ddx_jvp_0".into(),
             "__ddx_jvp_1".into(),
@@ -58,6 +73,13 @@ fn rewritten(calls: &Calls) -> String {
             },
         ],
     };
+    value.columns.retain(|c| !reused.contains(&c.as_str()));
+    value
+        .tangents
+        .retain(|t| !reused.contains(&t.column.as_str()));
+    if value.tangents.len() < 2 {
+        value.columns.pop();
+    }
     let mut queries: Vec<&ddx_core::sqlparser::ast::Query> = Vec::new();
     let steps: Vec<String> = calls
         .calls
@@ -375,15 +397,13 @@ fn a_tangent_is_a_column_of_its_select_s_rows() {
         unreachable!()
     };
     // f is the SELECT with each jvp written as its expression, after
-    // the CTEs it reads.
+    // the CTEs it reads; one that repeats a column before it (the first,
+    // `SUM(val)`, as `l`) is written once, as that column.
     assert_eq!(a.derivative.of(), b.derivative.of());
     let f = a.derivative.of().to_string();
     assert!(f.starts_with("WITH h AS ("), "{f}");
     assert!(
-        f.ends_with(
-            "SELECT n, SUM(val) AS l, SUM(val) AS \"__ddx_jvp_0\", MAX(val) AS \
-             \"__ddx_jvp_1\" FROM h GROUP BY n"
-        ),
+        f.ends_with("SELECT n, SUM(val) AS l, MAX(val) AS \"__ddx_jvp_1\" FROM h GROUP BY n"),
         "{f}"
     );
     let dw = a.derivative.seed_query().unwrap().to_string();
@@ -394,10 +414,22 @@ fn a_tangent_is_a_column_of_its_select_s_rows() {
     let out = rewritten(&found);
     assert!(
         out.ends_with(
-            "SELECT \"l\", \"t1\" AS \"dl\", CAST(0 AS DOUBLE) AS \"dm\" FROM \"v\" ORDER BY n"
+            "SELECT \"n\", \"l\", \"t0\" AS \"dl\", CAST(0 AS DOUBLE) AS \"dm\" FROM \"v\" \
+             ORDER BY n"
         ),
         "{out}"
     );
+}
+
+#[test]
+fn a_repeated_jvp_is_kept_under_a_positional_group_by() {
+    // `GROUP BY 1` names a column by position: taking out the repeat would
+    // move the columns after it.
+    let sql = "WITH dw AS (SELECT i, 0.5 AS val FROM w) \
+               SELECT n, SUM(val) AS l, jvp(SUM(val), w.val, dw) AS dl FROM w GROUP BY 1";
+    let found = find(sql);
+    let f = found.calls[0].derivative.of().to_string();
+    assert!(f.contains("SUM(val) AS \"__ddx_jvp_0\""), "{f}");
 }
 
 #[test]

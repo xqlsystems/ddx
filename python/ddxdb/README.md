@@ -58,6 +58,7 @@ a thin wrapper over the `ddx-ad` engine.
 ```bash
 pip install ddxdb                  # the programs, for any engine
 pip install "ddxdb[datafusion]"    # + Context and ddxdb.ad, on DataFusion
+pip install "ddxdb[duckdb]"        # + ddxdb.duckdb, on DuckDB
 ```
 
 ## `Context`, for DataFusion
@@ -71,6 +72,23 @@ no engine.
 On a plain `SessionContext`, `ddxdb.ad.sql(ctx, statement)` does the same, and
 `ddxdb.ad.sql_all` runs several statements that take `grad` of one loss for
 the price of one backward pass.
+
+## On DuckDB
+
+`ddxdb.duckdb.sql(con, statement)` is the same on a DuckDB connection, and
+`ddxdb.ad.sql` accepts one too:
+
+```python
+import duckdb
+from ddxdb import duckdb as ad
+
+con = duckdb.connect()
+con.register("w", arrow_table)          # or a table, a view, a temp table
+ad.sql(con, """
+WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
+""")
+```
 
 ## Programs, and how they compose
 

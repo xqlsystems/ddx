@@ -264,6 +264,31 @@ pub fn unbound_reads(plan: &Plan) -> Vec<String> {
     out
 }
 
+/// The name of every table `plan` reads, each its parts joined by `.`, in
+/// the order they appear, subqueries' included.
+pub fn tables_read(plan: &Plan) -> Vec<String> {
+    let mut out = Vec::new();
+    reads().each(plan, |read| {
+        if let Some(ReadType::NamedTable(t)) = &read.read_type {
+            out.push(t.names.join("."));
+        }
+    });
+    out
+}
+
+/// `plan` with each table it reads named as `rename` says, or as it was
+/// where `rename` returns `None`: for a producer that writes a table by a
+/// name the engine would not find it by (DuckDB's drops its schema).
+pub fn rename_tables(plan: &mut Plan, rename: &mut dyn FnMut(&[String]) -> Option<Vec<String>>) {
+    reads().modify(plan, |read| {
+        if let Some(ReadType::NamedTable(t)) = &mut read.read_type {
+            if let Some(names) = rename(&t.names) {
+                t.names = names;
+            }
+        }
+    });
+}
+
 /// Fill in the types of every unbound read in `plan` (see the module docs).
 ///
 /// `schema` is asked for each unbound table by name and returns its column

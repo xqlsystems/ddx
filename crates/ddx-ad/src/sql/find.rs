@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use ddx_core::sqlparser::ast::{
-    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
-    With,
+    Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Value,
+    ValueWithSpan, Visit, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::Dialect;
 use ddx_core::sqlparser::parser::Parser;
@@ -219,7 +219,21 @@ pub(super) enum Site {
         select: usize,
         hidden: String,
         name: String,
+        /// Set when its expression repeats a column before it in the
+        /// `SELECT`, which `f` then writes once: DuckDB's Substrait producer
+        /// drops a column that repeats another, so the plan would not say
+        /// which is which.
+        reuse: Option<Reuse>,
     },
+}
+
+/// A `jvp` call whose expression `f` writes once, as another column: that
+/// column's position among `f`'s columns, and where the call's own column
+/// goes among them (before the column at `at`, or last).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Reuse {
+    pub(super) column: usize,
+    pub(super) at: usize,
 }
 
 /// A table in a `FROM` clause whose rows `grad` or `vjp` calls are columns
@@ -500,6 +514,7 @@ impl Found<'_> {
                 select: index,
                 hidden: format!("__ddx_jvp_{earlier}"),
                 name: tangent_name(select, function)?,
+                reuse: None,
             },
         })
     }
@@ -542,6 +557,7 @@ impl Found<'_> {
                     k += 1;
                 }
             }
+            let reuses = write_repeats_once(&mut f);
             let f = Box::new(build::query(
                 with_of(self.ctes, visible, &reads_of(select)),
                 f,
@@ -553,6 +569,9 @@ impl Found<'_> {
                 }
                 if let Derivative::Jvp { of, .. } = &mut call.derivative {
                     *of = f.clone();
+                }
+                if let Site::Tangent { hidden, reuse, .. } = &mut call.site {
+                    *reuse = reuses.get(hidden.as_str()).copied();
                 }
                 match &along {
                     None => along = Some(call.derivative.clone()),
@@ -610,6 +629,56 @@ pub(super) fn same_column(a: &ColumnRef, b: &ColumnRef) -> bool {
 
 /// The first argument of `item`, if it is a `jvp` call, maybe under an
 /// alias.
+/// `f`'s `jvp` columns (`__ddx_jvp_{k}`) that repeat a column before them,
+/// taken out of `f`, by their names: DuckDB's Substrait producer drops a
+/// column that repeats another (`SELECT x AS a, x AS b`), so `f` writes each
+/// expression once. Not with a wildcard, whose columns are not its items.
+fn write_repeats_once(f: &mut Select) -> HashMap<String, Reuse> {
+    let mut reuses = HashMap::new();
+    if f.projection.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    }) {
+        return reuses;
+    }
+    // Nor with `GROUP BY 3`, which names a column by its position.
+    if let GroupByExpr::Expressions(keys, _) = &f.group_by {
+        let positional = |k: &Expr| {
+            matches!(
+                k,
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(..),
+                    ..
+                })
+            )
+        };
+        if keys.iter().any(positional) {
+            return reuses;
+        }
+    }
+    let expr = |item: &SelectItem| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e.clone()),
+        _ => None,
+    };
+    let mut kept: Vec<SelectItem> = Vec::new();
+    for item in std::mem::take(&mut f.projection) {
+        if let SelectItem::ExprWithAlias { expr: e, alias } = &item {
+            if alias.value.starts_with("__ddx_jvp_") {
+                if let Some(column) = kept.iter().position(|k| expr(k).as_ref() == Some(e)) {
+                    let at = kept.len();
+                    reuses.insert(alias.value.clone(), Reuse { column, at });
+                    continue;
+                }
+            }
+        }
+        kept.push(item);
+    }
+    f.projection = kept;
+    reuses
+}
+
 fn jvp_expr(item: &SelectItem) -> Option<Expr> {
     let (SelectItem::UnnamedExpr(Expr::Function(f))
     | SelectItem::ExprWithAlias {

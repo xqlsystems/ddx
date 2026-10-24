@@ -493,7 +493,12 @@ def _register(ctx: SessionContext, name: str, table: pa.Table) -> None:
     ctx.register_record_batches(name, [batches])
 
 
-def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
+def _duckdb(con) -> bool:
+    """Whether ``con`` is a DuckDB connection, without importing DuckDB."""
+    return type(con).__name__ == "DuckDBPyConnection"
+
+
+def sql(ctx: SessionContext, statement: str, *, dialect: Optional[str] = None):
     """Run ``statement``, in which, as columns of a ``SELECT``, ``grad(loss,
     column)`` is the gradient at each row of the loss the CTE ``loss``
     computes; ``vjp(f, column, cotangent)`` the same for any CTE ``f`` along
@@ -507,7 +512,11 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
     dropped once the statement is planned; the DataFrame keeps what it reads.
     A loss defined in a ``WITH RECURSIVE`` clause is refused. ``dialect``
     is how the statement is parsed to find the calls: a dialect name
-    ``sqlparser`` knows, or ``"datafusion"``.
+    ``sqlparser`` knows, or ``"datafusion"``, the default.
+
+    ``ctx`` may be a DuckDB connection instead, which :func:`ddxdb.duckdb.sql`
+    runs on. Its statements are DuckDB's, so ``dialect`` is ``"duckdb"``
+    or left out.
     """
     return sql_all(ctx, [statement], dialect=dialect)[0]
 
@@ -516,7 +525,7 @@ def sql(ctx: SessionContext, statement: str, *, dialect: str = "datafusion"):
 _programs: "weakref.WeakKeyDictionary[SessionContext, Programs]" = weakref.WeakKeyDictionary()
 
 
-def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "datafusion") -> list:
+def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional[str] = None) -> list:
     """:func:`sql` for several statements. Statements that take ``grad`` of the
     same loss query share one run of its program, so a training step can update
     each parameter table with its own statement and pay for the backward pass
@@ -529,13 +538,19 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: str = "d
     on the tables' values, and is built again when one of those changes. One
     caveat: DataFusion's optimizer folds ``now()`` into a literal, so a
     program whose query reads it keeps the time of the call that built it."""
+    if _duckdb(ctx):
+        from . import duckdb as on_duckdb
+
+        if dialect not in (None, "duckdb"):
+            raise ValueError(f"a DuckDB connection's statements are in DuckDB's dialect, not {dialect!r}")
+        return on_duckdb.sql_all(ctx, statements)
     # Which programs to run, how each is built and run, and how each
     # statement reads them are ddx-ad's (ddx_ad::rewrite); DataFusion plans and
     # runs.
     # A planned DataFrame holds the tables it reads, so they can leave the
     # catalog once every statement is planned.
     programs = _programs.setdefault(ctx, Programs())
-    with rewrite(DataFusionBackend(ctx), statements, dialect, programs) as rewritten:
+    with rewrite(DataFusionBackend(ctx), statements, dialect or "datafusion", programs) as rewritten:
         # SessionContext's own sql, not a ddxdb.Context's, which would look for
         # calls again.
         return [SessionContext.sql(ctx, s) for s in rewritten.statements]

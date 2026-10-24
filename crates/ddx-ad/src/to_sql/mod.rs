@@ -1257,7 +1257,11 @@ impl Reader<'_> {
                     )));
                 }
                 let op = match op {
-                    Op::Divide { .. } => Op::Divide { integer },
+                    Op::Divide { integer: false } => Op::Divide { integer },
+                    // DuckDB's `//` of floats is not a truncating division.
+                    Op::Divide { integer: true } if !integer => {
+                        return Err(unknown_function(name));
+                    }
                     op => op,
                 };
                 Expr::Op { op, args }
@@ -1519,6 +1523,8 @@ fn syntax(name: &str) -> Option<Syntax> {
         "subtract" => Operator(ir::Op::Subtract),
         "multiply" => Operator(ir::Op::Multiply),
         "divide" => Operator(ir::Op::Divide { integer: false }),
+        // DuckDB's integer division, as `SET integer_division` plans `/`.
+        "//" => Operator(ir::Op::Divide { integer: true }),
         "modulus" | "mod" => Operator(ir::Op::Modulus),
         "equal" => Operator(ir::Op::Eq),
         "not_equal" => Operator(ir::Op::NotEq),

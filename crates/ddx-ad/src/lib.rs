@@ -108,6 +108,7 @@ internal! {
 }
 
 pub use compose::Differentiable;
+pub use emit::{rename_tables, tables_read};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
 pub use jvp::{jvp, jvp_with};

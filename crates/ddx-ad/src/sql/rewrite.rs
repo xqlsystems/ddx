@@ -18,7 +18,7 @@ use ddx_core::sqlparser::ast::{
 use ddx_core::sqlparser::tokenizer::Location;
 
 use super::build::{self, named, quoted, table};
-use super::find::{select_at, Calls, Site};
+use super::find::{select_at, Calls, Reuse, Site};
 use crate::error::{AdError, Result};
 use crate::tables::OutputTable;
 
@@ -141,7 +141,7 @@ impl Calls {
                 .insert(*end, ExcludeSelectItem::Multiple(excluded));
         }
         for (s, &at) in self.selects.iter().enumerate() {
-            let mine: Vec<(usize, &str, &str)> = self
+            let mine: Vec<(usize, &str, &str, Option<Reuse>)> = self
                 .calls
                 .iter()
                 .enumerate()
@@ -150,7 +150,8 @@ impl Calls {
                         select,
                         hidden,
                         name,
-                    } if *select == s => Some((i, hidden.as_str(), name.as_str())),
+                        reuse,
+                    } if *select == s => Some((i, hidden.as_str(), name.as_str(), *reuse)),
                     _ => None,
                 })
                 .collect();
@@ -160,20 +161,36 @@ impl Calls {
                 ));
             };
             let own = &value.columns[..value.columns.len() - value.tangents.len()];
-            let projection = own
-                .iter()
-                .map(|c| match mine.iter().find(|(_, h, _)| h == c) {
-                    Some((_, _, name)) => SelectItem::ExprWithAlias {
-                        expr: value
-                            .tangents
-                            .iter()
-                            .find(|t| &t.column == c)
-                            .map_or_else(zero, |t| Expr::Identifier(quoted(&t.tangent))),
+            let tangent_of = |c: &String| {
+                value
+                    .tangents
+                    .iter()
+                    .find(|t| &t.column == c)
+                    .map_or_else(zero, |t| Expr::Identifier(quoted(&t.tangent)))
+            };
+            // A call whose expression repeats an earlier column is the
+            // tangent of that column, where the call was ([`Reuse`]).
+            let reused = |at: usize| {
+                mine.iter().filter_map(move |(_, _, name, reuse)| {
+                    let r = (*reuse)?;
+                    (r.at == at).then(|| SelectItem::ExprWithAlias {
+                        expr: tangent_of(&own[r.column]),
+                        alias: quoted(name),
+                    })
+                })
+            };
+            let mut projection = Vec::new();
+            for (i, c) in own.iter().enumerate() {
+                projection.extend(reused(i));
+                projection.push(match mine.iter().find(|(_, h, _, _)| h == c) {
+                    Some((_, _, name, _)) => SelectItem::ExprWithAlias {
+                        expr: tangent_of(c),
                         alias: quoted(name),
                     },
                     None => SelectItem::UnnamedExpr(Expr::Identifier(quoted(c))),
-                })
-                .collect();
+                });
+            }
+            projection.extend(reused(own.len()));
             let from = TableWithJoins {
                 relation: table(ObjectName::from(vec![quoted(&value.step)]), None),
                 joins: Vec::new(),
