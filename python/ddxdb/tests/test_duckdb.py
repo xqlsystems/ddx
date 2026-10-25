@@ -12,6 +12,7 @@ of the catalog.
 """
 
 import math
+import textwrap
 
 import pyarrow as pa
 import pytest
@@ -322,6 +323,70 @@ def test_a_view_that_cannot_be_copied_is_tried_again(ad, con):
     assert pairs(ad.sql(con, loss)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
+def test_a_view_whose_cte_is_read_twice_is_differentiated(ad, con):
+    # DuckDB's producer has no plan for the CTE it materializes, so ddx
+    # plans the view's CTEs itself, as a query's.
+    con.execute(
+        """CREATE VIEW m AS WITH s AS (SELECT i, val * 2 AS y FROM w)
+           SELECT a.i, a.y * b.y AS y FROM s a JOIN s b ON a.i = b.i"""
+    )
+    loss = "WITH loss AS (SELECT SUM(y) AS l FROM m) SELECT i, grad(loss, val) FROM w"
+    # l = Σ 4 val², so ∂l/∂val = 8 val.
+    assert pairs(ad.sql(con, loss)) == [(0, 8.0), (1, -16.0), (2, 4.0)]
+
+
+def test_a_view_s_sql_is_given_where_its_names_resolve_as_the_query_s(ad, con):
+    con.execute("CREATE SCHEMA s")
+    con.execute("CREATE VIEW here AS SELECT 1 AS x")
+    con.execute("CREATE TEMP VIEW tv AS SELECT 2 AS x")
+    con.execute("CREATE VIEW s.there AS SELECT 3 AS x")
+    con.execute("CREATE TABLE t (x INTEGER)")
+    backend = ad.DuckDBBackend(con)
+    assert "SELECT 1" in backend.view_sql("here")
+    assert "SELECT 1" in backend.view_sql('"HERE"')
+    assert "SELECT 2" in backend.view_sql("tv")
+    # A view in another schema reads names in its own; a table has no SQL.
+    assert backend.view_sql("s.there") is None
+    assert backend.view_sql("t") is None
+    # A temporary table of the view's name is what the name reads.
+    con.execute("CREATE TEMP TABLE here (x INTEGER)")
+    assert backend.view_sql("here") is None
+
+
+@pytest.mark.parametrize("hint", ["MATERIALIZED", "NOT MATERIALIZED"])
+def test_a_cte_with_a_materialization_hint_is_differentiated(ad, con, hint):
+    statement = f"""WITH s AS {hint} (SELECT i, val * 2 AS y FROM w),
+                         loss AS (SELECT SUM(y) AS l FROM s)
+                    SELECT i, grad(loss, val) FROM w"""
+    assert pairs(ad.sql(con, statement)) == [(0, 2.0), (1, 2.0), (2, 2.0)]
+
+
+def test_a_window_over_an_aggregate_is_differentiated(ad):
+    # DuckDB writes a window as a window relation, and OVER () as RANGE up
+    # to the current row, which, with no ORDER BY, is the whole partition.
+    c = duckdb.connect()
+    c.execute(
+        "CREATE TABLE w AS SELECT i, g, val::DOUBLE AS val"
+        " FROM (VALUES (0, 0, 1.0), (1, 0, 2.0), (2, 1, 0.5)) v(i, g, val)"
+    )
+    softmax_normalizer = """WITH s AS (SELECT g, SUM(val) AS s FROM w GROUP BY g),
+             p AS (SELECT exp(s - MAX(s) OVER ()) AS e FROM s),
+             loss AS (SELECT SUM(e) AS l FROM p)
+        SELECT i, grad(loss, val) FROM w"""
+    # s = (3, 0.5), so l = 1 + e⁻²·⁵: ∂l/∂s = (-e⁻²·⁵, e⁻²·⁵), each val's
+    # its group's.
+    e = math.exp(-2.5)
+    assert dict(pairs(ad.sql(c, softmax_normalizer))) == pytest.approx({0: -e, 1: -e, 2: e})
+    over_a_table = """WITH p AS (SELECT exp(val - MAX(val) OVER ()) AS e FROM w),
+             loss AS (SELECT SUM(e) AS l FROM p)
+        SELECT i, grad(loss, val) FROM w"""
+    # The maximum, 2, takes -Σ of the others' exponentials as well as its own 1.
+    others = math.exp(-1.0) + math.exp(-1.5)
+    assert dict(pairs(ad.sql(c, over_a_table))) == pytest.approx(
+        {0: math.exp(-1.0), 1: 1 - (1 + others), 2: math.exp(-1.5)}
+    )
+
+
 # Refusals.
 
 
@@ -342,6 +407,17 @@ def test_a_floor_division_of_floats_is_refused(ad, con):
     with pytest.raises(Exception, match="`//`"):
         ad.sql(con, "WITH loss AS (SELECT SUM(val * (val // 2.0)) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert ddx_tables(con) == []
+
+
+def test_the_module_docs_example_runs(ad):
+    # The example at the top of ddxdb.duckdb's docs, as it is written there.
+    doc = ad.__doc__
+    start = doc.index("    import duckdb")
+    example = textwrap.dedent(doc[start : doc.index("\n\n", doc.index("ad.sql(", start))])
+    example = example.replace("ad.sql(con,", "result = ad.sql(con,", 1)
+    scope = {}
+    exec(example, scope)
+    assert pairs(scope["result"]) == pytest.approx([(0, 0.8), (1, 1.6)])
 
 
 def test_ad_sql_takes_a_duckdb_connection(con):

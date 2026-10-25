@@ -42,7 +42,7 @@
 
 use substrait::proto::aggregate_function::AggregationInvocation;
 use substrait::proto::expression::window_function::bound::Kind;
-use substrait::proto::expression::window_function::Bound;
+use substrait::proto::expression::window_function::{Bound, BoundsType};
 use substrait::proto::expression::WindowFunction;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::{Expression, FunctionArgument};
@@ -118,10 +118,17 @@ pub(crate) fn reduce_rule<'e>(
 /// narrower than it (an unset bound is the partition's end)? Then it is its
 /// reduction over the partition, broadcast back to the partition's rows,
 /// and its value does not depend on how a partition's rows are ordered.
+/// A `RANGE` frame with no `ORDER BY` makes every row of a partition a peer
+/// of the current one, so `CURRENT ROW` is its end too: DuckDB writes
+/// `OVER ()` as `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 pub(crate) fn whole_partition(w: &WindowFunction) -> bool {
+    let peers = w.sorts.is_empty() && w.bounds_type == BoundsType::Range as i32;
     let unbounded = |b: &Option<Bound>| {
-        b.as_ref()
-            .is_none_or(|b| matches!(b.kind, None | Some(Kind::Unbounded(_))))
+        b.as_ref().is_none_or(|b| match b.kind {
+            None | Some(Kind::Unbounded(_)) => true,
+            Some(Kind::CurrentRow(_)) => peers,
+            _ => false,
+        })
     };
     unbounded(&w.lower_bound) && unbounded(&w.upper_bound)
 }
@@ -226,5 +233,32 @@ mod tests {
     #[test]
     fn an_aggregate_with_no_rule_has_none() {
         assert_eq!(rule("stddev", AggregationInvocation::All).unwrap(), None);
+    }
+
+    #[test]
+    fn a_range_frame_with_no_order_by_is_its_whole_partition() {
+        use substrait::proto::expression::window_function::bound::{CurrentRow, Preceding};
+        use substrait::proto::SortField;
+        let bound = |kind| Some(Bound { kind: Some(kind) });
+        let current = || bound(Kind::CurrentRow(CurrentRow {}));
+        let frame = |bounds_type: BoundsType, upper, sorted: bool| WindowFunction {
+            bounds_type: bounds_type as i32,
+            upper_bound: upper,
+            sorts: if sorted {
+                vec![SortField::default()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        // DuckDB's OVER (): RANGE up to the current row, which every row of
+        // the partition is a peer of.
+        assert!(whole_partition(&frame(BoundsType::Range, current(), false)));
+        assert!(whole_partition(&frame(BoundsType::Rows, None, false)));
+        // A running frame, and a ROWS frame up to the row itself, are not.
+        assert!(!whole_partition(&frame(BoundsType::Range, current(), true)));
+        assert!(!whole_partition(&frame(BoundsType::Rows, current(), false)));
+        let one_back = bound(Kind::Preceding(Preceding { offset: 1 }));
+        assert!(!whole_partition(&frame(BoundsType::Range, one_back, false)));
     }
 }

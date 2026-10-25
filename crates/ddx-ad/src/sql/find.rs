@@ -15,7 +15,6 @@ use ddx_core::sqlparser::ast::{
     ValueWithSpan, Visit, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::Dialect;
-use ddx_core::sqlparser::parser::Parser;
 use ddx_core::sqlparser::tokenizer::{Location, Span};
 
 use super::build;
@@ -277,7 +276,7 @@ impl Calls {
         if !["grad", "vjp", "jvp"].iter().any(|n| lower.contains(n)) {
             return Ok(None);
         }
-        let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+        let Ok(statements) = super::parse::parse(dialect, sql) else {
             return Ok(None);
         };
         let [Statement::Query(query)] = statements.as_slice() else {
