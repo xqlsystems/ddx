@@ -60,12 +60,27 @@ fn without_hints(
         } else {
             continue;
         };
-        if !matches!(solid.get(end + 1).map(|t| &t.token), Some(Token::LParen)) {
+        // A CTE's query follows; a table alias's column list would not.
+        if !matches!(solid.get(end + 1).map(|t| &t.token), Some(Token::LParen))
+            || !(keyword(end + 2, Keyword::SELECT)
+                || keyword(end + 2, Keyword::WITH)
+                || keyword(end + 2, Keyword::VALUES)
+                || keyword(end + 2, Keyword::FROM)
+                || matches!(solid.get(end + 2).map(|t| &t.token), Some(Token::LParen)))
+        {
             continue;
         }
-        let Some(name) = cte_name(&solid, at) else {
+        let Some((name, before)) = cte_name(&solid, at) else {
             continue;
         };
+        // A CTE's name follows `WITH`, `RECURSIVE` or the comma after
+        // another CTE.
+        let listed = matches!(solid[before].token, Token::Comma)
+            || keyword(before, Keyword::WITH)
+            || keyword(before, Keyword::RECURSIVE);
+        if !listed {
+            continue;
+        }
         hints.insert(name, hint);
         blank.extend(&solid[at + 1..=end]);
     }
@@ -85,9 +100,10 @@ fn without_hints(
     Some((blanked, hints))
 }
 
-/// Where the name of the CTE whose `AS` is `solid[at]` starts: the word
-/// before it, or before its column list.
-fn cte_name(solid: &[&TokenWithSpan], at: usize) -> Option<Location> {
+/// Where the name of the CTE whose `AS` is `solid[at]` starts, the word
+/// before it or before its column list, and the index of the token before
+/// the name.
+fn cte_name(solid: &[&TokenWithSpan], at: usize) -> Option<(Location, usize)> {
     let mut i = at.checked_sub(1)?;
     if solid[i].token == Token::RParen {
         let mut depth = 0usize;
@@ -106,7 +122,8 @@ fn cte_name(solid: &[&TokenWithSpan], at: usize) -> Option<Location> {
         }
         i = i.checked_sub(1)?;
     }
-    matches!(solid[i].token, Token::Word(_)).then_some(solid[i].span.start)
+    let before = i.checked_sub(1)?;
+    matches!(solid[i].token, Token::Word(_)).then_some((solid[i].span.start, before))
 }
 
 /// The byte each line of `sql` starts at.
@@ -190,5 +207,15 @@ mod tests {
     fn a_column_named_materialized_is_not_a_hint() {
         let sql = "SELECT x AS materialized FROM t";
         assert_eq!(printed(&DuckDbDialect {}, sql), sql);
+    }
+
+    #[test]
+    fn a_table_alias_named_materialized_is_not_a_hint() {
+        // Its column list is not a query, and it is not in a WITH list.
+        let sql = "WITH s AS MATERIALIZED (SELECT 1 AS i) SELECT * FROM s AS materialized (i)";
+        assert_eq!(
+            printed(&DuckDbDialect {}, sql),
+            "WITH s AS MATERIALIZED (SELECT 1 AS i) SELECT * FROM s AS materialized (i)"
+        );
     }
 }

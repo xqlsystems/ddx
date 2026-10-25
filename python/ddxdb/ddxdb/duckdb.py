@@ -18,11 +18,6 @@ its gradient in SQL, as :mod:`ddxdb.ad` does on DataFusion::
         SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
     ''')
 
-A gradient is taken with respect to ``REAL`` or ``DOUBLE`` columns. DuckDB
-types a literal such as ``1.0`` as a ``DECIMAL``, so a table made from one
-(``CREATE TABLE w AS SELECT 1.0 AS val``) has a ``DECIMAL`` column: cast it,
-``1.0::DOUBLE``.
-
 ``grad``, ``vjp`` and ``jvp`` mean what they mean in :mod:`ddxdb.ad`. The
 tables a loss reads may be anything the connection's own queries read: tables,
 temporary tables, views, Arrow data registered with ``con.register`` (as
@@ -303,22 +298,24 @@ class DuckDBBackend:
         It is given for a temporary view, or one in the current schema,
         whose SQL resolves names as the query does; a view in another
         schema resolves them in its own, and is left to DuckDB."""
-        parts = _name_parts(name)
+        # DuckDB matches names without regard to case, quoted or not.
+        parts = _name_parts(name, normalize=False)
         if parts is None:
             return None
-        catalog = self._sync()
-        # DuckDB matches names without regard to case, quoted or not.
         parts = [p.lower() for p in parts]
-        db, schema = self._database.lower(), self._schema.lower()
+        db, schema = (
+            p.lower() for p in self.con.execute("SELECT current_database(), current_schema()").fetchone()
+        )
         if len(parts) == 1:
             paths = [("temp", "main"), (db, schema)]
         elif len(parts) == 2:
-            paths = [(db, parts[0])] + ([("temp", "main")] if parts[0] == "temp" else [])
+            # A schema of the current database, or a database's main schema.
+            paths = [(db, parts[0]), (parts[0], "main")]
         elif len(parts) == 3:
             paths = [tuple(parts[:2])]
         else:
             return None
-        by_path = {tuple(p.lower() for p in key): what for key, what in catalog.items()}
+        by_path = {tuple(p.lower() for p in key): what for key, what in self._catalog().items()}
         for path in paths:
             found = by_path.get((*path, parts[-1]))
             if found is None:

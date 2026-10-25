@@ -345,6 +345,10 @@ def test_a_view_s_sql_is_given_where_its_names_resolve_as_the_query_s(ad, con):
     assert "SELECT 1" in backend.view_sql("here")
     assert "SELECT 1" in backend.view_sql('"HERE"')
     assert "SELECT 2" in backend.view_sql("tv")
+    assert "SELECT 2" in backend.view_sql("temp.tv")
+    assert "SELECT 1" in backend.view_sql("memory.here")
+    assert "SELECT 1" in backend.view_sql("main.here")
+    assert "SELECT 1" in backend.view_sql("memory.main.here")
     # A view in another schema reads names in its own; a table has no SQL.
     assert backend.view_sql("s.there") is None
     assert backend.view_sql("t") is None
