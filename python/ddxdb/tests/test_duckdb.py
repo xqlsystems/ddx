@@ -141,6 +141,19 @@ def test_calls_nest_in_sql(ad, con):
     assert [t for _, t in rel.fetchall()] == pytest.approx([6.0, -12.0, 3.0])
 
 
+def test_a_window_over_a_call_is_differentiated(ad, con):
+    # The jvp's query reads the grad call's result through a window, which
+    # DuckDB writes as a window relation.
+    statement = """WITH loss AS (SELECT SUM(val * val * val) AS l FROM w),
+        g AS (SELECT i, grad(loss, val) AS val FROM w),
+        p AS (SELECT i, val - MAX(val) OVER () AS val FROM g),
+        v AS (SELECT i, 1.0::DOUBLE AS val FROM w)
+        SELECT i, jvp(val, w.val, v) FROM p"""
+    # g = 3 val², so along 1 its tangent is 6 val, and the maximum's is
+    # row 1's, 6 · -2 = -12: each row's tangent is 6 val + 12.
+    assert dict(pairs(ad.sql(con, statement))) == pytest.approx({0: 18.0, 1: 0.0, 2: 15.0})
+
+
 def test_jvp_along_a_number_is_the_derivative_row_by_row(ad, con):
     rows = ad.sql(con, "SELECT i, val, jvp(sin(val), w.val, 1) AS d FROM w ORDER BY i").fetchall()
     assert [d for _, _, d in rows] == pytest.approx([math.cos(v) for _, v, _ in rows])

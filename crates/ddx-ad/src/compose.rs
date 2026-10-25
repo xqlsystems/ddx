@@ -369,6 +369,9 @@ pub(crate) struct After {
 
 impl After {
     pub(crate) fn new(programs: &[&dyn Differentiable], query: &Plan) -> Result<After> {
+        // Before the query is split at the relations it shares, which may be
+        // window relations, and its relations are redeclared.
+        let query = &*crate::forward::windows_as_projections(query);
         let namespace = crate::forward::new_namespace();
         let mut ext = Extensions::new(&Functions::from_plan(&Plan::default())?);
         let mut renamed: HashMap<String, String> = HashMap::new();
