@@ -260,13 +260,10 @@ class DataFusionBackend:
         table a view reads, so this can't be refused here as it is from
         Rust: create a view again after registering what it reads."""
         try:
+            # All of them: how the plans compare depends on the optimizer's.
             settings = dict(
                 (r["name"], r["value"])
-                for r in self.ctx.sql(
-                    "SELECT name, value FROM information_schema.df_settings WHERE name IN "
-                    "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema', "
-                    "'datafusion.sql_parser.enable_ident_normalization')"
-                )
+                for r in self.ctx.sql("SELECT name, value FROM information_schema.df_settings")
                 .to_arrow_table()
                 .to_pylist()
             )
@@ -308,7 +305,7 @@ class DataFusionBackend:
         if probe is None:
             return None
         try:
-            same = _same_plans(self.ctx, name, probe)
+            same = _same_plans(self.ctx, name, probe, settings)
         except ValueError:
             # The view's tables, or its SQL's, no longer plan.
             return None
@@ -327,11 +324,12 @@ class DataFusionBackend:
 
 
 #: Per context, each view's last optimized comparison: the two unoptimized
-#: plans it was made for, and whether the optimized ones matched.
+#: plans and the settings it was made for, and whether the optimized plans
+#: matched.
 _compared: "weakref.WeakKeyDictionary[SessionContext, dict]" = weakref.WeakKeyDictionary()
 
 
-def _same_plans(ctx: SessionContext, name: str, probe: str) -> bool:
+def _same_plans(ctx: SessionContext, name: str, probe: str, settings: dict) -> bool:
     """Whether reading the view ``name`` plans as ``probe``, its SQL read in
     its place, does.
 
@@ -341,20 +339,21 @@ def _same_plans(ctx: SessionContext, name: str, probe: str) -> bool:
     until both are optimized, which coerces both alike. Optimizing a model's
     view takes long, and a training loop asks on every step, so the plans
     are compared unoptimized first, and an optimized comparison is kept for
-    the unoptimized plans it was made for: the optimizer gives the same
-    plans for the same ones."""
+    the unoptimized plans and the session ``settings`` it was made under:
+    the optimizer gives the same plans for the same ones."""
     view = _plan_under_alias(ctx, f"SELECT * FROM {name}", optimized=False)
     query = _plan_under_alias(ctx, probe, optimized=False)
     if view == query:
         return True
     compared = _compared.setdefault(ctx, {})
+    made = (view, query, settings)
     kept = compared.get(name)
-    if kept is not None and kept[0] == view and kept[1] == query:
-        return kept[2]
+    if kept is not None and kept[0] == made:
+        return kept[1]
     same = _plan_under_alias(ctx, f"SELECT * FROM {name}", optimized=True) == _plan_under_alias(
         ctx, probe, optimized=True
     )
-    compared[name] = (view, query, same)
+    compared[name] = (made, same)
     return same
 
 

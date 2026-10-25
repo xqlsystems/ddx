@@ -713,11 +713,17 @@ def test_a_coerced_view_is_optimized_once_while_it_is_unchanged(ad, ctx, monkeyp
     assert backend.view_sql("outer_v") is not None
     assert backend.view_sql("outer_v") is not None
     assert len(optimizing) == 2
+    # The comparison depends on how the session optimizes: under another
+    # setting it is made again.
+    ctx.sql("SET datafusion.optimizer.max_passes = 1").collect()
+    assert backend.view_sql("outer_v") is not None
+    assert len(optimizing) == 4
+    ctx.sql("SET datafusion.optimizer.max_passes = 3").collect()
     # Redefined beneath it, the view still runs the inner view it was made
     # with: its plans change, and are compared again.
     ctx.sql("CREATE OR REPLACE VIEW inner_v AS SELECT i, val * 4 AS v FROM w").collect()
     assert backend.view_sql("outer_v") is None
-    assert len(optimizing) == 4
+    assert len(optimizing) == 6
 
 
 def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
