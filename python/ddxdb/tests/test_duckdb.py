@@ -372,6 +372,61 @@ def test_a_view_whose_cte_is_read_twice_is_differentiated(ad, con):
     assert pairs(ad.sql(con, loss)) == [(0, 8.0), (1, -16.0), (2, 4.0)]
 
 
+def test_a_view_whose_cte_computes_a_window_and_is_read_twice_is_differentiated(ad, con):
+    # A softmax: its weights, a window, are read by the output and by their
+    # sum. DuckDB writes a window as a relation of its own, which ddx reads
+    # as a projection.
+    con.execute(
+        """CREATE VIEW m AS WITH s AS (SELECT i, exp(val - MAX(val) OVER ()) AS y FROM w)
+           SELECT a.i, a.y / t.z AS y FROM s a CROSS JOIN (SELECT SUM(y) AS z FROM s) t"""
+    )
+    loss = "WITH loss AS (SELECT SUM(y * y) AS l FROM m) SELECT i, grad(loss, val) FROM w"
+    # l = Σ pᵢ², so ∂l/∂valₖ = 2 pₖ (pₖ - l).
+    e = [math.exp(v) for v in (1.0, -2.0, 0.5)]
+    p = [x / sum(e) for x in e]
+    l = sum(x * x for x in p)
+    got = pairs(ad.sql(con, loss))
+    assert [i for i, _ in got] == [0, 1, 2]
+    assert [g for _, g in got] == pytest.approx([2 * x * (x - l) for x in p], abs=1e-15)
+
+
+def test_attention_is_differentiated_through_its_softmax_view(ad):
+    # The view's weights are read by their normalizer and by the heads,
+    # which join the values and the normalizer on the same keys: DuckDB's
+    # plan joins the values to the normalizer on them too, so a key repeats.
+    con = duckdb.connect()
+    for name, val in [("q", "sin(1 + 3 * t + c)"), ("k", "cos(1 + 3 * t + c)"), ("v", "sin(2 + 3 * t + c)")]:
+        con.execute(f"CREATE TABLE {name} AS SELECT t, c, {val} AS val FROM range(3) a(t), range(2) b(c)")
+    con.execute(
+        """CREATE VIEW attention AS
+           WITH scores AS (
+             SELECT q.t AS i, k.t AS j, SUM(q.val * k.val) AS x
+             FROM q JOIN k ON q.c = k.c GROUP BY q.t, k.t),
+           weights AS (
+             SELECT i, j, exp(x - MAX(x) OVER (PARTITION BY i)) AS p FROM scores),
+           norm AS (SELECT i, SUM(p) AS z FROM weights GROUP BY i)
+           SELECT a.i AS t, v.c, SUM(a.p / n.z * v.val) AS val
+           FROM weights a JOIN v ON a.j = v.t JOIN norm n ON a.i = n.i
+           GROUP BY a.i, v.c"""
+    )
+
+    def loss():
+        return con.execute("SELECT SUM(val * val) FROM attention").fetchone()[0]
+
+    for table in ["q", "k"]:
+        sql = f"WITH loss AS (SELECT SUM(val * val) AS l FROM attention) SELECT t, c, grad(loss, val) FROM {table}"
+        got = sorted(ad.sql(con, sql).fetchall())
+        # The engine's own central differences of the loss.
+        h, want = 1e-6, []
+        for t, c, _ in got:
+            moved = []
+            for step in (h, -2 * h, h):
+                con.execute(f"UPDATE {table} SET val = val + {step} WHERE t = {t} AND c = {c}")
+                moved.append(loss())
+            want.append((moved[0] - moved[1]) / (2 * h))
+        assert [g for _, _, g in got] == pytest.approx(want, abs=1e-8)
+
+
 def test_a_view_s_sql_is_given_where_its_names_resolve_as_the_query_s(ad, con):
     con.execute("CREATE SCHEMA s")
     con.execute("CREATE VIEW here AS SELECT 1 AS x")
