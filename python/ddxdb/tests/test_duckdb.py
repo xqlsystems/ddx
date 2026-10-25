@@ -325,6 +325,30 @@ def test_the_planner_plans_under_the_connection_s_settings(ad, con):
     assert pairs(ad.sql(con, loss)) == [(0, 0.0), (1, 0.0), (2, 1.0)]
 
 
+def test_a_filter_on_a_table_s_column_keeps_the_table_s_rows(ad, con):
+    # The planner's copy of each table is empty. Planned with DuckDB's
+    # statistics, `WHERE p.layer = 0` would match no rows, and the plan would
+    # leave p's scan out.
+    con.register(
+        "p",
+        pa.table(
+            {
+                "layer": pa.array([0, 0, 1], pa.int64()),
+                "i": pa.array([0, 1, 0], pa.int64()),
+                "w": pa.array([3.0, 5.0, 7.0]),
+            }
+        ),
+    )
+    loss = "WITH loss AS (SELECT SUM(w.val * p.w) AS l FROM w JOIN p ON w.i = p.i WHERE p.layer = 0) "
+    # l = 3 val₀ + 5 val₁.
+    assert pairs(ad.sql(con, loss + "SELECT i, grad(loss, val) FROM w")) == [(0, 3.0), (1, 5.0), (2, 0.0)]
+    assert pairs(ad.sql(con, loss + "SELECT layer, i, grad(loss, w) FROM p")) == [
+        (0, 0, 1.0),
+        (0, 1, -2.0),
+        (1, 0, 0.0),
+    ]
+
+
 def test_a_view_that_cannot_be_copied_is_tried_again(ad, con):
     con.execute("CREATE TABLE t AS SELECT * FROM w")
     con.execute("CREATE VIEW m AS SELECT i, val FROM t")

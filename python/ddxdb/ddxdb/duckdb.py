@@ -116,6 +116,10 @@ class DuckDBBackend:
         self._con = weakref.ref(con)
         self._planner = duckdb.connect()
         _load_substrait(self._planner)
+        # The mirror's tables are empty, and DuckDB's statistics would say
+        # so: a filter on one's column (`WHERE layer = 0`) would be planned
+        # as no rows, and its scan left out of the plan.
+        self._planner.execute("SET disabled_optimizers = 'statistics_propagation'")
         # What the planner mirrors: each object's columns or view SQL, as last
         # copied, so an unchanged catalog is not copied again.
         self._mirrored: dict = {}
