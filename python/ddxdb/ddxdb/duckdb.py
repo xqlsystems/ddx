@@ -11,7 +11,8 @@ its gradient in SQL, as :mod:`ddxdb.ad` does on DataFusion::
     from ddxdb import duckdb as ad
 
     con = duckdb.connect()
-    con.execute("CREATE TABLE w AS SELECT * FROM (VALUES (0, 1.0), (1, 2.0)) v(i, val)")
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, 2.0)")
     ad.sql(con, '''
         WITH loss AS (SELECT SUM(val * val) AS l FROM w)
         SELECT i, val - 0.1 * grad(loss, val) AS val FROM w
@@ -53,7 +54,7 @@ try:
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
-from . import Programs, rewrite
+from . import Programs, _name_parts, rewrite
 from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
 __all__ = ["DuckDBBackend", "sql", "sql_all"]
@@ -288,6 +289,41 @@ class DuckDBBackend:
         # settings that change what a query means; not on any values.
         catalog = self._sync()
         return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items())))
+
+    def view_sql(self, name: str) -> Optional[str]:
+        """The SQL of the view ``name`` reads, so ddx plans each CTE the
+        view reads more than once on its own: DuckDB's Substrait producer
+        has no plan for a CTE it materializes. DuckDB binds a view's SQL by
+        name each time a query reads the view, so the SQL means what runs.
+        It is given for a temporary view, or one in the current schema,
+        whose SQL resolves names as the query does; a view in another
+        schema resolves them in its own, and is left to DuckDB."""
+        # DuckDB matches names without regard to case, quoted or not.
+        parts = _name_parts(name, normalize=False)
+        if parts is None:
+            return None
+        parts = [p.lower() for p in parts]
+        db, schema = (
+            p.lower() for p in self.con.execute("SELECT current_database(), current_schema()").fetchone()
+        )
+        if len(parts) == 1:
+            paths = [("temp", "main"), (db, schema)]
+        elif len(parts) == 2:
+            # A schema of the current database, or a database's main schema.
+            paths = [(db, parts[0]), (parts[0], "main")]
+        elif len(parts) == 3:
+            paths = [tuple(parts[:2])]
+        else:
+            return None
+        by_path = {tuple(p.lower() for p in key): what for key, what in self._catalog().items()}
+        for path in paths:
+            found = by_path.get((*path, parts[-1]))
+            if found is None:
+                continue
+            kind, sql = found
+            here = path == ("temp", "main") or path == (db, schema)
+            return sql if kind == "view" and here else None
+        return None
 
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")

@@ -26,6 +26,7 @@ you wrote, ``InvalidColumn`` that a column cannot be differentiated. Catch the
 one you can act on rather than matching on message text.
 """
 
+import re
 from dataclasses import dataclass, field
 from importlib import metadata as _metadata
 from typing import Optional, Protocol, Sequence
@@ -53,6 +54,28 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     vjp_plan,
 )
 from ._ddxdb import _rewrite
+
+
+#: One part of a table name: quoted, with ``""`` for a quote inside it, or
+#: unquoted, up to the next dot.
+_PART = r'"(?:[^"]|"")*"|[^."]+'
+_NAME = re.compile(rf"(?:{_PART})(?:\.(?:{_PART}))*")
+
+
+def _name_parts(name: str, normalize: bool = True) -> Optional[list]:
+    """The parts of a table name as SQL writes it: a quoted part as
+    written, an unquoted one in lower case if ``normalize``, as DataFusion
+    resolves them by default; ``None`` if it does not parse."""
+    if not _NAME.fullmatch(name):
+        return None
+    return [
+        part[1:-1].replace('""', '"')
+        if part.startswith('"')
+        else part.lower()
+        if normalize
+        else part
+        for part in re.findall(_PART, name)
+    ]
 
 
 class Backend(Protocol):

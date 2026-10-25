@@ -65,7 +65,6 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
-import re
 import warnings
 import weakref
 from typing import NamedTuple, Optional, Sequence, Union
@@ -82,7 +81,7 @@ from ._ddxdb import (
     _not_in_subquery,
     _view_probe,
 )
-from . import Backend, Programs, rewrite
+from . import Backend, Programs, _name_parts, rewrite
 from ._ddxdb import (
     BackwardProgram,
     Check,
@@ -406,28 +405,6 @@ def _warn_if_view(ctx: SessionContext, parts: list) -> None:
             "SessionConfig().with_information_schema(True).",
             stacklevel=2,
         )
-
-
-#: One part of a table name: quoted, with ``""`` for a quote inside it, or
-#: unquoted, up to the next dot.
-_PART = r'"(?:[^"]|"")*"|[^."]+'
-_NAME = re.compile(rf"(?:{_PART})(?:\.(?:{_PART}))*")
-
-
-def _name_parts(name: str, normalize: bool = True) -> Optional[list]:
-    """The parts of a table name as SQL writes it, as DataFusion resolves
-    them: a quoted part as written, an unquoted one in lower case if
-    ``normalize``; ``None`` if it does not parse."""
-    if not _NAME.fullmatch(name):
-        return None
-    return [
-        part[1:-1].replace('""', '"')
-        if part.startswith('"')
-        else part.lower()
-        if normalize
-        else part
-        for part in re.findall(_PART, name)
-    ]
 
 
 class Outputs(NamedTuple):

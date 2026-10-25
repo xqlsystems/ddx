@@ -38,6 +38,7 @@
 //! derivative (a window rank, the `NULL` side of an outer join); each carries
 //! a refusal that is raised only if gradient actually reaches it.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -45,7 +46,7 @@ use std::rc::Rc;
 use prost::Message;
 
 use substrait::proto::aggregate_rel::Grouping;
-use substrait::proto::expression::RexType;
+use substrait::proto::expression::{RexType, WindowFunction};
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
@@ -53,8 +54,8 @@ use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::EmitKind;
 use substrait::proto::{
-    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, JoinRel, NamedStruct, Plan,
-    PlanRel, ProjectRel, ReadRel, Rel, RelCommon, SortRel,
+    AggregateFunction, AggregateRel, ConsistentPartitionWindowRel, CrossRel, Expression, FetchRel,
+    JoinRel, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, SortRel,
 };
 
 use crate::elementwise::depends;
@@ -65,8 +66,8 @@ use crate::expr::{
 };
 use crate::functions::Functions;
 use crate::optics::{
-    subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs, RelKind, Rex,
-    Setter, Tree,
+    subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs, PlanRels,
+    RelKind, Rex, Setter, Tree,
 };
 use crate::reduce::{reduce_rule, whole_partition, Reduce};
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
@@ -374,6 +375,7 @@ impl Forward {
     /// [`Forward::new`], naming every table the program writes under
     /// `namespace` rather than a fresh one.
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
+        let plan = &*windows_as_projections(plan);
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = checked_root(plan)?;
         let order = shared_relations(root, &plan.relations)?;
@@ -449,6 +451,55 @@ pub(crate) fn checked_root(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
         }
     }
     Ok((root, names))
+}
+
+/// `plan` with each window relation written as the projection of its
+/// window functions, the form DataFusion's producer writes and ddx's rules
+/// read; DuckDB's producer writes a `ConsistentPartitionWindowRel`. Both
+/// give their input's columns, then one per function, so the emit carries
+/// over. A plan with none is borrowed as it is.
+pub(crate) fn windows_as_projections(plan: &Plan) -> Cow<'_, Plan> {
+    let windows = PlanRels.then(Deep).then(RelKind);
+    if !windows.any(plan, |kind| matches!(kind, RelType::Window(_))) {
+        return Cow::Borrowed(plan);
+    }
+    let mut plan = plan.clone();
+    PlanRels.then(Deep).modify(&mut plan, |rel| {
+        if let Some(RelType::Window(w)) = &mut rel.rel_type {
+            let w = std::mem::take(&mut **w);
+            rel.rel_type = Some(RelType::Project(Box::new(window_as_projection(w))));
+        }
+    });
+    Cow::Owned(plan)
+}
+
+fn window_as_projection(w: ConsistentPartitionWindowRel) -> ProjectRel {
+    let expressions = w
+        .window_functions
+        .into_iter()
+        .map(|f| Expression {
+            rex_type: Some(RexType::WindowFunction(WindowFunction {
+                function_reference: f.function_reference,
+                arguments: f.arguments,
+                options: f.options,
+                output_type: f.output_type,
+                phase: f.phase,
+                sorts: w.sorts.clone(),
+                invocation: f.invocation,
+                partitions: w.partition_expressions.clone(),
+                bounds_type: f.bounds_type,
+                lower_bound: f.lower_bound,
+                upper_bound: f.upper_bound,
+                ..Default::default()
+            })),
+        })
+        .collect();
+    ProjectRel {
+        common: w.common,
+        input: w.input,
+        expressions,
+        advanced_extension: w.advanced_extension,
+    }
 }
 
 /// The relation at `ordinal` of `relations`, which a `ReferenceRel` names.
@@ -1796,6 +1847,11 @@ pub fn width(rel: &Rel) -> Result<usize> {
                     a.common.as_ref(),
                 )
             }
+            // Its input's columns, then one per function.
+            RelType::Window(w) => (
+                width(input(&w.input)?)? + w.window_functions.len(),
+                w.common.as_ref(),
+            ),
             RelType::Set(s) => (
                 width(s.inputs.first().ok_or_else(|| {
                     AdError::InvalidPlan("a set operation with no inputs".into())
@@ -1904,6 +1960,63 @@ pub(crate) fn rel_name(kind: &RelType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_relation_is_read_as_the_projection_of_its_functions() {
+        use substrait::proto::consistent_partition_window_rel::WindowRelFunction;
+        use substrait::proto::rel_common::Emit;
+        use substrait::proto::{FunctionArgument, RelRoot};
+        let rooted = |rel: Rel, names: Vec<String>| Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(PlanRelType::Root(RelRoot {
+                    input: Some(rel),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        };
+        let common = Some(RelCommon {
+            emit_kind: Some(EmitKind::Emit(Emit {
+                output_mapping: vec![2],
+            })),
+            ..Default::default()
+        });
+        let window = Rel {
+            rel_type: Some(RelType::Window(Box::new(ConsistentPartitionWindowRel {
+                common: common.clone(),
+                input: Some(Box::new(emit::read_step("t", vec!["a".into(), "b".into()]))),
+                window_functions: vec![WindowRelFunction {
+                    function_reference: 7,
+                    arguments: vec![FunctionArgument {
+                        arg_type: Some(ArgType::Value(field(1))),
+                    }],
+                    ..Default::default()
+                }],
+                partition_expressions: vec![field(0)],
+                sorts: vec![],
+                advanced_extension: None,
+            }))),
+        };
+        let plan = rooted(window, vec!["w".into()]);
+        let read = windows_as_projections(&plan);
+        let (root, _) = root_of(&read).unwrap();
+        let Some(RelType::Project(p)) = &root.rel_type else {
+            panic!("{root:?}")
+        };
+        // The same columns: the input's, then the function's, under its emit.
+        assert_eq!(p.common, common);
+        let [e] = p.expressions.as_slice() else {
+            panic!("{p:?}")
+        };
+        let Some(RexType::WindowFunction(f)) = &e.rex_type else {
+            panic!("{e:?}")
+        };
+        assert_eq!(f.function_reference, 7);
+        assert_eq!(f.partitions, vec![field(0)]);
+        // A plan with none is not copied.
+        let plain = rooted(emit::read_step("t", vec!["a".into()]), vec!["a".into()]);
+        assert!(matches!(windows_as_projections(&plain), Cow::Borrowed(_)));
+    }
 
     #[test]
     fn a_namespace_separates_its_clock_from_its_counter() {

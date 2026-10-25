@@ -112,6 +112,7 @@
 mod build;
 mod cache;
 mod find;
+mod parse;
 mod plan;
 mod rewrite;
 mod share;

@@ -31,7 +31,6 @@ use ddx_core::sqlparser::ast::{
     Visit, VisitMut, Visitor, With,
 };
 use ddx_core::sqlparser::dialect::GenericDialect;
-use ddx_core::sqlparser::parser::Parser;
 
 use super::build::{quoted, rename_reads, same};
 use crate::run::Backend;
@@ -293,7 +292,7 @@ pub fn view_probe(sql: &str) -> Option<String> {
 /// The query of a view's SQL, `CREATE VIEW … AS <query>` or the query
 /// alone, and its column list; `None` if it does not parse as either.
 fn definition(sql: &str) -> Option<(Query, Vec<TableAliasColumnDef>)> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let mut statements = super::parse::parse(&GenericDialect {}, sql).ok()?;
     if statements.len() != 1 {
         return None;
     }
@@ -377,6 +376,7 @@ fn rename<V: VisitMut>(node: &mut V, from: &ObjectName, to: &str) {
 mod tests {
     use super::*;
     use crate::program::Bound;
+    use ddx_core::sqlparser::parser::Parser;
     use substrait::proto::{NamedStruct, Plan};
 
     /// A backend that knows only views' SQL.
