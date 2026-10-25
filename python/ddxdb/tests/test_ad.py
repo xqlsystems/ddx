@@ -695,6 +695,31 @@ def test_a_view_whose_sql_needs_coercion_has_its_sql_given(ad, ctx):
     assert "val * 2" in ad.DataFusionBackend(ctx).view_sql("m")
 
 
+def test_a_coerced_view_is_optimized_once_while_it_is_unchanged(ad, ctx, monkeypatch):
+    # Its plans match only once optimized, which a large model's view takes
+    # long to be; a training loop asks on every step.
+    ctx.sql("CREATE VIEW inner_v AS SELECT i, val * 2 AS v FROM w").collect()
+    ctx.sql("CREATE VIEW outer_v AS SELECT i, v * 3 AS v FROM inner_v").collect()
+    real = ad._plan_under_alias
+    optimizing = []
+
+    def counted(c, sql, *, optimized: bool):
+        if optimized:
+            optimizing.append(sql)
+        return real(c, sql, optimized=optimized)
+
+    monkeypatch.setattr(ad, "_plan_under_alias", counted)
+    backend = ad.DataFusionBackend(ctx)
+    assert backend.view_sql("outer_v") is not None
+    assert backend.view_sql("outer_v") is not None
+    assert len(optimizing) == 2
+    # Redefined beneath it, the view still runs the inner view it was made
+    # with: its plans change, and are compared again.
+    ctx.sql("CREATE OR REPLACE VIEW inner_v AS SELECT i, val * 4 AS v FROM w").collect()
+    assert backend.view_sql("outer_v") is None
+    assert len(optimizing) == 4
+
+
 def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
     # DataFusion keeps the plan outer_v was made with, which reads the first
     # inner_v; its SQL now reads the second.
