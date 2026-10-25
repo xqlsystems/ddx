@@ -260,13 +260,10 @@ class DataFusionBackend:
         table a view reads, so this can't be refused here as it is from
         Rust: create a view again after registering what it reads."""
         try:
+            # All of them: how the plans compare depends on the optimizer's.
             settings = dict(
                 (r["name"], r["value"])
-                for r in self.ctx.sql(
-                    "SELECT name, value FROM information_schema.df_settings WHERE name IN "
-                    "('datafusion.catalog.default_catalog', 'datafusion.catalog.default_schema', "
-                    "'datafusion.sql_parser.enable_ident_normalization')"
-                )
+                for r in self.ctx.sql("SELECT name, value FROM information_schema.df_settings")
                 .to_arrow_table()
                 .to_pylist()
             )
@@ -308,9 +305,7 @@ class DataFusionBackend:
         if probe is None:
             return None
         try:
-            same = _plan_under_alias(self.ctx, f"SELECT * FROM {name}") == _plan_under_alias(
-                self.ctx, probe
-            )
+            same = _same_plans(self.ctx, name, probe, settings)
         except ValueError:
             # The view's tables, or its SQL's, no longer plan.
             return None
@@ -328,16 +323,47 @@ class DataFusionBackend:
         self.ctx.deregister_table(name)
 
 
-def _plan_under_alias(ctx: SessionContext, sql: str) -> str:
-    """The optimized plan of ``sql``, a ``SELECT *`` from one aliased
-    relation, under the alias: what that relation reads.
+#: Per context, each view's last optimized comparison: the two unoptimized
+#: plans and the settings it was made for, and whether the optimized plans
+#: matched.
+_compared: "weakref.WeakKeyDictionary[SessionContext, dict]" = weakref.WeakKeyDictionary()
 
-    Optimized, because DataFusion coerces the plan it keeps for a view
-    (``val * 2`` over a DOUBLE becomes ``val * CAST(2 AS DOUBLE)``) and
-    Python can't coerce the probe's plan alone; optimizing coerces both
-    alike. The ``SELECT *`` projection above the alias may be optimized
-    away, so the plan is read from below the first alias."""
-    plan = ctx.sql(sql).optimized_logical_plan()
+
+def _same_plans(ctx: SessionContext, name: str, probe: str, settings: dict) -> bool:
+    """Whether reading the view ``name`` plans as ``probe``, its SQL read in
+    its place, does.
+
+    DataFusion coerces the plan it keeps for a view (``val * 2`` over a
+    DOUBLE becomes ``val * CAST(2 AS DOUBLE)``), and Python can't coerce the
+    probe's plan alone, so a view that needs coercion plans unlike its SQL
+    until both are optimized, which coerces both alike. Optimizing a model's
+    view takes long, and a training loop asks on every step, so the plans
+    are compared unoptimized first, and an optimized comparison is kept for
+    the unoptimized plans and the session ``settings`` it was made under:
+    the optimizer gives the same plans for the same ones."""
+    view = _plan_under_alias(ctx, f"SELECT * FROM {name}", optimized=False)
+    query = _plan_under_alias(ctx, probe, optimized=False)
+    if view == query:
+        return True
+    compared = _compared.setdefault(ctx, {})
+    made = (view, query, settings)
+    kept = compared.get(name)
+    if kept is not None and kept[0] == made:
+        return kept[1]
+    same = _plan_under_alias(ctx, f"SELECT * FROM {name}", optimized=True) == _plan_under_alias(
+        ctx, probe, optimized=True
+    )
+    compared[name] = (made, same)
+    return same
+
+
+def _plan_under_alias(ctx: SessionContext, sql: str, *, optimized: bool) -> str:
+    """The plan of ``sql``, a ``SELECT *`` from one aliased relation, under
+    the alias: what that relation reads. Optimizing may remove the ``SELECT
+    *`` projection above the alias, so the plan is read from below the
+    first alias."""
+    df = ctx.sql(sql)
+    plan = df.optimized_logical_plan() if optimized else df.logical_plan()
     while plan.to_variant().__class__.__name__ != "SubqueryAlias":
         inputs = plan.inputs()
         if len(inputs) != 1:
