@@ -52,6 +52,10 @@ other's tables, and a user's table is never replaced unless its name starts
 with ``__ddx_``, which is reserved. None of them stays once :func:`run`
 returns.
 
+A training loop runs the same statements on every batch: :func:`prepare`
+prepares them once, and each later call runs the same plans again, without
+planning, keying or reading views.
+
 One limit Rust's ``ddx_datafusion::ad`` does not share: datafusion-python's
 Substrait consumer names a computed column by its whole expression, so a deep
 chain of row-wise maps that each read their input twice (twenty
@@ -65,9 +69,10 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
+import threading
 import warnings
 import weakref
-from typing import NamedTuple, Optional, Sequence, Union
+from typing import Callable, NamedTuple, Optional, Sequence, Union
 
 try:
     import pyarrow as pa
@@ -81,7 +86,7 @@ from ._ddxdb import (
     _not_in_subquery,
     _view_probe,
 )
-from . import Backend, Programs, _name_parts, rewrite
+from . import Backend, Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import (
     BackwardProgram,
     Check,
@@ -115,6 +120,7 @@ __all__ = [
     "jvp",
     "register_stop_gradient",
     "Outputs",
+    "prepare",
     "run",
     "sql",
     "sql_all",
@@ -557,3 +563,46 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
         # SessionContext's own sql, not a ddxdb.Context's, which would look for
         # calls again.
         return [SessionContext.sql(ctx, s) for s in rewritten.statements]
+
+
+def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional[str] = None) -> Callable[[], list]:
+    """:func:`sql_all`'s ``statements``, prepared to run again on ``ctx``, as
+    ``jax.jit`` prepares a function. Returns a function of no arguments that
+    runs them and returns what :func:`sql_all` would::
+
+        step = ad.prepare(ctx, statements)
+        for batch in batches:
+            ctx.register_record_batches("batch", [batch])
+            new_weights = step()
+
+    Its first call computes the calls as :func:`sql_all` does. Every later
+    one runs the same plans again (:class:`ddxdb.Prepared`), so it skips
+    what a call of :func:`sql_all` repeats: planning the objective, keying
+    each program, and checking that each view's SQL is still what
+    DataFusion runs for it.
+
+    In return, the tables the statements read must keep their schemas and
+    the views their definitions. Between calls, a table may change its
+    rows, or be registered again under its name, but not change its columns
+    or their types. A view redefined is not seen, and the old definition is
+    differentiated; prepare the statements again after changing one. Calls
+    wait for each other, since each writes the same tables.
+
+    ``ctx`` may be a DuckDB connection instead, which
+    :func:`ddxdb.duckdb.prepare` prepares on."""
+    if _duckdb(ctx):
+        from . import duckdb as on_duckdb
+
+        if dialect not in (None, "duckdb"):
+            raise ValueError(f"a DuckDB connection's statements are in DuckDB's dialect, not {dialect!r}")
+        return on_duckdb.prepare(ctx, statements)
+    prepared = Prepared(DataFusionBackend(ctx), statements, dialect or "datafusion")
+    lock = threading.Lock()
+
+    def run() -> list:
+        with lock, prepared.run() as rewritten:
+            # As in sql_all: SessionContext's own sql, and the tables leave
+            # the catalog once every statement is planned.
+            return [SessionContext.sql(ctx, s) for s in rewritten.statements]
+
+    return run

@@ -227,12 +227,57 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
+    run_bound(backend, program, Plans::Bind(None)).await
+}
+
+/// Where [`run_bound`] takes each plan from, its checks' then its steps',
+/// in order.
+pub(crate) enum Plans<'a> {
+    /// Bound as it runs, asking the engine for each schema, and kept here
+    /// if given.
+    Bind(Option<&'a mut Vec<Bound>>),
+    /// As an earlier run of the program, on the same tables, bound them.
+    Bound(&'a [Bound]),
+}
+
+impl Plans<'_> {
+    /// Plan `i` of the program, `plan` bound.
+    async fn get<B: Backend>(
+        &mut self,
+        backend: &mut B,
+        i: usize,
+        plan: &Unbound,
+        schemas: &mut HashMap<String, NamedStruct>,
+    ) -> Result<Bound, RunError<B::Error>> {
+        match self {
+            Plans::Bind(kept) => {
+                let bound = bind(backend, plan, schemas).await?;
+                if let Some(kept) = kept {
+                    kept.push(bound.clone());
+                }
+                Ok(bound)
+            }
+            Plans::Bound(plans) => plans.get(i).cloned().ok_or_else(|| {
+                RunError::Refused(AdError::Internal(format!(
+                    "plan {i} of a program was never bound"
+                )))
+            }),
+        }
+    }
+}
+
+/// [`run`], with each plan from `plans`.
+pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
+    backend: &mut B,
+    program: &P,
+    mut plans: Plans<'_>,
+) -> Result<(), RunError<B::Error>> {
     let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
     let result = async {
         let mut checks = Vec::with_capacity(program.checks().len());
-        for check in program.checks() {
-            checks.push(bind(backend, &check.plan, &mut schemas).await?);
+        for (i, check) in program.checks().iter().enumerate() {
+            checks.push(plans.get(backend, i, &check.plan, &mut schemas).await?);
         }
         let rows = if checks.is_empty() {
             Vec::new()
@@ -247,8 +292,10 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
                 program.checks()[i].message.clone(),
             )));
         }
-        for step in &steps {
-            let plan = bind(backend, &step.plan, &mut schemas).await?;
+        for (i, step) in steps.iter().enumerate() {
+            let plan = plans
+                .get(backend, checks.len() + i, &step.plan, &mut schemas)
+                .await?;
             // A table rewritten has the schema of this run's plan.
             schemas.remove(&step.name);
             backend

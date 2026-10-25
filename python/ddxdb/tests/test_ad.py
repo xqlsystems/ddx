@@ -763,3 +763,65 @@ def test_a_subquery_with_no_condition_on_the_outer_row_is_differentiated(ad, ctx
         "SELECT i, grad(loss, val) FROM w"
     )
     assert pairs(ad.sql(ctx, statement)) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+
+
+STEP = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, val - 0.1 * grad(loss, val) AS val FROM w"
+HVP = """WITH loss AS (SELECT SUM(val * val * val) AS l FROM w),
+              g AS (SELECT i, grad(loss, val) AS val FROM w)
+         SELECT i, jvp(val, w.val, b) AS hv FROM g"""
+
+
+def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, ctx):
+    step = ad.prepare(ctx, [STEP, HVP])
+    for k in range(3):
+        got = [pairs(df) for df in step()]
+        want = [pairs(df) for df in ad.sql_all(ctx, [STEP, HVP])]
+        assert got == want
+        assert not [t for t in ctx.catalog().schema().names() if t.startswith("__ddx_")]
+        # The next step's weights and a new direction, registered again as
+        # a training loop registers them.
+        ctx.deregister_table("w")
+        ctx.register_record_batches("w", [table([i for i, _ in got[0]], [v for _, v in got[0]]).to_batches()])
+        ctx.deregister_table("b")
+        ctx.register_record_batches("b", [table([0, 1, 2], [1.0, float(k), -1.0]).to_batches()])
+
+
+def test_a_later_prepared_call_asks_the_backend_only_to_run_plans(ad, ctx, monkeypatch):
+    ctx.sql("CREATE VIEW m AS SELECT i, val FROM w").collect()
+    asked = []
+    for method in ["select_all", "plan_sql", "plan_key", "view_sql", "returns_rows", "materialize"]:
+        original = getattr(ad.DataFusionBackend, method)
+
+        def spy(self, *args, _method=method, _original=original):
+            asked.append(_method)
+            return _original(self, *args)
+
+        monkeypatch.setattr(ad.DataFusionBackend, method, spy)
+    step = ad.prepare(ctx, ["WITH loss AS (SELECT SUM(val * val) AS l FROM m) SELECT i, grad(loss, val) FROM w"])
+    assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    assert {"plan_sql", "view_sql", "select_all"} <= set(asked) and "plan_key" not in asked
+    asked.clear()
+    assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    assert set(asked) <= {"returns_rows", "materialize"}, asked
+
+
+def test_a_failed_prepared_call_leaves_nothing_and_the_next_runs(ad, ctx):
+    step = ad.prepare(ctx, [STEP])
+    step()
+    ctx.deregister_table("w")
+    ctx.register_record_batches("w", [table([0, 0], [1.0, 2.0]).to_batches()])
+    with pytest.raises(ddxdb.InvalidColumn):
+        step()
+    assert not [t for t in ctx.catalog().schema().names() if t.startswith("__ddx_")]
+    ctx.deregister_table("w")
+    ctx.register_record_batches("w", [table([0, 1, 2], [3.0, 0.0, -1.0]).to_batches()])
+    assert dict(pairs(step()[0])) == pytest.approx({0: 3.0 - 2.7, 1: 0.0, 2: -1.0 - 0.3})
+
+
+def test_a_failed_first_prepared_call_prepares_nothing(ad, ctx):
+    prepared = ddxdb.prepare(ad.DataFusionBackend(ctx), [STEP.replace("FROM w", "FROM missing", 1)])
+    with pytest.raises(Exception):
+        prepared.run()
+    assert "not yet run" in repr(prepared)
+    with pytest.raises(TypeError):
+        ddxdb.prepare(ad.DataFusionBackend(ctx), STEP)

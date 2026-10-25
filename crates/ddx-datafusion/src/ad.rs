@@ -419,6 +419,88 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     frames
 }
 
+/// `statements`, prepared to run again on `ctx`: their `grad`, `vjp` and
+/// `jvp` calls computed on the first [`Prepared::run`] as [`sql_all`]
+/// computes them, and on every later one by running the same plans again
+/// ([`ddx_ad::Prepared`]), as `jax.jit` traces a function once and runs
+/// what it traced after that. A training loop prepares its step's
+/// statements once and runs them on every batch:
+///
+/// ```no_run
+/// # use datafusion::prelude::SessionContext;
+/// # use ddx_datafusion::ad;
+/// # async fn train(ctx: &SessionContext) -> datafusion::error::Result<()> {
+/// let step = ad::prepare(
+///     ctx,
+///     &["WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+///        SELECT i, val - 0.1 * grad(loss, val) AS val FROM w"],
+/// );
+/// for _ in 0..100 {
+///     let w = step.run().await?.remove(0).collect().await?;
+///     // Register `w`'s new rows as `w`, then run the next step.
+/// #   let _ = w;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A later run asks DataFusion for no plan of a query, so it skips what a
+/// call of [`sql_all`] repeats: planning the objective, keying the program,
+/// reading the views. In return, the tables the statements read must keep
+/// their schemas and the views their definitions: a table may change its
+/// rows, or be registered again under its name, between runs. A view
+/// redefined is not seen, and the old definition differentiated; prepare
+/// the statements again after changing one.
+pub fn prepare(ctx: &SessionContext, statements: &[&str]) -> Prepared {
+    Prepared {
+        ctx: ctx.clone(),
+        statements: statements.iter().map(|s| s.to_string()).collect(),
+        prepared: tokio::sync::Mutex::new(None),
+    }
+}
+
+/// Statements prepared to run again ([`prepare`]).
+pub struct Prepared {
+    ctx: SessionContext,
+    statements: Vec<String>,
+    /// Once a run has succeeded. Locked while one runs, since every run
+    /// writes the same tables.
+    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared>>,
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("statements", &self.statements)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Prepared {
+    /// Run the statements, as [`sql_all`] does: each a DataFrame that holds
+    /// what it reads. The first run that succeeds prepares them; a failed
+    /// one prepares nothing, and the next tries again. Runs wait for each
+    /// other.
+    pub async fn run(&self) -> Result<Vec<DataFrame>> {
+        let mut prepared = self.prepared.lock().await;
+        let mut engine = DataFusion(self.ctx.clone());
+        let out = match &*prepared {
+            Some(p) => p.run(&mut engine).await.map_err(from_run_error)?,
+            None => {
+                let statements: Vec<&str> = self.statements.iter().map(String::as_str).collect();
+                let (p, out) = ddx_ad::prepare(&mut engine, &statements, &GenericDialect {})
+                    .await
+                    .map_err(from_run_error)?;
+                *prepared = Some(p);
+                out
+            }
+        };
+        let frames = plan_each(&self.ctx, &out.statements).await;
+        out.release(&mut engine, &Programs::new()).await?;
+        frames
+    }
+}
+
 /// The programs [`sql_all`] keeps on `ctx` (and every context that shares
 /// its state), put there on first use.
 fn programs(ctx: &SessionContext) -> Arc<Programs> {

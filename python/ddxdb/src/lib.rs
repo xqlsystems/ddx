@@ -837,6 +837,53 @@ fn _rewrite(
     Ok((statements, tables, release))
 }
 
+/// `_rewrite`, once, keeping what ran to run again (`ddx_ad::prepare`):
+/// returns the `_Prepared`, then what `_rewrite` returns. Every program is
+/// built, and none kept in a `Programs`, so `plan_key` is never asked.
+#[pyfunction]
+#[pyo3(signature = (backend, statements, dialect = "datafusion"))]
+fn _prepare(
+    backend: Bound<'_, PyAny>,
+    statements: Vec<String>,
+    dialect: &str,
+) -> PyResult<(Prepared, Vec<String>, Vec<String>, Release)> {
+    let parser = parser_for(dialect)?;
+    let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+    let mut backend = PyBackend(backend.unbind());
+    let (prepared, out) =
+        now(ddx_ad::prepare(&mut backend, &refs, parser.as_ref())).map_err(run_err)?;
+    let (statements, tables) = (out.statements.clone(), out.tables.clone());
+    let release = Release {
+        rewritten: Mutex::new(Some(out)),
+        programs: None,
+    };
+    Ok((Prepared(prepared), statements, tables, release))
+}
+
+/// Statements `_prepare` computed the calls of, to compute again
+/// (`ddx_ad::Prepared`).
+#[pyclass(frozen, module = "ddxdb", name = "_Prepared")]
+struct Prepared(ddx_ad::Prepared);
+
+#[pymethods]
+impl Prepared {
+    /// Run again what `_prepare` ran, each plan as it was bound then, on
+    /// the same `backend`: returns what `_rewrite` returns.
+    fn run(&self, backend: Bound<'_, PyAny>) -> PyResult<(Vec<String>, Vec<String>, Release)> {
+        let out = now(self.0.run(&mut PyBackend(backend.unbind()))).map_err(run_err)?;
+        let (statements, tables) = (out.statements.clone(), out.tables.clone());
+        let release = Release {
+            rewritten: Mutex::new(Some(out)),
+            programs: None,
+        };
+        Ok((statements, tables, release))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
+}
+
 /// What `_rewrite` left for the caller to release: the tables its
 /// statements read, and the programs that wrote them, kept only once the
 /// tables are dropped (`ddx_ad::Rewritten::release`). Until then another
@@ -948,6 +995,7 @@ fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tangent>()?;
     m.add_class::<Programs>()?;
     m.add_function(wrap_pyfunction!(_rewrite, m)?)?;
+    m.add_function(wrap_pyfunction!(_prepare, m)?)?;
 
     m.add("DdxError", m.py().get_type::<DdxError>())?;
     m.add(

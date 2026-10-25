@@ -46,18 +46,19 @@ Importing this module requires DuckDB.
 
 from __future__ import annotations
 
+import threading
 import weakref
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 try:
     import duckdb
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
-from . import Programs, _name_parts, rewrite
+from . import Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
-__all__ = ["DuckDBBackend", "sql", "sql_all"]
+__all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
 
 
 def _ident(name: str) -> str:
@@ -383,13 +384,41 @@ def sql_all(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> list
     Each statement runs before this returns: a DuckDB relation reads its
     tables only when it runs, and the programs' tables are dropped once the
     statements have run. A result is copied into memory (as Arrow)."""
+    programs = _programs.setdefault(con, Programs())
+    with rewrite(_backend(con), statements, "duckdb", programs) as rewritten:
+        return _run_all(con, rewritten.statements)
+
+
+def prepare(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> Callable[[], list]:
+    """:func:`sql_all`'s ``statements``, prepared to run again on ``con``
+    (see :func:`ddxdb.ad.prepare`, which prepares them on DataFusion the
+    same way): a function of no arguments that runs them and returns what
+    :func:`sql_all` would. Its first call computes the calls; every later
+    one runs the same plans again, so the tables the statements read must
+    keep their schemas, and the views their definitions."""
+    prepared = Prepared(_backend(con), statements, "duckdb")
+    lock = threading.Lock()
+
+    def run() -> list:
+        with lock, prepared.run() as rewritten:
+            return _run_all(con, rewritten.statements)
+
+    return run
+
+
+def _backend(con: "duckdb.DuckDBPyConnection") -> DuckDBBackend:
+    """The backend of ``con``, made on first use and kept with it."""
     backend = _backends.get(con)
     if backend is None:
         backend = _backends[con] = DuckDBBackend(con)
-    programs = _programs.setdefault(con, Programs())
+    return backend
+
+
+def _run_all(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> list:
+    """Run each of ``statements``, each result copied into memory as Arrow;
+    ``None`` for one that returns no rows."""
     out = []
-    with rewrite(backend, statements, "duckdb", programs) as rewritten:
-        for statement in rewritten.statements:
-            result = con.execute(statement)
-            out.append(None if result.description is None else con.from_arrow(result.to_arrow_table()))
+    for statement in statements:
+        result = con.execute(statement)
+        out.append(None if result.description is None else con.from_arrow(result.to_arrow_table()))
     return out

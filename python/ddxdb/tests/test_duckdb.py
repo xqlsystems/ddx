@@ -530,3 +530,21 @@ def test_ad_sql_refuses_another_dialect_on_a_duckdb_connection(con):
     assert pairs(ad.sql(con, GRAD, dialect="duckdb")) == [(0, 3.0), (1, 12.0), (2, 0.75)]
     with pytest.raises(ValueError, match="DuckDB's dialect"):
         ad.sql(con, GRAD, dialect="sqlparser")
+
+
+def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, con):
+    step_sql = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, val - 0.1 * grad(loss, val) AS val FROM w"
+    step = ad.prepare(con, [step_sql, GRAD])
+    for _ in range(3):
+        got = [pairs(rel) for rel in step()]
+        assert got == [pairs(rel) for rel in ad.sql_all(con, [step_sql, GRAD])]
+        assert not ddx_tables(con)
+        con.register("w", table([i for i, _ in got[0]], [v for _, v in got[0]]))
+
+
+def test_ad_prepare_on_a_duckdb_connection_prepares_on_duckdb(con):
+    from ddxdb import ad
+
+    step = ad.prepare(con, [GRAD])
+    assert pairs(step()[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    assert pairs(step()[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]

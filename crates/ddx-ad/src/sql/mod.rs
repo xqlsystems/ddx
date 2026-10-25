@@ -105,6 +105,14 @@
 //! program's value. It is written out as SQL again; a statement with no
 //! call comes back as it was.
 //!
+//! A training loop runs the same statements on every batch. [`Programs`]
+//! keeps each program from one call of [`rewrite`] to the next, but each
+//! call still plans the statements' queries to find it. [`prepare`] goes
+//! further, as `jax.jit` does: it computes the calls once, and
+//! [`Prepared::run`] runs every plan of that run again, asking the engine
+//! only to run them, provided the tables' schemas and the views'
+//! definitions have not changed.
+//!
 //! The names `grad`, `vjp` and `jvp` are ddx's: a function of that name in a
 //! statement is one of these calls, and a misused one is refused with its
 //! usage.
@@ -114,6 +122,7 @@ mod cache;
 mod find;
 mod parse;
 mod plan;
+mod prepare;
 mod rewrite;
 mod share;
 #[cfg(test)]
@@ -127,9 +136,11 @@ use ddx_core::sqlparser::dialect::Dialect;
 
 use crate::error::AdError;
 use crate::program::{Options, Unbound};
-use crate::run::{Backend, RunError};
+use crate::run::{Backend, Plans, RunError};
 
 pub use cache::Programs;
+pub use prepare::{prepare, Prepared};
+use prepare::{results, Trace};
 pub(crate) use rewrite::quote;
 pub use views::view_probe;
 
@@ -215,7 +226,15 @@ pub fn rewrite<'a, B: Backend>(
         let mut planned = planned.map_err(RunError::Refused)?;
         let mut tables = Vec::new();
         let mut keys = Vec::new();
-        let result = run_all(backend, &mut planned, programs, &mut keys, &mut tables).await;
+        let result = run_all(
+            backend,
+            &mut planned,
+            Some(programs),
+            &mut keys,
+            &mut tables,
+            None,
+        )
+        .await;
         // Every program built or taken goes back once its tables are
         // dropped, whatever happened: a run that failed (a check that
         // returned a row, an engine's error) leaves its program as it was.
@@ -245,14 +264,17 @@ pub fn rewrite<'a, B: Backend>(
 }
 
 /// Build (or take from `programs`) and run every planned program in order,
-/// recording in `keys` what each is kept under and in `tables` what each
-/// leaves; then the rewritten statements.
+/// recording in `keys` what each is kept under, in `tables` what each
+/// leaves, and in `traces`, if given, the plans each ran; then the
+/// rewritten statements. With no `programs`, each is built, and kept under
+/// no key.
 async fn run_all<B: Backend>(
     backend: &mut B,
     planned: &mut plan::Derivatives,
-    programs: &Programs,
+    programs: Option<&Programs>,
     keys: &mut Vec<Option<cache::Key>>,
     tables: &mut Vec<String>,
+    mut traces: Option<&mut Vec<Trace>>,
 ) -> Result<Vec<String>, RunError<B::Error>> {
     while let Some(job) = planned.next().map_err(RunError::Refused)? {
         // Each CTE the engine would copy is planned once (see `share`); if
@@ -278,6 +300,7 @@ async fn run_all<B: Backend>(
             None => program_of_query(backend, planned, programs, &job).await?,
         };
         keys.push(key);
+        let mut trace = Trace::default();
         for (name, query) in planned.seeds(&job).map_err(RunError::Refused)? {
             let plan = backend.plan_sql(&query).await.map_err(RunError::Engine)?;
             // The engine's own plan of the query: every read already typed.
@@ -289,13 +312,15 @@ async fn run_all<B: Backend>(
                 .materialize(&name, &plan)
                 .await
                 .map_err(RunError::Engine)?;
+            trace.seeds.push((name, plan));
         }
         let program = planned.built(job.index);
-        crate::run::run(backend, program).await?;
-        tables.extend(
-            std::iter::once(program.value().step.clone())
-                .chain(program.gradients().iter().map(|g| g.step.clone())),
-        );
+        let kept = traces.is_some().then_some(&mut trace.plans);
+        crate::run::run_bound(backend, program, Plans::Bind(kept)).await?;
+        tables.extend(results(program));
+        if let Some(traces) = traces.as_deref_mut() {
+            traces.push(trace);
+        }
     }
     planned.rewrite().map_err(RunError::Refused)
 }
@@ -305,13 +330,16 @@ async fn run_all<B: Backend>(
 async fn program_of_query<B: Backend>(
     backend: &mut B,
     planned: &mut plan::Derivatives,
-    programs: &Programs,
+    programs: Option<&Programs>,
     job: &plan::Job,
 ) -> Result<Option<cache::Key>, RunError<B::Error>> {
-    let key = cache::Key::of(backend, job, std::slice::from_ref(&job.query), None)
-        .await
-        .map_err(RunError::Engine)?;
-    match key.as_ref().and_then(|k| programs.take(k)) {
+    let key = match programs {
+        Some(_) => cache::Key::of(backend, job, std::slice::from_ref(&job.query), None)
+            .await
+            .map_err(RunError::Engine)?,
+        None => None,
+    };
+    match key.as_ref().zip(programs).and_then(|(k, p)| p.take(k)) {
         Some(program) => planned.adopt(job, program).map_err(RunError::Refused)?,
         None => {
             let plan = backend
@@ -332,7 +360,7 @@ async fn program_of_query<B: Backend>(
 async fn program_of_split<B: Backend>(
     backend: &mut B,
     planned: &mut plan::Derivatives,
-    programs: &Programs,
+    programs: Option<&Programs>,
     job: &plan::Job,
     split: &share::Split,
 ) -> Result<Option<cache::Key>, RunError<B::Error>> {
@@ -358,10 +386,13 @@ async fn program_of_split<B: Backend>(
             .map(|p| p.sql.clone())
             .chain(std::iter::once(split.root.clone()))
             .collect();
-        let key = cache::Key::of(backend, job, &queries, Some(&split.namespace))
-            .await
-            .map_err(RunError::Engine)?;
-        if let Some(program) = key.as_ref().and_then(|k| programs.take(k)) {
+        let key = match programs {
+            Some(_) => cache::Key::of(backend, job, &queries, Some(&split.namespace))
+                .await
+                .map_err(RunError::Engine)?,
+            None => None,
+        };
+        if let Some(program) = key.as_ref().zip(programs).and_then(|(k, p)| p.take(k)) {
             planned.adopt(job, program).map_err(RunError::Refused)?;
             return Ok(key);
         }
