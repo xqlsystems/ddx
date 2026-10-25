@@ -11,9 +11,9 @@ Entries below the first release are maintained automatically by
 
 ## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.1...ddx-datafusion-v0.3.2) - 2026-10-25
 
-### Fixed
+### Changed
 
-- *(ddx-ad, ddxdb)* differentiate xarray-sql's models on DuckDB ([#200](https://github.com/xqlsystems/ddx/pull/200))
+- ddx-ad 0.2.5: windows in DuckDB's plans, and statements with a CTE materialization hint ([#200](https://github.com/xqlsystems/ddx/pull/200))
 
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.0...ddx-datafusion-v0.3.1) - 2026-10-24
 
