@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.4...ddx-ad-v0.2.5) - 2026-10-25
+
+### Fixed
+
+- *(ddx-ad, ddxdb)* differentiate xarray-sql's models on DuckDB ([#200](https://github.com/xqlsystems/ddx/pull/200))
+
 ## [0.2.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.3...ddx-ad-v0.2.4) - 2026-10-24
 
 ### Added
