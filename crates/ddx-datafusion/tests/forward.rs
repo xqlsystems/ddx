@@ -429,10 +429,11 @@ async fn a_reference_rel_that_loops_or_points_nowhere_is_an_invalid_plan() {
 }
 
 #[tokio::test]
-async fn a_reference_under_a_window_relation_is_refused_not_a_panic() {
-    // A window relation (`ConsistentPartitionWindowRel`) over a shared
-    // relation: reverse mode refuses the window relation, and must get as
-    // far as saying so.
+async fn a_window_relation_over_a_shared_relation_is_read() {
+    // A window relation (`ConsistentPartitionWindowRel`, as DuckDB writes a
+    // window) over a shared relation, here with no functions: read as the
+    // projection of its functions, in reverse mode and in forward mode,
+    // which splits the plan at the relation it shares first.
     use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
     use ddx_ad::substrait::proto::rel::RelType;
     use ddx_ad::substrait::proto::{ConsistentPartitionWindowRel, PlanRel, ReferenceRel, Rel};
@@ -454,5 +455,6 @@ async fn a_reference_under_a_window_relation_is_refused_not_a_panic() {
     plan.relations.push(PlanRel {
         rel_type: Some(PlanRelType::Rel(read)),
     });
-    assert!(Forward::new(&plan, &wrt).is_err());
+    Forward::new(&plan, &wrt).unwrap();
+    ddx_ad::jvp(&plan, &wrt).unwrap();
 }

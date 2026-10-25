@@ -1847,6 +1847,11 @@ pub fn width(rel: &Rel) -> Result<usize> {
                     a.common.as_ref(),
                 )
             }
+            // Its input's columns, then one per function.
+            RelType::Window(w) => (
+                width(input(&w.input)?)? + w.window_functions.len(),
+                w.common.as_ref(),
+            ),
             RelType::Set(s) => (
                 width(s.inputs.first().ok_or_else(|| {
                     AdError::InvalidPlan("a set operation with no inputs".into())

@@ -105,6 +105,9 @@ pub fn jvp_with<D: Differentiable + ?Sized>(
 
 /// [`jvp`] of a query.
 fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
+    // Before the plan is split at the relations it shares, which may be
+    // window relations.
+    let plan = &*windows_as_projections(plan);
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
     let mut sources = Sources::new(wrt, &namespace)?;
