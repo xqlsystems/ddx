@@ -241,28 +241,24 @@ pub(crate) enum Plans<'a> {
 }
 
 impl Plans<'_> {
-    /// Plan `i` of the program, `plan` bound.
-    async fn get<B: Backend>(
-        &mut self,
-        backend: &mut B,
-        i: usize,
-        plan: &Unbound,
-        schemas: &mut HashMap<String, NamedStruct>,
-    ) -> Result<Bound, RunError<B::Error>> {
-        match self {
-            Plans::Bind(kept) => {
-                let bound = bind(backend, plan, schemas).await?;
-                if let Some(kept) = kept {
-                    kept.push(bound.clone());
-                }
-                Ok(bound)
-            }
-            Plans::Bound(plans) => plans.get(i).cloned().ok_or_else(|| {
-                RunError::Refused(AdError::Internal(format!(
-                    "plan {i} of a program was never bound"
-                )))
-            }),
+    /// Plan `i` of the program, if an earlier run bound it.
+    fn replayed<E>(&self, i: usize) -> Option<Result<Bound, RunError<E>>> {
+        let Plans::Bound(plans) = self else {
+            return None;
+        };
+        Some(plans.get(i).cloned().ok_or_else(|| {
+            RunError::Refused(AdError::Internal(format!(
+                "plan {i} of a program was never bound"
+            )))
+        }))
+    }
+
+    /// `bound`, kept if this run keeps what it binds.
+    fn keep(&mut self, bound: Bound) -> Bound {
+        if let Plans::Bind(Some(kept)) = self {
+            kept.push(bound.clone());
         }
+        bound
     }
 }
 
@@ -277,7 +273,11 @@ pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
     let result = async {
         let mut checks = Vec::with_capacity(program.checks().len());
         for (i, check) in program.checks().iter().enumerate() {
-            checks.push(plans.get(backend, i, &check.plan, &mut schemas).await?);
+            let plan = match plans.replayed(i) {
+                Some(plan) => plan?,
+                None => plans.keep(bind(backend, &check.plan, &mut schemas).await?),
+            };
+            checks.push(plan);
         }
         let rows = if checks.is_empty() {
             Vec::new()
@@ -293,9 +293,10 @@ pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
             )));
         }
         for (i, step) in steps.iter().enumerate() {
-            let plan = plans
-                .get(backend, checks.len() + i, &step.plan, &mut schemas)
-                .await?;
+            let plan = match plans.replayed(checks.len() + i) {
+                Some(plan) => plan?,
+                None => plans.keep(bind(backend, &step.plan, &mut schemas).await?),
+            };
             // A table rewritten has the schema of this run's plan.
             schemas.remove(&step.name);
             backend
