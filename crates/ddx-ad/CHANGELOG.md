@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.4...ddx-ad-v0.2.5) - 2026-10-25
+
+### Fixed
+
+- Windows in DuckDB's plans are differentiated. DuckDB writes a window as a `ConsistentPartitionWindowRel`, which `grad`, `vjp`, `jvp` and a query over another call now read as the projection of its window functions, as DataFusion writes one. A `RANGE` frame with no `ORDER BY` that ends at the current row, DuckDB's `OVER ()`, is the whole partition. Before, only a window DuckDB happened to rewrite as a join to an aggregate was differentiated ([#200](https://github.com/xqlsystems/ddx/pull/200))
+- `rewrite` finds the calls in a statement whose CTE has a materialization hint (`AS MATERIALIZED`, `AS NOT MATERIALIZED`) in any dialect, and keeps the hint in the statement it returns. sqlparser parses the hint only in its Postgres dialect, so such a statement was passed over with its calls unrewritten ([#200](https://github.com/xqlsystems/ddx/pull/200))
+- A view's SQL with a materialization hint is read too, so its CTEs read more than once are planned once each ([#200](https://github.com/xqlsystems/ddx/pull/200))
+
 ## [0.2.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.3...ddx-ad-v0.2.4) - 2026-10-24
 
 ### Added
