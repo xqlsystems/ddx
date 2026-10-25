@@ -4608,11 +4608,24 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a runtime")
 }
 
-/// Run one case, turning a panic into a failure.
+/// The stack a case runs on. In a debug build, a case needs most of a test
+/// thread's 2 MB, and little of it is ddx's: DataFusion's SQL planner takes
+/// ~100 KB per nested subquery of the case's loss, and the poll functions of
+/// `check_case_inner` and `jvp_checks`, which hold every ddx future they
+/// await, ~430 KB. (ddx's own recursion is held to 2 MB by the
+/// `*_does_not_overflow_a_worker_threads_stack` tests.)
+const CASE_STACK: usize = 8 << 20;
+
+/// Run one case on a thread of its own, turning a panic into a failure.
 fn run_one(rt: &tokio::runtime::Runtime, seed: u64, props: Props) -> Outcome {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(check_case(seed, props))
-    })) {
+    let run = std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(CASE_STACK)
+            .spawn_scoped(s, || rt.block_on(check_case(seed, props)))
+            .expect("a thread")
+            .join()
+    });
+    match run {
         Ok(o) => o,
         Err(payload) => {
             let msg = payload
