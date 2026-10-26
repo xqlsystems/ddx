@@ -354,9 +354,10 @@ class DuckDBBackend:
         self._written.add(name)
 
     def drop_table(self, name: str) -> None:
+        # Forgotten first, so a failed drop leaves the name to the catalog.
+        self._written.discard(name)
         self.con.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
         self._planner.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
-        self._written.discard(name)
 
 
 #: The programs :func:`sql_all` keeps for each connection, gone with it.
