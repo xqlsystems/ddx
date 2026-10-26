@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
@@ -174,6 +174,83 @@ impl ddx_ad::Backend for DataFusion {
         });
         Ok(same.then(|| sql.clone()))
     }
+
+    async fn views_key(&mut self) -> Result<Option<String>> {
+        use datafusion::catalog::information_schema::INFORMATION_SCHEMA;
+        use datafusion::logical_expr::TableType;
+        // Each view's kept plan, not its SQL: DataFusion runs the plan, and
+        // a view made again with the same SQL after one it reads is
+        // redefined runs another.
+        let mut views = Vec::new();
+        let mut catalogs = self.0.catalog_names();
+        catalogs.sort();
+        for c in catalogs {
+            let Some(catalog) = self.0.catalog(&c) else {
+                continue;
+            };
+            let mut schemas = catalog.schema_names();
+            schemas.sort();
+            for s in schemas {
+                let Some(schema) = catalog.schema(&s).filter(|_| s != INFORMATION_SCHEMA) else {
+                    continue;
+                };
+                let mut names = schema.table_names();
+                names.sort();
+                for name in names {
+                    let Some(table) = schema.table(&name).await? else {
+                        continue;
+                    };
+                    if table.table_type() != TableType::View {
+                        continue;
+                    }
+                    let Some(plan) = table.get_logical_plan() else {
+                        return Ok(None);
+                    };
+                    views.push((format!("{c}.{s}.{name}"), plan.into_owned()));
+                }
+            }
+        }
+        // Compared with the plans the last call saw, not printed or hashed:
+        // a plan expands each view it reads, so it can print as megabytes,
+        // while one unchanged shares its parts with the plan seen, and
+        // compares at once.
+        let (changes, scans) = {
+            let seen = crate::ad::kept::<SeenViews>(&self.0);
+            let mut seen = seen.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if seen.plans != views {
+                seen.scans = views
+                    .iter()
+                    .map(|(name, plan)| Ok((name.clone(), crate::ad::scans(plan)?)))
+                    .collect::<Result<_>>()?;
+                seen.plans = views;
+                seen.changes += 1;
+            }
+            (seen.changes, seen.scans.clone())
+        };
+        // And whether each reads a table registered again since, which ddx
+        // would not differentiate as the view runs.
+        let mut key = changes.to_string();
+        for (name, scans) in &scans {
+            if let Some(table) = crate::ad::replaced_among(&self.0, scans).await? {
+                key.push_str(&format!(", {name} reads {table} as it was"));
+            }
+        }
+        Ok(Some(key))
+    }
+}
+
+/// Each view's kept plan, by its path, as [`DataFusion`]'s `views_key` last
+/// saw them on a context, and how many times they have changed since the
+/// context was made: the key's first part.
+#[derive(Default)]
+struct SeenViews(Mutex<Seen>);
+
+#[derive(Default)]
+struct Seen {
+    plans: Vec<(String, LogicalPlan)>,
+    /// The tables each reads.
+    scans: Vec<(String, crate::ad::Scans)>,
+    changes: u64,
 }
 
 /// Register `df`'s rows as the table `name`, materialized.

@@ -110,8 +110,9 @@
 //! call still plans the statements' queries to find it. [`prepare`] goes
 //! further, as `jax.jit` does: it computes the calls once, and
 //! [`Prepared::run`] runs every plan of that run again, asking the engine
-//! only to run them, provided the tables' schemas and the views'
-//! definitions have not changed.
+//! only to run them, provided the tables' schemas have not changed. It
+//! asks the engine whether a view has; if one has, it runs nothing, for
+//! the statements to be prepared again.
 //!
 //! The names `grad`, `vjp` and `jvp` are ddx's: a function of that name in a
 //! statement is one of these calls, and a misused one is refused with its

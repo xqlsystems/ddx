@@ -131,6 +131,15 @@ class Backend(Protocol):
         returns ``None``, leaves every view to the engine."""
         ...
 
+    def views_key(self) -> Optional[str]:
+        """Optional. Text that is the same at two calls only if the engine
+        runs each of its views as it did: every view's name and what the
+        engine runs for it. A :class:`Prepared` run compares it with the
+        one its statements were prepared with, and prepares them again if
+        it differs. A backend without it, or that returns ``None``, gets
+        them prepared on every run."""
+        ...
+
 
 @dataclass(frozen=True)
 class Rewritten:
@@ -215,13 +224,16 @@ class Prepared:
     as :func:`rewrite` does, and every later one runs the same plans again,
     each as it was bound then, as ``jax.jit`` traces a function once and
     runs what it traced after that (``ddx_ad::Prepared``). A later run asks
-    the backend for no plan, key, view or schema: only to run plans.
+    the backend for no plan, key or schema: only for its ``views_key()``,
+    and to run plans.
 
-    In return, the tables the statements read must keep their schemas and
-    the views their definitions. Between runs, a table may change its rows,
-    or be registered again under its name, but not change its columns or
-    their types; a view redefined is not seen, and the old definition is
-    differentiated. Prepare the statements again after changing either.
+    In return, the tables the statements read must keep their schemas.
+    Between runs, a table may change its rows, or be registered again under
+    its name, but not change its columns or their types; prepare the
+    statements again after changing one. A run whose backend's
+    ``views_key()`` differs from the one the statements were prepared with,
+    because a view was created, redefined or dropped, prepares them again.
+    A backend without ``views_key`` gets them prepared on every run.
 
     Every run writes the same tables, so runs must not overlap: release one
     run's :class:`Rewritten` before the next."""
@@ -238,14 +250,16 @@ class Prepared:
     def run(self) -> Rewritten:
         """Compute what the statements' calls read, and the statements
         rewritten to read it, as :func:`rewrite` returns them. The first run
-        that succeeds prepares the statements; one that fails prepares
-        nothing, and the next tries again. Either way, a failed run first
-        tries to drop every table it wrote."""
-        if self._prepared is None:
+        that succeeds prepares the statements, as does the first after a
+        view changes; one that fails prepares nothing, and the next tries
+        again. Either way, a failed run first tries to drop every table it
+        wrote."""
+        ran = None if self._prepared is None else self._prepared.run(self.backend)
+        if ran is None:
             prepared, out, tables, release = _prepare(self.backend, self.statements, self.dialect)
             self._prepared = prepared
         else:
-            out, tables, release = self._prepared.run(self.backend)
+            out, tables, release = ran
         return Rewritten(out, tables, self.backend, release)
 
     def __repr__(self) -> str:

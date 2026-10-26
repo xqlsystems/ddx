@@ -217,6 +217,17 @@ pub trait Backend: Send {
         let _ = name;
         async { Ok(None) }
     }
+
+    /// Text that is the same at two calls only if the engine runs each of
+    /// its views as it did: every view's name and what the engine runs for
+    /// it. [`crate::Prepared::run`] compares it with the one
+    /// [`crate::prepare`] read, and runs nothing once a view is created,
+    /// redefined or dropped, for the statements to be prepared again.
+    /// `None`, the default, means the engine cannot say, and nothing
+    /// prepared is run again.
+    fn views_key(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then

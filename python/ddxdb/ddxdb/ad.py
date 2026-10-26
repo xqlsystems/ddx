@@ -235,6 +235,10 @@ class DataFusionBackend:
 
     def __init__(self, ctx: SessionContext):
         self.ctx = ctx
+        # Each view's plan as views_key last saw it, and how many times
+        # they have changed.
+        self._views: list = []
+        self._views_seen = 0
 
     def select_all(self, name: str) -> bytes:
         return Serde.serialize_bytes(f'SELECT * FROM "{name}"', self.ctx)
@@ -315,6 +319,28 @@ class DataFusionBackend:
             # The view's tables, or its SQL's, no longer plan.
             return None
         return rows[0] if same else None
+
+    def views_key(self) -> str:
+        """How many times this backend has seen its context's views change:
+        each view's plan is the plan DataFusion runs for it, the one it kept
+        when it was made, which reads a view redefined since as it was then.
+        Plans compare in Rust, and a plan unchanged shares its kept part, so
+        the comparison is quick. Unlike Rust's, this can't tell a view that
+        reads a table registered again since (see :meth:`view_sql`)."""
+        views = []
+        for c in sorted(self.ctx.catalog_names()):
+            catalog = self.ctx.catalog(c)
+            for s in sorted(catalog.schema_names()):
+                if s == "information_schema":
+                    continue
+                schema = catalog.schema(s)
+                for t in sorted(schema.table_names()):
+                    if schema.table(t).kind == "view":
+                        path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
+                        views.append((path, self.ctx.table(path).logical_plan()))
+        if views != self._views:
+            self._views, self._views_seen = views, self._views_seen + 1
+        return str(self._views_seen)
 
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
@@ -581,11 +607,11 @@ def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
     each program, and checking that each view's SQL is still what
     DataFusion runs for it.
 
-    In return, the tables the statements read must keep their schemas and
-    the views their definitions. Between calls, a table may change its
-    rows, or be registered again under its name, but not change its columns
-    or their types. A view redefined is not seen, and the old definition is
-    differentiated; prepare the statements again after changing one. Calls
+    In return, the tables the statements read must keep their schemas.
+    Between calls, a table may change its rows, or be registered again under
+    its name, but not change its columns or their types. Each call compares
+    every view's plan with the one it was prepared with, and prepares the
+    statements again once a view is created, redefined or dropped. Calls
     wait for each other, since each writes the same tables.
 
     ``ctx`` may be a DuckDB connection instead, which

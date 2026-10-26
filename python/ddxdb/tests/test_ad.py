@@ -789,7 +789,7 @@ def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, ctx)
 def test_a_later_prepared_call_asks_the_backend_only_to_run_plans(ad, ctx, monkeypatch):
     ctx.sql("CREATE VIEW m AS SELECT i, val FROM w").collect()
     asked = []
-    for method in ["select_all", "plan_sql", "plan_key", "view_sql", "returns_rows", "materialize"]:
+    for method in ["select_all", "plan_sql", "plan_key", "view_sql", "views_key", "returns_rows", "materialize"]:
         original = getattr(ad.DataFusionBackend, method)
 
         def spy(self, *args, _method=method, _original=original):
@@ -802,7 +802,7 @@ def test_a_later_prepared_call_asks_the_backend_only_to_run_plans(ad, ctx, monke
     assert {"plan_sql", "view_sql", "select_all"} <= set(asked) and "plan_key" not in asked
     asked.clear()
     assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
-    assert set(asked) <= {"returns_rows", "materialize"}, asked
+    assert set(asked) <= {"views_key", "returns_rows", "materialize"}, asked
 
 
 def test_a_failed_prepared_call_leaves_nothing_and_the_next_runs(ad, ctx):
@@ -825,3 +825,27 @@ def test_a_failed_first_prepared_call_prepares_nothing(ad, ctx):
     assert "not yet run" in repr(prepared)
     with pytest.raises(TypeError):
         ddxdb.prepare(ad.DataFusionBackend(ctx), STEP)
+
+
+THROUGH_M = "WITH loss AS (SELECT SUM(val * val) AS l FROM m) SELECT i, grad(loss, val) FROM w"
+
+
+def test_a_prepared_call_differentiates_a_redefined_view_as_it_is_now(ad, ctx):
+    ctx.sql("CREATE VIEW m AS SELECT i, val FROM w").collect()
+    step = ad.prepare(ctx, [THROUGH_M])
+    assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    ctx.sql("CREATE OR REPLACE VIEW m AS SELECT i, 2 * val AS val FROM w").collect()
+    assert pairs(step()[0]) == [(0, 8.0), (1, -16.0), (2, 4.0)]
+
+
+def test_a_prepared_call_differentiates_a_view_as_datafusion_runs_it(ad, ctx):
+    # DataFusion keeps the plan a view was made with: `m` reads `inner_m`
+    # as it was until `m` is made again, with the same SQL.
+    ctx.sql("CREATE VIEW inner_m AS SELECT i, val FROM w").collect()
+    ctx.sql("CREATE VIEW m AS SELECT i, val FROM inner_m").collect()
+    step = ad.prepare(ctx, [THROUGH_M])
+    step()
+    ctx.sql("CREATE OR REPLACE VIEW inner_m AS SELECT i, 2 * val AS val FROM w").collect()
+    assert pairs(step()[0]) == pairs(ad.sql(ctx, THROUGH_M))
+    ctx.sql("CREATE OR REPLACE VIEW m AS SELECT i, val FROM inner_m").collect()
+    assert pairs(step()[0]) == pairs(ad.sql(ctx, THROUGH_M)) == [(0, 8.0), (1, -16.0), (2, 4.0)]

@@ -743,6 +743,16 @@ impl ddx_ad::Backend for PyBackend {
             b.call_method1("view_sql", (name,))?.extract()
         })
     }
+
+    fn views_key(&mut self) -> impl Future<Output = PyResult<Option<String>>> + Send {
+        // Optional: a backend without it gets nothing prepared run again.
+        self.call(|b| {
+            if !b.hasattr("views_key")? {
+                return Ok(None);
+            }
+            b.call_method0("views_key")?.extract()
+        })
+    }
 }
 
 /// Programs `rewrite` built, kept to run again (`ddx_ad::Programs`): pass
@@ -868,15 +878,22 @@ struct Prepared(ddx_ad::Prepared);
 #[pymethods]
 impl Prepared {
     /// Run again what `_prepare` ran, each plan as it was bound then, on
-    /// the same `backend`: returns what `_rewrite` returns.
-    fn run(&self, backend: Bound<'_, PyAny>) -> PyResult<(Vec<String>, Vec<String>, Release)> {
-        let out = now(self.0.run(&mut PyBackend(backend.unbind()))).map_err(run_err)?;
+    /// the same `backend`: returns what `_rewrite` returns, or `None`, and
+    /// runs nothing, if the backend's views are not as `_prepare` found
+    /// them.
+    fn run(
+        &self,
+        backend: Bound<'_, PyAny>,
+    ) -> PyResult<Option<(Vec<String>, Vec<String>, Release)>> {
+        let Some(out) = now(self.0.run(&mut PyBackend(backend.unbind()))).map_err(run_err)? else {
+            return Ok(None);
+        };
         let (statements, tables) = (out.statements.clone(), out.tables.clone());
         let release = Release {
             rewritten: Mutex::new(Some(out)),
             programs: None,
         };
-        Ok((statements, tables, release))
+        Ok(Some((statements, tables, release)))
     }
 
     fn __repr__(&self) -> String {

@@ -5,7 +5,8 @@
 //! Prepared statements (`ad::prepare`, `ddx_ad::Prepared`): the first run
 //! computes the calls as `ad::sql_all` does, and every later run runs the
 //! same plans again, on the tables' rows as they are then, asking the
-//! engine for no plan, key, view or schema.
+//! engine for no plan, key or schema: only whether its views have changed,
+//! in which case the statements are prepared again.
 
 use std::sync::{Arc, Mutex};
 
@@ -168,6 +169,10 @@ impl Backend for Counting {
         self.ask("view_sql");
         self.engine.view_sql(name).await
     }
+    async fn views_key(&mut self) -> Result<Option<String>, DataFusionError> {
+        self.ask("views_key");
+        self.engine.views_key().await
+    }
 }
 
 #[tokio::test]
@@ -200,13 +205,17 @@ async fn a_later_run_asks_the_engine_only_to_run_plans() {
         .unwrap();
     asked.lock().unwrap().clear();
 
-    let again = prepared.run(&mut backend).await.unwrap();
+    let again = prepared
+        .run(&mut backend)
+        .await
+        .unwrap()
+        .expect("no view changed");
     assert_eq!(again.statements, prepared.statements());
     let later = asked.lock().unwrap().clone();
     assert!(
         later
             .iter()
-            .all(|w| ["returns_rows", "materialize"].contains(w)),
+            .all(|w| ["views_key", "returns_rows", "materialize"].contains(w)),
         "{later:?}"
     );
     // The gradient of Σ val², 2·val, read through the view.
@@ -225,4 +234,82 @@ async fn a_later_run_asks_the_engine_only_to_run_plans() {
         .await
         .unwrap();
     assert!(ddx_tables(&ctx).is_empty(), "{:?}", ddx_tables(&ctx));
+}
+
+/// The gradient of `SUM(val * val)` over the view `m`, at each `i` of `w`,
+/// computed by `step` and by `ad::sql_all`.
+async fn grads(ctx: &SessionContext, step: &ad::Prepared) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let got = values(step.run().await.unwrap()).await;
+    let want = values(ad::sql_all(ctx, &[THROUGH_M]).await.unwrap()).await;
+    (got, want)
+}
+
+const THROUGH_M: &str = "WITH loss AS (SELECT SUM(val * val) AS l FROM m) \
+                         SELECT i, grad(loss, val) FROM w ORDER BY i";
+
+#[tokio::test]
+async fn a_view_redefined_is_differentiated_as_it_is_now() {
+    let ctx = SessionContext::new();
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    exec(&ctx, "CREATE VIEW m AS SELECT i, val FROM w").await;
+    let step = ad::prepare(&ctx, &[THROUGH_M]);
+    let (got, _) = grads(&ctx, &step).await;
+    assert_eq!(got, [vec![2.0, -4.0, 1.0]]);
+    // Made again as it was: the same plans run.
+    let before = DataFusion(ctx.clone()).views_key().await.unwrap();
+    exec(&ctx, "CREATE OR REPLACE VIEW m AS SELECT i, val FROM w").await;
+    assert_eq!(DataFusion(ctx.clone()).views_key().await.unwrap(), before);
+    let (got, _) = grads(&ctx, &step).await;
+    assert_eq!(got, [vec![2.0, -4.0, 1.0]]);
+    exec(
+        &ctx,
+        "CREATE OR REPLACE VIEW m AS SELECT i, 2 * val AS val FROM w",
+    )
+    .await;
+    let (got, _) = grads(&ctx, &step).await;
+    assert_eq!(got, [vec![8.0, -16.0, 4.0]]);
+    assert!(ddx_tables(&ctx).is_empty(), "{:?}", ddx_tables(&ctx));
+}
+
+#[tokio::test]
+async fn a_view_made_again_over_a_redefined_view_is_differentiated_as_it_runs() {
+    // DataFusion keeps the plan a view was made with: `m` reads `inner` as
+    // it was until `m` is made again, with the same SQL.
+    let ctx = SessionContext::new();
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    exec(&ctx, "CREATE VIEW inner_m AS SELECT i, val FROM w").await;
+    exec(&ctx, "CREATE VIEW m AS SELECT i, val FROM inner_m").await;
+    let step = ad::prepare(&ctx, &[THROUGH_M]);
+    grads(&ctx, &step).await;
+    exec(
+        &ctx,
+        "CREATE OR REPLACE VIEW inner_m AS SELECT i, 2 * val AS val FROM w",
+    )
+    .await;
+    let (got, want) = grads(&ctx, &step).await;
+    assert!(close(&got, &want), "{got:?}, not {want:?}");
+    exec(
+        &ctx,
+        "CREATE OR REPLACE VIEW m AS SELECT i, val FROM inner_m",
+    )
+    .await;
+    let (got, want) = grads(&ctx, &step).await;
+    assert!(close(&got, &want), "{got:?}, not {want:?}");
+    assert_eq!(got, [vec![8.0, -16.0, 4.0]]);
+}
+
+#[tokio::test]
+async fn a_view_over_a_table_registered_again_is_refused_as_sql_all_refuses_it() {
+    let ctx = SessionContext::new();
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    exec(&ctx, "CREATE VIEW m AS SELECT i, val FROM w").await;
+    let step = ad::prepare(&ctx, &[THROUGH_M]);
+    step.run().await.unwrap();
+    // `m` still reads the old `w`, and ddx would read the new one.
+    put(&ctx, "w", &[3.0, 0.0, -1.0]).await;
+    let err = step.run().await.unwrap_err().to_string();
+    assert!(err.contains("registered again"), "{err}");
+    exec(&ctx, "CREATE OR REPLACE VIEW m AS SELECT i, val FROM w").await;
+    let (got, _) = grads(&ctx, &step).await;
+    assert_eq!(got, [vec![6.0, 0.0, -2.0]]);
 }

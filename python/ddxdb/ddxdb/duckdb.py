@@ -339,6 +339,16 @@ class DuckDBBackend:
             return sql if kind == "view" and here else None
         return None
 
+    def views_key(self) -> str:
+        # DuckDB binds a view's SQL each time a query reads it, so the SQL
+        # is what runs.
+        return repr(
+            self.con.execute(
+                "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() "
+                "WHERE NOT internal ORDER BY ALL"
+            ).fetchall()
+        )
+
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")
         return self.con.execute(f"SELECT 1 FROM ({query}) AS __ddx_check LIMIT 1").fetchone() is not None
@@ -395,7 +405,7 @@ def prepare(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> Call
     same way): a function of no arguments that runs them and returns what
     :func:`sql_all` would. Its first call computes the calls; every later
     one runs the same plans again, so the tables the statements read must
-    keep their schemas, and the views their definitions."""
+    keep their schemas. A call after a view changes prepares them again."""
     prepared = Prepared(_backend(con), statements, "duckdb")
     lock = threading.Lock()
 

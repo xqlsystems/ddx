@@ -548,3 +548,12 @@ def test_ad_prepare_on_a_duckdb_connection_prepares_on_duckdb(con):
     step = ad.prepare(con, [GRAD])
     assert pairs(step()[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
     assert pairs(step()[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+
+
+def test_a_prepared_call_differentiates_a_redefined_view_as_it_is_now(ad, con):
+    con.execute("CREATE VIEW m AS SELECT i, val FROM w")
+    statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM m) SELECT i, grad(loss, val) FROM w"
+    step = ad.prepare(con, [statement])
+    assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
+    con.execute("CREATE OR REPLACE VIEW m AS SELECT i, 2 * val AS val FROM w")
+    assert pairs(step()[0]) == [(0, 8.0), (1, -16.0), (2, 4.0)]
