@@ -499,13 +499,24 @@ impl Transposer<'_> {
         };
         let yc = join(y_rel, cotangent, on_y, JoinType::Inner);
         let x_groups: Vec<usize> = (0..ndims).filter(|&g| shape.groups[g].0 == x).collect();
-        let mut t_keys: Vec<Expression> = y_keys.iter().map(|&c| field(c)).collect();
-        t_keys.extend(x_groups.iter().map(|&g| field(ywidth + g)));
+        // t's keys, each column once: a plan may repeat a join key (DuckDB's
+        // does), and an aggregate's output has each distinct key once.
+        let mut t_cols: Vec<usize> = Vec::new();
+        let mut key_of = |c: usize| match t_cols.iter().position(|&k| k == c) {
+            Some(i) => i,
+            None => {
+                t_cols.push(c);
+                t_cols.len() - 1
+            }
+        };
+        let y_at: Vec<usize> = y_keys.iter().map(|&c| key_of(c)).collect();
+        let group_at: Vec<usize> = x_groups.iter().map(|&g| key_of(ywidth + g)).collect();
         let term = call(
             mul,
             vec![field(ywidth + ndims + cot_col), ys.factor.clone()],
         );
-        let t_value = y_keys.len() + x_groups.len();
+        let t_value = t_cols.len();
+        let t_keys = t_cols.iter().map(|&c| field(c)).collect();
         let mut t = aggregate(yc, t_keys, vec![(sum, vec![term])]);
         // t is most of the work. A side of one input and no window reads it
         // once; any other reads it once per input and once per window, so it
@@ -537,13 +548,13 @@ impl Transposer<'_> {
         let rel = project(region.rel.clone(), vec![xs.factor.clone()]);
         let t_at = factor_col + 1;
         let mut on_x = Vec::new();
-        for (k, &(l, r, _)) in shape.keys.iter().enumerate() {
+        for (&(l, r, _), &at) in shape.keys.iter().zip(&y_at) {
             let xc = if x == 0 { l } else { r };
-            on_x.push(call(same, vec![field(xc), field(t_at + k)]));
+            on_x.push(call(same, vec![field(xc), field(t_at + at)]));
         }
-        for (i, &g) in x_groups.iter().enumerate() {
+        for (&g, &at) in x_groups.iter().zip(&group_at) {
             let xc = shape.groups[g].1;
-            on_x.push(call(same, vec![field(xc), field(t_at + y_keys.len() + i)]));
+            on_x.push(call(same, vec![field(xc), field(t_at + at)]));
         }
         let base = join(
             rel,
