@@ -18,7 +18,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use ddx_ad::substrait::proto::{NamedStruct, Plan};
 use ddx_ad::{Backend, Bound};
 use ddx_datafusion::ad;
-use ddx_datafusion::engine::DataFusion;
+use ddx_datafusion::engine::{DataFusion, Kept};
 
 const STEP: &str = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) \
                     SELECT i, val - 0.1 * grad(loss, val) AS val FROM w ORDER BY i";
@@ -141,6 +141,7 @@ impl Counting {
 
 impl Backend for Counting {
     type Error = DataFusionError;
+    type Kept = Kept;
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct, DataFusionError> {
         self.ask("table_schema");
@@ -172,6 +173,26 @@ impl Backend for Counting {
     async fn session_key(&mut self) -> Result<Option<String>, DataFusionError> {
         self.ask("session_key");
         self.engine.session_key().await
+    }
+    async fn keep(&mut self, plan: &Bound) -> Result<Option<Kept>, DataFusionError> {
+        self.ask("keep");
+        self.engine.keep(plan).await
+    }
+    async fn materialize_kept(
+        &mut self,
+        name: &str,
+        plan: &Bound,
+        kept: &Kept,
+    ) -> Result<(), DataFusionError> {
+        self.ask("materialize_kept");
+        self.engine.materialize_kept(name, plan, kept).await
+    }
+    async fn returns_rows_kept(
+        &mut self,
+        plans: &[(&Bound, &Kept)],
+    ) -> Result<Vec<bool>, DataFusionError> {
+        self.ask("returns_rows_kept");
+        self.engine.returns_rows_kept(plans).await
     }
 }
 
@@ -211,11 +232,16 @@ async fn a_later_run_asks_the_engine_only_to_run_plans() {
         .unwrap()
         .expect("no view changed");
     assert_eq!(again.statements, prepared.statements());
+    // Every plan was kept, and runs as it was kept: none is planned again
+    // (but by the session, from SQL, with `DDX_STEPS_AS_SQL=1`).
     let later = asked.lock().unwrap().clone();
+    let run = if std::env::var_os("DDX_STEPS_AS_SQL").is_some_and(|v| v == "1") {
+        ["returns_rows", "materialize"]
+    } else {
+        ["returns_rows_kept", "materialize_kept"]
+    };
     assert!(
-        later
-            .iter()
-            .all(|w| ["session_key", "returns_rows", "materialize"].contains(w)),
+        later.iter().all(|w| *w == "session_key" || run.contains(w)),
         "{later:?}"
     );
     // The gradient of Σ val², 2·val, read through the view.
@@ -356,4 +382,144 @@ async fn a_run_after_a_table_changes_its_types_matches_sql_all() {
             .unwrap()
             .to_string()
     );
+}
+
+/// `sql_all`'s and a prepared run's rows of each statement, as text.
+async fn both(ctx: &SessionContext, step: &ad::Prepared, statements: &[&str]) -> (String, String) {
+    let text = |batches: Vec<RecordBatch>| {
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string()
+    };
+    let (mut got, mut want) = (String::new(), String::new());
+    for df in step.run().await.unwrap() {
+        got += &text(df.collect().await.unwrap());
+    }
+    for df in ad::sql_all(ctx, statements).await.unwrap() {
+        want += &text(df.collect().await.unwrap());
+    }
+    (got, want)
+}
+
+#[tokio::test]
+async fn a_kept_plan_counts_the_rows_its_table_has_at_each_run() {
+    // An ungrouped COUNT(*) of a table whose statistics are exact folds to
+    // the table's row count when it is planned.
+    let ctx = SessionContext::new();
+    let mean = "WITH loss AS (SELECT SUM(val * val) / COUNT(*) AS l FROM w) \
+                SELECT i, grad(loss, val) FROM w ORDER BY i";
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    let step = ad::prepare(&ctx, &[mean]);
+    for vals in [&[1.0, -2.0][..], &[1.0, -2.0, 0.5, 4.0, 3.0], &[2.0]] {
+        let (got, want) = both(&ctx, &step, &[mean]).await;
+        assert_eq!(got, want);
+        put(&ctx, "w", vals).await;
+    }
+}
+
+#[tokio::test]
+async fn a_kept_join_reads_its_build_side_as_it_is_at_each_run() {
+    // A join on keys a dynamic filter would narrow to the first run's, with
+    // dynamic filter pushdown on, as it is by default.
+    let ctx = SessionContext::new();
+    let join = "WITH loss AS (SELECT SUM(w.val * k.val) AS l FROM w JOIN k ON w.i = k.i) \
+                SELECT i, grad(loss, val) FROM w ORDER BY i";
+    put(&ctx, "w", &[1.0, -2.0, 0.5, 3.0, 4.0]).await;
+    exec(
+        &ctx,
+        "CREATE TABLE k (i BIGINT NOT NULL, val DOUBLE) AS VALUES (0, 1.0), (1, 2.0)",
+    )
+    .await;
+    let step = ad::prepare(&ctx, &[join]);
+    for keys in [
+        "(3, 5.0), (4, 6.0)",
+        "(1, 7.0)",
+        "(0, 1.0), (2, 1.0), (4, 1.0)",
+    ] {
+        let (got, want) = both(&ctx, &step, &[join]).await;
+        assert_eq!(got, want);
+        exec(&ctx, "DROP TABLE k").await;
+        exec(
+            &ctx,
+            &format!("CREATE TABLE k (i BIGINT NOT NULL, val DOUBLE) AS VALUES {keys}"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_kept_plan_over_a_table_split_otherwise_is_planned_again() {
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+    // One partition, so nothing repartitions the scan: the plan reads as
+    // many partitions as it was planned for.
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int64, false),
+        Field::new("val", DataType::Float64, true),
+    ]));
+    let batch = |i: Vec<i64>, v: Vec<f64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(i)),
+                Arc::new(Float64Array::from(v)),
+            ],
+        )
+        .unwrap()
+    };
+    let register = |partitions: Vec<Vec<RecordBatch>>| {
+        ctx.deregister_table("w").unwrap();
+        let table = MemTable::try_new(Arc::clone(&schema), partitions).unwrap();
+        ctx.register_table("w", Arc::new(table)).unwrap();
+    };
+    register(vec![vec![batch(vec![0, 1, 2], vec![1.0, -2.0, 0.5])]]);
+    let step = ad::prepare(&ctx, &[STEP]);
+    let (got, want) = both(&ctx, &step, &[STEP]).await;
+    assert_eq!(got, want);
+    // The same rows, in three partitions, then two.
+    register(vec![
+        vec![batch(vec![0], vec![1.0])],
+        vec![batch(vec![1], vec![-2.0])],
+        vec![batch(vec![2], vec![0.5])],
+    ]);
+    let (got, want) = both(&ctx, &step, &[STEP]).await;
+    assert_eq!(got, want);
+    register(vec![
+        vec![batch(vec![0, 1], vec![1.0, -2.0])],
+        vec![batch(vec![2, 3], vec![0.5, 9.0])],
+    ]);
+    let (got, want) = both(&ctx, &step, &[STEP]).await;
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn a_kept_count_is_of_the_rows_its_table_has_when_it_runs() {
+    // DataFusion folds an ungrouped COUNT(*) of a table whose statistics
+    // are exact into the count when it plans it.
+    let ctx = SessionContext::new();
+    let mut engine = DataFusion(ctx.clone());
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    let plan = engine
+        .plan_sql("SELECT COUNT(*) AS n FROM w")
+        .await
+        .unwrap();
+    let plan = ddx_ad::Unbound::from_plan(plan)
+        .bind(&mut |_| None)
+        .unwrap();
+    // A plan run as SQL (`DDX_STEPS_AS_SQL=1`) is not kept.
+    let Some(kept) = engine.keep(&plan).await.unwrap() else {
+        return;
+    };
+    for vals in [&[1.0, -2.0, 0.5][..], &[1.0], &[1.0, 2.0, 3.0, 4.0, 5.0]] {
+        put(&ctx, "w", vals).await;
+        engine.materialize_kept("n", &plan, &kept).await.unwrap();
+        let batches = ctx.table("n").await.unwrap().collect().await.unwrap();
+        let n = batches[0].column(0).as_primitive::<Int64Type>().value(0);
+        assert_eq!(n, vals.len() as i64);
+        let rows = engine.returns_rows_kept(&[(&plan, &kept)]).await.unwrap();
+        assert_eq!(rows, [true]);
+    }
 }

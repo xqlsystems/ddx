@@ -26,6 +26,9 @@ async-trait = "0.1"
 # ad::run runs a program's checks at once, a task each, and ad::Prepared
 # runs one at a time. Already in the tree through datafusion.
 tokio = { version = "1", features = ["rt", "sync"] }
+# A kept check stops reading at its first row. Already in the tree through
+# datafusion.
+futures = "0.3"
 
 [features]
 # Step-level access to a program's run (`ddx_datafusion::engine`), for ddx's

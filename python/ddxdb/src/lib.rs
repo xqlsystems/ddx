@@ -675,6 +675,7 @@ impl PyBackend {
 
 impl ddx_ad::Backend for PyBackend {
     type Error = PyErr;
+    type Kept = ();
 
     fn table_schema(&mut self, name: &str) -> impl Future<Output = PyResult<NamedStruct>> + Send {
         self.call(|b| {

@@ -384,6 +384,7 @@ mod tests {
 
     impl Backend for Views {
         type Error = String;
+        type Kept = ();
         async fn table_schema(&mut self, _: &str) -> Result<NamedStruct, String> {
             Err("no tables".into())
         }

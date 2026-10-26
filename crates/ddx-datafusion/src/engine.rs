@@ -16,10 +16,11 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::{FunctionRegistry, SessionState};
+use datafusion::execution::{FunctionRegistry, SessionState, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::optimizer::Analyzer;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -31,6 +32,8 @@ use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, ProjectRel, Rel};
 use ddx_ad::{AdError, Bound, Program, RunError, Step};
+
+pub use crate::kept::Kept;
 
 pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -61,6 +64,7 @@ pub struct DataFusion(pub SessionContext);
 
 impl ddx_ad::Backend for DataFusion {
     type Error = DataFusionError;
+    type Kept = crate::kept::Kept;
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
         table_schema(&self.0, name).await
@@ -90,6 +94,47 @@ impl ddx_ad::Backend for DataFusion {
 
     async fn materialize(&mut self, name: &str, plan: &Bound) -> Result<()> {
         materialize(&self.0, name, plan).await
+    }
+
+    async fn keep(&mut self, plan: &Bound) -> Result<Option<crate::kept::Kept>> {
+        // A plan run as SQL is planned from its SQL, by the session.
+        if steps_as_sql() {
+            return Ok(None);
+        }
+        crate::kept::keep(&self.0, plan).await.map(Some)
+    }
+
+    async fn materialize_kept(
+        &mut self,
+        name: &str,
+        plan: &Bound,
+        kept: &crate::kept::Kept,
+    ) -> Result<()> {
+        let physical = crate::kept::ready(&self.0, plan, kept).await?;
+        let task = Arc::new(TaskContext::from(&self.0.state()));
+        register_rows(&self.0, name, physical, task).await
+    }
+
+    async fn returns_rows_kept(
+        &mut self,
+        plans: &[(&Bound, &crate::kept::Kept)],
+    ) -> Result<Vec<bool>> {
+        // At once, as `returns_rows` runs them.
+        let task = Arc::new(TaskContext::from(&self.0.state()));
+        let mut tasks = Vec::with_capacity(plans.len());
+        for (plan, kept) in plans {
+            let physical = crate::kept::ready(&self.0, plan, kept).await?;
+            let task = Arc::clone(&task);
+            tasks.push(tokio::spawn(async move { any_row(physical, task).await }));
+        }
+        let mut rows = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            rows.push(
+                task.await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+            );
+        }
+        Ok(rows)
     }
 
     async fn drop_table(&mut self, name: &str) -> Result<()> {
@@ -281,6 +326,18 @@ pub async fn register(ctx: &SessionContext, name: &str, df: DataFrame) -> Result
     Ok(())
 }
 
+/// Does `physical` return any row?
+async fn any_row(physical: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<bool> {
+    use futures::TryStreamExt;
+    let mut stream = datafusion::physical_plan::execute_stream(physical, task)?;
+    while let Some(batch) = stream.try_next().await? {
+        if batch.num_rows() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Does `plan` (a check) return any row? The returns-rows primitive of
 /// [`ddx_ad::Backend`].
 pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
@@ -316,14 +373,24 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
 /// materialize primitive of [`ddx_ad::Backend`].
 pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Result<()> {
     let df = dataframe(ctx, plan).await?;
+    let task = Arc::new(df.task_ctx());
+    let physical = df.create_physical_plan().await?;
+    register_rows(ctx, name, physical, task).await
+}
+
+/// Run `physical` and register its rows as the table `name`, replacing one.
+async fn register_rows(
+    ctx: &SessionContext,
+    name: &str,
+    physical: Arc<dyn ExecutionPlan>,
+    task: Arc<TaskContext>,
+) -> Result<()> {
     // The schema of the plan that runs, not the logical one: a step read
     // from an unanalyzed plan can be typed before type coercion (a CASE
     // between BIGINT and DOUBLE branches), and the table must declare the
     // types its batches hold.
-    let task = df.task_ctx();
-    let physical = df.create_physical_plan().await?;
     let schema = physical.schema();
-    let batches = datafusion::physical_plan::collect(physical, Arc::new(task)).await?;
+    let batches = datafusion::physical_plan::collect(physical, task).await?;
     // A MemTable, not a view: DataFusion's Substrait consumer can pick
     // columns out of a table scan, and a later step reads only some.
     let table = MemTable::try_new(schema, vec![batches])?;
@@ -342,6 +409,15 @@ pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Resul
 /// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
 /// names mean nothing to ddx, whose plans refer to columns by position.
 pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
+    logical_plan_reading(ctx, plan, |_, table| table).await
+}
+
+/// [`logical_plan`], each table it reads as `read` gives it.
+pub(crate) async fn logical_plan_reading(
+    ctx: &SessionContext,
+    plan: &Plan,
+    read: fn(&TableReference, Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
+) -> Result<LogicalPlan> {
     let plan = bound(ctx, plan).await?;
     let state = ctx.state();
     let extensions = Extensions::try_from(&plan.extensions)?;
@@ -349,6 +425,7 @@ pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPl
         inner: DefaultSubstraitConsumer::new(&extensions, &state),
         state: &state,
         next: AtomicUsize::new(0),
+        read,
     };
     from_substrait_plan_with_consumer(&consumer, &plan).await
 }
@@ -402,6 +479,8 @@ struct ShortNames<'a> {
     inner: DefaultSubstraitConsumer<'a>,
     state: &'a SessionState,
     next: AtomicUsize,
+    /// Each table read, as the plan reads it.
+    read: fn(&TableReference, Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
 }
 
 #[async_trait]
@@ -410,7 +489,8 @@ impl SubstraitConsumer for ShortNames<'_> {
         &self,
         table: &TableReference,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.resolve_table_ref(table).await
+        let found = self.inner.resolve_table_ref(table).await?;
+        Ok(found.map(|provider| (self.read)(table, provider)))
     }
 
     fn get_extensions(&self) -> &Extensions {

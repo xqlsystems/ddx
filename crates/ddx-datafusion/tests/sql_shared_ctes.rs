@@ -26,6 +26,7 @@ struct Recording {
 
 impl Backend for Recording {
     type Error = datafusion::error::DataFusionError;
+    type Kept = ();
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
         self.inner.table_schema(name).await

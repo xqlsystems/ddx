@@ -36,6 +36,7 @@ struct Sync {
 
 impl Backend for Sync {
     type Error = DataFusionError;
+    type Kept = ();
 
     fn table_schema(
         &mut self,
