@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.5...ddx-ad-v0.2.6) - 2026-10-26
+
+### Fixed
+
+- *(ddx-ad)* differentiate a view's softmax on DuckDB ([#207](https://github.com/xqlsystems/ddx/pull/207))
+
 ## [0.2.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.4...ddx-ad-v0.2.5) - 2026-10-25
 
 ### Fixed
