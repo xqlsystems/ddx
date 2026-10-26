@@ -125,6 +125,8 @@ class DuckDBBackend:
         self._mirrored: dict = {}
         self._attached = {"memory"}
         self._settings: tuple = ()
+        # The tables materialize wrote, each mirrored as it wrote it.
+        self._written: set = set()
 
     @property
     def con(self) -> "duckdb.DuckDBPyConnection":
@@ -281,6 +283,13 @@ class DuckDBBackend:
     # The Backend protocol.
 
     def select_all(self, name: str) -> bytes:
+        if name in self._written:
+            # One of ddx's own, as materialize mirrored it: a temporary
+            # table, found by its name alone, whose plan depends on nothing
+            # else in the catalog, so the catalog is not read again.
+            return bytes(
+                self._planner.execute("SELECT * FROM get_substrait(?)", [f"SELECT * FROM {_ident(name)}"]).fetchone()[0]
+            )
         catalog = self._sync()
         return self._plan(f"SELECT * FROM {_ident(name)}", catalog)
 
@@ -336,13 +345,19 @@ class DuckDBBackend:
     def materialize(self, name: str, plan: bytes) -> None:
         query = to_sql(plan, "duckdb")
         self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {query}")
-        # Later steps read it: an empty copy for the planner.
+        # Later steps read it: an empty copy for the planner. Its name is
+        # ddx's (``__ddx_``), which no object the planner mirrors has, so
+        # what it replaces is the planner's table of the last run.
         columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
-        self._mirror_table(("temp", "main", name), [(c[0], c[1]) for c in columns])
+        cols = ", ".join(f"{_ident(c[0])} {c[1]}" for c in columns)
+        self._planner.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} ({cols})")
+        self._written.add(name)
 
     def drop_table(self, name: str) -> None:
+        # Forgotten first, so a failed drop leaves the name to the catalog.
+        self._written.discard(name)
         self.con.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
-        self._drop_mirrored(("temp", "main", name))
+        self._planner.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
 
 
 #: The programs :func:`sql_all` keeps for each connection, gone with it.
