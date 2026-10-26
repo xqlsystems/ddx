@@ -254,14 +254,14 @@ pub(crate) async fn replaced_table(
     replaced_among(ctx, &scans(plan)?).await
 }
 
-/// Each table `plan` reads, once: its name and the source read.
-pub(crate) type Scans = Vec<(
+/// A table a plan reads: its name and the source read.
+pub(crate) type Scan = (
     TableReference,
     Arc<dyn datafusion::logical_expr::TableSource>,
-)>;
+);
 
-/// The tables `plan` reads ([`Scans`]).
-pub(crate) fn scans(plan: &LogicalPlan) -> Result<Scans> {
+/// The tables `plan` reads, each once.
+pub(crate) fn scans(plan: &LogicalPlan) -> Result<Vec<Scan>> {
     use datafusion::common::tree_node::TreeNodeRecursion;
     // Each table once: a plan that reads views reads their tables as often
     // as the views are read, a thousand times in ten views that each read
@@ -283,10 +283,7 @@ pub(crate) fn scans(plan: &LogicalPlan) -> Result<Scans> {
 /// [`replaced_table`] among `scans`.
 pub(crate) async fn replaced_among(
     ctx: &SessionContext,
-    scans: &[(
-        TableReference,
-        Arc<dyn datafusion::logical_expr::TableSource>,
-    )],
+    scans: &[Scan],
 ) -> Result<Option<TableReference>> {
     use datafusion::datasource::cte_worktable::CteWorkTable;
     use datafusion::datasource::source_as_provider;
@@ -437,7 +434,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // Which programs to run, how each is built and run, and how each
     // statement reads them are ddx_ad::rewrite's; DataFusion plans and runs.
     let mut engine = DataFusion(ctx.clone());
-    let programs = programs(ctx);
+    let programs = kept::<Programs>(ctx);
     let out = ddx_ad::rewrite(&mut engine, &programs, statements, &GenericDialect {})
         .await
         .map_err(from_run_error)?;
@@ -477,9 +474,10 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 /// call of [`sql_all`] repeats: planning the objective, keying the program,
 /// reading the views. In return, the tables the statements read must keep
 /// their schemas: a table may change its rows, or be registered again
-/// under its name, between runs. Each run compares every view's kept plan
-/// with the one it was prepared with, and prepares the statements again
-/// once a view is created, redefined or dropped.
+/// under its name, between runs. Each run compares every view's kept plan,
+/// and the session's settings, with those it was prepared with, and
+/// prepares the statements again once a view is created, redefined or
+/// dropped, or a setting changes.
 pub fn prepare(ctx: &SessionContext, statements: &[&str]) -> Prepared {
     Prepared {
         ctx: ctx.clone(),
@@ -508,8 +506,8 @@ impl std::fmt::Debug for Prepared {
 impl Prepared {
     /// Run the statements, as [`sql_all`] does: each a DataFrame that holds
     /// what it reads. The first run that succeeds prepares them, as does
-    /// the first after a view changes; a failed one prepares nothing, and
-    /// the next tries again. Runs wait for each other.
+    /// the first after a view or a setting changes; a failed one prepares
+    /// nothing, and the next tries again. Runs wait for each other.
     pub async fn run(&self) -> Result<Vec<DataFrame>> {
         let mut prepared = self.prepared.lock().await;
         let mut engine = DataFusion(self.ctx.clone());
@@ -533,12 +531,6 @@ impl Prepared {
         out.release(&mut engine, &Programs::new()).await?;
         frames
     }
-}
-
-/// The programs [`sql_all`] keeps on `ctx` (and every context that shares
-/// its state), put there on first use.
-fn programs(ctx: &SessionContext) -> Arc<Programs> {
-    kept(ctx)
 }
 
 /// What ddx keeps on `ctx` (and every context that shares its state) as a

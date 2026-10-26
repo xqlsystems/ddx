@@ -169,9 +169,9 @@ impl Backend for Counting {
         self.ask("view_sql");
         self.engine.view_sql(name).await
     }
-    async fn views_key(&mut self) -> Result<Option<String>, DataFusionError> {
-        self.ask("views_key");
-        self.engine.views_key().await
+    async fn session_key(&mut self) -> Result<Option<String>, DataFusionError> {
+        self.ask("session_key");
+        self.engine.session_key().await
     }
 }
 
@@ -215,7 +215,7 @@ async fn a_later_run_asks_the_engine_only_to_run_plans() {
     assert!(
         later
             .iter()
-            .all(|w| ["views_key", "returns_rows", "materialize"].contains(w)),
+            .all(|w| ["session_key", "returns_rows", "materialize"].contains(w)),
         "{later:?}"
     );
     // The gradient of Σ val², 2·val, read through the view.
@@ -256,9 +256,9 @@ async fn a_view_redefined_is_differentiated_as_it_is_now() {
     let (got, _) = grads(&ctx, &step).await;
     assert_eq!(got, [vec![2.0, -4.0, 1.0]]);
     // Made again as it was: the same plans run.
-    let before = DataFusion(ctx.clone()).views_key().await.unwrap();
+    let before = DataFusion(ctx.clone()).session_key().await.unwrap();
     exec(&ctx, "CREATE OR REPLACE VIEW m AS SELECT i, val FROM w").await;
-    assert_eq!(DataFusion(ctx.clone()).views_key().await.unwrap(), before);
+    assert_eq!(DataFusion(ctx.clone()).session_key().await.unwrap(), before);
     let (got, _) = grads(&ctx, &step).await;
     assert_eq!(got, [vec![2.0, -4.0, 1.0]]);
     exec(
@@ -312,4 +312,19 @@ async fn a_view_over_a_table_registered_again_is_refused_as_sql_all_refuses_it()
     exec(&ctx, "CREATE OR REPLACE VIEW m AS SELECT i, val FROM w").await;
     let (got, _) = grads(&ctx, &step).await;
     assert_eq!(got, [vec![6.0, 0.0, -2.0]]);
+}
+
+#[tokio::test]
+async fn a_run_after_the_default_schema_changes_matches_sql_all() {
+    let ctx = SessionContext::new();
+    exec(&ctx, "CREATE SCHEMA s").await;
+    put(&ctx, "w", &[1.0, 2.0]).await;
+    put(&ctx, "s.w", &[10.0, 20.0]).await;
+    let step = ad::prepare(&ctx, &[STEP]);
+    let first = values(step.run().await.unwrap()).await;
+    exec(&ctx, "SET datafusion.catalog.default_schema = 's'").await;
+    let got = values(step.run().await.unwrap()).await;
+    let want = values(ad::sql_all(&ctx, &[STEP]).await.unwrap()).await;
+    assert!(close(&got, &want), "{got:?}, not {want:?}");
+    assert!(!close(&got, &first), "{got:?} read the old schema's w");
 }

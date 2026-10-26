@@ -598,3 +598,16 @@ def test_threads_with_a_cursor_each_differentiate_at_once(ad, tmp_path):
     with ThreadPoolExecutor(4) as pool:
         got = list(pool.map(call, range(4)))
     assert got == [[[(0, 3.0), (1, 12.0), (2, 0.75)]] * 4] * 4
+
+
+def test_a_prepared_call_after_a_setting_changes_matches_sql_all(ad):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, -2.0), (2, 0.5), (3, 1.0)")
+    # The gradient is i / 2, which DuckDB divides as integers once told to.
+    statement = "WITH loss AS (SELECT SUM(val * (i / 2)) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    step = ad.prepare(con, [statement])
+    assert pairs(step()[0]) == [(0, 0.0), (1, 0.5), (2, 1.0), (3, 1.5)]
+    con.execute("SET integer_division = true")
+    assert pairs(step()[0]) == pairs(ad.sql_all(con, [statement])[0]) == [(0, 0.0), (1, 0.0), (2, 1.0), (3, 1.0)]
+

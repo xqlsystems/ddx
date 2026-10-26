@@ -131,13 +131,16 @@ class Backend(Protocol):
         returns ``None``, leaves every view to the engine."""
         ...
 
-    def views_key(self) -> Optional[str]:
+    def session_key(self) -> Optional[str]:
         """Optional. Text that is the same at two calls only if the engine
-        runs each of its views as it did: every view's name and what the
-        engine runs for it. A :class:`Prepared` run compares it with the
-        one its statements were prepared with, and prepares them again if
-        it differs. A backend without it, or that returns ``None``, gets
-        them prepared on every run."""
+        would plan any query as it did, given tables of the same schemas:
+        what :meth:`plan_key` depends on but the query and its tables. That
+        is every view's name and what the engine runs for it, the settings
+        that change what a query means, and where names are searched. A
+        :class:`Prepared` run compares it with the one its statements were
+        prepared with, and prepares them again if it differs. A backend
+        without it, or that returns ``None``, gets them prepared on every
+        run."""
         ...
 
 
@@ -224,16 +227,17 @@ class Prepared:
     as :func:`rewrite` does, and every later one runs the same plans again,
     each as it was bound then, as ``jax.jit`` traces a function once and
     runs what it traced after that (``ddx_ad::Prepared``). A later run asks
-    the backend for no plan, key or schema: only for its ``views_key()``,
+    the backend for no plan, key or schema: only for its ``session_key()``,
     and to run plans.
 
     In return, the tables the statements read must keep their schemas.
     Between runs, a table may change its rows, or be registered again under
     its name, but not change its columns or their types; prepare the
     statements again after changing one. A run whose backend's
-    ``views_key()`` differs from the one the statements were prepared with,
-    because a view was created, redefined or dropped, prepares them again.
-    A backend without ``views_key`` gets them prepared on every run.
+    ``session_key()`` differs from the one the statements were prepared
+    with (a view was created, redefined or dropped, or a setting changed)
+    prepares them again.
+    A backend without ``session_key`` gets them prepared on every run.
 
     Every run writes the same tables, so runs must not overlap: release one
     run's :class:`Rewritten` before the next."""

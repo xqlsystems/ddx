@@ -789,7 +789,7 @@ def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, ctx)
 def test_a_later_prepared_call_asks_the_backend_only_to_run_plans(ad, ctx, monkeypatch):
     ctx.sql("CREATE VIEW m AS SELECT i, val FROM w").collect()
     asked = []
-    for method in ["select_all", "plan_sql", "plan_key", "view_sql", "views_key", "returns_rows", "materialize"]:
+    for method in ["select_all", "plan_sql", "plan_key", "view_sql", "session_key", "returns_rows", "materialize"]:
         original = getattr(ad.DataFusionBackend, method)
 
         def spy(self, *args, _method=method, _original=original):
@@ -802,7 +802,7 @@ def test_a_later_prepared_call_asks_the_backend_only_to_run_plans(ad, ctx, monke
     assert {"plan_sql", "view_sql", "select_all"} <= set(asked) and "plan_key" not in asked
     asked.clear()
     assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
-    assert set(asked) <= {"views_key", "returns_rows", "materialize"}, asked
+    assert set(asked) <= {"session_key", "returns_rows", "materialize"}, asked
 
 
 def test_a_failed_prepared_call_leaves_nothing_and_the_next_runs(ad, ctx):

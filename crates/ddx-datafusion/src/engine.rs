@@ -175,12 +175,13 @@ impl ddx_ad::Backend for DataFusion {
         Ok(same.then(|| sql.clone()))
     }
 
-    async fn views_key(&mut self) -> Result<Option<String>> {
+    async fn session_key(&mut self) -> Result<Option<String>> {
         use datafusion::catalog::information_schema::INFORMATION_SCHEMA;
         use datafusion::logical_expr::TableType;
         // Each view's kept plan, not its SQL: DataFusion runs the plan, and
         // a view made again with the same SQL after one it reads is
-        // redefined runs another.
+        // redefined runs another. (Finding the views loads every table: a
+        // schema says what a table is only once it has loaded it.)
         let mut views = Vec::new();
         let mut catalogs = self.0.catalog_names();
         catalogs.sort();
@@ -197,7 +198,9 @@ impl ddx_ad::Backend for DataFusion {
                 let mut names = schema.table_names();
                 names.sort();
                 for name in names {
-                    let Some(table) = schema.table(&name).await? else {
+                    // A table that fails to load is no view the statements
+                    // read: they would fail too.
+                    let Ok(Some(table)) = schema.table(&name).await else {
                         continue;
                     };
                     if table.table_type() != TableType::View {
@@ -235,11 +238,16 @@ impl ddx_ad::Backend for DataFusion {
                 key.push_str(&format!(", {name} reads {table} as it was"));
             }
         }
+        // And the session's settings, which hold where names are searched
+        // and how they are read.
+        for entry in self.0.state().config().options().entries() {
+            key.push_str(&format!("\n{}={:?}", entry.key, entry.value));
+        }
         Ok(Some(key))
     }
 }
 
-/// Each view's kept plan, by its path, as [`DataFusion`]'s `views_key` last
+/// Each view's kept plan, by its path, as [`DataFusion`]'s `session_key` last
 /// saw them on a context, and how many times they have changed since the
 /// context was made: the key's first part.
 #[derive(Default)]
@@ -249,7 +257,7 @@ struct SeenViews(Mutex<Seen>);
 struct Seen {
     plans: Vec<(String, LogicalPlan)>,
     /// The tables each reads.
-    scans: Vec<(String, crate::ad::Scans)>,
+    scans: Vec<(String, Vec<crate::ad::Scan>)>,
     changes: u64,
 }
 

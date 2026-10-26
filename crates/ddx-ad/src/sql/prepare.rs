@@ -42,8 +42,9 @@ pub(super) fn results(program: &dyn Built) -> impl Iterator<Item = String> + '_ 
 /// change its rows, or be registered again under its name, but not change
 /// its columns, their types or its name. A run after a table's schema
 /// changes fails or reads it wrongly; to change one, prepare the
-/// statements again. Views are checked: a run asks only for the engine's
-/// [`Backend::views_key`], and runs nothing once a view has changed.
+/// statements again. The rest of what a plan depends on is checked: a run
+/// asks the engine for its [`Backend::session_key`], and runs nothing once
+/// a view, a setting or where names are searched has changed.
 ///
 /// Every run writes the same tables, so two must not overlap: a run's
 /// tables stay until its [`Rewritten::release`].
@@ -51,8 +52,8 @@ pub struct Prepared {
     /// Each job's program, in order, with what its run did.
     jobs: Vec<(Box<dyn Built>, Trace)>,
     statements: Vec<String>,
-    /// The engine's views, as [`prepare`] found them.
-    views: Option<String>,
+    /// The engine's session, as [`prepare`] found it.
+    session: Option<String>,
 }
 
 impl fmt::Debug for Prepared {
@@ -82,7 +83,7 @@ pub fn prepare<'a, B: Backend>(
     let planned = plan::Derivatives::plan(statements, dialect);
     async move {
         let mut planned = planned.map_err(RunError::Refused)?;
-        let views = backend.views_key().await.map_err(RunError::Engine)?;
+        let session = backend.session_key().await.map_err(RunError::Engine)?;
         let (mut tables, mut keys, mut traces) = (Vec::new(), Vec::new(), Vec::new());
         let result = run_all(
             backend,
@@ -100,7 +101,7 @@ pub fn prepare<'a, B: Backend>(
         let prepared = Prepared {
             jobs: planned.into_built().into_iter().zip(traces).collect(),
             statements: statements.clone(),
-            views,
+            session,
         };
         let rewritten = Rewritten {
             statements,
@@ -120,8 +121,8 @@ impl Prepared {
     /// ([`Rewritten::release`], which keeps no program). If anything
     /// fails, every table this run wrote is dropped.
     ///
-    /// Returns `None`, and runs nothing, if the engine's views are not as
-    /// [`prepare`] found them, or it cannot say ([`Backend::views_key`]):
+    /// Returns `None`, and runs nothing, if the engine's session is not as
+    /// [`prepare`] found it, or it cannot say ([`Backend::session_key`]):
     /// the statements are then prepared again.
     // Not an `async fn`, so that its future is promised `Send`, as
     // `rewrite`'s is.
@@ -131,8 +132,8 @@ impl Prepared {
         backend: &'a mut B,
     ) -> impl Future<Output = Result<Option<Rewritten>, RunError<B::Error>>> + Send + 'a {
         async move {
-            let views = backend.views_key().await.map_err(RunError::Engine)?;
-            if views.is_none() || views != self.views {
+            let session = backend.session_key().await.map_err(RunError::Engine)?;
+            if session.is_none() || session != self.session {
                 return Ok(None);
             }
             let mut tables = Vec::new();

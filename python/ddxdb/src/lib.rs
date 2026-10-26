@@ -744,13 +744,13 @@ impl ddx_ad::Backend for PyBackend {
         })
     }
 
-    fn views_key(&mut self) -> impl Future<Output = PyResult<Option<String>>> + Send {
+    fn session_key(&mut self) -> impl Future<Output = PyResult<Option<String>>> + Send {
         // Optional: a backend without it gets nothing prepared run again.
         self.call(|b| {
-            if !b.hasattr("views_key")? {
+            if !b.hasattr("session_key")? {
                 return Ok(None);
             }
-            b.call_method0("views_key")?.extract()
+            b.call_method0("session_key")?.extract()
         })
     }
 }
@@ -839,12 +839,7 @@ fn _rewrite(
         let kept = programs.as_ref().map_or(&fresh, |p| &p.get().0);
         now(ddx_ad::rewrite(&mut backend, kept, &refs, parser.as_ref())).map_err(run_err)?
     };
-    let (statements, tables) = (out.statements.clone(), out.tables.clone());
-    let release = Release {
-        rewritten: Mutex::new(Some(out)),
-        programs,
-    };
-    Ok((statements, tables, release))
+    Ok(Release::of(out, programs))
 }
 
 /// `_rewrite`, once, keeping what ran to run again (`ddx_ad::prepare`):
@@ -862,11 +857,7 @@ fn _prepare(
     let mut backend = PyBackend(backend.unbind());
     let (prepared, out) =
         now(ddx_ad::prepare(&mut backend, &refs, parser.as_ref())).map_err(run_err)?;
-    let (statements, tables) = (out.statements.clone(), out.tables.clone());
-    let release = Release {
-        rewritten: Mutex::new(Some(out)),
-        programs: None,
-    };
+    let (statements, tables, release) = Release::of(out, None);
     Ok((Prepared(prepared), statements, tables, release))
 }
 
@@ -888,12 +879,7 @@ impl Prepared {
         let Some(out) = now(self.0.run(&mut PyBackend(backend.unbind()))).map_err(run_err)? else {
             return Ok(None);
         };
-        let (statements, tables) = (out.statements.clone(), out.tables.clone());
-        let release = Release {
-            rewritten: Mutex::new(Some(out)),
-            programs: None,
-        };
-        Ok(Some((statements, tables, release)))
+        Ok(Some(Release::of(out, None)))
     }
 
     fn __repr__(&self) -> String {
@@ -909,6 +895,22 @@ impl Prepared {
 struct Release {
     rewritten: Mutex<Option<ddx_ad::Rewritten>>,
     programs: Option<Py<Programs>>,
+}
+
+impl Release {
+    /// `out`'s statements and tables, and what releases them, then keeps
+    /// `programs`' programs.
+    fn of(
+        out: ddx_ad::Rewritten,
+        programs: Option<Py<Programs>>,
+    ) -> (Vec<String>, Vec<String>, Release) {
+        let (statements, tables) = (out.statements.clone(), out.tables.clone());
+        let release = Release {
+            rewritten: Mutex::new(Some(out)),
+            programs,
+        };
+        (statements, tables, release)
+    }
 }
 
 #[pymethods]

@@ -87,8 +87,8 @@ Its first call computes the calls as `sql_all` does. Later calls run the same
 plans again, asking DataFusion for no plan of a query, so they skip what a call
 of `sql_all` repeats: about a quarter of a small GPT's training step. In return, the
 tables must keep their schemas. A table may change its rows, or be registered
-again, between calls. A call after a view is created, redefined or dropped
-prepares the statements again.
+again, between calls. A call after a view is created, redefined or dropped, or
+a setting changes, prepares the statements again.
 
 ## On DuckDB
 
