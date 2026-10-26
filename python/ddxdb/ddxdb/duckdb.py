@@ -41,23 +41,29 @@ How it runs (:class:`DuckDBBackend`):
 Every table a program writes is named with the prefix ``__ddx_``, which ddxdb
 reserves, and none stays once a call returns.
 
+A DuckDB connection is not safe to use from two threads at once, and neither
+are these functions on one connection. As DuckDB asks, give each thread a
+cursor of its own (``con.cursor()``): each gets a planner of its own, and
+writes its tables as temporary tables, which only that cursor sees.
+
 Importing this module requires DuckDB.
 """
 
 from __future__ import annotations
 
+import threading
 import weakref
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 try:
     import duckdb
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
-from . import Programs, _name_parts, rewrite
+from . import Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
-__all__ = ["DuckDBBackend", "sql", "sql_all"]
+__all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
 
 
 def _ident(name: str) -> str:
@@ -243,7 +249,6 @@ class DuckDBBackend:
         for db, schema in self.con.execute("SELECT database_name, schema_name FROM duckdb_schemas()").fetchall():
             if db not in ("system", "temp"):
                 self._path((db, schema, ""))
-        self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
         settings = tuple(
             self.con.execute(
                 "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
@@ -252,8 +257,16 @@ class DuckDBBackend:
         )
         if settings != self._settings:
             for name, value in settings:
-                self._planner.execute(f"SET {name} = {_literal(value)}")
+                if name != "search_path":
+                    self._planner.execute(f"SET {name} = {_literal(value)}")
             self._settings = settings
+        # Where names are searched, last: `USE` sets the search path to its
+        # schema alone, and a search path set sets the current schema, its
+        # first; an empty one means the planner's own database.
+        self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
+        path = dict(settings)["search_path"]
+        if path:
+            self._planner.execute(f"SET search_path = {_literal(path)}")
         return catalog
 
     def _plan(self, sql: str, catalog: dict) -> bytes:
@@ -338,6 +351,19 @@ class DuckDBBackend:
             return sql if kind == "view" and here else None
         return None
 
+    def session_key(self) -> str:
+        # What plan_key depends on but the query: every object's columns or
+        # view SQL (DuckDB binds a view's SQL each time a query reads it, so
+        # the SQL is what runs), which also names every object, so a table
+        # made to shadow another is seen; where names are searched; and the
+        # settings that change what a query means.
+        where = self.con.execute("SELECT current_database(), current_schema()").fetchone()
+        settings = self.con.execute(
+            "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
+            [list(_SETTINGS)],
+        ).fetchall()
+        return repr((where, settings, sorted(self._catalog().items())))
+
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")
         return self.con.execute(f"SELECT 1 FROM ({query}) AS __ddx_check LIMIT 1").fetchone() is not None
@@ -383,13 +409,43 @@ def sql_all(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> list
     Each statement runs before this returns: a DuckDB relation reads its
     tables only when it runs, and the programs' tables are dropped once the
     statements have run. A result is copied into memory (as Arrow)."""
+    programs = _programs.setdefault(con, Programs())
+    with rewrite(_backend(con), statements, "duckdb", programs) as rewritten:
+        return _run_all(con, rewritten.statements)
+
+
+def prepare(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> Callable[[], list]:
+    """:func:`sql_all`'s ``statements``, prepared to run again on ``con``
+    (see :func:`ddxdb.ad.prepare`, which prepares them on DataFusion the
+    same way): a function of no arguments that runs them and returns what
+    :func:`sql_all` would. Its first call computes the calls; every later
+    one runs the same plans again, on the tables' rows as they are then. A
+    call after a table's schema, a view, a setting or the current schema
+    changes, or a table is made that shadows another, prepares them
+    again."""
+    prepared = Prepared(_backend(con), statements, "duckdb")
+    lock = threading.Lock()
+
+    def run() -> list:
+        with lock, prepared.run() as rewritten:
+            return _run_all(con, rewritten.statements)
+
+    return run
+
+
+def _backend(con: "duckdb.DuckDBPyConnection") -> DuckDBBackend:
+    """The backend of ``con``, made on first use and kept with it."""
     backend = _backends.get(con)
     if backend is None:
         backend = _backends[con] = DuckDBBackend(con)
-    programs = _programs.setdefault(con, Programs())
+    return backend
+
+
+def _run_all(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> list:
+    """Run each of ``statements``, each result copied into memory as Arrow;
+    ``None`` for one that returns no rows."""
     out = []
-    with rewrite(backend, statements, "duckdb", programs) as rewritten:
-        for statement in rewritten.statements:
-            result = con.execute(statement)
-            out.append(None if result.description is None else con.from_arrow(result.to_arrow_table()))
+    for statement in statements:
+        result = con.execute(statement)
+        out.append(None if result.description is None else con.from_arrow(result.to_arrow_table()))
     return out

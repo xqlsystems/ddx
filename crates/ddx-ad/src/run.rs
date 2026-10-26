@@ -217,6 +217,19 @@ pub trait Backend: Send {
         let _ = name;
         async { Ok(None) }
     }
+
+    /// Text that is the same at two calls only if the engine would plan
+    /// any query as it did: what [`Backend::plan_key`] depends on but the
+    /// query. That is every table's name and schema, every view's name and
+    /// what the engine runs for it, the settings that change what a query
+    /// means, and where names are searched.
+    /// [`crate::Prepared::run`] compares it with the one [`crate::prepare`]
+    /// read, and runs nothing once it differs, for the statements to be
+    /// prepared again. `None`, the default, means the engine cannot say,
+    /// and nothing prepared is run again.
+    fn session_key(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then
@@ -227,18 +240,77 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
+    run_bound(backend, program, Plans::Bind(None)).await
+}
+
+/// Where [`run_bound`] takes each plan from, its checks' then its steps',
+/// in order.
+pub(crate) enum Plans<'a> {
+    /// Bound as it runs, asking the engine for each schema, and kept here
+    /// if given.
+    Bind(Option<&'a mut Vec<Bound>>),
+    /// As an earlier run of the program, on the same tables, bound them.
+    Bound(&'a [Bound]),
+}
+
+impl<'a> Plans<'a> {
+    /// The plans an earlier run bound, if this run replays them.
+    fn replayed(&self) -> Option<&'a [Bound]> {
+        match self {
+            Plans::Bound(plans) => Some(plans),
+            Plans::Bind(_) => None,
+        }
+    }
+
+    /// `bound`, kept if this run keeps what it binds.
+    fn keep(&mut self, bound: Bound) -> Bound {
+        if let Plans::Bind(Some(kept)) = self {
+            kept.push(bound.clone());
+        }
+        bound
+    }
+}
+
+/// [`run`], with each plan from `plans`.
+pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
+    backend: &mut B,
+    program: &P,
+    mut plans: Plans<'_>,
+) -> Result<(), RunError<B::Error>> {
     let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
+    let replayed = plans.replayed();
+    // A replayed plan is read where it was kept, not copied.
+    let kept = |i: usize| {
+        replayed.map(|plans| {
+            plans.get(i).ok_or_else(|| {
+                RunError::Refused(AdError::Internal(format!(
+                    "plan {i} of a program was never bound"
+                )))
+            })
+        })
+    };
     let result = async {
-        let mut checks = Vec::with_capacity(program.checks().len());
-        for check in program.checks() {
-            checks.push(bind(backend, &check.plan, &mut schemas).await?);
-        }
+        let n = program.checks().len();
+        let mut bound = Vec::new();
+        let checks: &[Bound] = match replayed {
+            Some(plans) => plans.get(..n).ok_or_else(|| {
+                RunError::Refused(AdError::Internal(
+                    "a program's checks were never bound".into(),
+                ))
+            })?,
+            None => {
+                for check in program.checks() {
+                    bound.push(plans.keep(bind(backend, &check.plan, &mut schemas).await?));
+                }
+                &bound
+            }
+        };
         let rows = if checks.is_empty() {
             Vec::new()
         } else {
             backend
-                .returns_rows(&checks)
+                .returns_rows(checks)
                 .await
                 .map_err(RunError::Engine)?
         };
@@ -247,8 +319,13 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
                 program.checks()[i].message.clone(),
             )));
         }
-        for step in &steps {
-            let plan = bind(backend, &step.plan, &mut schemas).await?;
+        for (i, step) in steps.iter().enumerate() {
+            let plan = match kept(n + i) {
+                Some(plan) => std::borrow::Cow::Borrowed(plan?),
+                None => std::borrow::Cow::Owned(
+                    plans.keep(bind(backend, &step.plan, &mut schemas).await?),
+                ),
+            };
             // A table rewritten has the schema of this run's plan.
             schemas.remove(&step.name);
             backend

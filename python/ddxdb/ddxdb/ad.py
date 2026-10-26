@@ -52,6 +52,10 @@ other's tables, and a user's table is never replaced unless its name starts
 with ``__ddx_``, which is reserved. None of them stays once :func:`run`
 returns.
 
+A training loop runs the same statements on every batch: :func:`prepare`
+prepares them once, and each later call runs the same plans again, without
+planning, keying or reading views.
+
 One limit Rust's ``ddx_datafusion::ad`` does not share: datafusion-python's
 Substrait consumer names a computed column by its whole expression, so a deep
 chain of row-wise maps that each read their input twice (twenty
@@ -65,9 +69,10 @@ Importing this module requires DataFusion.
 
 from __future__ import annotations
 
+import threading
 import warnings
 import weakref
-from typing import NamedTuple, Optional, Sequence, Union
+from typing import Callable, NamedTuple, Optional, Sequence, Union
 
 try:
     import pyarrow as pa
@@ -81,7 +86,7 @@ from ._ddxdb import (
     _not_in_subquery,
     _view_probe,
 )
-from . import Backend, Programs, _name_parts, rewrite
+from . import Backend, Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import (
     BackwardProgram,
     Check,
@@ -115,6 +120,7 @@ __all__ = [
     "jvp",
     "register_stop_gradient",
     "Outputs",
+    "prepare",
     "run",
     "sql",
     "sql_all",
@@ -229,6 +235,10 @@ class DataFusionBackend:
 
     def __init__(self, ctx: SessionContext):
         self.ctx = ctx
+        # Each view's plan and table's schema as session_key last saw them,
+        # and how many times they have changed.
+        self._catalog: list = []
+        self._changes = 0
 
     def select_all(self, name: str) -> bytes:
         return Serde.serialize_bytes(f'SELECT * FROM "{name}"', self.ctx)
@@ -309,6 +319,49 @@ class DataFusionBackend:
             # The view's tables, or its SQL's, no longer plan.
             return None
         return rows[0] if same else None
+
+    def session_key(self) -> Optional[str]:
+        """The session's settings, which hold where names are searched and
+        how they are read, and how many times this backend has seen its
+        context's views or tables' schemas change. Each view's plan is the
+        plan DataFusion runs for it, the one it kept when it was made, which
+        reads a view redefined since as it was then. Plans compare in Rust,
+        and a plan unchanged shares its kept part, so the comparison is
+        quick.
+
+        ``None`` without the information schema, which holds the settings:
+        each call then prepares the statements again. Unlike Rust's, this
+        can't tell a view that reads a table registered again since (see
+        :meth:`view_sql`)."""
+        try:
+            settings = (
+                self.ctx.sql("SELECT name, value FROM information_schema.df_settings ORDER BY name")
+                .to_arrow_table()
+                .to_pylist()
+            )
+        except ValueError:
+            # DataFusion raises ValueError for a table it can't find: here,
+            # the information schema is off.
+            return None
+        # Each view's plan, and every other table's schema, which the plans
+        # were bound to; ddx's own tables come and go with each run.
+        catalog = []
+        for c in sorted(self.ctx.catalog_names()):
+            cat = self.ctx.catalog(c)
+            for s in sorted(cat.schema_names()):
+                if s == "information_schema":
+                    continue
+                schema = cat.schema(s)
+                for t in sorted(schema.table_names()):
+                    table = schema.table(t)
+                    path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
+                    if table.kind == "view":
+                        catalog.append((path, self.ctx.table(path).logical_plan()))
+                    elif not t.startswith("__ddx_"):
+                        catalog.append((path, table.schema))
+        if catalog != self._catalog:
+            self._catalog, self._changes = catalog, self._changes + 1
+        return f"{self._changes} {settings!r}"
 
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
@@ -557,3 +610,48 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
         # SessionContext's own sql, not a ddxdb.Context's, which would look for
         # calls again.
         return [SessionContext.sql(ctx, s) for s in rewritten.statements]
+
+
+def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional[str] = None) -> Callable[[], list]:
+    """:func:`sql_all`'s ``statements``, prepared to run again on ``ctx``, as
+    ``jax.jit`` prepares a function. Returns a function of no arguments that
+    runs them and returns what :func:`sql_all` would::
+
+        step = ad.prepare(ctx, statements)
+        for batch in batches:
+            ctx.deregister_table("batch")
+            ctx.register_record_batches("batch", [batch])
+            new_weights = step()
+
+    Its first call computes the calls as :func:`sql_all` does. Every later
+    one runs the same plans again (:class:`ddxdb.Prepared`), so it skips
+    what a call of :func:`sql_all` repeats: planning the objective, keying
+    each program, and checking that each view's SQL is still what
+    DataFusion runs for it.
+
+    Between calls, a table may change its rows, or be registered again under
+    its name. Each call compares every table's schema, every view's plan
+    and the session's settings with those it was prepared with, and
+    prepares the statements again once one has changed. As with
+    :func:`sql_all`'s kept programs, a ``now()`` in a loss keeps the time
+    of the call that prepared it: DataFusion folds it into a constant. Calls
+    wait for each other, since each writes the same tables.
+
+    ``ctx`` may be a DuckDB connection instead, which
+    :func:`ddxdb.duckdb.prepare` prepares on."""
+    if _duckdb(ctx):
+        from . import duckdb as on_duckdb
+
+        if dialect not in (None, "duckdb"):
+            raise ValueError(f"a DuckDB connection's statements are in DuckDB's dialect, not {dialect!r}")
+        return on_duckdb.prepare(ctx, statements)
+    prepared = Prepared(DataFusionBackend(ctx), statements, dialect or "datafusion")
+    lock = threading.Lock()
+
+    def run() -> list:
+        with lock, prepared.run() as rewritten:
+            # As in sql_all: SessionContext's own sql, and the tables leave
+            # the catalog once every statement is planned.
+            return [SessionContext.sql(ctx, s) for s in rewritten.statements]
+
+    return run

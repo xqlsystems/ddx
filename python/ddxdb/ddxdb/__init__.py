@@ -53,7 +53,7 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     run,
     vjp_plan,
 )
-from ._ddxdb import _rewrite
+from ._ddxdb import _prepare, _rewrite
 
 
 #: One part of a table name: quoted, with ``""`` for a quote inside it, or
@@ -81,7 +81,8 @@ def _name_parts(name: str, normalize: bool = True) -> Optional[list]:
 class Backend(Protocol):
     """An engine ddx runs on: the primitives of ``ddx_ad::Backend``.
     :func:`run` needs the first four to run a program; rewriting SQL that
-    calls ``grad``, ``vjp`` or ``jvp`` also needs :meth:`plan_sql`. Plans
+    calls ``grad``, ``vjp`` or ``jvp`` (:func:`rewrite`, :func:`prepare`)
+    also needs :meth:`plan_sql`. Plans
     cross as serialized Substrait, with their reads of earlier steps already
     bound. :class:`ddxdb.ad.DataFusionBackend` is one; any object with these
     methods is another."""
@@ -128,6 +129,18 @@ class Backend(Protocol):
         objective as CTEs, so a model that is a view has the CTEs it reads
         more than once planned once each. A backend without it, or that
         returns ``None``, leaves every view to the engine."""
+        ...
+
+    def session_key(self) -> Optional[str]:
+        """Optional. Text that is the same at two calls only if the engine
+        would plan any query as it did, given tables of the same schemas:
+        what :meth:`plan_key` depends on but the query and its tables. That
+        is every view's name and what the engine runs for it, the settings
+        that change what a query means, and where names are searched. A
+        :class:`Prepared` run compares it with the one its statements were
+        prepared with, and prepares them again if it differs. A backend
+        without it, or that returns ``None``, gets them prepared on every
+        run."""
         ...
 
 
@@ -207,6 +220,60 @@ def rewrite(
     return Rewritten(out, tables, backend, release)
 
 
+class Prepared:
+    """Statements prepared to run again on one backend (:func:`prepare`).
+
+    The first :meth:`run` computes the ``grad``, ``vjp`` and ``jvp`` calls
+    as :func:`rewrite` does, and every later one runs the same plans again,
+    each as it was bound then, as ``jax.jit`` traces a function once and
+    runs what it traced after that (``ddx_ad::Prepared``). A later run asks
+    the backend for no plan, key or schema: only for its ``session_key()``,
+    and to run plans.
+
+    Between runs, a table may change its rows, or be registered again under
+    its name. A run whose backend's ``session_key()`` differs from the one
+    the statements were prepared with (a table's schema, a view or a
+    setting changed) prepares them again. A backend without
+    ``session_key`` gets them prepared on every run.
+
+    Every run writes the same tables, so runs must not overlap: release one
+    run's :class:`Rewritten` before the next."""
+
+    def __init__(self, backend: "Backend", statements: Sequence[str], dialect: str = "datafusion"):
+        # As in rewrite: a str would be a statement per character.
+        if isinstance(statements, str):
+            raise TypeError("statements is a list of SQL statements; to prepare one, pass [statement]")
+        self.backend = backend
+        self.statements = list(statements)
+        self.dialect = dialect
+        self._prepared = None
+
+    def run(self) -> Rewritten:
+        """Compute what the statements' calls read, and the statements
+        rewritten to read it, as :func:`rewrite` returns them. The first run
+        that succeeds prepares the statements, as does the first after a
+        view changes; one that fails prepares nothing, and the next tries
+        again. Either way, a failed run first tries to drop every table it
+        wrote."""
+        ran = None if self._prepared is None else self._prepared.run(self.backend)
+        if ran is None:
+            prepared, out, tables, release = _prepare(self.backend, self.statements, self.dialect)
+            self._prepared = prepared
+        else:
+            out, tables, release = ran
+        return Rewritten(out, tables, self.backend, release)
+
+    def __repr__(self) -> str:
+        state = "prepared" if self._prepared is not None else "not yet run"
+        return f"Prepared({len(self.statements)} statements, {state})"
+
+
+def prepare(backend: "Backend", statements: Sequence[str], dialect: str = "datafusion") -> Prepared:
+    """``statements``, prepared to run again on ``backend``: see
+    :class:`Prepared`. Nothing runs until :meth:`Prepared.run`."""
+    return Prepared(backend, statements, dialect)
+
+
 # Single-sourced from the installed distribution metadata, which maturin fills
 # from pyproject.toml. Hardcoding it here would be a third copy of the version
 # (pyproject, Cargo.toml, here) with nothing keeping them equal, and the one
@@ -227,7 +294,9 @@ __all__ = [
     "UnknownColumn",
     "InvalidColumn",
     "Backend",
+    "Prepared",
     "Rewritten",
+    "prepare",
     "rewrite",
     "BackwardProgram",
     "Check",

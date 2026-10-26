@@ -251,23 +251,49 @@ pub(crate) async fn replaced_table(
     ctx: &SessionContext,
     plan: &LogicalPlan,
 ) -> Result<Option<TableReference>> {
+    replaced_among(ctx, &scans(plan)?).await
+}
+
+/// A table a plan reads: its name and the source read.
+pub(crate) type Scan = (
+    TableReference,
+    Arc<dyn datafusion::logical_expr::TableSource>,
+);
+
+/// The tables `plan` reads, each once.
+pub(crate) fn scans(plan: &LogicalPlan) -> Result<Vec<Scan>> {
     use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::datasource::cte_worktable::CteWorkTable;
-    use datafusion::datasource::source_as_provider;
+    // Each table once: a plan that reads views reads their tables as often
+    // as the views are read, a thousand times in ten views that each read
+    // the last twice.
+    let mut seen = std::collections::HashSet::new();
     let mut scans = Vec::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
-            scans.push((scan.table_name.clone(), Arc::clone(&scan.source)));
+            let source = Arc::as_ptr(&scan.source) as *const () as usize;
+            if seen.insert((scan.table_name.clone(), source)) {
+                scans.push((scan.table_name.clone(), Arc::clone(&scan.source)));
+            }
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
+    Ok(scans)
+}
+
+/// [`replaced_table`] among `scans`.
+pub(crate) async fn replaced_among(
+    ctx: &SessionContext,
+    scans: &[Scan],
+) -> Result<Option<TableReference>> {
+    use datafusion::datasource::cte_worktable::CteWorkTable;
+    use datafusion::datasource::source_as_provider;
     let same = |a: &Arc<dyn datafusion::catalog::TableProvider>,
                 b: &Arc<dyn datafusion::catalog::TableProvider>| {
         std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
     };
     for (name, source) in scans {
         // A source that is not a registered table's: nothing to compare.
-        let Ok(read) = source_as_provider(&source) else {
+        let Ok(read) = source_as_provider(source) else {
             continue;
         };
         // A recursive CTE reads its own rows through a work table named
@@ -276,14 +302,14 @@ pub(crate) async fn replaced_table(
             continue;
         }
         let Ok(now) = ctx.table_provider(name.clone()).await else {
-            return Ok(Some(name));
+            return Ok(Some(name.clone()));
         };
         if same(&now, &read) {
             continue;
         }
         let again = ctx.table_provider(name.clone()).await?;
         if same(&now, &again) {
-            return Ok(Some(name));
+            return Ok(Some(name.clone()));
         }
     }
     Ok(None)
@@ -408,7 +434,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     // Which programs to run, how each is built and run, and how each
     // statement reads them are ddx_ad::rewrite's; DataFusion plans and runs.
     let mut engine = DataFusion(ctx.clone());
-    let programs = programs(ctx);
+    let programs = kept::<Programs>(ctx);
     let out = ddx_ad::rewrite(&mut engine, &programs, statements, &GenericDialect {})
         .await
         .map_err(from_run_error)?;
@@ -419,19 +445,107 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
     frames
 }
 
-/// The programs [`sql_all`] keeps on `ctx` (and every context that shares
-/// its state), put there on first use.
-fn programs(ctx: &SessionContext) -> Arc<Programs> {
+/// `statements`, prepared to run again on `ctx`: their `grad`, `vjp` and
+/// `jvp` calls computed on the first [`Prepared::run`] as [`sql_all`]
+/// computes them, and on every later one by running the same plans again
+/// ([`ddx_ad::Prepared`]), as `jax.jit` traces a function once and runs
+/// what it traced after that. A training loop prepares its step's
+/// statements once and runs them on every batch:
+///
+/// ```no_run
+/// # use datafusion::prelude::SessionContext;
+/// # use ddx_datafusion::ad;
+/// # async fn train(ctx: &SessionContext) -> datafusion::error::Result<()> {
+/// let step = ad::prepare(
+///     ctx,
+///     &["WITH loss AS (SELECT SUM(val * val) AS l FROM w) \
+///        SELECT i, val - 0.1 * grad(loss, val) AS val FROM w"],
+/// );
+/// for _ in 0..100 {
+///     let w = step.run().await?.remove(0).collect().await?;
+///     // Register `w`'s new rows as `w`, then run the next step.
+/// #   let _ = w;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A later run asks DataFusion for no plan of a query, so it skips what a
+/// call of [`sql_all`] repeats: planning the objective, keying the program,
+/// reading the views. A table may change its rows, or be registered again
+/// under its name, between runs. Each run compares every table's schema,
+/// every view's kept plan and the session's settings with those it was
+/// prepared with, and prepares the statements again once one has changed.
+/// The caveat [`sql`] gives holds here too: a `now()` in a loss keeps the
+/// time of the run that prepared it.
+pub fn prepare(ctx: &SessionContext, statements: &[&str]) -> Prepared {
+    Prepared {
+        ctx: ctx.clone(),
+        statements: statements.iter().map(|s| s.to_string()).collect(),
+        prepared: tokio::sync::Mutex::new(None),
+    }
+}
+
+/// Statements prepared to run again ([`prepare`]).
+pub struct Prepared {
+    ctx: SessionContext,
+    statements: Vec<String>,
+    /// Once a run has succeeded. Locked while one runs, since every run
+    /// writes the same tables.
+    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared>>,
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("statements", &self.statements)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Prepared {
+    /// Run the statements, as [`sql_all`] does: each a DataFrame that holds
+    /// what it reads. The first run that succeeds prepares them, as does
+    /// the first after a view or a setting changes; a failed one prepares
+    /// nothing, and the next tries again. Runs wait for each other.
+    pub async fn run(&self) -> Result<Vec<DataFrame>> {
+        let mut prepared = self.prepared.lock().await;
+        let mut engine = DataFusion(self.ctx.clone());
+        let ran = match &*prepared {
+            Some(p) => p.run(&mut engine).await.map_err(from_run_error)?,
+            None => None,
+        };
+        let out = match ran {
+            Some(out) => out,
+            // Not yet prepared, or a view has changed since.
+            None => {
+                let statements: Vec<&str> = self.statements.iter().map(String::as_str).collect();
+                let (p, out) = ddx_ad::prepare(&mut engine, &statements, &GenericDialect {})
+                    .await
+                    .map_err(from_run_error)?;
+                *prepared = Some(p);
+                out
+            }
+        };
+        let frames = plan_each(&self.ctx, &out.statements).await;
+        out.release(&mut engine, &Programs::new()).await?;
+        frames
+    }
+}
+
+/// What ddx keeps on `ctx` (and every context that shares its state) as a
+/// `T`, put there on first use.
+pub(crate) fn kept<T: Default + Send + Sync + 'static>(ctx: &SessionContext) -> Arc<T> {
     let state = ctx.state_ref();
-    if let Some(p) = state.read().config().get_extension::<Programs>() {
+    if let Some(p) = state.read().config().get_extension::<T>() {
         return p;
     }
     let mut state = state.write();
-    // Another call may have put them there since the read.
-    if let Some(p) = state.config().get_extension::<Programs>() {
+    // Another call may have put it there since the read.
+    if let Some(p) = state.config().get_extension::<T>() {
         return p;
     }
-    let p = Arc::new(Programs::new());
+    let p = Arc::new(T::default());
     state.config_mut().set_extension(Arc::clone(&p));
     p
 }

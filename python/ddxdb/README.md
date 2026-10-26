@@ -73,6 +73,23 @@ On a plain `SessionContext`, `ddxdb.ad.sql(ctx, statement)` does the same, and
 `ddxdb.ad.sql_all` runs several statements that take `grad` of one loss for
 the price of one backward pass.
 
+A training loop runs the same statements on every batch. `ddxdb.ad.prepare`
+prepares them once, as `jax.jit` traces a function once:
+
+```python
+step = ad.prepare(ctx, [step_w, step_b])
+for batch in batches:
+    ctx.deregister_table("batch")
+    ctx.register_record_batches("batch", [batch])
+    w, b = step()                       # what sql_all would return
+```
+
+Its first call computes the calls as `sql_all` does. Later calls run the same
+plans again, asking DataFusion for no plan of a query, so they skip what a call
+of `sql_all` repeats: about a quarter of a small GPT's training step. A table
+may change its rows, or be registered again, between calls. A call after a
+table's schema, a view or a setting changes prepares the statements again.
+
 ## On DuckDB
 
 `ddxdb.duckdb.sql(con, statement)` is the same on a DuckDB connection, and
@@ -139,7 +156,9 @@ is built once and run again on later steps. A program is kept under the
 backend's `plan_key(sql)`, a text that changes whenever the engine's plan of
 the query could (its tables' schemas, its views' definitions), so a backend
 without that method gets nothing kept. `ddxdb.ad.sql` and `Context.sql` keep
-programs for each context this way on their own.
+programs for each context this way on their own. `ddxdb.prepare(backend,
+statements)` prepares them instead, as `ddxdb.ad.prepare` does: its `run()`
+returns a `Rewritten` like `ddxdb.rewrite`'s.
 
 ## What you can write
 
