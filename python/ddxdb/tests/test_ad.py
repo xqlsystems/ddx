@@ -820,7 +820,7 @@ def test_a_failed_prepared_call_leaves_nothing_and_the_next_runs(ad, ctx):
 
 def test_a_failed_first_prepared_call_prepares_nothing(ad, ctx):
     prepared = ddxdb.prepare(ad.DataFusionBackend(ctx), [STEP.replace("FROM w", "FROM missing", 1)])
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="missing"):
         prepared.run()
     assert "not yet run" in repr(prepared)
     with pytest.raises(TypeError):

@@ -41,6 +41,11 @@ How it runs (:class:`DuckDBBackend`):
 Every table a program writes is named with the prefix ``__ddx_``, which ddxdb
 reserves, and none stays once a call returns.
 
+A DuckDB connection is not safe to use from two threads at once, and neither
+are these functions on one connection. As DuckDB asks, give each thread a
+cursor of its own (``con.cursor()``): each gets a planner of its own, and
+writes its tables as temporary tables, which only that cursor sees.
+
 Importing this module requires DuckDB.
 """
 
@@ -244,7 +249,6 @@ class DuckDBBackend:
         for db, schema in self.con.execute("SELECT database_name, schema_name FROM duckdb_schemas()").fetchall():
             if db not in ("system", "temp"):
                 self._path((db, schema, ""))
-        self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
         settings = tuple(
             self.con.execute(
                 "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
@@ -253,8 +257,16 @@ class DuckDBBackend:
         )
         if settings != self._settings:
             for name, value in settings:
-                self._planner.execute(f"SET {name} = {_literal(value)}")
+                if name != "search_path":
+                    self._planner.execute(f"SET {name} = {_literal(value)}")
             self._settings = settings
+        # Where names are searched, last: `USE` sets the search path to its
+        # schema alone, and a search path set sets the current schema, its
+        # first; an empty one means the planner's own database.
+        self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
+        path = dict(settings)["search_path"]
+        if path:
+            self._planner.execute(f"SET search_path = {_literal(path)}")
         return catalog
 
     def _plan(self, sql: str, catalog: dict) -> bytes:

@@ -557,3 +557,44 @@ def test_a_prepared_call_differentiates_a_redefined_view_as_it_is_now(ad, con):
     assert pairs(step()[0]) == [(0, 2.0), (1, -4.0), (2, 1.0)]
     con.execute("CREATE OR REPLACE VIEW m AS SELECT i, 2 * val AS val FROM w")
     assert pairs(step()[0]) == [(0, 8.0), (1, -16.0), (2, 4.0)]
+
+
+
+
+def test_a_prepared_call_plans_in_a_file_database(ad, tmp_path):
+    # Its current database is the file's, not the planner's `memory`: the
+    # first call plans before any other has set where names are searched.
+    con = duckdb.connect(str(tmp_path / "model.duckdb"))
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, -2.0), (2, 0.5)")
+    step = ad.prepare(con, [GRAD])
+    assert pairs(step()[0]) == pairs(step()[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+
+
+def test_the_planner_searches_names_as_the_connection_does(ad, con):
+    con.execute("CREATE SCHEMA s")
+    con.execute("CREATE TABLE s.v (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO s.v VALUES (0, 2.0)")
+    con.execute("SET search_path = 's,main'")
+    statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM v) SELECT i, grad(loss, val) FROM v"
+    assert pairs(ad.prepare(con, [statement])()[0]) == [(0, 4.0)]
+    assert pairs(ad.sql_all(con, [statement])[0]) == [(0, 4.0)]
+
+
+def test_threads_with_a_cursor_each_differentiate_at_once(ad, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    con = duckdb.connect(str(tmp_path / "db.duckdb"))
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, -2.0), (2, 0.5)")
+
+    def call(k):
+        cur = con.cursor()
+        step = ad.prepare(cur, [GRAD])
+        got = [pairs(step()[0]) for _ in range(3)] + [pairs(ad.sql_all(cur, [GRAD])[0])]
+        assert not ddx_tables(cur)
+        return got
+
+    with ThreadPoolExecutor(4) as pool:
+        got = list(pool.map(call, range(4)))
+    assert got == [[[(0, 3.0), (1, 12.0), (2, 0.75)]] * 4] * 4
