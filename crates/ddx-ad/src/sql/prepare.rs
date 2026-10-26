@@ -37,14 +37,11 @@ pub(super) fn results(program: &dyn Built) -> impl Iterator<Item = String> + '_ 
 /// once per batch.
 ///
 /// [`Prepared::run`] runs what the first run ran, each plan as it was bound
-/// then. It asks the engine for no plan, key or schema, so the statements'
-/// tables must keep theirs: between runs, a table the statements read may
-/// change its rows, or be registered again under its name, but not change
-/// its columns, their types or its name. A run after a table's schema
-/// changes fails or reads it wrongly; to change one, prepare the
-/// statements again. The rest of what a plan depends on is checked: a run
-/// asks the engine for its [`Backend::session_key`], and runs nothing once
-/// a view, a setting or where names are searched has changed.
+/// then, on the tables' rows as they are: between runs, a table may change
+/// its rows, or be registered again under its name. It asks the engine for
+/// no plan, key or schema, only for its [`Backend::session_key`], and runs
+/// nothing once a table's schema, a view, a setting or where names are
+/// searched has changed.
 ///
 /// Every run writes the same tables, so two must not overlap: a run's
 /// tables stay until its [`Rewritten::release`].

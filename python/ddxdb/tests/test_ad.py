@@ -849,3 +849,12 @@ def test_a_prepared_call_differentiates_a_view_as_datafusion_runs_it(ad, ctx):
     assert pairs(step()[0]) == pairs(ad.sql(ctx, THROUGH_M))
     ctx.sql("CREATE OR REPLACE VIEW m AS SELECT i, val FROM inner_m").collect()
     assert pairs(step()[0]) == pairs(ad.sql(ctx, THROUGH_M)) == [(0, 8.0), (1, -16.0), (2, 4.0)]
+
+
+def test_a_prepared_call_after_a_table_changes_its_types_matches_sql_all(ad, ctx):
+    step = ad.prepare(ctx, [STEP])
+    step()
+    ctx.deregister_table("w")
+    w32 = pa.table({"i": pa.array([0, 1, 2], pa.int64()), "val": pa.array([1.0, -2.0, 0.5], pa.float32())})
+    ctx.register_record_batches("w", [w32.to_batches()])
+    assert pairs(step()[0]) == pairs(ad.sql_all(ctx, [STEP])[0])

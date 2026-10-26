@@ -328,3 +328,32 @@ async fn a_run_after_the_default_schema_changes_matches_sql_all() {
     assert!(close(&got, &want), "{got:?}, not {want:?}");
     assert!(!close(&got, &first), "{got:?} read the old schema's w");
 }
+
+#[tokio::test]
+async fn a_run_after_a_table_changes_its_types_matches_sql_all() {
+    let ctx = SessionContext::new();
+    put(&ctx, "w", &[1.0, -2.0, 0.5]).await;
+    let step = ad::prepare(&ctx, &[STEP]);
+    step.run().await.unwrap();
+    // The same rows, as FLOAT: the plans were bound to DOUBLE.
+    exec(&ctx, "DROP TABLE w").await;
+    exec(
+        &ctx,
+        "CREATE TABLE w (i BIGINT NOT NULL, val FLOAT) AS VALUES (0, 1.0), (1, -2.0), (2, 0.5)",
+    )
+    .await;
+    let got = step.run().await.unwrap();
+    let want = ad::sql_all(&ctx, &[STEP]).await.unwrap();
+    let (got, want) = (
+        got[0].clone().collect().await.unwrap(),
+        want[0].clone().collect().await.unwrap(),
+    );
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&got)
+            .unwrap()
+            .to_string(),
+        datafusion::arrow::util::pretty::pretty_format_batches(&want)
+            .unwrap()
+            .to_string()
+    );
+}

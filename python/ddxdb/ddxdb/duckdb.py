@@ -352,19 +352,17 @@ class DuckDBBackend:
         return None
 
     def session_key(self) -> str:
-        # What plan_key depends on but the query and the tables: each view's
-        # SQL (DuckDB binds it each time a query reads the view, so the SQL
-        # is what runs), where names are searched, and the settings that
-        # change what a query means.
-        views = self.con.execute(
-            "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() WHERE NOT internal ORDER BY ALL"
-        ).fetchall()
+        # What plan_key depends on but the query: every object's columns or
+        # view SQL (DuckDB binds a view's SQL each time a query reads it, so
+        # the SQL is what runs), which also names every object, so a table
+        # made to shadow another is seen; where names are searched; and the
+        # settings that change what a query means.
         where = self.con.execute("SELECT current_database(), current_schema()").fetchone()
         settings = self.con.execute(
             "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
             [list(_SETTINGS)],
         ).fetchall()
-        return repr((views, where, settings))
+        return repr((where, settings, sorted(self._catalog().items())))
 
     def returns_rows(self, plan: bytes) -> bool:
         query = to_sql(plan, "duckdb")
@@ -421,9 +419,10 @@ def prepare(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> Call
     (see :func:`ddxdb.ad.prepare`, which prepares them on DataFusion the
     same way): a function of no arguments that runs them and returns what
     :func:`sql_all` would. Its first call computes the calls; every later
-    one runs the same plans again, so the tables the statements read must
-    keep their schemas. A call after a view, a setting, or the current
-    schema changes prepares them again."""
+    one runs the same plans again, on the tables' rows as they are then. A
+    call after a table's schema, a view, a setting or the current schema
+    changes, or a table is made that shadows another, prepares them
+    again."""
     prepared = Prepared(_backend(con), statements, "duckdb")
     lock = threading.Lock()
 

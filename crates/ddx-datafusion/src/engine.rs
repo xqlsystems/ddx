@@ -180,9 +180,10 @@ impl ddx_ad::Backend for DataFusion {
         use datafusion::logical_expr::TableType;
         // Each view's kept plan, not its SQL: DataFusion runs the plan, and
         // a view made again with the same SQL after one it reads is
-        // redefined runs another. (Finding the views loads every table: a
-        // schema says what a table is only once it has loaded it.)
-        let mut views = Vec::new();
+        // redefined runs another. And every other table's schema, which the
+        // plans were bound to: finding the views loads every table anyway
+        // (a schema says what a table is only once it has loaded it).
+        let (mut views, mut tables) = (Vec::new(), Vec::new());
         let mut catalogs = self.0.catalog_names();
         catalogs.sort();
         for c in catalogs {
@@ -203,13 +204,18 @@ impl ddx_ad::Backend for DataFusion {
                     let Ok(Some(table)) = schema.table(&name).await else {
                         continue;
                     };
+                    let path = format!("{c}.{s}.{name}");
                     if table.table_type() != TableType::View {
+                        // ddx's own tables come and go with each run.
+                        if !name.starts_with("__ddx_") {
+                            tables.push((path, table.schema()));
+                        }
                         continue;
                     }
                     let Some(plan) = table.get_logical_plan() else {
                         return Ok(None);
                     };
-                    views.push((format!("{c}.{s}.{name}"), plan.into_owned()));
+                    views.push((path, plan.into_owned()));
                 }
             }
         }
@@ -218,7 +224,7 @@ impl ddx_ad::Backend for DataFusion {
         // while one unchanged shares its parts with the plan seen, and
         // compares at once.
         let (changes, scans) = {
-            let seen = crate::ad::kept::<SeenViews>(&self.0);
+            let seen = crate::ad::kept::<SeenCatalog>(&self.0);
             let mut seen = seen.0.lock().unwrap_or_else(PoisonError::into_inner);
             if seen.plans != views {
                 seen.scans = views
@@ -226,6 +232,10 @@ impl ddx_ad::Backend for DataFusion {
                     .map(|(name, plan)| Ok((name.clone(), crate::ad::scans(plan)?)))
                     .collect::<Result<_>>()?;
                 seen.plans = views;
+                seen.changes += 1;
+            }
+            if seen.tables != tables {
+                seen.tables = tables;
                 seen.changes += 1;
             }
             (seen.changes, seen.scans.clone())
@@ -247,17 +257,19 @@ impl ddx_ad::Backend for DataFusion {
     }
 }
 
-/// Each view's kept plan, by its path, as [`DataFusion`]'s `session_key` last
-/// saw them on a context, and how many times they have changed since the
-/// context was made: the key's first part.
+/// Each view's kept plan and each other table's schema, by its path, as
+/// [`DataFusion`]'s `session_key` last saw them on a context, and how many
+/// times they have changed since the context was made: the key's first
+/// part.
 #[derive(Default)]
-struct SeenViews(Mutex<Seen>);
+struct SeenCatalog(Mutex<Seen>);
 
 #[derive(Default)]
 struct Seen {
     plans: Vec<(String, LogicalPlan)>,
-    /// The tables each reads.
+    /// The tables each view reads.
     scans: Vec<(String, Vec<crate::ad::Scan>)>,
+    tables: Vec<(String, datafusion::arrow::datatypes::SchemaRef)>,
     changes: u64,
 }
 

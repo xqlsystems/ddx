@@ -79,16 +79,16 @@ prepares them once, as `jax.jit` traces a function once:
 ```python
 step = ad.prepare(ctx, [step_w, step_b])
 for batch in batches:
+    ctx.deregister_table("batch")
     ctx.register_record_batches("batch", [batch])
     w, b = step()                       # what sql_all would return
 ```
 
 Its first call computes the calls as `sql_all` does. Later calls run the same
 plans again, asking DataFusion for no plan of a query, so they skip what a call
-of `sql_all` repeats: about a quarter of a small GPT's training step. In return, the
-tables must keep their schemas. A table may change its rows, or be registered
-again, between calls. A call after a view is created, redefined or dropped, or
-a setting changes, prepares the statements again.
+of `sql_all` repeats: about a quarter of a small GPT's training step. A table
+may change its rows, or be registered again, between calls. A call after a
+table's schema, a view or a setting changes prepares the statements again.
 
 ## On DuckDB
 

@@ -235,10 +235,10 @@ class DataFusionBackend:
 
     def __init__(self, ctx: SessionContext):
         self.ctx = ctx
-        # Each view's plan as session_key last saw it, and how many times
-        # they have changed.
-        self._views: list = []
-        self._views_seen = 0
+        # Each view's plan and table's schema as session_key last saw them,
+        # and how many times they have changed.
+        self._catalog: list = []
+        self._changes = 0
 
     def select_all(self, name: str) -> bytes:
         return Serde.serialize_bytes(f'SELECT * FROM "{name}"', self.ctx)
@@ -323,10 +323,11 @@ class DataFusionBackend:
     def session_key(self) -> Optional[str]:
         """The session's settings, which hold where names are searched and
         how they are read, and how many times this backend has seen its
-        context's views change: each view's plan is the plan DataFusion runs
-        for it, the one it kept when it was made, which reads a view
-        redefined since as it was then. Plans compare in Rust, and a plan
-        unchanged shares its kept part, so the comparison is quick.
+        context's views or tables' schemas change. Each view's plan is the
+        plan DataFusion runs for it, the one it kept when it was made, which
+        reads a view redefined since as it was then. Plans compare in Rust,
+        and a plan unchanged shares its kept part, so the comparison is
+        quick.
 
         ``None`` without the information schema, which holds the settings:
         each call then prepares the statements again. Unlike Rust's, this
@@ -342,20 +343,25 @@ class DataFusionBackend:
             # DataFusion raises ValueError for a table it can't find: here,
             # the information schema is off.
             return None
-        views = []
+        # Each view's plan, and every other table's schema, which the plans
+        # were bound to; ddx's own tables come and go with each run.
+        catalog = []
         for c in sorted(self.ctx.catalog_names()):
-            catalog = self.ctx.catalog(c)
-            for s in sorted(catalog.schema_names()):
+            cat = self.ctx.catalog(c)
+            for s in sorted(cat.schema_names()):
                 if s == "information_schema":
                     continue
-                schema = catalog.schema(s)
+                schema = cat.schema(s)
                 for t in sorted(schema.table_names()):
-                    if schema.table(t).kind == "view":
-                        path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
-                        views.append((path, self.ctx.table(path).logical_plan()))
-        if views != self._views:
-            self._views, self._views_seen = views, self._views_seen + 1
-        return f"{self._views_seen} {settings!r}"
+                    table = schema.table(t)
+                    path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
+                    if table.kind == "view":
+                        catalog.append((path, self.ctx.table(path).logical_plan()))
+                    elif not t.startswith("__ddx_"):
+                        catalog.append((path, table.schema))
+        if catalog != self._catalog:
+            self._catalog, self._changes = catalog, self._changes + 1
+        return f"{self._changes} {settings!r}"
 
     def returns_rows(self, plan: bytes) -> bool:
         lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
@@ -613,6 +619,7 @@ def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
 
         step = ad.prepare(ctx, statements)
         for batch in batches:
+            ctx.deregister_table("batch")
             ctx.register_record_batches("batch", [batch])
             new_weights = step()
 
@@ -622,13 +629,13 @@ def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
     each program, and checking that each view's SQL is still what
     DataFusion runs for it.
 
-    In return, the tables the statements read must keep their schemas.
     Between calls, a table may change its rows, or be registered again under
-    its name, but not change its columns or their types. Each call compares
-    every view's plan, and the session's settings, with those it was
-    prepared with, and prepares the statements again once a view is
-    created, redefined or dropped, or a setting changes. Calls wait for
-    each other, since each writes the same tables.
+    its name. Each call compares every table's schema, every view's plan
+    and the session's settings with those it was prepared with, and
+    prepares the statements again once one has changed. As with
+    :func:`sql_all`'s kept programs, a ``now()`` in a loss keeps the time
+    of the call that prepared it: DataFusion folds it into a constant. Calls
+    wait for each other, since each writes the same tables.
 
     ``ctx`` may be a DuckDB connection instead, which
     :func:`ddxdb.duckdb.prepare` prepares on."""

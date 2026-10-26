@@ -472,12 +472,12 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 ///
 /// A later run asks DataFusion for no plan of a query, so it skips what a
 /// call of [`sql_all`] repeats: planning the objective, keying the program,
-/// reading the views. In return, the tables the statements read must keep
-/// their schemas: a table may change its rows, or be registered again
-/// under its name, between runs. Each run compares every view's kept plan,
-/// and the session's settings, with those it was prepared with, and
-/// prepares the statements again once a view is created, redefined or
-/// dropped, or a setting changes.
+/// reading the views. A table may change its rows, or be registered again
+/// under its name, between runs. Each run compares every table's schema,
+/// every view's kept plan and the session's settings with those it was
+/// prepared with, and prepares the statements again once one has changed.
+/// The caveat [`sql`] gives holds here too: a `now()` in a loss keeps the
+/// time of the run that prepared it.
 pub fn prepare(ctx: &SessionContext, statements: &[&str]) -> Prepared {
     Prepared {
         ctx: ctx.clone(),

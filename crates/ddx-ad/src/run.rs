@@ -219,10 +219,10 @@ pub trait Backend: Send {
     }
 
     /// Text that is the same at two calls only if the engine would plan
-    /// any query as it did, given tables of the same schemas: what
-    /// [`Backend::plan_key`] depends on but the query and its tables. That
-    /// is every view's name and what the engine runs for it, the settings
-    /// that change what a query means, and where names are searched.
+    /// any query as it did: what [`Backend::plan_key`] depends on but the
+    /// query. That is every table's name and schema, every view's name and
+    /// what the engine runs for it, the settings that change what a query
+    /// means, and where names are searched.
     /// [`crate::Prepared::run`] compares it with the one [`crate::prepare`]
     /// read, and runs nothing once it differs, for the statements to be
     /// prepared again. `None`, the default, means the engine cannot say,

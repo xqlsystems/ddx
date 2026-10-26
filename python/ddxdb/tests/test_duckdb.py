@@ -611,3 +611,27 @@ def test_a_prepared_call_after_a_setting_changes_matches_sql_all(ad):
     con.execute("SET integer_division = true")
     assert pairs(step()[0]) == pairs(ad.sql_all(con, [statement])[0]) == [(0, 0.0), (1, 0.0), (2, 1.0), (3, 1.0)]
 
+
+
+def test_a_prepared_call_after_a_table_shadows_another_refuses_as_sql_all_does(ad):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, 2.0)")
+    statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    step = ad.prepare(con, [statement])
+    step()
+    con.execute("CREATE TEMP TABLE w AS SELECT i, val * 10 AS val FROM main.w")
+    for call in (step, lambda: ad.sql_all(con, [statement])):
+        with pytest.raises(Exception, match="names 2 objects"):
+            call()
+
+
+def test_a_prepared_call_after_a_column_changes_its_type_matches_sql_all(ad):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE w (i BIGINT, val DOUBLE)")
+    con.execute("INSERT INTO w VALUES (0, 1.0), (1, 2.0)")
+    statement = "WITH loss AS (SELECT SUM(val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    step = ad.prepare(con, [statement])
+    step()
+    con.execute("ALTER TABLE w ALTER val TYPE FLOAT")
+    assert pairs(step()[0]) == pairs(ad.sql_all(con, [statement])[0])

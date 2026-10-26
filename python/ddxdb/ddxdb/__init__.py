@@ -230,14 +230,11 @@ class Prepared:
     the backend for no plan, key or schema: only for its ``session_key()``,
     and to run plans.
 
-    In return, the tables the statements read must keep their schemas.
     Between runs, a table may change its rows, or be registered again under
-    its name, but not change its columns or their types; prepare the
-    statements again after changing one. A run whose backend's
-    ``session_key()`` differs from the one the statements were prepared
-    with (a view was created, redefined or dropped, or a setting changed)
-    prepares them again.
-    A backend without ``session_key`` gets them prepared on every run.
+    its name. A run whose backend's ``session_key()`` differs from the one
+    the statements were prepared with (a table's schema, a view or a
+    setting changed) prepares them again. A backend without
+    ``session_key`` gets them prepared on every run.
 
     Every run writes the same tables, so runs must not overlap: release one
     run's :class:`Rewritten` before the next."""
