@@ -894,7 +894,7 @@ def test_a_kept_step_reads_the_values_written_into_its_tables_at_each_call(ad, k
     write_w = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
     write_b = writable(kept, "b", [0, 1, 2], [0.25, 3.0, -1.0])
     asked = []
-    for method in ["materialize", "returns_rows", "keep", "materialize_kept", "returns_rows_kept"]:
+    for method in ["materialize", "returns_rows", "keep", "materialize_kept", "returns_rows_kept", "_physical"]:
         original = getattr(ad.DataFusionBackend, method)
 
         def spy(self, *args, _method=method, _original=original):
@@ -906,7 +906,10 @@ def test_a_kept_step_reads_the_values_written_into_its_tables_at_each_call(ad, k
     for k in range(3):
         asked.clear()
         got = [pairs(df) for df in step()]
-        assert set(asked) == ({"keep", "materialize_kept", "returns_rows_kept"} if k == 0 else {"materialize_kept", "returns_rows_kept"})
+        # Each plan is planned once, when it is kept: none again later.
+        later = {"materialize_kept", "returns_rows_kept"}
+        assert set(asked) == (later | {"keep", "_physical"} if k == 0 else later), asked
+        assert asked.count("_physical") == asked.count("keep")
         want = [pairs(df) for df in ad.sql_all(kept, [STEP, HVP])]
         assert got == want
         assert not [t for t in kept.catalog().schema().names() if t.startswith("__ddx_")]

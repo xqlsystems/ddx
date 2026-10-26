@@ -256,8 +256,9 @@ class DataFusionBackend:
         # and how many times they have changed.
         self._catalog: list = []
         self._changes = 0
-        # How many times a kept step's rows were stored anew, not written
-        # in place: a kept plan made before then may read the old ones.
+        # How many times a kept step's rows replaced the ones it had stored
+        # rather than being written there: a plan kept before then may read
+        # the old ones.
         self._stored = 0
         self._warned = False
 
@@ -418,8 +419,11 @@ class DataFusionBackend:
             kept.plan, kept.schema = self._physical(plan)
         rows = pa.Table.from_batches(_execute(self.ctx, kept.plan), kept.schema)
         if not kept.write(rows):
+            # Rows stored for the first time make no kept plan stale: a plan
+            # that reads this step's table is kept after the step first runs.
+            replaced = kept.batch is not None
             kept.store(rows)
-            self._stored += 1
+            self._stored += replaced
         kept.stored = self._stored
         self.ctx.deregister_table(name)
         self.ctx.register_record_batches(name, [[kept.batch]])
