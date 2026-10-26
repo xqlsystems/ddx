@@ -635,3 +635,10 @@ def test_a_prepared_call_after_a_column_changes_its_type_matches_sql_all(ad):
     step()
     con.execute("ALTER TABLE w ALTER val TYPE FLOAT")
     assert pairs(step()[0]) == pairs(ad.sql_all(con, [statement])[0])
+
+
+def test_in_place_is_refused_on_duckdb(con):
+    from ddxdb import ad
+
+    with pytest.raises(ValueError, match="in_place"):
+        ad.prepare(con, [GRAD], in_place=True)

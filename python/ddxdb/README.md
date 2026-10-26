@@ -90,6 +90,16 @@ of `sql_all` repeats: about a quarter of a small GPT's training step. A table
 may change its rows, or be registered again, between calls. A call after a
 table's schema, a view or a setting changes prepares the statements again.
 
+`ad.prepare(ctx, statements, in_place=True)` goes further: later calls run
+each step's physical plan again rather than planning it, which takes a small
+GPT's step from about 280 to 85 ms. A physical plan holds the tables it read, so
+this is for a loop that writes new values into its tables' memory rather than
+registering them again, as `xarray_sql`'s prepared queries do; a table
+registered again would go unread, and the results would be wrong. It needs the
+[xqlsystems fork of datafusion](https://github.com/xqlsystems/datafusion-python/tree/reset-plan-state-55.0)
+(`ExecutionPlan.reset_state`), the information schema, and dynamic filter
+pushdown off; without them it warns, and plans every step as before.
+
 ## On DuckDB
 
 `ddxdb.duckdb.sql(con, statement)` is the same on a DuckDB connection, and

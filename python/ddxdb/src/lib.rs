@@ -675,7 +675,8 @@ impl PyBackend {
 
 impl ddx_ad::Backend for PyBackend {
     type Error = PyErr;
-    type Kept = ();
+    /// What the Python backend's `keep` returned.
+    type Kept = Py<PyAny>;
 
     fn table_schema(&mut self, name: &str) -> impl Future<Output = PyResult<NamedStruct>> + Send {
         self.call(|b| {
@@ -752,6 +753,48 @@ impl ddx_ad::Backend for PyBackend {
                 return Ok(None);
             }
             b.call_method0("session_key")?.extract()
+        })
+    }
+
+    fn keep(
+        &mut self,
+        plan: &ddx_ad::Bound,
+    ) -> impl Future<Output = PyResult<Option<Py<PyAny>>>> + Send {
+        // Optional: a backend without it, or whose `keep` returns `None`,
+        // gets each plan as it is.
+        self.call(|b| {
+            if !b.hasattr("keep")? {
+                return Ok(None);
+            }
+            let kept = b.call_method1("keep", (bytes(b.py(), plan),))?;
+            Ok((!kept.is_none()).then(|| kept.unbind()))
+        })
+    }
+
+    fn materialize_kept(
+        &mut self,
+        name: &str,
+        plan: &ddx_ad::Bound,
+        kept: &Py<PyAny>,
+    ) -> impl Future<Output = PyResult<()>> + Send {
+        self.call(|b| {
+            b.call_method1("materialize_kept", (name, bytes(b.py(), plan), kept))?;
+            Ok(())
+        })
+    }
+
+    fn returns_rows_kept(
+        &mut self,
+        plans: &[(&ddx_ad::Bound, &Py<PyAny>)],
+    ) -> impl Future<Output = PyResult<Vec<bool>>> + Send {
+        self.call(|b| {
+            plans
+                .iter()
+                .map(|(plan, kept)| {
+                    b.call_method1("returns_rows_kept", (bytes(b.py(), plan), *kept))?
+                        .extract()
+                })
+                .collect()
         })
     }
 }
@@ -865,7 +908,7 @@ fn _prepare(
 /// Statements `_prepare` computed the calls of, to compute again
 /// (`ddx_ad::Prepared`).
 #[pyclass(frozen, module = "ddxdb", name = "_Prepared")]
-struct Prepared(ddx_ad::Prepared);
+struct Prepared(ddx_ad::Prepared<Py<PyAny>>);
 
 #[pymethods]
 impl Prepared {

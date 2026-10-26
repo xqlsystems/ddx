@@ -858,3 +858,101 @@ def test_a_prepared_call_after_a_table_changes_its_types_matches_sql_all(ad, ctx
     w32 = pa.table({"i": pa.array([0, 1, 2], pa.int64()), "val": pa.array([1.0, -2.0, 0.5], pa.float32())})
     ctx.register_record_batches("w", [w32.to_batches()])
     assert pairs(step()[0]) == pairs(ad.sql_all(ctx, [STEP])[0])
+
+
+@pytest.fixture
+def kept(ad, ctx):
+    """``ctx``, able to keep plans (``ad.prepare(..., in_place=True)``)."""
+    from datafusion.plan import ExecutionPlan
+
+    if not hasattr(ExecutionPlan, "reset_state"):
+        pytest.skip("needs the xqlsystems fork of datafusion (ExecutionPlan.reset_state)")
+    for name in ad._DYNAMIC_FILTERS:
+        ctx.sql(f"SET {name} = false").collect()
+    return ctx
+
+
+def writable(ctx, name, i, val):
+    """Register ``name`` as ``table(i, val)`` over memory of its own, and
+    return a function that writes new ``i`` and ``val`` into it."""
+    columns = [pa.array(i, pa.int64()), pa.array(val, pa.float64())]
+    buffers = [pa.allocate_buffer(8 * len(i)) for _ in columns]
+    for buffer, column in zip(buffers, columns):
+        memoryview(buffer)[:] = memoryview(column.buffers()[1])
+    arrays = [pa.Array.from_buffers(c.type, len(c), [None, b]) for c, b in zip(columns, buffers)]
+    ctx.deregister_table(name)
+    ctx.register_record_batches(name, [[pa.RecordBatch.from_arrays(arrays, ["i", "val"])]])
+
+    def write(i, val):
+        memoryview(buffers[0]).cast("q")[:] = memoryview(pa.array(i, pa.int64()).buffers()[1]).cast("q")
+        memoryview(buffers[1]).cast("d")[:] = memoryview(pa.array(val, pa.float64()).buffers()[1]).cast("d")
+
+    return write
+
+
+def test_a_kept_step_reads_the_values_written_into_its_tables_at_each_call(ad, kept, monkeypatch):
+    write_w = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    write_b = writable(kept, "b", [0, 1, 2], [0.25, 3.0, -1.0])
+    asked = []
+    for method in ["materialize", "returns_rows", "keep", "materialize_kept", "returns_rows_kept"]:
+        original = getattr(ad.DataFusionBackend, method)
+
+        def spy(self, *args, _method=method, _original=original):
+            asked.append(_method)
+            return _original(self, *args)
+
+        monkeypatch.setattr(ad.DataFusionBackend, method, spy)
+    step = ad.prepare(kept, [STEP, HVP], in_place=True)
+    for k in range(3):
+        asked.clear()
+        got = [pairs(df) for df in step()]
+        assert set(asked) == ({"keep", "materialize_kept", "returns_rows_kept"} if k == 0 else {"materialize_kept", "returns_rows_kept"})
+        want = [pairs(df) for df in ad.sql_all(kept, [STEP, HVP])]
+        assert got == want
+        assert not [t for t in kept.catalog().schema().names() if t.startswith("__ddx_")]
+        write_w([i for i, _ in got[0]], [v for _, v in got[0]])
+        write_b([2, 1, 0], [1.0, float(k), -1.0])
+
+
+def test_a_kept_step_whose_rows_change_in_number_is_planned_again(ad, kept):
+    # The steps that save each group's sum have a row for each value of w
+    # over 0: here 2, 3, 0, then 3.
+    statement = (
+        "WITH loss AS (SELECT SUM(l) AS l FROM "
+        "(SELECT i, LN(SUM(val * val)) AS l FROM w WHERE val > 0 GROUP BY i)) "
+        "SELECT i, grad(loss, val) AS g FROM w"
+    )
+    write = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    step = ad.prepare(kept, [statement], in_place=True)
+    for val in [[1.0, -2.0, 0.5], [1.0, 2.0, 0.5], [-1.0, -2.0, -0.5], [3.0, 2.0, 0.5]]:
+        write([0, 1, 2], val)
+        assert pairs(step()[0]) == pairs(ad.sql(kept, statement))
+
+
+def test_a_kept_check_reads_the_values_written_into_its_tables(ad, kept):
+    write = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    step = ad.prepare(kept, [STEP], in_place=True)
+    step()
+    write([0, 0, 2], [1.0, -2.0, 0.5])
+    with pytest.raises(ddxdb.InvalidColumn):
+        step()
+    write([0, 1, 2], [3.0, 0.0, -1.0])
+    assert dict(pairs(step()[0])) == pytest.approx({0: 3.0 - 2.7, 1: 0.0, 2: -1.0 - 0.3})
+
+
+def test_in_place_without_what_it_needs_warns_and_plans_each_step(ad, ctx):
+    # A bare context pushes dynamic filters down.
+    step = ad.prepare(ctx, [STEP], in_place=True)
+    with pytest.warns(UserWarning, match="in_place"):
+        got = pairs(step()[0])
+    assert got == pairs(ad.sql(ctx, STEP))
+
+
+def test_a_kept_steps_rows_are_stored_anew_for_a_null_where_a_value_was(ad):
+    rows = pa.table({"i": pa.array([0, 1], pa.int64()), "val": pa.array([1.0, 2.0])})
+    kept = ad._Kept(None, rows.schema, 0)
+    kept.store(rows)
+    assert kept.write(pa.table({"i": pa.array([1, 0], pa.int64()), "val": pa.array([3.0, 4.0])}))
+    assert kept.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]
+    assert not kept.write(pa.table({"i": pa.array([0, 1], pa.int64()), "val": pa.array([5.0, None])}))
+    assert kept.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]

@@ -77,6 +77,7 @@ from typing import Callable, NamedTuple, Optional, Sequence, Union
 try:
     import pyarrow as pa
     from datafusion import SessionContext, udf
+    from datafusion.plan import ExecutionPlan
     from datafusion.substrait import Consumer, Serde
 except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.ad needs DataFusion: pip install 'ddxdb[datafusion]'") from e
@@ -229,16 +230,36 @@ def _refuse_not_in(sql: str) -> None:
         )
 
 
+#: The settings under which DataFusion pushes into a plan's scans a filter
+#: its first run finds. ``ExecutionPlan.reset_state`` keeps that filter, so
+#: a plan run again would leave out rows that this run's tables hold.
+_DYNAMIC_FILTERS = tuple(
+    f"datafusion.optimizer.enable{kind}_dynamic_filter_pushdown" for kind in ("", "_join", "_topk", "_aggregate")
+)
+
+
 class DataFusionBackend:
     """A DataFusion ``SessionContext`` as a :class:`ddxdb.Backend`:
-    each step's result is registered as an in-memory table."""
+    each step's result is registered as an in-memory table.
 
-    def __init__(self, ctx: SessionContext):
+    With ``in_place``, the caller promises that between runs of a
+    :class:`ddxdb.Prepared`, the tables its statements read change only by
+    writes into the memory they hold, as ``xarray_sql``'s prepared queries
+    write them; never by being registered again. Then each plan's physical
+    plan is kept and run again (:meth:`keep`), rather than planned on every
+    run. See :func:`prepare`."""
+
+    def __init__(self, ctx: SessionContext, *, in_place: bool = False):
         self.ctx = ctx
+        self.in_place = in_place
         # Each view's plan and table's schema as session_key last saw them,
         # and how many times they have changed.
         self._catalog: list = []
         self._changes = 0
+        # How many times a kept step's rows were stored anew, not written
+        # in place: a kept plan made before then may read the old ones.
+        self._stored = 0
+        self._warned = False
 
     def select_all(self, name: str) -> bytes:
         return Serde.serialize_bytes(f'SELECT * FROM "{name}"', self.ctx)
@@ -373,6 +394,135 @@ class DataFusionBackend:
 
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
+
+    def keep(self, plan: bytes) -> Optional["_Kept"]:
+        """``plan``'s physical plan, kept to run again, with ``in_place``;
+        otherwise ``None``. Also ``None``, with a warning, if this
+        datafusion has no ``ExecutionPlan.reset_state`` (the xqlsystems
+        fork's, branch ``reset-plan-state-55.0``), or a setting in
+        :data:`_DYNAMIC_FILTERS` is on, or the information schema that
+        holds the settings is off.
+
+        A kept step's rows are stored in memory of its own, and each later
+        run writes its rows there, so the kept plans that read the step
+        read them. When a run's rows can't be written there (another number
+        of rows, a NULL, or a column that isn't an integer or a float and
+        changed), they are stored anew, and every plan kept before then is
+        planned again."""
+        if not self.in_place or not self._can_keep():
+            return None
+        return _Kept(*self._physical(plan), self._stored)
+
+    def materialize_kept(self, name: str, plan: bytes, kept: "_Kept") -> None:
+        if kept.stored != self._stored:
+            kept.plan, kept.schema = self._physical(plan)
+        rows = pa.Table.from_batches(_execute(self.ctx, kept.plan), kept.schema)
+        if not kept.write(rows):
+            kept.store(rows)
+            self._stored += 1
+        kept.stored = self._stored
+        self.ctx.deregister_table(name)
+        self.ctx.register_record_batches(name, [[kept.batch]])
+
+    def returns_rows_kept(self, plan: bytes, kept: "_Kept") -> bool:
+        # A check reads no step's table, only the caller's, which change in
+        # place: its plan never needs planning again.
+        return any(b.num_rows for b in _execute(self.ctx, kept.plan))
+
+    def _physical(self, plan: bytes):
+        """``plan``'s physical plan, and the schema of its rows."""
+        lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
+        df = self.ctx.create_dataframe_from_logical_plan(lp)
+        return df.execution_plan(), df.schema()
+
+    def _can_keep(self) -> bool:
+        """Whether a plan can be kept: see :meth:`keep`."""
+        if not hasattr(ExecutionPlan, "reset_state"):
+            why = (
+                "this datafusion has no ExecutionPlan.reset_state; install the xqlsystems fork "
+                "(branch reset-plan-state-55.0)"
+            )
+        else:
+            try:
+                rows = (
+                    self.ctx.sql(
+                        "SELECT name, value FROM information_schema.df_settings WHERE name IN "
+                        f"({', '.join(repr(n) for n in _DYNAMIC_FILTERS)})"
+                    )
+                    .to_arrow_table()
+                    .to_pylist()
+                )
+            except ValueError:
+                # DataFusion raises ValueError for a table it can't find:
+                # here, the information schema is off.
+                rows = None
+            if rows is None:
+                why = "this SessionContext has no information_schema, which holds its settings"
+            else:
+                on = sorted(r["name"] for r in rows if r["value"] != "false")
+                if not on:
+                    return True
+                why = f"{', '.join(on)} {'is' if len(on) == 1 else 'are'} on; set them to false"
+        if not self._warned:
+            self._warned = True
+            warnings.warn(f"in_place: ddxdb plans every step on every run, since {why}", stacklevel=2)
+        return False
+
+
+def _execute(ctx: SessionContext, plan) -> list:
+    """The rows of a kept physical plan, run again: every node's state
+    reset, so a hash join reads its build side again."""
+    plan = plan.reset_state()
+    return [b.to_pyarrow() for p in range(plan.partition_count) for b in ctx.execute(plan, p)]
+
+
+class _Kept:
+    """A plan :meth:`DataFusionBackend.keep` kept: its physical plan, made
+    when the backend had stored rows anew ``stored`` times, and a step's
+    rows, in memory each run writes into."""
+
+    def __init__(self, plan, schema: pa.Schema, stored: int):
+        self.plan, self.schema, self.stored = plan, schema, stored
+        self.batch: Optional[pa.RecordBatch] = None
+        # Per column, the memory a run writes its values into; None for a
+        # column whose values must stay the same.
+        self._buffers: list = []
+
+    def store(self, rows: pa.Table) -> None:
+        """Store ``rows``, each integer or float column without a NULL in
+        memory of its own."""
+        columns, self._buffers = [], []
+        for column in rows.columns:
+            column = column.combine_chunks()
+            buffer = None
+            if column.null_count == 0 and (pa.types.is_integer(column.type) or pa.types.is_floating(column.type)):
+                buffer = pa.allocate_buffer(len(column) * column.type.byte_width)
+                memoryview(buffer)[:] = _values(column)
+                column = pa.Array.from_buffers(column.type, len(column), [None, buffer])
+            columns.append(column)
+            self._buffers.append(buffer)
+        self.batch = pa.RecordBatch.from_arrays(columns, schema=self.schema)
+
+    def write(self, rows: pa.Table) -> bool:
+        """Write ``rows`` into the stored ones, if they fit: as many, no
+        NULL where a value is written, and the rest as they were."""
+        if self.batch is None or rows.num_rows != self.batch.num_rows:
+            return False
+        columns = [c.combine_chunks() for c in rows.columns]
+        for buffer, new, old in zip(self._buffers, columns, self.batch.columns):
+            if new.null_count if buffer is not None else not new.equals(old):
+                return False
+        for buffer, new in zip(self._buffers, columns):
+            if buffer is not None:
+                memoryview(buffer)[:] = _values(new)
+        return True
+
+
+def _values(column: pa.Array) -> memoryview:
+    """The bytes of ``column``'s values: an integer or float column's."""
+    width = column.type.byte_width
+    start = column.offset * width
+    return memoryview(column.buffers()[1])[start : start + len(column) * width]
 
 
 #: Per context, each view's last optimized comparison: the two unoptimized
@@ -612,7 +762,13 @@ def sql_all(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
         return [SessionContext.sql(ctx, s) for s in rewritten.statements]
 
 
-def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional[str] = None) -> Callable[[], list]:
+def prepare(
+    ctx: SessionContext,
+    statements: Sequence[str],
+    *,
+    dialect: Optional[str] = None,
+    in_place: bool = False,
+) -> Callable[[], list]:
     """:func:`sql_all`'s ``statements``, prepared to run again on ``ctx``, as
     ``jax.jit`` prepares a function. Returns a function of no arguments that
     runs them and returns what :func:`sql_all` would::
@@ -637,15 +793,30 @@ def prepare(ctx: SessionContext, statements: Sequence[str], *, dialect: Optional
     of the call that prepared it: DataFusion folds it into a constant. Calls
     wait for each other, since each writes the same tables.
 
+    ``in_place=True`` makes later calls faster still, by running each
+    step's physical plan again rather than planning it (see
+    :class:`DataFusionBackend`). A physical plan holds the tables it read
+    when it was made, so it is for a caller that changes its tables only by
+    writing into the memory they hold, as ``xarray_sql``'s prepared queries
+    do. A table registered again under its name would go unread: the plans
+    would read the one it replaced, and give wrong results without an
+    error. A call also writes into the memory of the tables the last call's
+    DataFrames read, so collect those first. It needs the xqlsystems fork
+    of datafusion (``ExecutionPlan.reset_state``), the information schema,
+    and the four ``enable*_dynamic_filter_pushdown`` settings off; without
+    them, it warns and plans each step as before.
+
     ``ctx`` may be a DuckDB connection instead, which
-    :func:`ddxdb.duckdb.prepare` prepares on."""
+    :func:`ddxdb.duckdb.prepare` prepares on, without ``in_place``."""
     if _duckdb(ctx):
         from . import duckdb as on_duckdb
 
         if dialect not in (None, "duckdb"):
             raise ValueError(f"a DuckDB connection's statements are in DuckDB's dialect, not {dialect!r}")
+        if in_place:
+            raise ValueError("in_place is for a DataFusion SessionContext; DuckDB plans each step on every call")
         return on_duckdb.prepare(ctx, statements)
-    prepared = Prepared(DataFusionBackend(ctx), statements, dialect or "datafusion")
+    prepared = Prepared(DataFusionBackend(ctx, in_place=in_place), statements, dialect or "datafusion")
     lock = threading.Lock()
 
     def run() -> list:
