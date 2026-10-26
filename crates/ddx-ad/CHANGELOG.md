@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.5...ddx-ad-v0.2.6) - 2026-10-26
+
+### Fixed
+
+- A softmax over a window in a view, its weights read by the output and by their sum, is differentiated on DuckDB. Each CTE such a view reads more than once is planned on its own, and the pieces' window functions are now declared as a projection's are; before, the view reached DuckDB's Substrait producer whole and failed with `Not implemented Error: CTE` (#204, [#207](https://github.com/xqlsystems/ddx/pull/207))
+- The contraction rule groups by each join key once. A plan that repeats a key column, as DuckDB's plan of attention does, made a step whose root named more columns than its relation had ([#207](https://github.com/xqlsystems/ddx/pull/207))
+
 ## [0.2.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.4...ddx-ad-v0.2.5) - 2026-10-25
 
 ### Fixed

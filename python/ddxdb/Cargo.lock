@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-ad"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ddx-core",
  "prost",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ddx-ad",
  "ddx-core",

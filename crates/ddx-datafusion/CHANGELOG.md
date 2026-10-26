@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.2...ddx-datafusion-v0.3.3) - 2026-10-26
+
+### Changed
+
+- ddx-ad 0.2.6: a softmax view's shared window, and plans that repeat a join key ([#207](https://github.com/xqlsystems/ddx/pull/207))
+
 ## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.1...ddx-datafusion-v0.3.2) - 2026-10-25
 
 ### Changed
