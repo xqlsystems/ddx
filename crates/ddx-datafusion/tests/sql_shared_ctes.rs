@@ -26,13 +26,13 @@ struct Recording {
 
 impl Backend for Recording {
     type Error = datafusion::error::DataFusionError;
-    type Kept = ();
+    type Compiled = ();
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
         self.inner.table_schema(name).await
     }
 
-    async fn returns_rows(&mut self, plans: &[Bound]) -> Result<Vec<bool>> {
+    async fn returns_rows(&mut self, plans: &[&Bound]) -> Result<Vec<bool>> {
         self.inner.returns_rows(plans).await
     }
 

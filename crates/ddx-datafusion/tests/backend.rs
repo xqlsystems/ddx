@@ -36,7 +36,7 @@ struct Sync {
 
 impl Backend for Sync {
     type Error = DataFusionError;
-    type Kept = ();
+    type Compiled = ();
 
     fn table_schema(
         &mut self,
@@ -51,7 +51,7 @@ impl Backend for Sync {
 
     fn returns_rows(
         &mut self,
-        plans: &[Bound],
+        plans: &[&Bound],
     ) -> impl Future<Output = Result<Vec<bool>, Self::Error>> + Send {
         ready(
             plans

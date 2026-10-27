@@ -18,7 +18,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use ddx_ad::substrait::proto::{NamedStruct, Plan};
 use ddx_ad::{Backend, Bound};
 use ddx_datafusion::ad;
-use ddx_datafusion::engine::{DataFusion, Kept};
+use ddx_datafusion::engine::{Compiled, DataFusion};
 
 const STEP: &str = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) \
                     SELECT i, val - 0.1 * grad(loss, val) AS val FROM w ORDER BY i";
@@ -141,13 +141,13 @@ impl Counting {
 
 impl Backend for Counting {
     type Error = DataFusionError;
-    type Kept = Kept;
+    type Compiled = Compiled;
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct, DataFusionError> {
         self.ask("table_schema");
         self.engine.table_schema(name).await
     }
-    async fn returns_rows(&mut self, plans: &[Bound]) -> Result<Vec<bool>, DataFusionError> {
+    async fn returns_rows(&mut self, plans: &[&Bound]) -> Result<Vec<bool>, DataFusionError> {
         self.ask("returns_rows");
         self.engine.returns_rows(plans).await
     }
@@ -174,25 +174,25 @@ impl Backend for Counting {
         self.ask("session_key");
         self.engine.session_key().await
     }
-    async fn keep(&mut self, plan: &Bound) -> Result<Option<Kept>, DataFusionError> {
-        self.ask("keep");
-        self.engine.keep(plan).await
+    async fn compile(&mut self, plan: &Bound) -> Result<Option<Compiled>, DataFusionError> {
+        self.ask("compile");
+        self.engine.compile(plan).await
     }
-    async fn materialize_kept(
+    async fn materialize_compiled(
         &mut self,
         name: &str,
         plan: &Bound,
-        kept: &Kept,
+        compiled: &Compiled,
     ) -> Result<(), DataFusionError> {
-        self.ask("materialize_kept");
-        self.engine.materialize_kept(name, plan, kept).await
+        self.ask("materialize_compiled");
+        self.engine.materialize_compiled(name, plan, compiled).await
     }
-    async fn returns_rows_kept(
+    async fn returns_rows_compiled(
         &mut self,
-        plans: &[(&Bound, &Kept)],
+        plans: &[(&Bound, &Compiled)],
     ) -> Result<Vec<bool>, DataFusionError> {
-        self.ask("returns_rows_kept");
-        self.engine.returns_rows_kept(plans).await
+        self.ask("returns_rows_compiled");
+        self.engine.returns_rows_compiled(plans).await
     }
 }
 
@@ -232,13 +232,13 @@ async fn a_later_run_asks_the_engine_only_to_run_plans() {
         .unwrap()
         .expect("no view changed");
     assert_eq!(again.statements, prepared.statements());
-    // Every plan was kept, and runs as it was kept: none is planned again
+    // Every plan was compiled, and runs as it was compiled: none is planned again
     // (but by the session, from SQL, with `DDX_STEPS_AS_SQL=1`).
     let later = asked.lock().unwrap().clone();
     let run = if std::env::var_os("DDX_STEPS_AS_SQL").is_some_and(|v| v == "1") {
         ["returns_rows", "materialize"]
     } else {
-        ["returns_rows_kept", "materialize_kept"]
+        ["returns_rows_compiled", "materialize_compiled"]
     };
     assert!(
         later.iter().all(|w| *w == "session_key" || run.contains(w)),
@@ -402,7 +402,7 @@ async fn both(ctx: &SessionContext, step: &ad::Prepared, statements: &[&str]) ->
 }
 
 #[tokio::test]
-async fn a_kept_plan_counts_the_rows_its_table_has_at_each_run() {
+async fn a_compiled_plan_counts_the_rows_its_table_has_at_each_run() {
     // An ungrouped COUNT(*) of a table whose statistics are exact folds to
     // the table's row count when it is planned.
     let ctx = SessionContext::new();
@@ -418,7 +418,7 @@ async fn a_kept_plan_counts_the_rows_its_table_has_at_each_run() {
 }
 
 #[tokio::test]
-async fn a_kept_join_reads_its_build_side_as_it_is_at_each_run() {
+async fn a_compiled_join_reads_its_build_side_as_it_is_at_each_run() {
     // A join on keys a dynamic filter would narrow to the first run's, with
     // dynamic filter pushdown on, as it is by default.
     let ctx = SessionContext::new();
@@ -448,7 +448,7 @@ async fn a_kept_join_reads_its_build_side_as_it_is_at_each_run() {
 }
 
 #[tokio::test]
-async fn a_kept_plan_over_a_table_split_otherwise_is_planned_again() {
+async fn a_compiled_plan_over_a_table_split_otherwise_is_planned_again() {
     use datafusion::arrow::array::{Float64Array, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -496,7 +496,7 @@ async fn a_kept_plan_over_a_table_split_otherwise_is_planned_again() {
 }
 
 #[tokio::test]
-async fn a_kept_count_is_of_the_rows_its_table_has_when_it_runs() {
+async fn a_compiled_count_is_of_the_rows_its_table_has_when_it_runs() {
     // DataFusion folds an ungrouped COUNT(*) of a table whose statistics
     // are exact into the count when it plans it.
     let ctx = SessionContext::new();
@@ -509,17 +509,23 @@ async fn a_kept_count_is_of_the_rows_its_table_has_when_it_runs() {
     let plan = ddx_ad::Unbound::from_plan(plan)
         .bind(&mut |_| None)
         .unwrap();
-    // A plan run as SQL (`DDX_STEPS_AS_SQL=1`) is not kept.
-    let Some(kept) = engine.keep(&plan).await.unwrap() else {
+    // A plan run as SQL (`DDX_STEPS_AS_SQL=1`) is not compiled.
+    let Some(compiled) = engine.compile(&plan).await.unwrap() else {
         return;
     };
     for vals in [&[1.0, -2.0, 0.5][..], &[1.0], &[1.0, 2.0, 3.0, 4.0, 5.0]] {
         put(&ctx, "w", vals).await;
-        engine.materialize_kept("n", &plan, &kept).await.unwrap();
+        engine
+            .materialize_compiled("n", &plan, &compiled)
+            .await
+            .unwrap();
         let batches = ctx.table("n").await.unwrap().collect().await.unwrap();
         let n = batches[0].column(0).as_primitive::<Int64Type>().value(0);
         assert_eq!(n, vals.len() as i64);
-        let rows = engine.returns_rows_kept(&[(&plan, &kept)]).await.unwrap();
+        let rows = engine
+            .returns_rows_compiled(&[(&plan, &compiled)])
+            .await
+            .unwrap();
         assert_eq!(rows, [true]);
     }
 }

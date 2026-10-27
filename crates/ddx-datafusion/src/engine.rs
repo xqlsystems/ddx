@@ -33,7 +33,7 @@ use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, ProjectRel, Rel};
 use ddx_ad::{AdError, Bound, Program, RunError, Step};
 
-pub use crate::kept::Kept;
+pub use crate::compiled::Compiled;
 
 pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -64,13 +64,13 @@ pub struct DataFusion(pub SessionContext);
 
 impl ddx_ad::Backend for DataFusion {
     type Error = DataFusionError;
-    type Kept = crate::kept::Kept;
+    type Compiled = crate::compiled::Compiled;
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
         table_schema(&self.0, name).await
     }
 
-    async fn returns_rows(&mut self, plans: &[Bound]) -> Result<Vec<bool>> {
+    async fn returns_rows(&mut self, plans: &[&Bound]) -> Result<Vec<bool>> {
         // The checks read no step and none reads another, so they run at
         // once, each a task of its own (polled together on one task, they
         // ran one after another): on a large wrt table they are most of a
@@ -78,7 +78,7 @@ impl ddx_ad::Backend for DataFusion {
         let tasks: Vec<_> = plans
             .iter()
             .map(|plan| {
-                let (ctx, plan) = (self.0.clone(), (**plan).clone());
+                let (ctx, plan) = (self.0.clone(), (***plan).clone());
                 tokio::spawn(async move { returns_rows(&ctx, &plan).await })
             })
             .collect();
@@ -96,34 +96,34 @@ impl ddx_ad::Backend for DataFusion {
         materialize(&self.0, name, plan).await
     }
 
-    async fn keep(&mut self, plan: &Bound) -> Result<Option<crate::kept::Kept>> {
+    async fn compile(&mut self, plan: &Bound) -> Result<Option<crate::compiled::Compiled>> {
         // A plan run as SQL is planned from its SQL, by the session.
         if steps_as_sql() {
             return Ok(None);
         }
-        crate::kept::keep(&self.0, plan).await.map(Some)
+        crate::compiled::compile(&self.0, plan).await.map(Some)
     }
 
-    async fn materialize_kept(
+    async fn materialize_compiled(
         &mut self,
         name: &str,
         plan: &Bound,
-        kept: &crate::kept::Kept,
+        compiled: &crate::compiled::Compiled,
     ) -> Result<()> {
-        let physical = crate::kept::ready(&self.0, plan, kept).await?;
+        let physical = crate::compiled::ready(&self.0, plan, compiled).await?;
         let task = Arc::new(TaskContext::from(&self.0.state()));
         register_rows(&self.0, name, physical, task).await
     }
 
-    async fn returns_rows_kept(
+    async fn returns_rows_compiled(
         &mut self,
-        plans: &[(&Bound, &crate::kept::Kept)],
+        plans: &[(&Bound, &crate::compiled::Compiled)],
     ) -> Result<Vec<bool>> {
         // At once, as `returns_rows` runs them.
         let task = Arc::new(TaskContext::from(&self.0.state()));
         let mut tasks = Vec::with_capacity(plans.len());
-        for (plan, kept) in plans {
-            let physical = crate::kept::ready(&self.0, plan, kept).await?;
+        for (plan, compiled) in plans {
+            let physical = crate::compiled::ready(&self.0, plan, compiled).await?;
             let task = Arc::clone(&task);
             tasks.push(tokio::spawn(async move { any_row(physical, task).await }));
         }

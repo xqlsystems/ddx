@@ -861,8 +861,8 @@ def test_a_prepared_call_after_a_table_changes_its_types_matches_sql_all(ad, ctx
 
 
 @pytest.fixture
-def kept(ad, ctx):
-    """``ctx``, able to keep plans (``ad.prepare(..., in_place=True)``)."""
+def compiling(ad, ctx):
+    """``ctx``, able to compile plans (``ad.prepare(..., in_place=True)``)."""
     from datafusion.plan import ExecutionPlan
 
     if not hasattr(ExecutionPlan, "reset_state"):
@@ -890,11 +890,11 @@ def writable(ctx, name, i, val):
     return write
 
 
-def test_a_kept_step_reads_the_values_written_into_its_tables_at_each_call(ad, kept, monkeypatch):
-    write_w = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
-    write_b = writable(kept, "b", [0, 1, 2], [0.25, 3.0, -1.0])
+def test_a_compiled_step_reads_the_values_written_into_its_tables_at_each_call(ad, compiling, monkeypatch):
+    write_w = writable(compiling, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    write_b = writable(compiling, "b", [0, 1, 2], [0.25, 3.0, -1.0])
     asked = []
-    for method in ["materialize", "returns_rows", "keep", "materialize_kept", "returns_rows_kept", "_physical"]:
+    for method in ["materialize", "returns_rows", "compile", "materialize_compiled", "returns_rows_compiled", "_physical"]:
         original = getattr(ad.DataFusionBackend, method)
 
         def spy(self, *args, _method=method, _original=original):
@@ -902,22 +902,22 @@ def test_a_kept_step_reads_the_values_written_into_its_tables_at_each_call(ad, k
             return _original(self, *args)
 
         monkeypatch.setattr(ad.DataFusionBackend, method, spy)
-    step = ad.prepare(kept, [STEP, HVP], in_place=True)
+    step = ad.prepare(compiling, [STEP, HVP], in_place=True)
     for k in range(3):
         asked.clear()
         got = [pairs(df) for df in step()]
-        # Each plan is planned once, when it is kept: none again later.
-        later = {"materialize_kept", "returns_rows_kept"}
-        assert set(asked) == (later | {"keep", "_physical"} if k == 0 else later), asked
-        assert asked.count("_physical") == asked.count("keep")
-        want = [pairs(df) for df in ad.sql_all(kept, [STEP, HVP])]
+        # Each plan is planned once, when it is compiling: none again later.
+        later = {"materialize_compiled", "returns_rows_compiled"}
+        assert set(asked) == (later | {"compile", "_physical"} if k == 0 else later), asked
+        assert asked.count("_physical") == asked.count("compile")
+        want = [pairs(df) for df in ad.sql_all(compiling, [STEP, HVP])]
         assert got == want
-        assert not [t for t in kept.catalog().schema().names() if t.startswith("__ddx_")]
+        assert not [t for t in compiling.catalog().schema().names() if t.startswith("__ddx_")]
         write_w([i for i, _ in got[0]], [v for _, v in got[0]])
         write_b([2, 1, 0], [1.0, float(k), -1.0])
 
 
-def test_a_kept_step_whose_rows_change_in_number_is_planned_again(ad, kept):
+def test_a_compiled_step_whose_rows_change_in_number_is_planned_again(ad, compiling):
     # The steps that save each group's sum have a row for each value of w
     # over 0: here 2, 3, 0, then 3.
     statement = (
@@ -925,16 +925,16 @@ def test_a_kept_step_whose_rows_change_in_number_is_planned_again(ad, kept):
         "(SELECT i, LN(SUM(val * val)) AS l FROM w WHERE val > 0 GROUP BY i)) "
         "SELECT i, grad(loss, val) AS g FROM w"
     )
-    write = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
-    step = ad.prepare(kept, [statement], in_place=True)
+    write = writable(compiling, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    step = ad.prepare(compiling, [statement], in_place=True)
     for val in [[1.0, -2.0, 0.5], [1.0, 2.0, 0.5], [-1.0, -2.0, -0.5], [3.0, 2.0, 0.5]]:
         write([0, 1, 2], val)
-        assert pairs(step()[0]) == pairs(ad.sql(kept, statement))
+        assert pairs(step()[0]) == pairs(ad.sql(compiling, statement))
 
 
-def test_a_kept_check_reads_the_values_written_into_its_tables(ad, kept):
-    write = writable(kept, "w", [0, 1, 2], [1.0, -2.0, 0.5])
-    step = ad.prepare(kept, [STEP], in_place=True)
+def test_a_compiled_check_reads_the_values_written_into_its_tables(ad, compiling):
+    write = writable(compiling, "w", [0, 1, 2], [1.0, -2.0, 0.5])
+    step = ad.prepare(compiling, [STEP], in_place=True)
     step()
     write([0, 0, 2], [1.0, -2.0, 0.5])
     with pytest.raises(ddxdb.InvalidColumn):
@@ -951,11 +951,39 @@ def test_in_place_without_what_it_needs_warns_and_plans_each_step(ad, ctx):
     assert got == pairs(ad.sql(ctx, STEP))
 
 
-def test_a_kept_steps_rows_are_stored_anew_for_a_null_where_a_value_was(ad):
+def test_a_compiled_steps_rows_are_stored_anew_for_a_null_where_a_value_was(ad):
     rows = pa.table({"i": pa.array([0, 1], pa.int64()), "val": pa.array([1.0, 2.0])})
-    kept = ad._Kept(None, rows.schema, 0)
-    kept.store(rows)
-    assert kept.write(pa.table({"i": pa.array([1, 0], pa.int64()), "val": pa.array([3.0, 4.0])}))
-    assert kept.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]
-    assert not kept.write(pa.table({"i": pa.array([0, 1], pa.int64()), "val": pa.array([5.0, None])}))
-    assert kept.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]
+    compiled = ad._Compiled(None, rows.schema, 0)
+    compiled.store(rows)
+    assert compiled.write(pa.table({"i": pa.array([1, 0], pa.int64()), "val": pa.array([3.0, 4.0])}))
+    assert compiled.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]
+    assert not compiled.write(pa.table({"i": pa.array([0, 1], pa.int64()), "val": pa.array([5.0, None])}))
+    assert compiled.batch.to_pylist() == [{"i": 1, "val": 3.0}, {"i": 0, "val": 4.0}]
+
+
+def test_a_compiled_check_reads_a_seed_as_this_call_stored_it(ad, compiling):
+    # The tangent is a seed ddx stores, with a row for each value of w over
+    # 0, at the key i % 2: at the second call it has 3 rows, two at key 0,
+    # which its check refuses.
+    statement = (
+        "WITH t AS (SELECT i % 2 AS i, val FROM w WHERE val > 0) "
+        "SELECT i, jvp(val * val, w.val, t) AS d FROM w"
+    )
+    write = writable(compiling, "w", [0, 1, 2], [1.0, 2.0, -0.5])
+    step = ad.prepare(compiling, [statement], in_place=True)
+    assert pairs(step()[0]) == pairs(ad.sql(compiling, statement))
+    write([0, 1, 2], [1.0, 2.0, 0.5])
+    with pytest.raises(ddxdb.InvalidColumn):
+        ad.sql(compiling, statement).collect()
+    with pytest.raises(ddxdb.InvalidColumn):
+        step()
+
+
+def test_a_compiled_steps_rows_are_of_the_schema_its_batches_have(ad):
+    # A plan's schema may differ from its batches', in which columns are
+    # nullable: the rows take the batches', as DataFrame.to_arrow_table's
+    # do, and the plan's only when there are no batches.
+    planned = pa.schema([pa.field("i", pa.int64(), nullable=True)])
+    batch = pa.RecordBatch.from_arrays([pa.array([1], pa.int64())], schema=pa.schema([pa.field("i", pa.int64(), nullable=False)]))
+    assert ad._rows([batch], planned).schema == batch.schema
+    assert ad._rows([], planned).schema == planned

@@ -12,25 +12,22 @@ use ddx_core::sqlparser::dialect::Dialect;
 
 use super::plan::{self, Built};
 use super::{run_all, Programs, Rewritten};
-use crate::program::Bound;
 use crate::run::{Backend, Plans, RunError, Traced};
 
 /// What a job's run did on the engine, beyond what its program says: the
-/// plans it ran, each bound to the engine's tables, and what the engine
-/// kept of each to run again ([`Backend::keep`]).
-pub(super) struct Trace<K> {
-    /// Each seed's table, the engine's plan of its query, and what was kept
-    /// of it.
-    pub seeds: Vec<(String, Bound, Option<K>)>,
+/// plans it ran, each as [`Traced`].
+pub(super) struct Trace<C> {
+    /// Each seed's table, and the engine's plan of its query.
+    pub seeds: Vec<(String, Traced<C>)>,
     /// Its program's checks', then its steps'.
-    pub plans: Traced<K>,
+    pub plans: Vec<Traced<C>>,
 }
 
-impl<K> Default for Trace<K> {
+impl<C> Default for Trace<C> {
     fn default() -> Self {
         Trace {
             seeds: Vec::new(),
-            plans: Traced::default(),
+            plans: Vec::new(),
         }
     }
 }
@@ -47,7 +44,7 @@ pub(super) fn results(program: &dyn Built) -> impl Iterator<Item = String> + '_ 
 /// once per batch.
 ///
 /// [`Prepared::run`] runs what the first run ran, each plan as it was bound
-/// then, or as the engine kept it then ([`Backend::keep`]), on the tables'
+/// then, or as the engine compiled it then ([`Backend::compile`]), on the tables'
 /// rows as they are: between runs, a table may change its rows, or be
 /// registered again under its name. It asks the engine for
 /// no plan, key or schema, only for its [`Backend::session_key`], and runs
@@ -56,15 +53,15 @@ pub(super) fn results(program: &dyn Built) -> impl Iterator<Item = String> + '_ 
 ///
 /// Every run writes the same tables, so two must not overlap: a run's
 /// tables stay until its [`Rewritten::release`].
-pub struct Prepared<K = ()> {
+pub struct Prepared<C = ()> {
     /// Each job's program, in order, with what its run did.
-    jobs: Vec<(Box<dyn Built>, Trace<K>)>,
+    jobs: Vec<(Box<dyn Built>, Trace<C>)>,
     statements: Vec<String>,
     /// The engine's session, as [`prepare`] found it.
     session: Option<String>,
 }
 
-impl<K> fmt::Debug for Prepared<K> {
+impl<C> fmt::Debug for Prepared<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Prepared")
             .field("statements", &self.statements)
@@ -75,14 +72,14 @@ impl<K> fmt::Debug for Prepared<K> {
 
 /// What [`prepare`] returns.
 type Preparing<B> =
-    Result<(Prepared<<B as Backend>::Kept>, Rewritten), RunError<<B as Backend>::Error>>;
+    Result<(Prepared<<B as Backend>::Compiled>, Rewritten), RunError<<B as Backend>::Error>>;
 
 /// [`crate::rewrite`], once: compute what the calls in `statements` read on
 /// `backend`, and rewrite each statement to read it, keeping what ran to
 /// run again ([`Prepared::run`]). It builds every program, keeping none in
 /// a [`Programs`], so it asks for no [`Backend::plan_key`]. It has the
-/// engine keep each plan it runs ([`Backend::keep`]), for later runs to run
-/// what was kept.
+/// engine compile each plan it runs ([`Backend::compile`]), for later runs
+/// to run what was compiled.
 ///
 /// Returns the prepared statements, and this run's [`Rewritten`] (whose
 /// [`Rewritten::release`] keeps no program, in whichever `programs` it is
@@ -126,7 +123,7 @@ pub fn prepare<'a, B: Backend>(
     }
 }
 
-impl<K: Send + Sync> Prepared<K> {
+impl<C: Send + Sync> Prepared<C> {
     /// Run what [`prepare`] ran, on the same `backend`: each job's seeds,
     /// then its program's checks and steps, each plan as it was bound then
     /// (see the type's docs for what that asks of the tables). Returns the
@@ -141,7 +138,7 @@ impl<K: Send + Sync> Prepared<K> {
     // Not an `async fn`, so that its future is promised `Send`, as
     // `rewrite`'s is.
     #[allow(clippy::manual_async_fn)]
-    pub fn run<'a, B: Backend<Kept = K>>(
+    pub fn run<'a, B: Backend<Compiled = C>>(
         &'a self,
         backend: &'a mut B,
     ) -> impl Future<Output = Result<Option<Rewritten>, RunError<B::Error>>> + Send + 'a {
@@ -153,9 +150,9 @@ impl<K: Send + Sync> Prepared<K> {
             let mut tables = Vec::new();
             for (program, trace) in &self.jobs {
                 let result = async {
-                    for (name, plan, kept) in &trace.seeds {
+                    for (name, seed) in &trace.seeds {
                         tables.push(name.clone());
-                        crate::run::materialize(backend, name, plan, kept.as_ref()).await?;
+                        crate::run::materialize(backend, name, seed).await?;
                     }
                     crate::run::run_bound(backend, &**program, Plans::Bound(&trace.plans)).await
                 }

@@ -2,20 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! A program's plans, kept to run again ([`ddx_ad::Backend::keep`]): each
-//! a physical plan, built once, that reads its tables as they are on every
-//! run.
+//! A program's plans, compiled to run again
+//! ([`ddx_ad::Backend::compile`]): each a physical plan, built once, that
+//! reads its tables as they are on every run.
 //!
 //! A physical plan holds what its scans read: a `MemTable`'s scan holds its
-//! batches. So a kept plan's every scan is a [`LiveExec`], a leaf that names
-//! its table, and each run replaces it with a scan of the table registered
+//! batches. So a compiled plan's every scan is a [`LiveExec`], a leaf that
+//! names its table, and each run replaces it with a scan of the table registered
 //! under that name then, and resets every other node's state (a hash join's
 //! build side, say), as `reset_plan_states` does. A scan that differs from
 //! the one the plan was built for, in its schema, partitioning or ordering,
 //! would not mean what the plan assumes: the plan is built again.
 //!
-//! Nothing a kept plan's first run reads is built into it. Its scans state
-//! their tables' statistics as inexact, so the optimizer cannot fold an
+//! Nothing a compiled plan's first run reads is built into it. Its scans
+//! state their tables' statistics as inexact, so the optimizer cannot fold an
 //! ungrouped `COUNT(*)` into the first run's number; a filter pushed into a
 //! scan is applied again above it; and dynamic filters are off while it is
 //! planned, since a reset plan keeps the filter its first run pushed down.
@@ -41,40 +41,40 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use ddx_ad::substrait::proto::Plan;
 
-/// A plan, as [`crate::engine::DataFusion`] keeps it: its physical plan,
+/// A plan, as [`crate::engine::DataFusion`] compiles it: its physical plan,
 /// whose scans are [`LiveExec`]s, replaced when its tables' scans have
 /// changed (see the module docs).
-pub struct Kept(Mutex<Arc<dyn ExecutionPlan>>);
+pub struct Compiled(Mutex<Arc<dyn ExecutionPlan>>);
 
-impl fmt::Debug for Kept {
+impl fmt::Debug for Compiled {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Kept")
+        f.write_str("Compiled")
     }
 }
 
-/// `plan`, kept to run again on `ctx`.
-pub(crate) async fn keep(ctx: &SessionContext, plan: &Plan) -> Result<Kept> {
-    Ok(Kept(Mutex::new(physical(ctx, plan).await?)))
+/// `plan`, compiled to run again on `ctx`.
+pub(crate) async fn compile(ctx: &SessionContext, plan: &Plan) -> Result<Compiled> {
+    Ok(Compiled(Mutex::new(physical(ctx, plan).await?)))
 }
 
-/// `kept` (made of `plan`), ready to run once on `ctx`'s tables as they
+/// `compiled` (made of `plan`), ready to run once on `ctx`'s tables as they
 /// are: each scan replaced, every node's state reset. Built again from
 /// `plan` if a table's scan has changed.
 pub(crate) async fn ready(
     ctx: &SessionContext,
     plan: &Plan,
-    kept: &Kept,
+    compiled: &Compiled,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let state = ctx.state();
-    let physical = Arc::clone(&kept.0.lock().unwrap_or_else(PoisonError::into_inner));
+    let physical = Arc::clone(&compiled.0.lock().unwrap_or_else(PoisonError::into_inner));
     if let Some(ready) = with_scans(&state, &physical).await? {
         return Ok(ready);
     }
     let physical = self::physical(ctx, plan).await?;
     let ready = with_scans(&state, &physical).await?.ok_or_else(|| {
-        DataFusionError::Internal("a kept plan's scans changed as it was built".into())
+        DataFusionError::Internal("a compiled plan's scans changed as it was built".into())
     })?;
-    *kept.0.lock().unwrap_or_else(PoisonError::into_inner) = physical;
+    *compiled.0.lock().unwrap_or_else(PoisonError::into_inner) = physical;
     Ok(ready)
 }
 
@@ -135,7 +135,7 @@ async fn with_scans(
     Ok(Some(ready))
 }
 
-/// A table as a kept plan reads it: by name, when the plan runs (see the
+/// A table as a compiled plan reads it: by name, when the plan runs (see the
 /// module docs). Planned as the table registered when the plan is built.
 #[derive(Debug)]
 struct Live {
@@ -216,7 +216,7 @@ impl TableProvider for Live {
     }
 }
 
-/// A kept plan's scan of a table: replaced by the table's own scan, as
+/// A compiled plan's scan of a table: replaced by the table's own scan, as
 /// registered when the plan runs, before it runs (see the module docs).
 #[derive(Debug)]
 struct LiveExec {
@@ -301,7 +301,7 @@ impl ExecutionPlan for LiveExec {
 
     fn execute(&self, _: usize, _: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         Err(DataFusionError::Internal(format!(
-            "a kept plan ran its scan of '{}' before the scan was replaced",
+            "a compiled plan ran its scan of '{}' before the scan was replaced",
             self.reference
         )))
     }

@@ -246,8 +246,8 @@ class DataFusionBackend:
     :class:`ddxdb.Prepared`, the tables its statements read change only by
     writes into the memory they hold, as ``xarray_sql``'s prepared queries
     write them; never by being registered again. Then each plan's physical
-    plan is kept and run again (:meth:`keep`), rather than planned on every
-    run. See :func:`prepare`."""
+    plan is compiled once and run again (:meth:`compile`), rather than
+    planned on every run. See :func:`prepare`."""
 
     def __init__(self, ctx: SessionContext, *, in_place: bool = False):
         self.ctx = ctx
@@ -256,9 +256,9 @@ class DataFusionBackend:
         # and how many times they have changed.
         self._catalog: list = []
         self._changes = 0
-        # How many times a kept step's rows replaced the ones it had stored
-        # rather than being written there: a plan kept before then may read
-        # the old ones.
+        # How many times a compiled step's rows replaced the ones it had
+        # stored rather than being written there: a plan compiled before
+        # then may read the old ones.
         self._stored = 0
         self._warned = False
 
@@ -396,42 +396,46 @@ class DataFusionBackend:
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
 
-    def keep(self, plan: bytes) -> Optional["_Kept"]:
-        """``plan``'s physical plan, kept to run again, with ``in_place``;
+    def compile(self, plan: bytes) -> Optional["_Compiled"]:
+        """``plan``'s physical plan, compiled to run again, with ``in_place``;
         otherwise ``None``. Also ``None``, with a warning, if this
         datafusion has no ``ExecutionPlan.reset_state`` (the xqlsystems
         fork's, branch ``reset-plan-state-55.0``), or a setting in
         :data:`_DYNAMIC_FILTERS` is on, or the information schema that
         holds the settings is off.
 
-        A kept step's rows are stored in memory of its own, and each later
-        run writes its rows there, so the kept plans that read the step
+        A compiled step's rows are stored in memory of its own, and each later
+        run writes its rows there, so the compiled plans that read the step
         read them. When a run's rows can't be written there (another number
-        of rows, a NULL, or a column that isn't an integer or a float and
-        changed), they are stored anew, and every plan kept before then is
-        planned again."""
-        if not self.in_place or not self._can_keep():
+        of rows, another schema, a NULL, or a column that isn't an integer
+        or a float and changed), they are stored anew, and every plan
+        compiled before then is planned again."""
+        if not self.in_place or not self._can_compile():
             return None
-        return _Kept(*self._physical(plan), self._stored)
+        return _Compiled(*self._physical(plan), self._stored)
 
-    def materialize_kept(self, name: str, plan: bytes, kept: "_Kept") -> None:
-        if kept.stored != self._stored:
-            kept.plan, kept.schema = self._physical(plan)
-        rows = pa.Table.from_batches(_execute(self.ctx, kept.plan), kept.schema)
-        if not kept.write(rows):
-            # Rows stored for the first time make no kept plan stale: a plan
-            # that reads this step's table is kept after the step first runs.
-            replaced = kept.batch is not None
-            kept.store(rows)
+    def materialize_compiled(self, name: str, plan: bytes, compiled: "_Compiled") -> None:
+        if compiled.stored != self._stored:
+            compiled.plan, compiled.schema = self._physical(plan)
+        rows = _rows(_execute(self.ctx, compiled.plan), compiled.schema)
+        if not compiled.write(rows):
+            # Rows stored for the first time make no compiled plan stale: a
+            # plan that reads this step's table is compiled after the step
+            # first runs.
+            replaced = compiled.batch is not None
+            compiled.store(rows)
             self._stored += replaced
-        kept.stored = self._stored
+        compiled.stored = self._stored
         self.ctx.deregister_table(name)
-        self.ctx.register_record_batches(name, [[kept.batch]])
+        self.ctx.register_record_batches(name, [[compiled.batch]])
 
-    def returns_rows_kept(self, plan: bytes, kept: "_Kept") -> bool:
-        # A check reads no step's table, only the caller's, which change in
-        # place: its plan never needs planning again.
-        return any(b.num_rows for b in _execute(self.ctx, kept.plan))
+    def returns_rows_compiled(self, plan: bytes, compiled: "_Compiled") -> bool:
+        # A check may read a seed (a tangent, say), whose rows may have been
+        # stored anew since.
+        if compiled.stored != self._stored:
+            compiled.plan, compiled.schema = self._physical(plan)
+            compiled.stored = self._stored
+        return any(b.num_rows for b in _execute(self.ctx, compiled.plan))
 
     def _physical(self, plan: bytes):
         """``plan``'s physical plan, and the schema of its rows."""
@@ -439,8 +443,8 @@ class DataFusionBackend:
         df = self.ctx.create_dataframe_from_logical_plan(lp)
         return df.execution_plan(), df.schema()
 
-    def _can_keep(self) -> bool:
-        """Whether a plan can be kept: see :meth:`keep`."""
+    def _can_compile(self) -> bool:
+        """Whether a plan can be compiled: see :meth:`compile`."""
         if not hasattr(ExecutionPlan, "reset_state"):
             why = (
                 "this datafusion has no ExecutionPlan.reset_state; install the xqlsystems fork "
@@ -473,17 +477,24 @@ class DataFusionBackend:
         return False
 
 
+def _rows(batches: list, schema: pa.Schema) -> pa.Table:
+    """``batches`` as a table, as ``DataFrame.to_arrow_table`` makes one:
+    of the batches' own schema, which may differ from the plan's (in which
+    columns are nullable, say), and of ``schema`` only if there are none."""
+    return pa.Table.from_batches(batches) if batches else schema.empty_table()
+
+
 def _execute(ctx: SessionContext, plan) -> list:
-    """The rows of a kept physical plan, run again: every node's state
+    """The rows of a compiled physical plan, run again: every node's state
     reset, so a hash join reads its build side again."""
     plan = plan.reset_state()
     return [b.to_pyarrow() for p in range(plan.partition_count) for b in ctx.execute(plan, p)]
 
 
-class _Kept:
-    """A plan :meth:`DataFusionBackend.keep` kept: its physical plan, made
-    when the backend had stored rows anew ``stored`` times, and a step's
-    rows, in memory each run writes into."""
+class _Compiled:
+    """A plan :meth:`DataFusionBackend.compile` compiled: its physical plan,
+    made when the backend had replaced stored rows ``stored`` times, and a
+    step's rows, in memory each run writes into."""
 
     def __init__(self, plan, schema: pa.Schema, stored: int):
         self.plan, self.schema, self.stored = plan, schema, stored
@@ -505,12 +516,13 @@ class _Kept:
                 column = pa.Array.from_buffers(column.type, len(column), [None, buffer])
             columns.append(column)
             self._buffers.append(buffer)
-        self.batch = pa.RecordBatch.from_arrays(columns, schema=self.schema)
+        self.batch = pa.RecordBatch.from_arrays(columns, schema=rows.schema)
 
     def write(self, rows: pa.Table) -> bool:
-        """Write ``rows`` into the stored ones, if they fit: as many, no
-        NULL where a value is written, and the rest as they were."""
-        if self.batch is None or rows.num_rows != self.batch.num_rows:
+        """Write ``rows`` into the stored ones, if they fit: as many, of the
+        same schema, no NULL where a value is written, and the rest as they
+        were."""
+        if self.batch is None or rows.num_rows != self.batch.num_rows or rows.schema != self.batch.schema:
             return False
         columns = [c.combine_chunks() for c in rows.columns]
         for buffer, new, old in zip(self._buffers, columns, self.batch.columns):
@@ -797,7 +809,7 @@ def prepare(
     of the call that prepared it: DataFusion folds it into a constant. Calls
     wait for each other, since each writes the same tables.
 
-    ``in_place=True`` makes later calls faster still, by running each
+    Experimental: ``in_place=True`` makes later calls faster still, by running each
     step's physical plan again rather than planning it (see
     :class:`DataFusionBackend`). A physical plan holds the tables it read
     when it was made, so it is for a caller that changes its tables only by

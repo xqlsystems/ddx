@@ -496,7 +496,7 @@ pub struct Prepared {
     statements: Vec<String>,
     /// Once a run has succeeded. Locked while one runs, since every run
     /// writes the same tables.
-    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared<crate::engine::Kept>>>,
+    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared<crate::engine::Compiled>>>,
 }
 
 impl std::fmt::Debug for Prepared {
