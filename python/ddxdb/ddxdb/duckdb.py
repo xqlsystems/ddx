@@ -314,7 +314,9 @@ class DuckDBBackend:
         connection finds it. The producer writes a table by its name alone,
         so a name is taken as the only object of that name in the catalog,
         and refused if there are two."""
-        self._copy(self._stale)
+        # Only the tables it names: each of ddx's has a name no other has,
+        # so one that ``sql`` doesn't hold, ``sql`` doesn't read.
+        self._copy({name for name in self._stale if name in sql})
         plan = bytes(self._planner.execute("SELECT * FROM get_substrait(?)", [sql]).fetchone()[0])
         renamed = {}
         for name in set(_tables_read(plan)):

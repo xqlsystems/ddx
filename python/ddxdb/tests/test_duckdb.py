@@ -570,16 +570,20 @@ def test_a_later_prepared_call_asks_the_planner_for_nothing(ad, con):
 
 
 def test_the_planner_copies_only_the_tables_it_plans_a_read_of(ad, con, monkeypatch):
-    # The value and the gradient are written but read by no later step, so
-    # the planner never needs, or gets, a copy of them.
+    # No later step reads a value or a gradient, and the second statement's
+    # plan doesn't either, so the planner never needs, or gets, a copy of
+    # one: only of what the steps save and pass back.
     backend = ad._backend(con)
     planner = backend._planner = Spy(backend._planner)
     spy = Spy(con)
     monkeypatch.setattr(ad.DuckDBBackend, "con", property(lambda self: spy))
-    assert pairs(ad.sql_all(con, [GRAD])[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    got = [pairs(rel) for rel in ad.sql_all(con, [GRAD, GRAD.replace("val * val * val", "val * val")])]
+    assert got == [[(0, 3.0), (1, 12.0), (2, 0.75)], [(0, 2.0), (1, -4.0), (2, 1.0)]]
     made = lambda sent: [s.split()[5] for s in sent if s.startswith("CREATE OR REPLACE TEMP TABLE")]
     written, copied = made(spy.sent), made(planner.sent)
-    assert set(copied) < set(written)
+    results = [n for n in written if "_value" in n or "_grad_" in n]
+    assert len(results) == 4
+    assert copied and set(copied) <= set(written) - set(results)
     assert not ddx_tables(con)
 
 
