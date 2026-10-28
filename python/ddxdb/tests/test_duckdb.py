@@ -75,8 +75,8 @@ def test_statements_sharing_a_loss_share_its_program(ad, con):
         ],
     )
     w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
-    assert pairs(fw) == pytest.approx([(i, w[i] - 0.5 * 2 * w[i] * b[i]) for i in range(3)])
-    assert pairs(fb) == pytest.approx([(i, b[i] - 0.5 * w[i] * w[i]) for i in range(3)])
+    assert dict(pairs(fw)) == pytest.approx({i: w[i] - 0.5 * 2 * w[i] * b[i] for i in range(3)})
+    assert dict(pairs(fb)) == pytest.approx({i: b[i] - 0.5 * w[i] * w[i] for i in range(3)})
 
 
 def test_an_unnamed_gradient_column_is_named_for_its_column(ad, con):
@@ -97,7 +97,7 @@ def test_windows_differentiate(ad, con):
     # AVG and MAX's rules write window functions, which DuckDB's Substrait
     # consumer refuses: the steps run as SQL.
     rel = ad.sql(con, "WITH loss AS (SELECT AVG(val) + MAX(val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
-    assert pairs(rel) == pytest.approx([(0, 1 / 3 + 1.0), (1, 1 / 3), (2, 1 / 3)])
+    assert dict(pairs(rel)) == pytest.approx({0: 1 / 3 + 1.0, 1: 1 / 3, 2: 1 / 3})
 
 
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, con):
@@ -513,7 +513,7 @@ def test_the_module_docs_example_runs(ad):
     example = example.replace("ad.sql(con,", "result = ad.sql(con,", 1)
     scope = {}
     exec(example, scope)
-    assert pairs(scope["result"]) == pytest.approx([(0, 0.8), (1, 1.6)])
+    assert dict(pairs(scope["result"])) == pytest.approx({0: 0.8, 1: 1.6})
 
 
 def test_ad_sql_takes_a_duckdb_connection(con):
