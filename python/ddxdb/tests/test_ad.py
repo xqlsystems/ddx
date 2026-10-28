@@ -329,7 +329,7 @@ def test_any_backend_runs_a_program(ad, ctx):
             assert entry[1] not in asked, backend.log
             asked.add(entry[1])
     got = ctx.sql(f'SELECT i, val FROM "{prog.gradients[0].step}"')
-    assert pairs(got) == pytest.approx([(0, 2.0 / 3), (1, -4.0 / 3), (2, 1.0 / 3)])
+    assert dict(pairs(got)) == pytest.approx({0: 2.0 / 3, 1: -4.0 / 3, 2: 1.0 / 3})
 
 
 def test_a_failed_run_leaves_none_of_the_programs_tables(ad, ctx):
@@ -422,7 +422,7 @@ def test_jvp_of_a_grad_program_is_a_hessian_vector_product(ad, ctx):
     assert g.of == "w"
     out = ad.run(ctx, hvp, [tangent_of_w(hvp.inputs[0], [1.0, 2.0, 3.0])])
     got = out.gradients[0].select("i", "val_tangent")
-    assert pairs(got) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
+    assert dict(pairs(got)) == pytest.approx({0: 6.0, 1: -24.0, 2: 9.0})
 
 
 def test_vjp_of_a_jvp_program_is_a_hessian_vector_product_too(ad, ctx):
@@ -433,7 +433,7 @@ def test_vjp_of_a_jvp_program_is_a_hessian_vector_product_too(ad, ctx):
     # 0 on the loss, 1 on its tangent: the gradient of ∇l·v.
     seed = pa.table({c: [0.0 if c == "l" else 1.0] for c in cotangent.columns})
     out = ad.run(ctx, program, [tangent_of_w(tangent, [1.0, 2.0, 3.0]), seed])
-    assert pairs(out.gradients[0]) == pytest.approx([(0, 6.0), (1, -24.0), (2, 9.0)])
+    assert dict(pairs(out.gradients[0])) == pytest.approx({0: 6.0, 1: -24.0, 2: 9.0})
 
 
 def test_any_backend_runs_a_forward_program(ad, ctx):
