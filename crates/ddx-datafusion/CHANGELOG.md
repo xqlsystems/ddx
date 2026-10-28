@@ -9,6 +9,13 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.0...ddx-datafusion-v0.4.1) - 2026-10-28
+
+### Other
+
+- *(ddx-ad)* rebuild a contraction's side with the keys its join implies ([#225](https://github.com/xqlsystems/ddx/pull/225))
+- *(ddx-ad)* join a contraction's cotangent on keys the join makes equal ([#220](https://github.com/xqlsystems/ddx/pull/220))
+
 ## [0.4.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.3...ddx-datafusion-v0.4.0) - 2026-10-28
 
 ### Added

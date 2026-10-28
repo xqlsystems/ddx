@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.0...ddx-ad-v0.3.1) - 2026-10-28
+
+### Other
+
+- *(ddx-ad)* rebuild a contraction's side with the keys its join implies ([#225](https://github.com/xqlsystems/ddx/pull/225))
+- *(ddx-ad)* drop each step's table after its last reader ([#223](https://github.com/xqlsystems/ddx/pull/223))
+- *(ddx-ad, ddxdb)* run a step whose names would grow large as SQL ([#221](https://github.com/xqlsystems/ddx/pull/221))
+- *(ddx-ad)* join a contraction's cotangent on keys the join makes equal ([#220](https://github.com/xqlsystems/ddx/pull/220))
+
 ## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.6...ddx-ad-v0.3.0) - 2026-10-28
 
 ### Added
