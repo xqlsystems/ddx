@@ -905,6 +905,113 @@ async fn batched_attention_pairs_no_two_sequences_or_heads() {
 }
 
 #[tokio::test]
+async fn batched_attention_joined_through_v_matches_the_general_rule() {
+    // The normalizer's sequence and head are joined through v, as DuckDB's
+    // plan joins them, so the side `weights JOIN norm` is rebuilt with keys
+    // its own conditions don't state (issue #222): `=`, which drops v's
+    // NULL sequences, and IS NOT DISTINCT FROM, which keeps them.
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    let make = |rng: &mut Rng, ctx: &SessionContext| {
+        let (ns, nh) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+        let (nt, nd) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+        for name in ["q", "k", "v"] {
+            let null = (name != "k").then_some("s");
+            let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
+            register(ctx, name, table(rng, &dims, &["val"], 0.0, null));
+        }
+    };
+    let scores = |t: &str| t.ends_with("saved_0");
+    for (seed, eq) in [(0x222a, "="), (0x222b, "IS NOT DISTINCT FROM")] {
+        let through_v = |q: String| {
+            q.replace("JOIN v ON a.s = v.s", &format!("JOIN v ON (a.s {eq} v.s)"))
+                .replace(
+                    "JOIN norm n ON a.s = n.s AND a.h = n.h",
+                    &format!("JOIN norm n ON (v.s {eq} n.s) AND v.h = n.h"),
+                )
+        };
+        cases_of(
+            seed,
+            25,
+            &through_v(batched_attention("", "")),
+            &through_v(batched_attention(
+                "AND (q.d IS NULL OR q.d + k.t >= 0)",
+                "WHERE v.t IS NULL OR v.t + a.i >= 0",
+            )),
+            &wrt,
+            &[(&named("q"), &named("k")), (&scores, &named("v"))],
+            &make,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn batched_attention_s_normalizer_joins_each_score_once() {
+    // DuckDB's plan joins the normalizer on the sequence and head through
+    // v (`v.s = n.s`), as this query does. Rebuilt without v, the side
+    // `weights JOIN norm` joined each score to every sequence's and head's
+    // normalizer: S·H times its rows, 1,296 here (issue #222). With one
+    // channel, no join the query needs has more than S·H·T² rows.
+    let (ns, nh, nt, nd) = (3, 2, 8, 1);
+    let ctx = SessionContext::new();
+    let mut rng = Rng::new(0x222);
+    for name in ["q", "k", "v"] {
+        let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
+        register(&ctx, name, table(&mut rng, &dims, &["val"], 0.0, None));
+    }
+    let loss = batched_attention("", "").replace(
+        "JOIN norm n ON a.s = n.s AND a.h = n.h",
+        "JOIN norm n ON v.s = n.s AND v.h = n.h",
+    );
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    let program = ad::grad(&ctx, &loss, &wrt).await.unwrap();
+    let mut most = (0, String::new());
+    for step in program.steps() {
+        let plan = ddx_datafusion::engine::logical_plan(&ctx, &step.plan)
+            .await
+            .unwrap();
+        let df = ctx.execute_logical_plan(plan).await.unwrap();
+        let task = Arc::new(df.task_ctx());
+        let physical = df.create_physical_plan().await.unwrap();
+        datafusion::physical_plan::collect(physical.clone(), task)
+            .await
+            .unwrap();
+        let rows = largest_join(&physical);
+        if rows > most.0 {
+            most = (rows, step.name.as_str().to_string());
+        }
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+    }
+    assert!(
+        most.0 <= ns * nh * nt * nt,
+        "a join in {} has {} rows",
+        most.1,
+        most.0
+    );
+}
+
+/// The most rows any join in `plan` returned when it ran.
+fn largest_join(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> usize {
+    let own = if plan.name().contains("Join") {
+        plan.metrics().and_then(|m| m.output_rows()).unwrap_or(0)
+    } else {
+        0
+    };
+    plan.children()
+        .into_iter()
+        .map(largest_join)
+        .fold(own, usize::max)
+}
+
+#[tokio::test]
 async fn a_side_that_does_not_move_is_still_checked_for_a_total_order() {
     // w is constant here, but t recomputes it: a LIMIT inside it may keep
     // other rows on a second run, so the contraction rule refuses it as the
