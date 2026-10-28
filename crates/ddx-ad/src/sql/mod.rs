@@ -314,7 +314,7 @@ async fn run_all<B: Backend>(
             seeds.push((name, seed));
         }
         let program = planned.built(job.index);
-        let drops = Drops::of(program);
+        let drops = Drops::of(program).map_err(RunError::Refused)?;
         let mut plans = Vec::new();
         let traced = traces.is_some().then_some(&mut plans);
         crate::run::run_bound(backend, program, Plans::Bind(traced), &drops).await?;

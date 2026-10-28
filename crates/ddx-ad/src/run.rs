@@ -284,7 +284,8 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
-    run_bound(backend, program, Plans::Bind(None), &Drops::of(program)).await
+    let drops = Drops::of(program).map_err(RunError::Refused)?;
+    run_bound(backend, program, Plans::Bind(None), &drops).await
 }
 
 /// A plan as a run ran it, to run again: bound to the engine's tables, and
@@ -354,13 +355,19 @@ pub(crate) struct Drops {
 }
 
 impl Drops {
-    pub(crate) fn of<P: Program + ?Sized>(program: &P) -> Drops {
+    /// Refuses a program two of whose steps write one table: a read of it
+    /// could not say which it reads, nor so when the table is dead.
+    pub(crate) fn of<P: Program + ?Sized>(program: &P) -> Result<Drops, AdError> {
         let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
-        let index: HashMap<&str, usize> = steps
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.name.as_str(), i))
-            .collect();
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        for (i, s) in steps.iter().enumerate() {
+            if index.insert(s.name.as_str(), i).is_some() {
+                return Err(AdError::InvalidPlan(format!(
+                    "two steps write the table `{}`",
+                    s.name
+                )));
+            }
+        }
         // Each step's last reader, or itself: by every table a plan names,
         // a read already typed included.
         let mut last: Vec<usize> = (0..steps.len()).collect();
@@ -377,7 +384,7 @@ impl Drops {
                 after[j].push(i);
             }
         }
-        Drops { after }
+        Ok(Drops { after })
     }
 }
 
@@ -747,6 +754,18 @@ mod tests {
             ]
         );
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_program_two_of_whose_steps_write_one_table_is_refused_before_it_runs() {
+        // s1 reads the first s0: dropped after the second, the table would
+        // be gone when s1 runs.
+        let p = program_reading(0, &["s0", "s1", "s0", "v"], &["t", "s0", "t", "s0"]);
+        let (seen, result) = trace(&p, &[], "");
+        assert!(seen.is_empty(), "{seen:?}");
+        assert!(result
+            .unwrap_err()
+            .contains("two steps write the table `s0`"));
     }
 
     #[test]
