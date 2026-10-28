@@ -819,6 +819,91 @@ async fn causal_attention_matches_the_general_rule() {
     .await;
 }
 
+/// Batched, multi-head causal attention: each sequence `s` and head `h`
+/// attends within itself.
+fn batched_attention(scores: &str, output: &str) -> String {
+    format!(
+        "WITH scores AS (SELECT q.s, q.h, q.t AS i, k.t AS j, SUM(q.val * k.val) / 2.0 AS e \
+         FROM q JOIN k ON q.s = k.s AND q.h = k.h AND q.d = k.d WHERE q.t >= k.t {scores} \
+         GROUP BY q.s, q.h, q.t, k.t), \
+         weights AS (SELECT s, h, i, j, exp(e - MAX(e) OVER (PARTITION BY s, h, i)) AS w \
+         FROM scores), \
+         norm AS (SELECT s, h, i, SUM(w) AS z FROM weights GROUP BY s, h, i), \
+         attention AS (SELECT a.s, a.i AS t, a.h, v.d, SUM(a.w / n.z * v.val) AS x \
+         FROM weights a JOIN v ON a.s = v.s AND a.h = v.h AND a.j = v.t \
+         JOIN norm n ON a.s = n.s AND a.h = n.h AND a.i = n.i {output} \
+         GROUP BY a.s, a.i, a.h, v.d) \
+         SELECT SUM(x * x) / 2 AS l FROM attention"
+    )
+}
+
+#[tokio::test]
+async fn batched_attention_matches_the_general_rule() {
+    // The output's join ties v's sequence and head to the cotangent's only
+    // through the weights, so t joins the cotangent on keys the query
+    // never joined v to it on (issue #217).
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    let make = |rng: &mut Rng, ctx: &SessionContext| {
+        let (ns, nh) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+        let (nt, nd) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+        for name in ["q", "k", "v"] {
+            let null = (name == "v").then_some("s");
+            let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
+            register(ctx, name, table(rng, &dims, &["val"], 0.0, null));
+        }
+    };
+    let scores = |t: &str| t.ends_with("saved_0");
+    cases_of(
+        0xba7c,
+        60,
+        &batched_attention("", ""),
+        &batched_attention(
+            "AND (q.d IS NULL OR q.d + k.t >= 0)",
+            "WHERE v.t IS NULL OR v.t + a.i >= 0",
+        ),
+        &wrt,
+        &[(&named("q"), &named("k")), (&scores, &named("v"))],
+        &make,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn batched_attention_pairs_no_two_sequences_or_heads() {
+    // Without the keys the join makes equal, the contraction of v with the
+    // output's cotangent has (S·H·T)² rows: 2,304 here (issue #217).
+    let (ns, nh, nt, nd) = (3, 2, 8, 4);
+    let ctx = SessionContext::new();
+    let mut rng = Rng::new(0x217);
+    for name in ["q", "k", "v"] {
+        let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
+        register(&ctx, name, table(&mut rng, &dims, &["val"], 0.0, None));
+    }
+    let wrt = [ColumnRef::new("q", "val")];
+    let program = ad::grad(&ctx, &batched_attention("", ""), &wrt)
+        .await
+        .unwrap();
+    let mut contractions = 0;
+    for step in program.steps() {
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+        if step.name.as_str().contains("contraction_") {
+            let rows = ctx.table(step.name.as_str()).await.unwrap().count().await;
+            let rows = rows.unwrap();
+            assert!(
+                rows <= ns * nh * nt * nt,
+                "{} has {rows} rows",
+                step.name.as_str()
+            );
+            contractions += 1;
+        }
+    }
+    assert!(contractions > 0, "the contraction rule did not apply");
+}
+
 #[tokio::test]
 async fn a_side_that_does_not_move_is_still_checked_for_a_total_order() {
     // w is constant here, but t recomputes it: a LIMIT inside it may keep

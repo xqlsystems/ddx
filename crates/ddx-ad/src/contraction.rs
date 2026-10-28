@@ -44,6 +44,14 @@
 //! transposes `p = w / z` and then `p @ v`. An input no factor reads joins
 //! the side its join conditions tie it to.
 //!
+//! **Keys the join makes equal.** Batched attention's output joins `w.s =
+//! v.s` and groups by `w.s` (the sequence), so in every joined row `v.s` is
+//! the cotangent's `s`, though `v` and the cotangent share no key for it. A
+//! join key that the region's equalities, transitively, hold equal to a
+//! grouping key of `X` joins `t`'s cotangent on that key too, and `t` is
+//! summed by it once. Without it, `t` pairs each row of `Y` with every
+//! group of `X`: every two sequences, (sequences × positions)² rows.
+//!
 //! **A mask.** A conjunct of the join condition that reads only grouping
 //! keys, as causal attention's `q.t >= k.t` in `SUM(q.x * k.x) … GROUP BY
 //! q.t, k.t` does, selects groups rather than rows: every row of a group
@@ -108,12 +116,23 @@ struct Side {
     factor: Expression,
 }
 
+/// A condition between a contraction's sides, `=` or IS NOT DISTINCT FROM.
+struct Key {
+    /// Its column on each side.
+    cols: [usize; 2],
+    not_distinct: bool,
+    /// For each side, a grouping key on that side that every row of the
+    /// region holds equal to this key (or both NULL), through the join's
+    /// equalities, if one does: attention's `a.seq = v.seq`, whose `a.seq`
+    /// is grouped by.
+    group: [Option<usize>; 2],
+}
+
 /// A contraction's shape, in each side's own column numbers.
 struct Shape {
     sides: [Side; 2],
-    /// The conditions between the sides: `(column of side 0, column of side
-    /// 1, is_not_distinct_from)`.
-    keys: Vec<(usize, usize, bool)>,
+    /// The conditions between the sides.
+    keys: Vec<Key>,
     /// Each grouping key: its side and column.
     groups: Vec<(usize, usize)>,
     /// The conditions that read only grouping keys, over the cotangent's
@@ -287,6 +306,17 @@ impl Transposer<'_> {
         let side_of_leaf: Vec<usize> = roots.iter().map(|&r| usize::from(r != first)).collect();
         let side_of_col = |c: usize| leaf_of(c).map(|l| side_of_leaf[l]);
 
+        // Columns every row of the region holds equal, or both NULL, through
+        // its equalities, transitively: each column's class.
+        let mut class: Vec<usize> = (0..below).collect();
+        for c in &conds {
+            if let Some((_, a, b)) = self.equality(c)? {
+                if a < below && b < below {
+                    let (ra, rb) = (root(&mut class, a), root(&mut class, b));
+                    class[ra] = rb;
+                }
+            }
+        }
         // The conditions: within a side, between them, or a mask.
         let mut within = [Vec::new(), Vec::new()];
         let mut keys = Vec::new();
@@ -359,12 +389,18 @@ impl Transposer<'_> {
         let [left, right]: [Side; 2] = sides.try_into().ok().expect("two sides");
         let keys = keys
             .into_iter()
-            .map(|(a, b, nd)| {
-                (
-                    left.at[a].expect("side 0"),
-                    right.at[b].expect("side 1"),
-                    nd,
-                )
+            .map(|(a, b, not_distinct)| {
+                let mut group = [None, None];
+                for (s, g) in group.iter_mut().enumerate() {
+                    *g = group_cols.iter().position(|&gc| {
+                        side_of_col(gc) == Some(s) && root(&mut class, gc) == root(&mut class, a)
+                    });
+                }
+                Key {
+                    cols: [left.at[a].expect("side 0"), right.at[b].expect("side 1")],
+                    not_distinct,
+                    group,
+                }
             })
             .collect();
         let groups = group_cols
@@ -455,22 +491,29 @@ impl Transposer<'_> {
         let all = |conds: Vec<Expression>| conds.into_iter().reduce(|a, b| call(and, vec![a, b]));
 
         // t: Y joined to the cotangent on Y's grouping keys, summed by Y's
-        // join keys and the cotangent's X-side grouping keys.
+        // join keys and the cotangent's X-side grouping keys. A join key that
+        // the region holds equal to an X-side grouping key joins the
+        // cotangent on it too, and is summed by once: without it, t would
+        // pair every row of Y with every group of X, as attention's backward
+        // would pair every two sequences and heads.
         let ndims = shape.groups.len();
         let ywidth = ys.region.defs.len();
+        let y_keys: Vec<usize> = shape.keys.iter().map(|k| k.cols[y]).collect();
         let on_y = shape
             .groups
             .iter()
             .enumerate()
             .filter(|(_, (s, _))| *s == y)
-            .map(|(g, &(_, c))| call(same, vec![field(c), field(ywidth + g)]))
+            .map(|(g, &(_, c))| (c, g))
+            .chain(
+                shape
+                    .keys
+                    .iter()
+                    .filter_map(|k| k.group[x].map(|g| (k.cols[y], g))),
+            )
+            .map(|(c, g)| call(same, vec![field(c), field(ywidth + g)]))
             .collect();
         let on_y = all(on_y).expect("checked: the other side holds a grouping key");
-        let y_keys: Vec<usize> = shape
-            .keys
-            .iter()
-            .map(|&(l, r, _)| if y == 0 { l } else { r })
-            .collect();
         // Every key of the join with x below is null-safe, so DataFusion can
         // hash it (it can't hash a join that mixes `=` with IS NOT DISTINCT
         // FROM, and falls back to a nested loop). For a key that was `=`, a
@@ -480,7 +523,7 @@ impl Transposer<'_> {
             .keys
             .iter()
             .zip(&y_keys)
-            .filter(|((_, _, not_distinct), _)| !not_distinct)
+            .filter(|(k, _)| !k.not_distinct)
             // `IS NOT NULL`, from names every engine ddx targets knows.
             .map(|(_, &c)| {
                 if_then(
@@ -509,7 +552,14 @@ impl Transposer<'_> {
                 t_cols.len() - 1
             }
         };
-        let y_at: Vec<usize> = y_keys.iter().map(|&c| key_of(c)).collect();
+        let y_at: Vec<usize> = shape
+            .keys
+            .iter()
+            .map(|k| match k.group[x] {
+                Some(g) => key_of(ywidth + g),
+                None => key_of(k.cols[y]),
+            })
+            .collect();
         let group_at: Vec<usize> = x_groups.iter().map(|&g| key_of(ywidth + g)).collect();
         let term = call(
             mul,
@@ -548,9 +598,8 @@ impl Transposer<'_> {
         let rel = project(region.rel.clone(), vec![xs.factor.clone()]);
         let t_at = factor_col + 1;
         let mut on_x = Vec::new();
-        for (&(l, r, _), &at) in shape.keys.iter().zip(&y_at) {
-            let xc = if x == 0 { l } else { r };
-            on_x.push(call(same, vec![field(xc), field(t_at + at)]));
+        for (k, &at) in shape.keys.iter().zip(&y_at) {
+            on_x.push(call(same, vec![field(k.cols[x]), field(t_at + at)]));
         }
         for (&g, &at) in x_groups.iter().zip(&group_at) {
             let xc = shape.groups[g].1;
