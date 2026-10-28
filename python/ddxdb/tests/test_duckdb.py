@@ -542,6 +542,46 @@ def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, con)
         con.register("w", table([i for i, _ in got[0]], [v for _, v in got[0]]))
 
 
+class Spy:
+    """A DuckDB connection, each statement it is sent recorded."""
+
+    def __init__(self, con):
+        self.of, self.sent = con, []
+
+    def execute(self, sql, *args):
+        self.sent.append(sql)
+        return self.of.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self.of, name)
+
+
+def test_a_later_prepared_call_asks_the_planner_for_nothing(ad, con):
+    # A later call replays the plans of the first: none needs the planner's
+    # copy of a table to bind it, so none is made, or dropped.
+    step = ad.prepare(con, [GRAD])
+    step()
+    backend = ad._backends[con]
+    planner = backend._planner = Spy(backend._planner)
+    con.register("w", table([0, 1, 2], [2.0, 0.0, -1.0]))
+    assert pairs(step()[0]) == [(0, 12.0), (1, 0.0), (2, 3.0)]
+    assert planner.sent == []
+    assert not ddx_tables(con)
+
+
+def test_an_sql_call_reads_the_connection_s_catalog_once(ad, con, monkeypatch):
+    con.execute("CREATE VIEW v AS SELECT i, val * 2 AS val FROM w")
+    statements = [
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM v) SELECT i, grad(loss, val) FROM w",
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM v) SELECT i, val - grad(loss, val) FROM w",
+    ]
+    spy = Spy(con)
+    monkeypatch.setattr(ad.DuckDBBackend, "con", property(lambda self: spy))
+    got = [pairs(rel) for rel in ad.sql_all(con, statements)]
+    assert got[0] == [(0, 8.0), (1, -16.0), (2, 4.0)]
+    assert sum("duckdb_columns()" in sql for sql in spy.sent) == 1
+
+
 def test_ad_prepare_on_a_duckdb_connection_prepares_on_duckdb(con):
     from ddxdb import ad
 
