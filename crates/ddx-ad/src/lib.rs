@@ -89,6 +89,7 @@ mod contraction;
 mod elementwise;
 mod error;
 mod functions;
+mod inlined;
 mod jvp;
 mod opt;
 mod optics;
@@ -111,6 +112,7 @@ pub use compose::Differentiable;
 pub use emit::{rename_tables, tables_read};
 pub use error::{AdError, Result};
 pub use functions::STOP_GRADIENT;
+pub use inlined::inlined_size;
 pub use jvp::{jvp, jvp_with};
 pub use program::{
     decode_plan, grad, grad_with, vjp, vjp_with, BackwardProgram, Bound, Check, ForwardProgram,

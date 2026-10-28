@@ -56,13 +56,12 @@ A training loop runs the same statements on every batch: :func:`prepare`
 prepares them once, and each later call runs the same plans again, without
 planning, keying or reading views.
 
-One limit Rust's ``ddx_datafusion::ad`` does not share: datafusion-python's
-Substrait consumer names a computed column by its whole expression, so a deep
-chain of row-wise maps that each read their input twice (twenty
-``sin(v) + 0.1 * v`` layers, say) makes a very large plan here. The Rust
-adapter consumes steps with short names. (datafusion-python also decodes a
-plan with protobuf's default nesting limit; ddx splits every step deeper
-than it into steps, so none reaches it.)
+datafusion-python's Substrait consumer names a computed column by its whole
+expression, so a step whose names would grow large (a deep chain of columns
+that each read the one before twice, as stacked softmaxes do) runs as SQL
+instead (see :func:`_dataframe`). (datafusion-python also decodes a plan with
+protobuf's default nesting limit; ddx splits every step deeper than it into
+steps, so none reaches it.)
 
 Importing this module requires DataFusion.
 """
@@ -84,8 +83,10 @@ except ImportError as e:  # pragma: no cover - depends on the environment
 
 from ._ddxdb import (
     UnsupportedExpression,
+    _inlined_size,
     _not_in_subquery,
     _view_probe,
+    to_sql,
 )
 from . import Backend, Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import (
@@ -386,12 +387,10 @@ class DataFusionBackend:
         return f"{self._changes} {settings!r}"
 
     def returns_rows(self, plan: bytes) -> bool:
-        lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
-        return self.ctx.create_dataframe_from_logical_plan(lp).limit(1).count() > 0
+        return _dataframe(self.ctx, plan).limit(1).count() > 0
 
     def materialize(self, name: str, plan: bytes) -> None:
-        lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
-        _register(self.ctx, name, self.ctx.create_dataframe_from_logical_plan(lp).to_arrow_table())
+        _register(self.ctx, name, _dataframe(self.ctx, plan).to_arrow_table())
 
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
@@ -439,8 +438,7 @@ class DataFusionBackend:
 
     def _physical(self, plan: bytes):
         """``plan``'s physical plan, and the schema of its rows."""
-        lp = Consumer.from_substrait_plan(self.ctx, _deserialize(plan))
-        df = self.ctx.create_dataframe_from_logical_plan(lp)
+        df = _dataframe(self.ctx, plan)
         return df.execution_plan(), df.schema()
 
     def _can_compile(self) -> bool:
@@ -688,6 +686,35 @@ def _release(ctx: SessionContext, program: Program) -> None:
     """Drop every table ``program`` registered on ``ctx``."""
     for step in program.steps():
         ctx.deregister_table(step.name)
+
+
+#: The size (:func:`ddxdb._ddxdb._inlined_size`) above which a step runs as
+#: SQL rather than through datafusion-python's Substrait consumer.
+_SQL_ABOVE = 2_000
+
+
+def _dataframe(ctx: SessionContext, plan: bytes):
+    """``plan``, a step or a check, ready to run on ``ctx``.
+
+    datafusion-python's Substrait consumer names each computed column after
+    its whole expression, so a column computed from computed columns has a
+    name holding theirs. In a chain of columns that each read the one before
+    twice, as a softmax's do, names grow exponentially, and DataFusion
+    formats, hashes and compares them as it plans: four stacked softmaxes'
+    gradient took 9.5 s to plan where its SQL took 1.2 s. A plan whose
+    columns, written out, are larger than :data:`_SQL_ABOVE` nodes runs as
+    the SQL ``to_sql`` writes for it, whose names are short; the rest stay
+    on Substrait, which DataFusion plans faster (a GPT step's in about half
+    the time). So does a plan ``to_sql`` cannot write, which may call a
+    function the consumer knows and the writer does not."""
+    size = _inlined_size(plan)
+    if size is not None and size > _SQL_ABOVE:
+        try:
+            return ctx.sql(to_sql(plan, "datafusion"))
+        except UnsupportedExpression:
+            pass
+    lp = Consumer.from_substrait_plan(ctx, _deserialize(plan))
+    return ctx.create_dataframe_from_logical_plan(lp)
 
 
 def _deserialize(plan: bytes):

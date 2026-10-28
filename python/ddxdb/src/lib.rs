@@ -134,6 +134,14 @@ fn to_sql(plan: &[u8], dialect: &str) -> PyResult<String> {
     ddx_ad::to_sql(&decode(plan)?, dialect).map_err(ad_to_py_err)
 }
 
+/// The size of `plan`'s (serialized Substrait's) largest column written out
+/// down to the tables it reads, or `None` if it holds a relation that has
+/// no size: `ddx_ad::inlined_size`.
+#[pyfunction]
+fn _inlined_size(plan: &[u8]) -> PyResult<Option<u64>> {
+    Ok(ddx_ad::inlined_size(&decode(plan)?))
+}
+
 /// The name of every table `plan` (serialized Substrait) reads, its parts
 /// joined by `.`: `ddx_ad::tables_read`.
 #[pyfunction]
@@ -1041,6 +1049,7 @@ fn base_schema(plan: &Plan) -> Option<NamedStruct> {
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
     m.add_function(wrap_pyfunction!(to_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(_inlined_size, m)?)?;
     m.add_function(wrap_pyfunction!(_tables_read, m)?)?;
     m.add_function(wrap_pyfunction!(_rename_tables, m)?)?;
     m.add_function(wrap_pyfunction!(grad_plan, m)?)?;
