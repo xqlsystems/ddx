@@ -12,24 +12,16 @@ use ddx_core::sqlparser::dialect::Dialect;
 
 use super::plan::{self, Built};
 use super::{run_all, Programs, Rewritten};
-use crate::run::{Backend, Plans, RunError, Traced};
+use crate::run::{Backend, Drops, Plans, RunError, Traced};
 
 /// What a job's run did on the engine, beyond what its program says: the
-/// plans it ran, each as [`Traced`].
+/// plans it ran, each as [`Traced`], and when it dropped each table.
 pub(super) struct Trace<C> {
     /// Each seed's table, and the engine's plan of its query.
     pub seeds: Vec<(String, Traced<C>)>,
     /// Its program's checks', then its steps'.
     pub plans: Vec<Traced<C>>,
-}
-
-impl<C> Default for Trace<C> {
-    fn default() -> Self {
-        Trace {
-            seeds: Vec::new(),
-            plans: Vec::new(),
-        }
-    }
+    pub drops: Drops,
 }
 
 /// The tables `program` leaves for the statements to read: its value, then
@@ -154,7 +146,13 @@ impl<C: Send + Sync> Prepared<C> {
                         tables.push(name.clone());
                         crate::run::materialize(backend, name, seed).await?;
                     }
-                    crate::run::run_bound(backend, &**program, Plans::Bound(&trace.plans)).await
+                    crate::run::run_bound(
+                        backend,
+                        &**program,
+                        Plans::Bound(&trace.plans),
+                        &trace.drops,
+                    )
+                    .await
                 }
                 .await;
                 if let Err(e) = result {

@@ -284,7 +284,7 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
-    run_bound(backend, program, Plans::Bind(None)).await
+    run_bound(backend, program, Plans::Bind(None), &Drops::of(program)).await
 }
 
 /// A plan as a run ran it, to run again: bound to the engine's tables, and
@@ -304,14 +304,26 @@ pub(crate) enum Plans<'a, C> {
     Bound(&'a [Traced<C>]),
 }
 
-/// [`run`], with each plan from `plans`.
+/// [`run`], with each plan from `plans`, and each intermediate table
+/// dropped when `drops`, worked out from `program`, says.
 pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     plans: Plans<'_, B::Compiled>,
+    drops: &Drops,
 ) -> Result<(), RunError<B::Error>> {
     let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
-    let mut live = Live::new(program, &steps);
+    if drops.after.len() != steps.len() {
+        return Err(RunError::Refused(AdError::Internal(format!(
+            "a program of {} steps run with the drops of {}",
+            steps.len(),
+            drops.after.len()
+        ))));
+    }
+    let mut live = Live {
+        drops,
+        dropped: vec![false; steps.len()],
+    };
     let result = match plans {
         Plans::Bind(traced) => bind_and_run(backend, program, &steps, &mut live, traced).await,
         Plans::Bound(traced) => replay(backend, program, &steps, &mut live, traced).await,
@@ -332,17 +344,18 @@ pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
     first.map_or(Ok(()), Err)
 }
 
-/// Which intermediate tables a run drops after each step: those no later
-/// step reads. A table no step reads is dropped as soon as it is written.
-struct Live {
+/// When a run of a program drops each intermediate table: once the last
+/// step that reads it has run, and a table no step reads as soon as it is
+/// written. It depends only on the program, so a prepared program works it
+/// out once.
+pub(crate) struct Drops {
     /// By step, the steps whose tables are dropped once it has run.
-    dead_after: Vec<Vec<usize>>,
-    /// By step, whether its table has been dropped.
-    dropped: Vec<bool>,
+    after: Vec<Vec<usize>>,
 }
 
-impl Live {
-    fn new<P: Program + ?Sized>(program: &P, steps: &[&Step]) -> Live {
+impl Drops {
+    pub(crate) fn of<P: Program + ?Sized>(program: &P) -> Drops {
+        let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
         let index: HashMap<&str, usize> = steps
             .iter()
             .enumerate()
@@ -358,18 +371,24 @@ impl Live {
                 }
             }
         }
-        let mut dead_after = vec![Vec::new(); steps.len()];
+        let mut after = vec![Vec::new(); steps.len()];
         for (i, &j) in last.iter().enumerate() {
             if !program.is_result(&steps[i].name) {
-                dead_after[j].push(i);
+                after[j].push(i);
             }
         }
-        Live {
-            dead_after,
-            dropped: vec![false; steps.len()],
-        }
+        Drops { after }
     }
+}
 
+/// A run's progress through its [`Drops`].
+struct Live<'a> {
+    drops: &'a Drops,
+    /// By step, whether its table has been dropped.
+    dropped: Vec<bool>,
+}
+
+impl Live<'_> {
     /// Drop the tables no step after step `j` reads.
     async fn ran<B: Backend>(
         &mut self,
@@ -377,7 +396,7 @@ impl Live {
         steps: &[&Step],
         j: usize,
     ) -> Result<(), RunError<B::Error>> {
-        for &i in &self.dead_after[j] {
+        for &i in &self.drops.after[j] {
             backend
                 .drop_table(&steps[i].name)
                 .await
@@ -394,7 +413,7 @@ async fn bind_and_run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     steps: &[&Step],
-    live: &mut Live,
+    live: &mut Live<'_>,
     mut traced: Option<&mut Vec<Traced<B::Compiled>>>,
 ) -> Result<(), RunError<B::Error>> {
     let compiling = traced.is_some();
@@ -428,7 +447,7 @@ async fn replay<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     steps: &[&Step],
-    live: &mut Live,
+    live: &mut Live<'_>,
     traced: &[Traced<B::Compiled>],
 ) -> Result<(), RunError<B::Error>> {
     let n = program.checks().len();
