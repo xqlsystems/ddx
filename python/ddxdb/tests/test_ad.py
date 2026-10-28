@@ -528,6 +528,33 @@ def test_a_step_whose_names_would_grow_large_runs_as_sql(ad, ctx, monkeypatch):
     assert ran
 
 
+def test_a_large_step_sql_cannot_write_runs_on_substrait(ad, ctx, monkeypatch):
+    # to_sql writes only the functions it knows; a step it refuses runs
+    # through the consumer, however large its names.
+    import math
+
+    refused = []
+
+    def refuse(plan, dialect):
+        refused.append(plan)
+        raise ad.UnsupportedExpression("a function to_sql does not know")
+
+    monkeypatch.setattr(ad, "to_sql", refuse)
+    ctes = ["h0 AS (SELECT i, val AS v FROM w)"]
+    for k in range(1, 13):
+        ctes.append(f"h{k} AS (SELECT i, sin(v) + 0.1 * v AS v FROM h{k - 1})")
+    df = ad.sql(ctx, f"WITH {', '.join(ctes)}, loss AS (SELECT SUM(v) AS l FROM h12) SELECT i, grad(loss, val) FROM w")
+    want = []
+    for v in [1.0, -2.0, 0.5]:
+        d = 1.0
+        for _ in range(12):
+            d *= math.cos(v) + 0.1
+            v = math.sin(v) + 0.1 * v
+        want.append(d)
+    assert dict(pairs(df)) == pytest.approx(dict(enumerate(want)))
+    assert refused
+
+
 def test_vjp_in_sql_pulls_a_cotangent_back(ad, ctx):
     df = ad.sql(
         ctx,

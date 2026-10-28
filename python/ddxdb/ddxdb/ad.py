@@ -705,10 +705,14 @@ def _dataframe(ctx: SessionContext, plan: bytes):
     columns, written out, are larger than :data:`_SQL_ABOVE` nodes runs as
     the SQL ``to_sql`` writes for it, whose names are short; the rest stay
     on Substrait, which DataFusion plans faster (a GPT step's in about half
-    the time)."""
+    the time). So does a plan ``to_sql`` cannot write, which may call a
+    function the consumer knows and the writer does not."""
     size = _inlined_size(plan)
     if size is not None and size > _SQL_ABOVE:
-        return ctx.sql(to_sql(plan, "datafusion"))
+        try:
+            return ctx.sql(to_sql(plan, "datafusion"))
+        except UnsupportedExpression:
+            pass
     lp = Consumer.from_substrait_plan(ctx, _deserialize(plan))
     return ctx.create_dataframe_from_logical_plan(lp)
 
