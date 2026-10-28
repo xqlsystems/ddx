@@ -128,6 +128,34 @@ struct Key {
     group: [Option<usize>; 2],
 }
 
+/// Disjoint sets of `0..n`, joined a pair at a time: a union-find.
+struct Classes(Vec<usize>);
+
+impl Classes {
+    fn new(n: usize) -> Classes {
+        Classes((0..n).collect())
+    }
+
+    /// The root of `a`'s set, which names it.
+    fn root(&mut self, a: usize) -> usize {
+        let mut r = a;
+        while self.0[r] != r {
+            r = self.0[r];
+        }
+        self.0[a] = r;
+        r
+    }
+
+    fn join(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.root(a), self.root(b));
+        self.0[ra] = rb;
+    }
+
+    fn same(&mut self, a: usize, b: usize) -> bool {
+        self.root(a) == self.root(b)
+    }
+}
+
 /// A contraction's shape, in each side's own column numbers.
 struct Shape {
     sides: [Side; 2],
@@ -242,21 +270,12 @@ impl Transposer<'_> {
         // Split the leaves into the two sides: those a factor reads together
         // are on one side, and a leaf no factor reads goes with those its
         // conditions tie it to.
-        let mut side_of: Vec<usize> = (0..leaves.len()).collect();
-        fn root(side_of: &mut [usize], l: usize) -> usize {
-            let mut r = l;
-            while side_of[r] != r {
-                r = side_of[r];
-            }
-            side_of[l] = r;
-            r
-        }
+        let mut side_of = Classes::new(leaves.len());
         let mut read = vec![false; leaves.len()];
-        let ties = |sets: &[Vec<usize>], side_of: &mut Vec<usize>| {
+        let ties = |sets: &[Vec<usize>], side_of: &mut Classes| {
             for set in sets {
                 for w in set.windows(2) {
-                    let (a, b) = (root(side_of, w[0]), root(side_of, w[1]));
-                    side_of[a] = b;
+                    side_of.join(w[0], w[1]);
                 }
             }
         };
@@ -295,7 +314,7 @@ impl Transposer<'_> {
             .cloned()
             .collect();
         ties(&unread, &mut side_of);
-        let roots: Vec<usize> = (0..leaves.len()).map(|l| root(&mut side_of, l)).collect();
+        let roots: Vec<usize> = (0..leaves.len()).map(|l| side_of.root(l)).collect();
         let first = roots[0];
         let Some(other) = roots.iter().copied().find(|&r| r != first) else {
             return Ok(None);
@@ -308,12 +327,11 @@ impl Transposer<'_> {
 
         // Columns every row of the region holds equal, or both NULL, through
         // its equalities, transitively: each column's class.
-        let mut class: Vec<usize> = (0..below).collect();
+        let mut class = Classes::new(below);
         for c in &conds {
             if let Some((_, a, b)) = self.equality(c)? {
                 if a < below && b < below {
-                    let (ra, rb) = (root(&mut class, a), root(&mut class, b));
-                    class[ra] = rb;
+                    class.join(a, b);
                 }
             }
         }
@@ -392,9 +410,9 @@ impl Transposer<'_> {
             .map(|(a, b, not_distinct)| {
                 let mut group = [None, None];
                 for (s, g) in group.iter_mut().enumerate() {
-                    *g = group_cols.iter().position(|&gc| {
-                        side_of_col(gc) == Some(s) && root(&mut class, gc) == root(&mut class, a)
-                    });
+                    *g = group_cols
+                        .iter()
+                        .position(|&gc| side_of_col(gc) == Some(s) && class.same(gc, a));
                 }
                 Key {
                     cols: [left.at[a].expect("side 0"), right.at[b].expect("side 1")],
