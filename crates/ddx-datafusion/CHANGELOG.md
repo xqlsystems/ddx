@@ -9,6 +9,17 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.3...ddx-datafusion-v0.4.0) - 2026-10-28
+
+### Added
+
+- `ad::prepare(ctx, statements)`: a training step's statements prepared once, run by each call of what it returns. A later call skips planning the objective, keying each program and reading each view, and prepares the statements again once a table's schema, a view or a setting changes ([#203](https://github.com/xqlsystems/ddx/pull/203))
+- A prepared step's physical plan is built once and run again on every call: each table scan in it reads the table registered under its name when the call runs, and the plan is built again if that table's scan differs in schema, partitioning or ordering. On xarray-sql's GPT step, a later call takes about 95 ms rather than 300 ms, and matches `sql_all` ([#214](https://github.com/xqlsystems/ddx/pull/214))
+
+### Changed
+
+- **Breaking:** ddx-ad 0.3.0, whose `Backend` has an associated type `Compiled` (here `engine::Compiled`) and whose `returns_rows` takes `&[&Bound]` ([#214](https://github.com/xqlsystems/ddx/pull/214))
+
 ## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.2...ddx-datafusion-v0.3.3) - 2026-10-26
 
 ### Changed
