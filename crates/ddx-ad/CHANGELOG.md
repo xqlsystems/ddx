@@ -9,12 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.0...ddx-ad-v0.3.1) - 2026-10-28
 
-### Other
+### Added
 
-- *(ddx-ad)* rebuild a contraction's side with the keys its join implies ([#225](https://github.com/xqlsystems/ddx/pull/225))
-- *(ddx-ad)* drop each step's table after its last reader ([#223](https://github.com/xqlsystems/ddx/pull/223))
-- *(ddx-ad, ddxdb)* run a step whose names would grow large as SQL ([#221](https://github.com/xqlsystems/ddx/pull/221))
-- *(ddx-ad)* join a contraction's cotangent on keys the join makes equal ([#220](https://github.com/xqlsystems/ddx/pull/220))
+- `inlined_size(plan)`: the size, in expression nodes, of a plan's largest column written out down to the tables it reads, or `None` for a plan holding a relation it cannot size. A Substrait consumer that names each computed column after its expression, as datafusion-python's does, gives names about this long, and they grow exponentially in a chain of columns that each read the one before twice, as stacked softmaxes do. An adapter can run such a step another way, as `to_sql`'s SQL ([#221](https://github.com/xqlsystems/ddx/pull/221))
+
+### Changed
+
+- Batched, multi-head attention's backward no longer pairs every two sequences and heads. The transpose of a contraction joins the cotangent on the keys its join holds equal to a grouping key, transitively: attention's output joins `v` to the weights on the sequence, and groups by the weights' sequence. At xarray-sql's GPT size, the contraction of `v` with the output's cotangent has 196,608 rows rather than 9.4 million ([#220](https://github.com/xqlsystems/ddx/pull/220))
+- A contraction's side is rebuilt with the equalities its join implies between that side's own columns. A plan may join the softmax's normalizer to the weights only through `v`, as DuckDB's does; the side `weights ⋈ norm` then joined each score to every sequence's normalizer. nanoGPT's CPU training step on DuckDB takes about 27 s rather than 34–48 s, and peaks at 2.3 GB rather than 5.8 GB ([#225](https://github.com/xqlsystems/ddx/pull/225))
+- A run drops each intermediate table once the last step that reads it has run, rather than all of them at the end, so it holds only the tables later steps still read: a GPT training step on DuckDB holds 49,089 step rows at its peak rather than 70,595. A prepared program works out when to drop each table once. A failed drop now fails the run, which drops every table left, and a program two of whose steps write one table is refused before it runs ([#223](https://github.com/xqlsystems/ddx/pull/223))
 
 ## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.6...ddx-ad-v0.3.0) - 2026-10-28
 
