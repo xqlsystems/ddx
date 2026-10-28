@@ -50,7 +50,11 @@
 //! join key that the region's equalities, transitively, hold equal to a
 //! grouping key of `X` joins `t`'s cotangent on that key too, and `t` is
 //! summed by it once. Without it, `t` pairs each row of `Y` with every
-//! group of `X`: every two sequences, (sequences × positions)² rows.
+//! group of `X`: every two sequences, (sequences × positions)² rows. A side
+//! is rebuilt with the equalities its own columns hold this way too: a plan
+//! may join the normalizer `n` through `v` (`v.s = n.s AND v.s = w.s`, as
+//! DuckDB's does), and without `n.s = w.s` the side `weights ⋈ norm` would
+//! join each score to every sequence's normalizer.
 //!
 //! **A mask.** A conjunct of the join condition that reads only grouping
 //! keys, as causal attention's `q.t >= k.t` in `SUM(q.x * k.x) … GROUP BY
@@ -328,12 +332,23 @@ impl Transposer<'_> {
         // Columns every row of the region holds equal, or both NULL, through
         // its equalities, transitively: each column's class.
         let mut class = Classes::new(below);
+        let mut null_safe = Vec::new();
         for c in &conds {
-            if let Some((_, a, b)) = self.equality(c)? {
+            if let Some((not_distinct, a, b)) = self.equality(c)? {
                 if a < below && b < below {
                     class.join(a, b);
+                    if not_distinct {
+                        null_safe.push(a);
+                    }
                 }
             }
+        }
+        // Whether a class holds an IS NOT DISTINCT FROM, so that its columns
+        // may be NULL together.
+        let mut not_distinct = vec![false; below];
+        for a in null_safe {
+            let r = class.root(a);
+            not_distinct[r] = true;
         }
         // The conditions: within a side, between them, or a mask.
         let mut within = [Vec::new(), Vec::new()];
@@ -374,6 +389,43 @@ impl Transposer<'_> {
         }
         if keys.is_empty() {
             return Ok(None);
+        }
+        // Within each side, the equalities its classes imply but its own
+        // conditions don't: batched attention's `n.s = a.s`, which a plan
+        // may state through the other side (`v.s = n.s AND v.s = a.s`, as
+        // DuckDB's does). Without them, the side is rebuilt joining every
+        // sequence's rows to every other's. Every row of the region holds
+        // them, so they drop only rows that join no row of the region. One
+        // is `=` where its class is all `=`, so DataFusion hashes it with
+        // the side's own `=` keys, and IS NOT DISTINCT FROM otherwise.
+        let equal = self.ext.anchor(Function::Equal);
+        let same = self.ext.anchor(Function::IsNotDistinctFrom);
+        for (s, within) in within.iter_mut().enumerate() {
+            let mut local = Classes::new(below);
+            for (c, _) in within.iter() {
+                if let Some((_, a, b)) = self.equality(c)? {
+                    if a < below && b < below {
+                        local.join(a, b);
+                    }
+                }
+            }
+            for a in (0..below).filter(|&a| side_of_col(a) == Some(s)) {
+                let tied = (0..a)
+                    .find(|&b| side_of_col(b) == Some(s) && class.same(a, b) && !local.same(a, b));
+                let Some(b) = tied else {
+                    continue;
+                };
+                local.join(a, b);
+                let f = if not_distinct[class.root(a)] {
+                    same
+                } else {
+                    equal
+                };
+                let mut ls = vec![leaf_of(b).expect("below"), leaf_of(a).expect("below")];
+                ls.sort();
+                ls.dedup();
+                within.push((call(f, vec![field(b), field(a)]), ls));
+            }
         }
         // Each side, rebuilt from its leaves.
         let mut product: [Option<Expression>; 2] = [None, None];
