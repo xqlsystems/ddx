@@ -132,8 +132,11 @@ class DuckDBBackend:
         self._mirrored: dict = {}
         self._attached = {"memory"}
         self._settings: tuple = ()
-        # The tables materialize wrote, each mirrored as it wrote it.
-        self._written: set = set()
+        # ddx's own tables (materialize's): those the planner has a copy of,
+        # current or not, and those written since their copy was made, if
+        # one was. A copy is made only when the planner is about to plan.
+        self._copied: set = set()
+        self._stale: set = set()
         # Within one call (_one_catalog): the caller's catalog, and the
         # planner's mirror of it, once read.
         self._call: Optional[dict] = None
@@ -305,6 +308,7 @@ class DuckDBBackend:
         connection finds it. The producer writes a table by its name alone,
         so a name is taken as the only object of that name in the catalog,
         and refused if there are two."""
+        self._copy(self._stale)
         plan = bytes(self._planner.execute("SELECT * FROM get_substrait(?)", [sql]).fetchone()[0])
         renamed = {}
         for name in set(_tables_read(plan)):
@@ -327,10 +331,11 @@ class DuckDBBackend:
     # The Backend protocol.
 
     def select_all(self, name: str) -> bytes:
-        if name in self._written:
-            # One of ddx's own, as materialize mirrored it: a temporary
-            # table, found by its name alone, whose plan depends on nothing
-            # else in the catalog, so the catalog is not read again.
+        if name in self._copied or name in self._stale:
+            # One of ddx's own: a temporary table, found by its name alone,
+            # whose plan depends on nothing else in the catalog, so the
+            # catalog is not read again.
+            self._copy({name})
             return bytes(
                 self._planner.execute("SELECT * FROM get_substrait(?)", [f"SELECT * FROM {_ident(name)}"]).fetchone()[0]
             )
@@ -400,55 +405,44 @@ class DuckDBBackend:
         return self.con.execute(f"SELECT 1 FROM ({query}) AS __ddx_check LIMIT 1").fetchone() is not None
 
     def materialize(self, name: str, plan: bytes) -> None:
-        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {to_sql(plan, 'duckdb')}")
-        self._mirror_written(name)
+        self.materialize_compiled(name, plan, to_sql(plan, "duckdb"))
 
-    def _mirror_written(self, name: str) -> None:
-        """An empty copy of the table ``name`` materialize wrote, for the
-        planner to plan the steps that read it. Its name is ddx's
-        (``__ddx_``), which no object the planner mirrors has, so what it
-        replaces is the planner's table of the last run."""
-        columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
-        cols = ", ".join(f"{_ident(c[0])} {c[1]}" for c in columns)
-        self._planner.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} ({cols})")
-        self._written.add(name)
+    def _copy(self, names) -> None:
+        """Give the planner an empty copy of each of ``names``, tables
+        materialize wrote, whose copy is missing or outdated, to plan what
+        reads them. Their names are ddx's (``__ddx_``), which no object the
+        planner mirrors has, so what a copy replaces is the planner's table
+        of an earlier write."""
+        for name in sorted(names & self._stale):
+            columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
+            cols = ", ".join(f"{_ident(c[0])} {c[1]}" for c in columns)
+            self._planner.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} ({cols})")
+            self._copied.add(name)
+            self._stale.discard(name)
 
     def drop_table(self, name: str) -> None:
-        mirrored = name in self._written
+        copied = name in self._copied
         # Forgotten first, so a failed drop leaves the name to the catalog.
-        self._written.discard(name)
+        self._copied.discard(name)
+        self._stale.discard(name)
         self.con.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
-        if mirrored:
+        if copied:
             self._planner.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
 
-    def compile(self, plan: bytes) -> "_Compiled":
+    def compile(self, plan: bytes) -> str:
         """``plan``'s SQL, written once for every run of a
         :class:`ddxdb.Prepared`. DuckDB plans the SQL again each run: a
         prepared statement keeps the statistics it was optimized with, and
         is planned again anyway once a temporary object is made or
         registered, as a training loop registers its weights each step."""
-        return _Compiled(to_sql(plan, "duckdb"))
+        return to_sql(plan, "duckdb")
 
-    def materialize_compiled(self, name: str, plan: bytes, compiled: "_Compiled") -> None:
-        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {compiled.sql}")
-        # Only the run that prepares a plan plans the steps that read its
-        # table; later runs replay their plans, and plan nothing.
-        if not compiled.ran:
-            self._mirror_written(name)
-            compiled.ran = True
+    def materialize_compiled(self, name: str, plan: bytes, compiled: str) -> None:
+        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {compiled}")
+        self._stale.add(name)
 
-    def returns_rows_compiled(self, plan: bytes, compiled: "_Compiled") -> bool:
-        return self._returns_rows(compiled.sql)
-
-
-class _Compiled:
-    """A plan :meth:`DuckDBBackend.compile` compiled: its SQL, and whether
-    it has run."""
-
-    __slots__ = ("sql", "ran")
-
-    def __init__(self, sql: str):
-        self.sql, self.ran = sql, False
+    def returns_rows_compiled(self, plan: bytes, compiled: str) -> bool:
+        return self._returns_rows(compiled)
 
 
 #: The programs :func:`sql_all` keeps for each connection, gone with it.

@@ -569,6 +569,20 @@ def test_a_later_prepared_call_asks_the_planner_for_nothing(ad, con):
     assert not ddx_tables(con)
 
 
+def test_the_planner_copies_only_the_tables_it_plans_a_read_of(ad, con, monkeypatch):
+    # The value and the gradient are written but read by no later step, so
+    # the planner never needs, or gets, a copy of them.
+    backend = ad._backend(con)
+    planner = backend._planner = Spy(backend._planner)
+    spy = Spy(con)
+    monkeypatch.setattr(ad.DuckDBBackend, "con", property(lambda self: spy))
+    assert pairs(ad.sql_all(con, [GRAD])[0]) == [(0, 3.0), (1, 12.0), (2, 0.75)]
+    made = lambda sent: [s.split()[5] for s in sent if s.startswith("CREATE OR REPLACE TEMP TABLE")]
+    written, copied = made(spy.sent), made(planner.sent)
+    assert set(copied) < set(written)
+    assert not ddx_tables(con)
+
+
 def test_an_sql_call_reads_the_connection_s_catalog_once(ad, con, monkeypatch):
     con.execute("CREATE VIEW v AS SELECT i, val * 2 AS val FROM w")
     statements = [
