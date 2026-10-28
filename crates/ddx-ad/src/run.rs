@@ -348,10 +348,11 @@ impl Live {
             .enumerate()
             .map(|(i, s)| (s.name.as_str(), i))
             .collect();
-        // Each step's last reader, or itself.
+        // Each step's last reader, or itself: by every table a plan names,
+        // a read already typed included.
         let mut last: Vec<usize> = (0..steps.len()).collect();
         for (j, step) in steps.iter().enumerate() {
-            for name in step.plan.reads() {
+            for name in crate::emit::tables_read(&step.plan.0) {
                 if let Some(&i) = index.get(name.as_str()) {
                     last[i] = last[i].max(j);
                 }
@@ -725,6 +726,32 @@ mod tests {
                 "write v",
                 "drop s0"
             ]
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_read_already_typed_keeps_its_table_until_it_runs() {
+        // v reads s0 with its schema stated, so binding asks for none; s0
+        // must still stay until v has run.
+        let mut p = program_reading(0, &["s0", "s1", "v"], &["t", "t", "s0"]);
+        let typed = p.steps[2]
+            .plan
+            .bind(&mut |_| {
+                Some(NamedStruct {
+                    names: vec!["x".into()],
+                    r#struct: Some(substrait::proto::r#type::Struct {
+                        types: vec![crate::expr::fp64()],
+                        ..Default::default()
+                    }),
+                })
+            })
+            .unwrap();
+        p.steps[2].plan = Unbound(typed.into_plan());
+        let (seen, result) = trace(&p, &[], "");
+        assert_eq!(
+            seen,
+            ["schema t", "write s0", "write s1", "drop s1", "write v", "drop s0"]
         );
         assert_eq!(result, Ok(()));
     }
