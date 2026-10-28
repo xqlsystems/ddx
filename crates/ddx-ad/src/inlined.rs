@@ -64,7 +64,8 @@ fn columns(rel: &Rel, mut inputs: Vec<Vec<u64>>, largest: &mut u64) -> Result<Ve
             .ok_or_else(|| AdError::InvalidPlan("a relation with no input".into()))
     };
     let (direct, common) = match kind {
-        RelType::Read(r) => (vec![1; width(rel)?], r.common.as_ref()),
+        // Its emit, if any, is in its width already.
+        RelType::Read(_) => return Ok(vec![1; width(rel)?]),
         RelType::Filter(f) => (first()?, f.common.as_ref()),
         RelType::Sort(s) => (first()?, s.common.as_ref()),
         RelType::Fetch(f) => (first()?, f.common.as_ref()),
@@ -189,6 +190,25 @@ mod tests {
         // the literal and two copies of the input.
         let n = (0..10).fold(1, |n, _| 2 * n + 3);
         assert_eq!(inlined_size(&p).unwrap(), n);
+    }
+
+    #[test]
+    fn a_read_s_emit_picks_its_columns_once() {
+        let mut rel = read_step("t", vec!["a".into(), "b".into()]);
+        if let Some(RelType::Read(r)) = rel.rel_type.as_mut() {
+            r.common = Some(substrait::proto::RelCommon {
+                emit_kind: Some(EmitKind::Emit(substrait::proto::rel_common::Emit {
+                    output_mapping: vec![1],
+                })),
+                ..Default::default()
+            });
+        }
+        let p = plan(
+            project_emit(rel, vec![call(0, vec![field(0), field(0)])], Some(vec![1])),
+            vec!["v".into()],
+            &Extensions::new(&Functions::default()),
+        );
+        assert_eq!(inlined_size(&p).unwrap(), 3);
     }
 
     #[test]
