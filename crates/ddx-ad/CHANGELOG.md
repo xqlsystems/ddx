@@ -7,12 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.7](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.6...ddx-ad-v0.2.7) - 2026-10-28
+## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.6...ddx-ad-v0.3.0) - 2026-10-28
 
-### Other
+### Added
 
-- *(ddx-ad, ddx-datafusion, ddxdb)* run each prepared step's physical plan again ([#214](https://github.com/xqlsystems/ddx/pull/214))
-- *(ddx-ad, ddx-datafusion, ddxdb)* prepare statements to run again ([#203](https://github.com/xqlsystems/ddx/pull/203))
+- `prepare` and `Prepared`: statements whose `grad`, `vjp` and `jvp` calls are computed once, to compute again, as `jax.jit` traces a function once. A later `Prepared::run` runs each program's plans as they were bound, asking the engine only for its new optional `Backend::session_key`; once a table's schema, a view or a setting changes, it runs nothing, for the statements to be prepared again ([#203](https://github.com/xqlsystems/ddx/pull/203))
+- An engine may compile each plan `prepare` runs, with the new optional `Backend::compile`, and `Prepared::run` runs what it compiled (`Backend::materialize_compiled`, `Backend::returns_rows_compiled`) rather than handing it the plan to plan again. The default compiles nothing ([#214](https://github.com/xqlsystems/ddx/pull/214))
+
+### Changed
+
+- **Breaking:** `Backend` has an associated type `Compiled`, what `compile` returns: `type Compiled = ();` for an engine that compiles nothing. `Backend::returns_rows` takes `&[&Bound]` ([#214](https://github.com/xqlsystems/ddx/pull/214))
 
 ## [0.2.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.5...ddx-ad-v0.2.6) - 2026-10-26
 
