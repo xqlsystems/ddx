@@ -11,8 +11,10 @@
 //! table, drop a table, and state a table's schema, to bind a plan's reads
 //! of earlier steps ([`Unbound::bind`]). The rest is the same everywhere and
 //! is [`run`]'s: the checks run first and a row from any refuses the program,
-//! then every step in order. A run that succeeds drops the intermediate
-//! tables and leaves the value and the gradients. A run that fails, at a
+//! then every step in order. Each intermediate table is dropped once the
+//! last step that reads it has run, so a run holds only the tables later
+//! steps still read; one that succeeds leaves the value and the gradients.
+//! A run that fails, at a
 //! check or a step, leaves none of the program's tables, so a loop that
 //! reruns one program (under a fixed [namespace](crate::Options::namespace),
 //! say) never finds this run's value beside an earlier run's gradient. Two
@@ -275,14 +277,15 @@ pub trait Backend: Send {
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then
-/// its steps, each plan bound to the tables the engine holds; then the
-/// intermediate tables are dropped, or, if anything failed, every table the
-/// program writes.
+/// its steps, each plan bound to the tables the engine holds, and each
+/// intermediate table dropped after its last reader; if anything failed,
+/// every table the program writes is dropped.
 pub async fn run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
 ) -> Result<(), RunError<B::Error>> {
-    run_bound(backend, program, Plans::Bind(None)).await
+    let drops = Drops::of(program).map_err(RunError::Refused)?;
+    run_bound(backend, program, Plans::Bind(None), &drops).await
 }
 
 /// A plan as a run ran it, to run again: bound to the engine's tables, and
@@ -302,32 +305,113 @@ pub(crate) enum Plans<'a, C> {
     Bound(&'a [Traced<C>]),
 }
 
-/// [`run`], with each plan from `plans`.
+/// [`run`], with each plan from `plans`, and each intermediate table
+/// dropped when `drops`, worked out from `program`, says.
 pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     plans: Plans<'_, B::Compiled>,
+    drops: &Drops,
 ) -> Result<(), RunError<B::Error>> {
     let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
-    let result = match plans {
-        Plans::Bind(traced) => bind_and_run(backend, program, &steps, traced).await,
-        Plans::Bound(traced) => replay(backend, program, &steps, traced).await,
+    if drops.after.len() != steps.len() {
+        return Err(RunError::Refused(AdError::Internal(format!(
+            "a program of {} steps run with the drops of {}",
+            steps.len(),
+            drops.after.len()
+        ))));
+    }
+    let mut live = Live {
+        drops,
+        dropped: vec![false; steps.len()],
     };
-    // On success the intermediates go; on failure every step's table, so an
-    // earlier run's value never sits beside this run's gradient. Every table
-    // is dropped even after a failed drop; the first failure is reported.
-    let failed = result.is_err();
-    let dropping = steps
-        .iter()
-        .filter(|s| failed || !program.is_result(&s.name))
-        .map(|s| s.name.as_str());
+    let result = match plans {
+        Plans::Bind(traced) => bind_and_run(backend, program, &steps, &mut live, traced).await,
+        Plans::Bound(traced) => replay(backend, program, &steps, &mut live, traced).await,
+    };
+    // On success every intermediate is gone already; on failure every
+    // step's table goes, so an earlier run's value never sits beside this
+    // run's gradient. Every table is dropped even after a failed drop; the
+    // first failure is reported.
     let mut first = result.err();
-    for name in dropping {
-        if let (Err(e), None) = (backend.drop_table(name).await, &first) {
+    let dropping: Vec<usize> = (0..steps.len())
+        .filter(|&i| !live.dropped[i] && (first.is_some() || !program.is_result(&steps[i].name)))
+        .collect();
+    for i in dropping {
+        if let (Err(e), None) = (backend.drop_table(&steps[i].name).await, &first) {
             first = Some(RunError::Engine(e));
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// When a run of a program drops each intermediate table: once the last
+/// step that reads it has run, and a table no step reads as soon as it is
+/// written. It depends only on the program, so a prepared program works it
+/// out once.
+pub(crate) struct Drops {
+    /// By step, the steps whose tables are dropped once it has run.
+    after: Vec<Vec<usize>>,
+}
+
+impl Drops {
+    /// Refuses a program two of whose steps write one table: a read of it
+    /// could not say which it reads, nor so when the table is dead.
+    pub(crate) fn of<P: Program + ?Sized>(program: &P) -> Result<Drops, AdError> {
+        let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        for (i, s) in steps.iter().enumerate() {
+            if index.insert(s.name.as_str(), i).is_some() {
+                return Err(AdError::InvalidPlan(format!(
+                    "two steps write the table `{}`",
+                    s.name
+                )));
+            }
+        }
+        // Each step's last reader, or itself: by every table a plan names,
+        // a read already typed included.
+        let mut last: Vec<usize> = (0..steps.len()).collect();
+        for (j, step) in steps.iter().enumerate() {
+            for name in crate::emit::tables_read(&step.plan.0) {
+                if let Some(&i) = index.get(name.as_str()) {
+                    last[i] = last[i].max(j);
+                }
+            }
+        }
+        let mut after = vec![Vec::new(); steps.len()];
+        for (i, &j) in last.iter().enumerate() {
+            if !program.is_result(&steps[i].name) {
+                after[j].push(i);
+            }
+        }
+        Ok(Drops { after })
+    }
+}
+
+/// A run's progress through its [`Drops`].
+struct Live<'a> {
+    drops: &'a Drops,
+    /// By step, whether its table has been dropped.
+    dropped: Vec<bool>,
+}
+
+impl Live<'_> {
+    /// Drop the tables no step after step `j` reads.
+    async fn ran<B: Backend>(
+        &mut self,
+        backend: &mut B,
+        steps: &[&Step],
+        j: usize,
+    ) -> Result<(), RunError<B::Error>> {
+        for &i in &self.drops.after[j] {
+            backend
+                .drop_table(&steps[i].name)
+                .await
+                .map_err(RunError::Engine)?;
+            self.dropped[i] = true;
+        }
+        Ok(())
+    }
 }
 
 /// `program`'s checks, then its steps, each plan bound as it runs, and, if
@@ -336,6 +420,7 @@ async fn bind_and_run<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     steps: &[&Step],
+    live: &mut Live<'_>,
     mut traced: Option<&mut Vec<Traced<B::Compiled>>>,
 ) -> Result<(), RunError<B::Error>> {
     let compiling = traced.is_some();
@@ -349,7 +434,7 @@ async fn bind_and_run<B: Backend, P: Program + ?Sized>(
     if let Some(traced) = traced.as_deref_mut() {
         traced.append(&mut checks);
     }
-    for step in steps {
+    for (j, step) in steps.iter().enumerate() {
         let plan = bind(backend, &step.plan, &mut schemas).await?;
         let ran = trace(backend, plan, compiling).await?;
         // A table rewritten has the schema of this run's plan.
@@ -358,6 +443,7 @@ async fn bind_and_run<B: Backend, P: Program + ?Sized>(
         if let Some(traced) = traced.as_deref_mut() {
             traced.push(ran);
         }
+        live.ran(backend, steps, j).await?;
     }
     Ok(())
 }
@@ -368,6 +454,7 @@ async fn replay<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
     steps: &[&Step],
+    live: &mut Live<'_>,
     traced: &[Traced<B::Compiled>],
 ) -> Result<(), RunError<B::Error>> {
     let n = program.checks().len();
@@ -380,8 +467,9 @@ async fn replay<B: Backend, P: Program + ?Sized>(
     }
     let (checks, plans) = traced.split_at(n);
     refuse_on_rows(backend, program, checks).await?;
-    for (step, ran) in steps.iter().zip(plans) {
+    for (j, (step, ran)) in steps.iter().zip(plans).enumerate() {
         materialize(backend, &step.name, ran).await?;
+        live.ran(backend, steps, j).await?;
     }
     Ok(())
 }
@@ -576,6 +664,14 @@ mod tests {
     }
 
     fn program(checks: usize, steps: &[&str]) -> Fake {
+        let reads: Vec<&str> = (0..steps.len())
+            .map(|i| if i == 0 { "t" } else { steps[i - 1] })
+            .collect();
+        program_reading(checks, steps, &reads)
+    }
+
+    /// A program whose step `i` is named `steps[i]` and reads `reads[i]`.
+    fn program_reading(checks: usize, steps: &[&str], reads: &[&str]) -> Fake {
         let ext = crate::functions::Extensions::new(&Default::default());
         let read = |name: &str| {
             Unbound(plan(
@@ -596,7 +692,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| Step {
                     name: s.to_string(),
-                    plan: read(if i == 0 { "t" } else { steps[i - 1] }),
+                    plan: read(reads[i]),
                 })
                 .collect(),
             value: OutputTable {
@@ -619,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn checks_then_steps_then_the_intermediates_are_dropped() {
+    fn checks_then_steps_each_intermediate_dropped_after_its_last_reader() {
         let (seen, result) = trace(&program(2, &["s0", "s1", "v"]), &[false, false], "");
         assert_eq!(
             seen,
@@ -629,11 +725,71 @@ mod tests {
                 "write s0",
                 "schema s0",
                 "write s1",
+                "drop s0",
                 "schema s1",
                 "write v",
-                "drop s0",
                 "drop s1"
             ]
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_table_read_later_is_kept_until_then_and_one_never_read_goes_at_once() {
+        // s1 reads s0, nothing reads s2, and v reads s0 again.
+        let p = program_reading(0, &["s0", "s1", "s2", "v"], &["t", "s0", "t", "s0"]);
+        let (seen, result) = trace(&p, &[], "");
+        assert_eq!(
+            seen,
+            [
+                "schema t",
+                "write s0",
+                "schema s0",
+                "write s1",
+                "drop s1",
+                "write s2",
+                "drop s2",
+                "write v",
+                "drop s0"
+            ]
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_program_two_of_whose_steps_write_one_table_is_refused_before_it_runs() {
+        // s1 reads the first s0: dropped after the second, the table would
+        // be gone when s1 runs.
+        let p = program_reading(0, &["s0", "s1", "s0", "v"], &["t", "s0", "t", "s0"]);
+        let (seen, result) = trace(&p, &[], "");
+        assert!(seen.is_empty(), "{seen:?}");
+        assert!(result
+            .unwrap_err()
+            .contains("two steps write the table `s0`"));
+    }
+
+    #[test]
+    fn a_read_already_typed_keeps_its_table_until_it_runs() {
+        // v reads s0 with its schema stated, so binding asks for none; s0
+        // must still stay until v has run.
+        let mut p = program_reading(0, &["s0", "s1", "v"], &["t", "t", "s0"]);
+        let typed = p.steps[2]
+            .plan
+            .bind(&mut |_| {
+                Some(NamedStruct {
+                    names: vec!["x".into()],
+                    r#struct: Some(substrait::proto::r#type::Struct {
+                        types: vec![crate::expr::fp64()],
+                        ..Default::default()
+                    }),
+                })
+            })
+            .unwrap();
+        p.steps[2].plan = Unbound(typed.into_plan());
+        let (seen, result) = trace(&p, &[], "");
+        assert_eq!(
+            seen,
+            ["schema t", "write s0", "write s1", "drop s1", "write v", "drop s0"]
         );
         assert_eq!(result, Ok(()));
     }
@@ -648,8 +804,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_step_drops_every_table_and_reports_the_step() {
-        let (seen, result) = trace(&program(0, &["s0", "s1", "v"]), &[], "write s1");
+    fn a_failed_step_drops_every_table_left_and_reports_the_step() {
+        let (seen, result) = trace(&program(0, &["s0", "s1", "s2", "v"]), &[], "write s2");
         assert_eq!(
             seen,
             [
@@ -658,17 +814,32 @@ mod tests {
                 "schema s0",
                 "write s1",
                 "drop s0",
+                "schema s1",
+                "write s2",
+                "drop s1",
+                "drop s2",
+                "drop v"
+            ]
+        );
+        assert_eq!(result, Err("write s2 failed".into()));
+    }
+
+    #[test]
+    fn a_failed_drop_fails_the_run_drops_the_rest_and_is_reported() {
+        let (seen, result) = trace(&program(0, &["s0", "s1", "v"]), &[], "drop s0");
+        assert_eq!(
+            seen,
+            [
+                "schema t",
+                "write s0",
+                "schema s0",
+                "write s1",
+                "drop s0",
+                "drop s0",
                 "drop s1",
                 "drop v"
             ]
         );
-        assert_eq!(result, Err("write s1 failed".into()));
-    }
-
-    #[test]
-    fn a_failed_drop_still_drops_the_rest_and_is_reported() {
-        let (seen, result) = trace(&program(0, &["s0", "s1", "v"]), &[], "drop s0");
-        assert_eq!(seen.last().unwrap(), "drop s1");
         assert_eq!(result, Err("drop s0 failed".into()));
     }
 }

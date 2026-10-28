@@ -137,7 +137,7 @@ use ddx_core::sqlparser::dialect::Dialect;
 
 use crate::error::AdError;
 use crate::program::{Options, Unbound};
-use crate::run::{Backend, Plans, RunError};
+use crate::run::{Backend, Drops, Plans, RunError};
 
 pub use cache::Programs;
 pub use prepare::{prepare, Prepared};
@@ -301,7 +301,7 @@ async fn run_all<B: Backend>(
             None => program_of_query(backend, planned, programs, &job).await?,
         };
         keys.push(key);
-        let mut trace = Trace::default();
+        let mut seeds = Vec::new();
         for (name, query) in planned.seeds(&job).map_err(RunError::Refused)? {
             let plan = backend.plan_sql(&query).await.map_err(RunError::Engine)?;
             // The engine's own plan of the query: every read already typed.
@@ -311,14 +311,20 @@ async fn run_all<B: Backend>(
             tables.push(name.clone());
             let seed = crate::run::trace(backend, plan, traces.is_some()).await?;
             crate::run::materialize(backend, &name, &seed).await?;
-            trace.seeds.push((name, seed));
+            seeds.push((name, seed));
         }
         let program = planned.built(job.index);
-        let traced = traces.is_some().then_some(&mut trace.plans);
-        crate::run::run_bound(backend, program, Plans::Bind(traced)).await?;
+        let drops = Drops::of(program).map_err(RunError::Refused)?;
+        let mut plans = Vec::new();
+        let traced = traces.is_some().then_some(&mut plans);
+        crate::run::run_bound(backend, program, Plans::Bind(traced), &drops).await?;
         tables.extend(results(program));
         if let Some(traces) = traces.as_deref_mut() {
-            traces.push(trace);
+            traces.push(Trace {
+                seeds,
+                plans,
+                drops,
+            });
         }
     }
     planned.rewrite().map_err(RunError::Refused)
