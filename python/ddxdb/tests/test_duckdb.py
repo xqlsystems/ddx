@@ -542,6 +542,64 @@ def test_a_prepared_step_reads_the_tables_rows_as_they_are_at_each_call(ad, con)
         con.register("w", table([i for i, _ in got[0]], [v for _, v in got[0]]))
 
 
+class Spy:
+    """A DuckDB connection, each statement it is sent recorded."""
+
+    def __init__(self, con):
+        self.of, self.sent = con, []
+
+    def execute(self, sql, *args):
+        self.sent.append(sql)
+        return self.of.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self.of, name)
+
+
+def test_a_later_prepared_call_asks_the_planner_for_nothing(ad, con):
+    # A later call replays the plans of the first: none needs the planner's
+    # copy of a table to bind it, so none is made, or dropped.
+    step = ad.prepare(con, [GRAD])
+    step()
+    backend = ad._backends[con]
+    planner = backend._planner = Spy(backend._planner)
+    con.register("w", table([0, 1, 2], [2.0, 0.0, -1.0]))
+    assert pairs(step()[0]) == [(0, 12.0), (1, 0.0), (2, 3.0)]
+    assert planner.sent == []
+    assert not ddx_tables(con)
+
+
+def test_the_planner_copies_only_the_tables_it_plans_a_read_of(ad, con, monkeypatch):
+    # No later step reads a value or a gradient, and the second statement's
+    # plan doesn't either, so the planner never needs, or gets, a copy of
+    # one: only of what the steps save and pass back.
+    backend = ad._backend(con)
+    planner = backend._planner = Spy(backend._planner)
+    spy = Spy(con)
+    monkeypatch.setattr(ad.DuckDBBackend, "con", property(lambda self: spy))
+    got = [pairs(rel) for rel in ad.sql_all(con, [GRAD, GRAD.replace("val * val * val", "val * val")])]
+    assert got == [[(0, 3.0), (1, 12.0), (2, 0.75)], [(0, 2.0), (1, -4.0), (2, 1.0)]]
+    made = lambda sent: [s.split()[5] for s in sent if s.startswith("CREATE OR REPLACE TEMP TABLE")]
+    written, copied = made(spy.sent), made(planner.sent)
+    results = [n for n in written if "_value" in n or "_grad_" in n]
+    assert len(results) == 4
+    assert copied and set(copied) <= set(written) - set(results)
+    assert not ddx_tables(con)
+
+
+def test_an_sql_call_reads_the_connection_s_catalog_once(ad, con, monkeypatch):
+    con.execute("CREATE VIEW v AS SELECT i, val * 2 AS val FROM w")
+    statements = [
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM v) SELECT i, grad(loss, val) FROM w",
+        "WITH loss AS (SELECT SUM(val * val) AS l FROM v) SELECT i, val - grad(loss, val) FROM w",
+    ]
+    spy = Spy(con)
+    monkeypatch.setattr(ad.DuckDBBackend, "con", property(lambda self: spy))
+    got = [pairs(rel) for rel in ad.sql_all(con, statements)]
+    assert got[0] == [(0, 8.0), (1, -16.0), (2, 4.0)]
+    assert sum("duckdb_columns()" in sql for sql in spy.sent) == 1
+
+
 def test_ad_prepare_on_a_duckdb_connection_prepares_on_duckdb(con):
     from ddxdb import ad
 

@@ -51,6 +51,8 @@ Importing this module requires DuckDB.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import threading
 import weakref
 from typing import Callable, Optional, Sequence
@@ -64,6 +66,21 @@ from . import Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
 __all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
+
+
+def _per_call(method):
+    """``method``, of a :class:`DuckDBBackend` and no arguments, its result
+    kept for the rest of a call (:meth:`DuckDBBackend._one_catalog`)."""
+
+    @functools.wraps(method)
+    def kept(self):
+        if self._call is None:
+            return method(self)
+        if method.__name__ not in self._call:
+            self._call[method.__name__] = method(self)
+        return self._call[method.__name__]
+
+    return kept
 
 
 def _ident(name: str) -> str:
@@ -131,8 +148,14 @@ class DuckDBBackend:
         self._mirrored: dict = {}
         self._attached = {"memory"}
         self._settings: tuple = ()
-        # The tables materialize wrote, each mirrored as it wrote it.
-        self._written: set = set()
+        # ddx's own tables (materialize's): those the planner has a copy of,
+        # current or not, and those written since their copy was made, if
+        # one was. A copy is made only when the planner is about to plan.
+        self._copied: set = set()
+        self._stale: set = set()
+        # Within one call (_one_catalog): each _per_call method's result,
+        # by its name.
+        self._call: Optional[dict] = None
 
     @property
     def con(self) -> "duckdb.DuckDBPyConnection":
@@ -143,6 +166,19 @@ class DuckDBBackend:
 
     # The caller's catalog, and the planner's copy of it.
 
+    @contextlib.contextmanager
+    def _one_catalog(self):
+        """Read the caller's catalog once in the block, rather than at each
+        plan, key or view: for one call's rewrite, which writes only ddx's
+        own tables, which the catalog leaves out. Not around the caller's
+        statements, which may change it."""
+        self._call = {}
+        try:
+            yield
+        finally:
+            self._call = None
+
+    @_per_call
     def _catalog(self) -> dict:
         """Each object on the caller's connection a query can read, but ddx's
         own, by ``(database, schema, name)``: either ``("table", columns)``,
@@ -181,6 +217,11 @@ class DuckDBBackend:
             self._planner.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(db)}.{_ident(schema)}")
         return ".".join(_ident(p) for p in key)
 
+    @_per_call
+    def _where(self) -> tuple:
+        """The caller's current database and schema."""
+        return self.con.execute("SELECT current_database(), current_schema()").fetchone()
+
     def _drop_mirrored(self, key) -> None:
         """Drop the planner's object at ``key``, a table or a view: DuckDB
         drops each only as what it is."""
@@ -213,12 +254,11 @@ class DuckDBBackend:
         finally:
             self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
 
+    @_per_call
     def _sync(self) -> dict:
         """Make the planner's catalog mirror the caller's, searched as the
         caller's is, and return the caller's."""
-        self._database, self._schema = self.con.execute(
-            "SELECT current_database(), current_schema()"
-        ).fetchone()
+        self._database, self._schema = self._where()
         catalog = self._catalog()
         if catalog != self._mirrored:
             for key in self._mirrored.keys() - catalog.keys():
@@ -274,6 +314,9 @@ class DuckDBBackend:
         connection finds it. The producer writes a table by its name alone,
         so a name is taken as the only object of that name in the catalog,
         and refused if there are two."""
+        # Only the tables it names: each of ddx's has a name no other has,
+        # so one that ``sql`` doesn't hold, ``sql`` doesn't read.
+        self._copy({name for name in self._stale if name in sql})
         plan = bytes(self._planner.execute("SELECT * FROM get_substrait(?)", [sql]).fetchone()[0])
         renamed = {}
         for name in set(_tables_read(plan)):
@@ -296,10 +339,11 @@ class DuckDBBackend:
     # The Backend protocol.
 
     def select_all(self, name: str) -> bytes:
-        if name in self._written:
-            # One of ddx's own, as materialize mirrored it: a temporary
-            # table, found by its name alone, whose plan depends on nothing
-            # else in the catalog, so the catalog is not read again.
+        if name in self._copied or name in self._stale:
+            # One of ddx's own: a temporary table, found by its name alone,
+            # whose plan depends on nothing else in the catalog, so the
+            # catalog is not read again.
+            self._copy({name})
             return bytes(
                 self._planner.execute("SELECT * FROM get_substrait(?)", [f"SELECT * FROM {_ident(name)}"]).fetchone()[0]
             )
@@ -329,9 +373,7 @@ class DuckDBBackend:
         if parts is None:
             return None
         parts = [p.lower() for p in parts]
-        db, schema = (
-            p.lower() for p in self.con.execute("SELECT current_database(), current_schema()").fetchone()
-        )
+        db, schema = (p.lower() for p in self._where())
         if len(parts) == 1:
             paths = [("temp", "main"), (db, schema)]
         elif len(parts) == 2:
@@ -357,7 +399,7 @@ class DuckDBBackend:
         # the SQL is what runs), which also names every object, so a table
         # made to shadow another is seen; where names are searched; and the
         # settings that change what a query means.
-        where = self.con.execute("SELECT current_database(), current_schema()").fetchone()
+        where = self._where()
         settings = self.con.execute(
             "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
             [list(_SETTINGS)],
@@ -365,25 +407,50 @@ class DuckDBBackend:
         return repr((where, settings, sorted(self._catalog().items())))
 
     def returns_rows(self, plan: bytes) -> bool:
-        query = to_sql(plan, "duckdb")
+        return self._returns_rows(to_sql(plan, "duckdb"))
+
+    def _returns_rows(self, query: str) -> bool:
         return self.con.execute(f"SELECT 1 FROM ({query}) AS __ddx_check LIMIT 1").fetchone() is not None
 
     def materialize(self, name: str, plan: bytes) -> None:
-        query = to_sql(plan, "duckdb")
-        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {query}")
-        # Later steps read it: an empty copy for the planner. Its name is
-        # ddx's (``__ddx_``), which no object the planner mirrors has, so
-        # what it replaces is the planner's table of the last run.
-        columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
-        cols = ", ".join(f"{_ident(c[0])} {c[1]}" for c in columns)
-        self._planner.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} ({cols})")
-        self._written.add(name)
+        self.materialize_compiled(name, plan, to_sql(plan, "duckdb"))
+
+    def _copy(self, names) -> None:
+        """Give the planner an empty copy of each of ``names``, tables
+        materialize wrote, whose copy is missing or outdated, to plan what
+        reads them. Their names are ddx's (``__ddx_``), which no object the
+        planner mirrors has, so what a copy replaces is the planner's table
+        of an earlier write."""
+        for name in sorted(names & self._stale):
+            columns = self.con.execute(f"DESCRIBE temp.main.{_ident(name)}").fetchall()
+            cols = ", ".join(f"{_ident(c[0])} {c[1]}" for c in columns)
+            self._planner.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} ({cols})")
+            self._copied.add(name)
+            self._stale.discard(name)
 
     def drop_table(self, name: str) -> None:
+        copied = name in self._copied
         # Forgotten first, so a failed drop leaves the name to the catalog.
-        self._written.discard(name)
+        self._copied.discard(name)
+        self._stale.discard(name)
         self.con.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
-        self._planner.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
+        if copied:
+            self._planner.execute(f"DROP TABLE IF EXISTS temp.main.{_ident(name)}")
+
+    def compile(self, plan: bytes) -> str:
+        """``plan``'s SQL, written once for every run of a
+        :class:`ddxdb.Prepared`. DuckDB plans the SQL again each run: a
+        prepared statement keeps the statistics it was optimized with, and
+        is planned again anyway once a temporary object is made or
+        registered, as a training loop registers its weights each step."""
+        return to_sql(plan, "duckdb")
+
+    def materialize_compiled(self, name: str, plan: bytes, compiled: str) -> None:
+        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {_ident(name)} AS {compiled}")
+        self._stale.add(name)
+
+    def returns_rows_compiled(self, plan: bytes, compiled: str) -> bool:
+        return self._returns_rows(compiled)
 
 
 #: The programs :func:`sql_all` keeps for each connection, gone with it.
@@ -410,7 +477,10 @@ def sql_all(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> list
     tables only when it runs, and the programs' tables are dropped once the
     statements have run. A result is copied into memory (as Arrow)."""
     programs = _programs.setdefault(con, Programs())
-    with rewrite(_backend(con), statements, "duckdb", programs) as rewritten:
+    backend = _backend(con)
+    with backend._one_catalog():
+        rewritten = rewrite(backend, statements, "duckdb", programs)
+    with rewritten:
         return _run_all(con, rewritten.statements)
 
 
@@ -423,12 +493,16 @@ def prepare(con: "duckdb.DuckDBPyConnection", statements: Sequence[str]) -> Call
     call after a table's schema, a view, a setting or the current schema
     changes, or a table is made that shadows another, prepares them
     again."""
-    prepared = Prepared(_backend(con), statements, "duckdb")
+    backend = _backend(con)
+    prepared = Prepared(backend, statements, "duckdb")
     lock = threading.Lock()
 
     def run() -> list:
-        with lock, prepared.run() as rewritten:
-            return _run_all(con, rewritten.statements)
+        with lock:
+            with backend._one_catalog():
+                rewritten = prepared.run()
+            with rewritten:
+                return _run_all(con, rewritten.statements)
 
     return run
 
