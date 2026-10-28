@@ -499,21 +499,28 @@ impl Transposer<'_> {
         let ndims = shape.groups.len();
         let ywidth = ys.region.defs.len();
         let y_keys: Vec<usize> = shape.keys.iter().map(|k| k.cols[y]).collect();
-        let on_y = shape
+        // Each pair once: a plan may repeat a join key (DuckDB's does).
+        let mut on_y: Vec<(usize, usize)> = Vec::new();
+        let y_groups = shape
             .groups
             .iter()
             .enumerate()
             .filter(|(_, (s, _))| *s == y)
-            .map(|(g, &(_, c))| (c, g))
-            .chain(
-                shape
-                    .keys
-                    .iter()
-                    .filter_map(|k| k.group[x].map(|g| (k.cols[y], g))),
-            )
+            .map(|(g, &(_, c))| (c, g));
+        let key_groups = shape
+            .keys
+            .iter()
+            .filter_map(|k| k.group[x].map(|g| (k.cols[y], g)));
+        for pair in y_groups.chain(key_groups) {
+            if !on_y.contains(&pair) {
+                on_y.push(pair);
+            }
+        }
+        let on_y = all(on_y
+            .into_iter()
             .map(|(c, g)| call(same, vec![field(c), field(ywidth + g)]))
-            .collect();
-        let on_y = all(on_y).expect("checked: the other side holds a grouping key");
+            .collect())
+        .expect("checked: the other side holds a grouping key");
         // Every key of the join with x below is null-safe, so DataFusion can
         // hash it (it can't hash a join that mixes `=` with IS NOT DISTINCT
         // FROM, and falls back to a nested loop). For a key that was `=`, a
@@ -597,14 +604,18 @@ impl Transposer<'_> {
         region.refusals.push(None);
         let rel = project(region.rel.clone(), vec![xs.factor.clone()]);
         let t_at = factor_col + 1;
-        let mut on_x = Vec::new();
-        for (k, &at) in shape.keys.iter().zip(&y_at) {
-            on_x.push(call(same, vec![field(k.cols[x]), field(t_at + at)]));
+        let mut on_x: Vec<(usize, usize)> = Vec::new();
+        let key_pairs = shape.keys.iter().map(|k| k.cols[x]).zip(y_at);
+        let group_pairs = x_groups.iter().map(|&g| shape.groups[g].1).zip(group_at);
+        for pair in key_pairs.chain(group_pairs) {
+            if !on_x.contains(&pair) {
+                on_x.push(pair);
+            }
         }
-        for (&g, &at) in x_groups.iter().zip(&group_at) {
-            let xc = shape.groups[g].1;
-            on_x.push(call(same, vec![field(xc), field(t_at + at)]));
-        }
+        let on_x = on_x
+            .into_iter()
+            .map(|(xc, at)| call(same, vec![field(xc), field(t_at + at)]))
+            .collect();
         let base = join(
             rel,
             t,
