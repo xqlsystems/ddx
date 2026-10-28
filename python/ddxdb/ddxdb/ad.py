@@ -706,7 +706,8 @@ def _dataframe(ctx: SessionContext, plan: bytes):
     the SQL ``to_sql`` writes for it, whose names are short; the rest stay
     on Substrait, which DataFusion plans faster (a GPT step's in about half
     the time)."""
-    if _inlined_size(plan) > _SQL_ABOVE:
+    size = _inlined_size(plan)
+    if size is not None and size > _SQL_ABOVE:
         return ctx.sql(to_sql(plan, "datafusion"))
     lp = Consumer.from_substrait_plan(ctx, _deserialize(plan))
     return ctx.create_dataframe_from_logical_plan(lp)

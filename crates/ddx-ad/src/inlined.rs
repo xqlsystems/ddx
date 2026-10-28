@@ -27,7 +27,15 @@ use crate::optics::{cata, Compose, Cosmos, Fold, Inputs, RelKind};
 /// twice, a softmax's say, and planning slows with them: so this tells an
 /// adapter when to run a step another way (as [`to_sql`](crate::to_sql)'s
 /// SQL, whose names are short).
-pub fn inlined_size(plan: &Plan) -> Result<u64> {
+///
+/// `None` if `plan` holds a relation it cannot size, such as a reference to
+/// a shared one or an extension's: the adapter then runs it as it would
+/// any plan, and a size alone never refuses one.
+pub fn inlined_size(plan: &Plan) -> Option<u64> {
+    sized(plan).ok()
+}
+
+fn sized(plan: &Plan) -> Result<u64> {
     let mut largest = 0;
     for r in &plan.relations {
         let rel = match &r.rel_type {
@@ -69,7 +77,16 @@ fn columns(rel: &Rel, mut inputs: Vec<Vec<u64>>, largest: &mut u64) -> Result<Ve
         RelType::Filter(f) => (first()?, f.common.as_ref()),
         RelType::Sort(s) => (first()?, s.common.as_ref()),
         RelType::Fetch(f) => (first()?, f.common.as_ref()),
-        RelType::Set(s) => (first()?, s.common.as_ref()),
+        // Each column as large as its largest input's.
+        RelType::Set(s) => {
+            let mut out = first()?;
+            for input in inputs.drain(..) {
+                for (o, n) in out.iter_mut().zip(input) {
+                    *o = (*o).max(n);
+                }
+            }
+            (out, s.common.as_ref())
+        }
         RelType::Project(p) => {
             let mut out = first()?;
             let computed: Vec<u64> = p.expressions.iter().map(|e| size(e, &out)).collect();
@@ -189,7 +206,7 @@ mod tests {
         // Each layer is 2·n + 3 for its input's n: the sum, the product,
         // the literal and two copies of the input.
         let n = (0..10).fold(1, |n, _| 2 * n + 3);
-        assert_eq!(inlined_size(&p).unwrap(), n);
+        assert_eq!(inlined_size(&p), Some(n));
     }
 
     #[test]
@@ -208,7 +225,7 @@ mod tests {
             vec!["v".into()],
             &Extensions::new(&Functions::default()),
         );
-        assert_eq!(inlined_size(&p).unwrap(), 3);
+        assert_eq!(inlined_size(&p), Some(3));
     }
 
     #[test]
@@ -220,6 +237,47 @@ mod tests {
             vec!["v".into()],
             &Extensions::new(&Functions::default()),
         );
-        assert_eq!(inlined_size(&p).unwrap(), 63);
+        assert_eq!(inlined_size(&p), Some(63));
+    }
+
+    #[test]
+    fn a_union_s_column_is_as_large_as_its_largest_input_s() {
+        let small = read_step("t", vec!["v".into()]);
+        let big = (0..3).fold(field(0), |e, _| call(0, vec![e.clone(), e]));
+        let big = project_emit(read_step("t", vec!["v".into()]), vec![big], Some(vec![1]));
+        let union = Rel {
+            rel_type: Some(RelType::Set(substrait::proto::SetRel {
+                inputs: vec![small, big],
+                op: substrait::proto::set_rel::SetOp::UnionAll as i32,
+                ..Default::default()
+            })),
+        };
+        // A column over the union reads its second input's 15 nodes twice.
+        let over = project_emit(
+            union,
+            vec![call(0, vec![field(0), field(0)])],
+            Some(vec![1]),
+        );
+        let p = plan(
+            over,
+            vec!["v".into()],
+            &Extensions::new(&Functions::default()),
+        );
+        assert_eq!(inlined_size(&p), Some(31));
+    }
+
+    #[test]
+    fn a_relation_it_cannot_size_gives_no_size() {
+        let reference = Rel {
+            rel_type: Some(RelType::Reference(substrait::proto::ReferenceRel {
+                subtree_ordinal: 0,
+            })),
+        };
+        let p = plan(
+            reference,
+            vec!["v".into()],
+            &Extensions::new(&Functions::default()),
+        );
+        assert_eq!(inlined_size(&p), None);
     }
 }

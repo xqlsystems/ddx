@@ -135,10 +135,11 @@ fn to_sql(plan: &[u8], dialect: &str) -> PyResult<String> {
 }
 
 /// The size of `plan`'s (serialized Substrait's) largest column written out
-/// down to the tables it reads: `ddx_ad::inlined_size`.
+/// down to the tables it reads, or `None` if it holds a relation that has
+/// no size: `ddx_ad::inlined_size`.
 #[pyfunction]
-fn _inlined_size(plan: &[u8]) -> PyResult<u64> {
-    ddx_ad::inlined_size(&decode(plan)?).map_err(ad_to_py_err)
+fn _inlined_size(plan: &[u8]) -> PyResult<Option<u64>> {
+    Ok(ddx_ad::inlined_size(&decode(plan)?))
 }
 
 /// The name of every table `plan` (serialized Substrait) reads, its parts
