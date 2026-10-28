@@ -909,25 +909,28 @@ async fn batched_attention_joined_through_v_matches_the_general_rule() {
     // The normalizer's sequence and head are joined through v, as DuckDB's
     // plan joins them, so the side `weights JOIN norm` is rebuilt with keys
     // its own conditions don't state (issue #222): `=`, which drops v's
-    // NULL sequences, and IS NOT DISTINCT FROM, which keeps them.
+    // NULL sequences, and IS NOT DISTINCT FROM, which joins them. Under
+    // IS NOT DISTINCT FROM every input may have NULL sequences, and the
+    // scores join them too, so NULL sequences reach the side rebuilt.
     let wrt = [
         ColumnRef::new("q", "val"),
         ColumnRef::new("k", "val"),
         ColumnRef::new("v", "val"),
     ];
-    let make = |rng: &mut Rng, ctx: &SessionContext| {
-        let (ns, nh) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
-        let (nt, nd) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
-        for name in ["q", "k", "v"] {
-            let null = (name != "k").then_some("s");
-            let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
-            register(ctx, name, table(rng, &dims, &["val"], 0.0, null));
-        }
-    };
     let scores = |t: &str| t.ends_with("saved_0");
     for (seed, eq) in [(0x222a, "="), (0x222b, "IS NOT DISTINCT FROM")] {
+        let make = |rng: &mut Rng, ctx: &SessionContext| {
+            let (ns, nh) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+            let (nt, nd) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
+            for name in ["q", "k", "v"] {
+                let null = (eq != "=" || name != "k").then_some("s");
+                let dims = [("s", ns), ("h", nh), ("t", nt), ("d", nd)];
+                register(ctx, name, table(rng, &dims, &["val"], 0.0, null));
+            }
+        };
         let through_v = |q: String| {
-            q.replace("JOIN v ON a.s = v.s", &format!("JOIN v ON (a.s {eq} v.s)"))
+            q.replace("JOIN k ON q.s = k.s", &format!("JOIN k ON (q.s {eq} k.s)"))
+                .replace("JOIN v ON a.s = v.s", &format!("JOIN v ON (a.s {eq} v.s)"))
                 .replace(
                     "JOIN norm n ON a.s = n.s AND a.h = n.h",
                     &format!("JOIN norm n ON (v.s {eq} n.s) AND v.h = n.h"),
@@ -973,6 +976,11 @@ async fn batched_attention_s_normalizer_joins_each_score_once() {
         ColumnRef::new("v", "val"),
     ];
     let program = ad::grad(&ctx, &loss, &wrt).await.unwrap();
+    let scores = |t: &str| t.ends_with("saved_0");
+    assert!(
+        !rebuilds(&ctx, &program, &scores, &named("v")).await,
+        "the contraction rule did not apply"
+    );
     let mut most = (0, String::new());
     for step in program.steps() {
         let plan = ddx_datafusion::engine::logical_plan(&ctx, &step.plan)
