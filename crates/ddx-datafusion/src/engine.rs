@@ -16,10 +16,11 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::{FunctionRegistry, SessionState};
+use datafusion::execution::{FunctionRegistry, SessionState, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::optimizer::Analyzer;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -31,6 +32,8 @@ use ddx_ad::substrait::proto::plan_rel::RelType as PlanRelType;
 use ddx_ad::substrait::proto::rel::RelType;
 use ddx_ad::substrait::proto::{NamedStruct, Plan, ProjectRel, Rel};
 use ddx_ad::{AdError, Bound, Program, RunError, Step};
+
+pub use crate::compiled::Compiled;
 
 pub(crate) fn to_df_err(e: AdError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -61,12 +64,13 @@ pub struct DataFusion(pub SessionContext);
 
 impl ddx_ad::Backend for DataFusion {
     type Error = DataFusionError;
+    type Compiled = crate::compiled::Compiled;
 
     async fn table_schema(&mut self, name: &str) -> Result<NamedStruct> {
         table_schema(&self.0, name).await
     }
 
-    async fn returns_rows(&mut self, plans: &[Bound]) -> Result<Vec<bool>> {
+    async fn returns_rows(&mut self, plans: &[&Bound]) -> Result<Vec<bool>> {
         // The checks read no step and none reads another, so they run at
         // once, each a task of its own (polled together on one task, they
         // ran one after another): on a large wrt table they are most of a
@@ -74,7 +78,7 @@ impl ddx_ad::Backend for DataFusion {
         let tasks: Vec<_> = plans
             .iter()
             .map(|plan| {
-                let (ctx, plan) = (self.0.clone(), (**plan).clone());
+                let (ctx, plan) = (self.0.clone(), (***plan).clone());
                 tokio::spawn(async move { returns_rows(&ctx, &plan).await })
             })
             .collect();
@@ -90,6 +94,47 @@ impl ddx_ad::Backend for DataFusion {
 
     async fn materialize(&mut self, name: &str, plan: &Bound) -> Result<()> {
         materialize(&self.0, name, plan).await
+    }
+
+    async fn compile(&mut self, plan: &Bound) -> Result<Option<crate::compiled::Compiled>> {
+        // A plan run as SQL is planned from its SQL, by the session.
+        if steps_as_sql() {
+            return Ok(None);
+        }
+        crate::compiled::compile(&self.0, plan).await.map(Some)
+    }
+
+    async fn materialize_compiled(
+        &mut self,
+        name: &str,
+        plan: &Bound,
+        compiled: &crate::compiled::Compiled,
+    ) -> Result<()> {
+        let physical = crate::compiled::ready(&self.0, plan, compiled).await?;
+        let task = Arc::new(TaskContext::from(&self.0.state()));
+        register_rows(&self.0, name, physical, task).await
+    }
+
+    async fn returns_rows_compiled(
+        &mut self,
+        plans: &[(&Bound, &crate::compiled::Compiled)],
+    ) -> Result<Vec<bool>> {
+        // At once, as `returns_rows` runs them.
+        let task = Arc::new(TaskContext::from(&self.0.state()));
+        let mut tasks = Vec::with_capacity(plans.len());
+        for (plan, compiled) in plans {
+            let physical = crate::compiled::ready(&self.0, plan, compiled).await?;
+            let task = Arc::clone(&task);
+            tasks.push(tokio::spawn(async move { any_row(physical, task).await }));
+        }
+        let mut rows = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            rows.push(
+                task.await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+            );
+        }
+        Ok(rows)
     }
 
     async fn drop_table(&mut self, name: &str) -> Result<()> {
@@ -281,6 +326,18 @@ pub async fn register(ctx: &SessionContext, name: &str, df: DataFrame) -> Result
     Ok(())
 }
 
+/// Does `physical` return any row?
+async fn any_row(physical: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<bool> {
+    use futures::TryStreamExt;
+    let mut stream = datafusion::physical_plan::execute_stream(physical, task)?;
+    while let Some(batch) = stream.try_next().await? {
+        if batch.num_rows() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Does `plan` (a check) return any row? The returns-rows primitive of
 /// [`ddx_ad::Backend`].
 pub async fn returns_rows(ctx: &SessionContext, plan: &Plan) -> Result<bool> {
@@ -316,14 +373,24 @@ pub async fn run_step(ctx: &SessionContext, step: &Step) -> Result<()> {
 /// materialize primitive of [`ddx_ad::Backend`].
 pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Result<()> {
     let df = dataframe(ctx, plan).await?;
+    let task = Arc::new(df.task_ctx());
+    let physical = df.create_physical_plan().await?;
+    register_rows(ctx, name, physical, task).await
+}
+
+/// Run `physical` and register its rows as the table `name`, replacing one.
+async fn register_rows(
+    ctx: &SessionContext,
+    name: &str,
+    physical: Arc<dyn ExecutionPlan>,
+    task: Arc<TaskContext>,
+) -> Result<()> {
     // The schema of the plan that runs, not the logical one: a step read
     // from an unanalyzed plan can be typed before type coercion (a CASE
     // between BIGINT and DOUBLE branches), and the table must declare the
     // types its batches hold.
-    let task = df.task_ctx();
-    let physical = df.create_physical_plan().await?;
     let schema = physical.schema();
-    let batches = datafusion::physical_plan::collect(physical, Arc::new(task)).await?;
+    let batches = datafusion::physical_plan::collect(physical, task).await?;
     // A MemTable, not a view: DataFusion's Substrait consumer can pick
     // columns out of a table scan, and a later step reads only some.
     let table = MemTable::try_new(schema, vec![batches])?;
@@ -342,6 +409,15 @@ pub async fn materialize(ctx: &SessionContext, name: &str, plan: &Plan) -> Resul
 /// after it: 14 such layers made a 60 MB plan, and 20 exhausted 13 GB. The
 /// names mean nothing to ddx, whose plans refer to columns by position.
 pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPlan> {
+    logical_plan_reading(ctx, plan, |_, table| table).await
+}
+
+/// [`logical_plan`], each table it reads as `read` gives it.
+pub(crate) async fn logical_plan_reading(
+    ctx: &SessionContext,
+    plan: &Plan,
+    read: fn(&TableReference, Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
+) -> Result<LogicalPlan> {
     let plan = bound(ctx, plan).await?;
     let state = ctx.state();
     let extensions = Extensions::try_from(&plan.extensions)?;
@@ -349,6 +425,7 @@ pub async fn logical_plan(ctx: &SessionContext, plan: &Plan) -> Result<LogicalPl
         inner: DefaultSubstraitConsumer::new(&extensions, &state),
         state: &state,
         next: AtomicUsize::new(0),
+        read,
     };
     from_substrait_plan_with_consumer(&consumer, &plan).await
 }
@@ -402,6 +479,8 @@ struct ShortNames<'a> {
     inner: DefaultSubstraitConsumer<'a>,
     state: &'a SessionState,
     next: AtomicUsize,
+    /// Each table read, as the plan reads it.
+    read: fn(&TableReference, Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
 }
 
 #[async_trait]
@@ -410,7 +489,8 @@ impl SubstraitConsumer for ShortNames<'_> {
         &self,
         table: &TableReference,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.resolve_table_ref(table).await
+        let found = self.inner.resolve_table_ref(table).await?;
+        Ok(found.map(|provider| (self.read)(table, provider)))
     }
 
     fn get_extensions(&self) -> &Extensions {

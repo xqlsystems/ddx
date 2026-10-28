@@ -143,6 +143,25 @@ class Backend(Protocol):
         run."""
         ...
 
+    def compile(self, plan: bytes) -> Optional[object]:
+        """Optional. ``plan`` made ready to run again, on whatever rows its
+        tables hold then (an engine's physical plan, say): an object a
+        :class:`Prepared` keeps, and passes to :meth:`materialize_compiled` or
+        :meth:`returns_rows_compiled` on later runs, rather than ``plan`` to
+        :meth:`materialize` or :meth:`returns_rows`. A backend without it,
+        or that returns ``None``, gets each plan as it is."""
+        ...
+
+    def materialize_compiled(self, name: str, plan: bytes, compiled: object) -> None:
+        """:meth:`materialize` of ``plan``, by running ``compiled``, which
+        :meth:`compile` made of it. Needed with :meth:`compile`."""
+        ...
+
+    def returns_rows_compiled(self, plan: bytes, compiled: object) -> bool:
+        """:meth:`returns_rows` of ``plan``, by running ``compiled``. Needed
+        with :meth:`compile`."""
+        ...
+
 
 @dataclass(frozen=True)
 class Rewritten:
@@ -228,7 +247,7 @@ class Prepared:
     each as it was bound then, as ``jax.jit`` traces a function once and
     runs what it traced after that (``ddx_ad::Prepared``). A later run asks
     the backend for no plan, key or schema: only for its ``session_key()``,
-    and to run plans.
+    and to run plans, or what its ``compile()`` made of them.
 
     Between runs, a table may change its rows, or be registered again under
     its name. A run whose backend's ``session_key()`` differs from the one

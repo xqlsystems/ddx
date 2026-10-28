@@ -384,10 +384,11 @@ mod tests {
 
     impl Backend for Views {
         type Error = String;
+        type Compiled = ();
         async fn table_schema(&mut self, _: &str) -> Result<NamedStruct, String> {
             Err("no tables".into())
         }
-        async fn returns_rows(&mut self, _: &[Bound]) -> Result<Vec<bool>, String> {
+        async fn returns_rows(&mut self, _: &[&Bound]) -> Result<Vec<bool>, String> {
             Err("no runs".into())
         }
         async fn materialize(&mut self, _: &str, _: &Bound) -> Result<(), String> {

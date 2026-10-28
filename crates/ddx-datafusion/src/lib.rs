@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ad;
+mod compiled;
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod engine;

@@ -1386,6 +1386,7 @@ dependencies = [
  "ddx-ad",
  "ddx-core",
  "ddx-datafusion",
+ "futures",
  "prost",
  "tokio",
 ]

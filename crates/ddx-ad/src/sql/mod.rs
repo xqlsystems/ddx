@@ -275,7 +275,7 @@ async fn run_all<B: Backend>(
     programs: Option<&Programs>,
     keys: &mut Vec<Option<cache::Key>>,
     tables: &mut Vec<String>,
-    mut traces: Option<&mut Vec<Trace>>,
+    mut traces: Option<&mut Vec<Trace<B::Compiled>>>,
 ) -> Result<Vec<String>, RunError<B::Error>> {
     while let Some(job) = planned.next().map_err(RunError::Refused)? {
         // Each CTE the engine would copy is planned once (see `share`); if
@@ -309,15 +309,13 @@ async fn run_all<B: Backend>(
                 .bind(&mut |_| None)
                 .map_err(RunError::Refused)?;
             tables.push(name.clone());
-            backend
-                .materialize(&name, &plan)
-                .await
-                .map_err(RunError::Engine)?;
-            trace.seeds.push((name, plan));
+            let seed = crate::run::trace(backend, plan, traces.is_some()).await?;
+            crate::run::materialize(backend, &name, &seed).await?;
+            trace.seeds.push((name, seed));
         }
         let program = planned.built(job.index);
-        let kept = traces.is_some().then_some(&mut trace.plans);
-        crate::run::run_bound(backend, program, Plans::Bind(kept)).await?;
+        let traced = traces.is_some().then_some(&mut trace.plans);
+        crate::run::run_bound(backend, program, Plans::Bind(traced)).await?;
         tables.extend(results(program));
         if let Some(traces) = traces.as_deref_mut() {
             traces.push(trace);

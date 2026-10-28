@@ -472,8 +472,12 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 ///
 /// A later run asks DataFusion for no plan of a query, so it skips what a
 /// call of [`sql_all`] repeats: planning the objective, keying the program,
-/// reading the views. A table may change its rows, or be registered again
-/// under its name, between runs. Each run compares every table's schema,
+/// reading the views. Nor does it plan ddx's own work: each check and step
+/// runs the physical plan the first run built for it, each scan in it
+/// replaced by a scan of its table as registered then. A table may change
+/// its rows, or be registered again under its name, between runs; a step
+/// over a table now split into other partitions, or sorted otherwise, is
+/// planned again. Each run compares every table's schema,
 /// every view's kept plan and the session's settings with those it was
 /// prepared with, and prepares the statements again once one has changed.
 /// The caveat [`sql`] gives holds here too: a `now()` in a loss keeps the
@@ -492,7 +496,7 @@ pub struct Prepared {
     statements: Vec<String>,
     /// Once a run has succeeded. Locked while one runs, since every run
     /// writes the same tables.
-    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared>>,
+    prepared: tokio::sync::Mutex<Option<ddx_ad::Prepared<crate::engine::Compiled>>>,
 }
 
 impl std::fmt::Debug for Prepared {

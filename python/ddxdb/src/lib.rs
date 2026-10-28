@@ -675,6 +675,8 @@ impl PyBackend {
 
 impl ddx_ad::Backend for PyBackend {
     type Error = PyErr;
+    /// What the Python backend's `compile` returned.
+    type Compiled = Py<PyAny>;
 
     fn table_schema(&mut self, name: &str) -> impl Future<Output = PyResult<NamedStruct>> + Send {
         self.call(|b| {
@@ -689,7 +691,7 @@ impl ddx_ad::Backend for PyBackend {
 
     fn returns_rows(
         &mut self,
-        plans: &[ddx_ad::Bound],
+        plans: &[&ddx_ad::Bound],
     ) -> impl Future<Output = PyResult<Vec<bool>>> + Send {
         self.call(|b| {
             plans
@@ -725,7 +727,7 @@ impl ddx_ad::Backend for PyBackend {
     }
 
     fn plan_key(&mut self, sql: &str) -> impl Future<Output = PyResult<Option<String>>> + Send {
-        // Optional: a backend without it gets no program kept.
+        // Optional: a backend without it gets no program compiled.
         self.call(|b| {
             if !b.hasattr("plan_key")? {
                 return Ok(None);
@@ -751,6 +753,48 @@ impl ddx_ad::Backend for PyBackend {
                 return Ok(None);
             }
             b.call_method0("session_key")?.extract()
+        })
+    }
+
+    fn compile(
+        &mut self,
+        plan: &ddx_ad::Bound,
+    ) -> impl Future<Output = PyResult<Option<Py<PyAny>>>> + Send {
+        // Optional: a backend without it, or whose `compile` returns `None`,
+        // gets each plan as it is.
+        self.call(|b| {
+            if !b.hasattr("compile")? {
+                return Ok(None);
+            }
+            let compiled = b.call_method1("compile", (bytes(b.py(), plan),))?;
+            Ok((!compiled.is_none()).then(|| compiled.unbind()))
+        })
+    }
+
+    fn materialize_compiled(
+        &mut self,
+        name: &str,
+        plan: &ddx_ad::Bound,
+        compiled: &Py<PyAny>,
+    ) -> impl Future<Output = PyResult<()>> + Send {
+        self.call(|b| {
+            b.call_method1("materialize_compiled", (name, bytes(b.py(), plan), compiled))?;
+            Ok(())
+        })
+    }
+
+    fn returns_rows_compiled(
+        &mut self,
+        plans: &[(&ddx_ad::Bound, &Py<PyAny>)],
+    ) -> impl Future<Output = PyResult<Vec<bool>>> + Send {
+        self.call(|b| {
+            plans
+                .iter()
+                .map(|(plan, compiled)| {
+                    b.call_method1("returns_rows_compiled", (bytes(b.py(), plan), *compiled))?
+                        .extract()
+                })
+                .collect()
         })
     }
 }
@@ -864,7 +908,7 @@ fn _prepare(
 /// Statements `_prepare` computed the calls of, to compute again
 /// (`ddx_ad::Prepared`).
 #[pyclass(frozen, module = "ddxdb", name = "_Prepared")]
-struct Prepared(ddx_ad::Prepared);
+struct Prepared(ddx_ad::Prepared<Py<PyAny>>);
 
 #[pymethods]
 impl Prepared {

@@ -147,6 +147,10 @@ pub trait Backend: Send {
     /// The engine's error.
     type Error: Send;
 
+    /// A plan the engine compiled to run again ([`Backend::compile`]): its
+    /// physical plan, say. `()` for an engine that compiles none.
+    type Compiled: Send + Sync;
+
     /// The schema of the table `name` as the engine's own Substrait producer
     /// states it: the `base_schema` of the read in its plan of
     /// `SELECT * FROM name`. ddx binds a plan's reads of earlier steps with
@@ -162,7 +166,7 @@ pub trait Backend: Send {
     /// another, or any table a step writes.
     fn returns_rows(
         &mut self,
-        plans: &[Bound],
+        plans: &[&Bound],
     ) -> impl Future<Output = Result<Vec<bool>, Self::Error>> + Send;
 
     /// Run `plan` and store its rows as the table `name`, replacing one.
@@ -230,6 +234,44 @@ pub trait Backend: Send {
     fn session_key(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
         async { Ok(None) }
     }
+
+    /// `plan`, compiled to run again, each time on the rows its tables hold
+    /// then: an engine's physical plan, say. [`crate::prepare`] compiles
+    /// each plan it runs, and [`crate::Prepared::run`] runs what was
+    /// compiled ([`Backend::materialize_compiled`],
+    /// [`Backend::returns_rows_compiled`]) rather than having the engine
+    /// plan `plan` again, as `jax.jit` compiles what it traced once.
+    ///
+    /// Optional: the default compiles nothing, returning `None`, and every
+    /// run gives the engine `plan` itself ([`Backend::materialize`],
+    /// [`Backend::returns_rows`]).
+    fn compile(
+        &mut self,
+        _plan: &Bound,
+    ) -> impl Future<Output = Result<Option<Self::Compiled>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
+
+    /// [`Backend::materialize`] of `plan`, by running `compiled`, which
+    /// [`Backend::compile`] made of it. The default runs `plan`.
+    fn materialize_compiled(
+        &mut self,
+        name: &str,
+        plan: &Bound,
+        _compiled: &Self::Compiled,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.materialize(name, plan)
+    }
+
+    /// [`Backend::returns_rows`] of each plan, by running what
+    /// [`Backend::compile`] made of it. The default runs the plans.
+    fn returns_rows_compiled(
+        &mut self,
+        plans: &[(&Bound, &Self::Compiled)],
+    ) -> impl Future<Output = Result<Vec<bool>, Self::Error>> + Send {
+        let plans: Vec<&Bound> = plans.iter().map(|(plan, _)| *plan).collect();
+        async move { self.returns_rows(&plans).await }
+    }
 }
 
 /// Run `program` on `backend`, as the module docs describe: its checks, then
@@ -243,99 +285,34 @@ pub async fn run<B: Backend, P: Program + ?Sized>(
     run_bound(backend, program, Plans::Bind(None)).await
 }
 
-/// Where [`run_bound`] takes each plan from, its checks' then its steps',
-/// in order.
-pub(crate) enum Plans<'a> {
-    /// Bound as it runs, asking the engine for each schema, and kept here
-    /// if given.
-    Bind(Option<&'a mut Vec<Bound>>),
-    /// As an earlier run of the program, on the same tables, bound them.
-    Bound(&'a [Bound]),
+/// A plan as a run ran it, to run again: bound to the engine's tables, and
+/// what the engine compiled of it, if anything ([`Backend::compile`]).
+pub(crate) struct Traced<C> {
+    pub plan: Bound,
+    pub compiled: Option<C>,
 }
 
-impl<'a> Plans<'a> {
-    /// The plans an earlier run bound, if this run replays them.
-    fn replayed(&self) -> Option<&'a [Bound]> {
-        match self {
-            Plans::Bound(plans) => Some(plans),
-            Plans::Bind(_) => None,
-        }
-    }
-
-    /// `bound`, kept if this run keeps what it binds.
-    fn keep(&mut self, bound: Bound) -> Bound {
-        if let Plans::Bind(Some(kept)) = self {
-            kept.push(bound.clone());
-        }
-        bound
-    }
+/// Where [`run_bound`] takes each plan from.
+pub(crate) enum Plans<'a, C> {
+    /// Bound as it runs, asking the engine for each schema; if given,
+    /// compiled by the engine and traced here, the checks' then the
+    /// steps'.
+    Bind(Option<&'a mut Vec<Traced<C>>>),
+    /// As an earlier run of the program, on the same tables, traced them.
+    Bound(&'a [Traced<C>]),
 }
 
 /// [`run`], with each plan from `plans`.
 pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
     backend: &mut B,
     program: &P,
-    mut plans: Plans<'_>,
+    plans: Plans<'_, B::Compiled>,
 ) -> Result<(), RunError<B::Error>> {
-    let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
     let steps: Vec<&Step> = (0..program.step_count()).map(|i| program.step(i)).collect();
-    let replayed = plans.replayed();
-    // A replayed plan is read where it was kept, not copied.
-    let kept = |i: usize| {
-        replayed.map(|plans| {
-            plans.get(i).ok_or_else(|| {
-                RunError::Refused(AdError::Internal(format!(
-                    "plan {i} of a program was never bound"
-                )))
-            })
-        })
+    let result = match plans {
+        Plans::Bind(traced) => bind_and_run(backend, program, &steps, traced).await,
+        Plans::Bound(traced) => replay(backend, program, &steps, traced).await,
     };
-    let result = async {
-        let n = program.checks().len();
-        let mut bound = Vec::new();
-        let checks: &[Bound] = match replayed {
-            Some(plans) => plans.get(..n).ok_or_else(|| {
-                RunError::Refused(AdError::Internal(
-                    "a program's checks were never bound".into(),
-                ))
-            })?,
-            None => {
-                for check in program.checks() {
-                    bound.push(plans.keep(bind(backend, &check.plan, &mut schemas).await?));
-                }
-                &bound
-            }
-        };
-        let rows = if checks.is_empty() {
-            Vec::new()
-        } else {
-            backend
-                .returns_rows(checks)
-                .await
-                .map_err(RunError::Engine)?
-        };
-        if let Some(i) = rows.iter().position(|&r| r) {
-            return Err(RunError::Refused(AdError::InvalidWrt(
-                program.checks()[i].message.clone(),
-            )));
-        }
-        for (i, step) in steps.iter().enumerate() {
-            let plan = match kept(n + i) {
-                Some(plan) => std::borrow::Cow::Borrowed(plan?),
-                None => std::borrow::Cow::Owned(
-                    plans.keep(bind(backend, &step.plan, &mut schemas).await?),
-                ),
-            };
-            // A table rewritten has the schema of this run's plan.
-            schemas.remove(&step.name);
-            backend
-                .materialize(&step.name, &plan)
-                .await
-                .map_err(RunError::Engine)?;
-        }
-        Ok(())
-    }
-    .await;
     // On success the intermediates go; on failure every step's table, so an
     // earlier run's value never sits beside this run's gradient. Every table
     // is dropped even after a failed drop; the first failure is reported.
@@ -351,6 +328,124 @@ pub(crate) async fn run_bound<B: Backend, P: Program + ?Sized>(
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// `program`'s checks, then its steps, each plan bound as it runs, and, if
+/// `traced` is given, compiled by the engine and traced there.
+async fn bind_and_run<B: Backend, P: Program + ?Sized>(
+    backend: &mut B,
+    program: &P,
+    steps: &[&Step],
+    mut traced: Option<&mut Vec<Traced<B::Compiled>>>,
+) -> Result<(), RunError<B::Error>> {
+    let compiling = traced.is_some();
+    let mut schemas: HashMap<String, NamedStruct> = HashMap::new();
+    let mut checks = Vec::new();
+    for check in program.checks() {
+        let plan = bind(backend, &check.plan, &mut schemas).await?;
+        checks.push(trace(backend, plan, compiling).await?);
+    }
+    refuse_on_rows(backend, program, &checks).await?;
+    if let Some(traced) = traced.as_deref_mut() {
+        traced.append(&mut checks);
+    }
+    for step in steps {
+        let plan = bind(backend, &step.plan, &mut schemas).await?;
+        let ran = trace(backend, plan, compiling).await?;
+        // A table rewritten has the schema of this run's plan.
+        schemas.remove(&step.name);
+        materialize(backend, &step.name, &ran).await?;
+        if let Some(traced) = traced.as_deref_mut() {
+            traced.push(ran);
+        }
+    }
+    Ok(())
+}
+
+/// `program`'s checks, then its steps, each plan as `traced` holds it: read
+/// where it was traced, not copied.
+async fn replay<B: Backend, P: Program + ?Sized>(
+    backend: &mut B,
+    program: &P,
+    steps: &[&Step],
+    traced: &[Traced<B::Compiled>],
+) -> Result<(), RunError<B::Error>> {
+    let n = program.checks().len();
+    if traced.len() != n + steps.len() {
+        return Err(RunError::Refused(AdError::Internal(format!(
+            "a program of {} plans replayed from {}",
+            n + steps.len(),
+            traced.len()
+        ))));
+    }
+    let (checks, plans) = traced.split_at(n);
+    refuse_on_rows(backend, program, checks).await?;
+    for (step, ran) in steps.iter().zip(plans) {
+        materialize(backend, &step.name, ran).await?;
+    }
+    Ok(())
+}
+
+/// `plan`, traced to run again: compiled by `backend` if `compiling`.
+pub(crate) async fn trace<B: Backend>(
+    backend: &mut B,
+    plan: Bound,
+    compiling: bool,
+) -> Result<Traced<B::Compiled>, RunError<B::Error>> {
+    let compiled = if compiling {
+        backend.compile(&plan).await.map_err(RunError::Engine)?
+    } else {
+        None
+    };
+    Ok(Traced { plan, compiled })
+}
+
+/// Run `ran`'s plan, or what was compiled of it, storing its rows as
+/// `name`.
+pub(crate) async fn materialize<B: Backend>(
+    backend: &mut B,
+    name: &str,
+    ran: &Traced<B::Compiled>,
+) -> Result<(), RunError<B::Error>> {
+    match &ran.compiled {
+        Some(compiled) => {
+            backend
+                .materialize_compiled(name, &ran.plan, compiled)
+                .await
+        }
+        None => backend.materialize(name, &ran.plan).await,
+    }
+    .map_err(RunError::Engine)
+}
+
+/// Refuse `program` if any of its `checks` (each compiled, if all were)
+/// returns a row.
+async fn refuse_on_rows<B: Backend, P: Program + ?Sized>(
+    backend: &mut B,
+    program: &P,
+    checks: &[Traced<B::Compiled>],
+) -> Result<(), RunError<B::Error>> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let compiled: Option<Vec<(&Bound, &B::Compiled)>> = checks
+        .iter()
+        .map(|c| Some((&c.plan, c.compiled.as_ref()?)))
+        .collect();
+    let rows = match compiled {
+        Some(compiled) => backend.returns_rows_compiled(&compiled).await,
+        None => {
+            let plans: Vec<&Bound> = checks.iter().map(|c| &c.plan).collect();
+            backend.returns_rows(&plans).await
+        }
+    }
+    .map_err(RunError::Engine)?;
+    if let Some(i) = rows.iter().position(|&r| r) {
+        return Err(RunError::Refused(AdError::InvalidWrt(
+            program.checks()[i].message.clone(),
+        )));
+    }
+    Ok(())
 }
 
 /// `plan` bound to the engine's tables, asking it for each schema not yet
@@ -411,6 +506,7 @@ mod tests {
 
     impl Backend for Log {
         type Error = String;
+        type Compiled = ();
         fn table_schema(
             &mut self,
             name: &str,
@@ -425,7 +521,7 @@ mod tests {
         }
         fn returns_rows(
             &mut self,
-            plans: &[Bound],
+            plans: &[&Bound],
         ) -> impl Future<Output = Result<Vec<bool>, String>> + Send {
             ready(
                 self.outcome(format!("check {}", plans.len()))
