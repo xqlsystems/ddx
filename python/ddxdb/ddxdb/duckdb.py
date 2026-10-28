@@ -52,6 +52,7 @@ Importing this module requires DuckDB.
 from __future__ import annotations
 
 import contextlib
+import functools
 import threading
 import weakref
 from typing import Callable, Optional, Sequence
@@ -65,6 +66,21 @@ from . import Prepared, Programs, _name_parts, rewrite
 from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
 
 __all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
+
+
+def _per_call(method):
+    """``method``, of a :class:`DuckDBBackend` and no arguments, its result
+    kept for the rest of a call (:meth:`DuckDBBackend._one_catalog`)."""
+
+    @functools.wraps(method)
+    def kept(self):
+        if self._call is None:
+            return method(self)
+        if method.__name__ not in self._call:
+            self._call[method.__name__] = method(self)
+        return self._call[method.__name__]
+
+    return kept
 
 
 def _ident(name: str) -> str:
@@ -137,8 +153,8 @@ class DuckDBBackend:
         # one was. A copy is made only when the planner is about to plan.
         self._copied: set = set()
         self._stale: set = set()
-        # Within one call (_one_catalog): the caller's catalog, and the
-        # planner's mirror of it, once read.
+        # Within one call (_one_catalog): each _per_call method's result,
+        # by its name.
         self._call: Optional[dict] = None
 
     @property
@@ -162,14 +178,13 @@ class DuckDBBackend:
         finally:
             self._call = None
 
+    @_per_call
     def _catalog(self) -> dict:
         """Each object on the caller's connection a query can read, but ddx's
         own, by ``(database, schema, name)``: either ``("table", columns)``,
         with columns as ``(name, type)``, or ``("view", sql)``. Temporary
         objects are in the database ``temp``. Registered Arrow data is a
         view with no SQL, and is a table here."""
-        if self._call is not None and "catalog" in self._call:
-            return self._call["catalog"]
         columns: dict = {}
         for db, schema, table, column, ty in self.con.execute(
             "SELECT database_name, schema_name, table_name, column_name, data_type "
@@ -189,8 +204,6 @@ class DuckDBBackend:
                 continue
             sql = views.get(key)
             catalog[key] = ("view", sql) if sql else ("table", tuple(cols))
-        if self._call is not None:
-            self._call["catalog"] = catalog
         return catalog
 
     def _path(self, key) -> str:
@@ -204,14 +217,10 @@ class DuckDBBackend:
             self._planner.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(db)}.{_ident(schema)}")
         return ".".join(_ident(p) for p in key)
 
+    @_per_call
     def _where(self) -> tuple:
         """The caller's current database and schema."""
-        if self._call is not None and "where" in self._call:
-            return self._call["where"]
-        where = self.con.execute("SELECT current_database(), current_schema()").fetchone()
-        if self._call is not None:
-            self._call["where"] = where
-        return where
+        return self.con.execute("SELECT current_database(), current_schema()").fetchone()
 
     def _drop_mirrored(self, key) -> None:
         """Drop the planner's object at ``key``, a table or a view: DuckDB
@@ -245,11 +254,10 @@ class DuckDBBackend:
         finally:
             self._planner.execute(f"USE {_ident(self._database)}.{_ident(self._schema)}")
 
+    @_per_call
     def _sync(self) -> dict:
         """Make the planner's catalog mirror the caller's, searched as the
         caller's is, and return the caller's."""
-        if self._call is not None and "synced" in self._call:
-            return self._call["synced"]
         self._database, self._schema = self._where()
         catalog = self._catalog()
         if catalog != self._mirrored:
@@ -299,8 +307,6 @@ class DuckDBBackend:
         path = dict(settings)["search_path"]
         if path:
             self._planner.execute(f"SET search_path = {_literal(path)}")
-        if self._call is not None:
-            self._call["synced"] = catalog
         return catalog
 
     def _plan(self, sql: str, catalog: dict) -> bytes:
