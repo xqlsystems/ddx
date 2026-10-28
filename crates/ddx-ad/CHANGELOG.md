@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.6...ddx-ad-v0.2.7) - 2026-10-28
+
+### Other
+
+- *(ddx-ad, ddx-datafusion, ddxdb)* run each prepared step's physical plan again ([#214](https://github.com/xqlsystems/ddx/pull/214))
+- *(ddx-ad, ddx-datafusion, ddxdb)* prepare statements to run again ([#203](https://github.com/xqlsystems/ddx/pull/203))
+
 ## [0.2.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.2.5...ddx-ad-v0.2.6) - 2026-10-26
 
 ### Fixed

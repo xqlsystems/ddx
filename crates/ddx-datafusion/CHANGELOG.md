@@ -9,6 +9,13 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.3...ddx-datafusion-v0.3.4) - 2026-10-28
+
+### Other
+
+- *(ddx-ad, ddx-datafusion, ddxdb)* run each prepared step's physical plan again ([#214](https://github.com/xqlsystems/ddx/pull/214))
+- *(ddx-ad, ddx-datafusion, ddxdb)* prepare statements to run again ([#203](https://github.com/xqlsystems/ddx/pull/203))
+
 ## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.2...ddx-datafusion-v0.3.3) - 2026-10-26
 
 ### Changed
