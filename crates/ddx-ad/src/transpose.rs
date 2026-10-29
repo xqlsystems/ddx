@@ -655,8 +655,10 @@ impl<'a> Transposer<'a> {
                 }
                 Def::Union(arms) => {
                     // Each input's column gets the cotangent in the rows it
-                    // gave, and NULL, none, in the others'.
-                    for &(branch, col) in arms {
+                    // gave, and NULL, none, in the others'. An input whose
+                    // column reads no wrt table gets none, as a map's
+                    // constant operand does.
+                    for &(branch, col) in arms.iter().filter(|&&(_, col)| region.varied[col]) {
                         pending
                             .entry(col)
                             .or_default()
