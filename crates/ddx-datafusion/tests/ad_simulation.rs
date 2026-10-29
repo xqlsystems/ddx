@@ -9,7 +9,8 @@
 //! This file generates the queries: random compositions of the relational
 //! primitives ddx has a differentiation rule for each of (map, select,
 //! broadcast, reduce), over small random tables, written the way a user writes
-//! SQL — CTEs, joins on shared dims, grouped SUM/AVG/MAX/MIN, filters,
+//! SQL — CTEs, joins on shared dims, grouped SUM/AVG/MAX/MIN, contractions
+//! (`SUM(f(a) * g(b))` over a join, with NULL keys and factors), filters,
 //! semi-joins, a rank filter, a softmax with and without its shift stopped.
 //! Each is then held to two kinds of property.
 //!
@@ -394,9 +395,12 @@ impl Modes {
                     ulps: on("ulps"),
                 }
             }
+            // Ties and NULLs often: only they reach the conventions at a
+            // tie and for a row an aggregate skips, which a finite
+            // difference can't see or a mutant breaks only there.
             Err(_) => Modes {
-                ties: r.below(100) < 15,
-                nulls: null_pct() > 0 && r.below(100) < 10,
+                ties: r.below(100) < 30,
+                nulls: null_pct() > 0 && r.below(100) < 25,
                 extreme: (r.below(100) < 8).then(|| extreme(&mut r)),
                 // Drawn either way, so seeds replay alike, but only a soak
                 // uses it: a big case is slow, and a bug found only in many
@@ -845,9 +849,10 @@ impl Gen<'_> {
             return self.leaf();
         }
         match self.rng.below(100) {
-            0..=19 => self.map(depth),
-            20..=39 => self.join(depth),
-            40..=59 => self.reduce(depth),
+            0..=16 => self.map(depth),
+            17..=33 => self.join(depth),
+            34..=50 => self.reduce(depth),
+            51..=59 => self.contract(depth),
             60..=66 => self.filter(depth),
             67..=73 => self.rank(depth),
             74..=80 => self.softmax(depth),
@@ -1128,6 +1133,156 @@ impl Gen<'_> {
         // exact values is exact, as ddx's rule follows a saved aggregate.
         self.nodes[m].jitter = n.jitter || agg.contains("SUM(") || agg.contains("AVG(");
         m
+    }
+
+    /// `SUM(f(a.v) * g(b.v))` over a join on the dims `a` and `b` share,
+    /// grouped by some of each side's own dims and some shared ones: the
+    /// contraction ddx-ad transposes without rebuilding its join
+    /// (`contraction.rs`). A matrix product when `a` and `b` are matrices,
+    /// batched as attention's is when a shared dim is kept. Each equality is
+    /// `=` or `IS NOT DISTINCT FROM`, which data tables' NULL keys tell
+    /// apart, and a kept shared dim is read from either side, as the join
+    /// holds them equal.
+    fn contract(&mut self, depth: u32) -> usize {
+        let a = self.node(depth - 1);
+        let b = self.node(depth - 1);
+        let (na, nb) = (self.nodes[a].clone(), self.nodes[b].clone());
+        let shared: Vec<&'static str> = na
+            .dims
+            .iter()
+            .filter(|d| nb.dims.contains(d))
+            .copied()
+            .collect();
+        let mut all = na.dims.clone();
+        all.extend(nb.dims.iter().filter(|d| !na.dims.contains(d)));
+        if shared.is_empty() || self.dom.rows(&all) > self.cap {
+            return a;
+        }
+        let mut keys: Vec<&'static str> = Vec::new();
+        let mut spelled: BTreeMap<&'static str, String> = BTreeMap::new();
+        for &d in &all {
+            let kept = if shared.contains(&d) {
+                self.rng.below(100) < 30
+            } else {
+                self.rng.below(100) < 75
+            };
+            if kept {
+                let side =
+                    if !nb.dims.contains(&d) || (na.dims.contains(&d) && self.rng.below(2) == 0) {
+                        "a"
+                    } else {
+                        "b"
+                    };
+                keys.push(d);
+                spelled.insert(d, format!("{side}.{d}"));
+            }
+        }
+        keys.sort_by_key(|d| DIMS.iter().position(|x| x == d));
+        let select: Vec<String> = keys
+            .iter()
+            .map(|d| format!("{} AS {d}", spelled[d]))
+            .collect();
+        let grouped: Vec<String> = keys.iter().map(|d| spelled[d].clone()).collect();
+        let on: Vec<String> = shared
+            .iter()
+            .map(|d| {
+                let eq = if self.rng.below(2) == 0 {
+                    "="
+                } else {
+                    "IS NOT DISTINCT FROM"
+                };
+                format!("a.{d} {eq} b.{d}")
+            })
+            .collect();
+        // Sometimes both sides hold NULL for one value of a shared dim: `=`
+        // never matches those rows, and IS NOT DISTINCT FROM pairs them.
+        let nulled = (self.rng.below(100) < 50).then(|| {
+            let d = *self.rng.pick(&shared);
+            (
+                d,
+                self.key_type.lit(self.rng.below(self.dom.size(d) as u64)),
+            )
+        });
+        let side = |c: usize, dims: &[&'static str], tan: bool| match &nulled {
+            None => format!("§{c}§"),
+            Some((n, k)) => {
+                let cols: Vec<String> = dims
+                    .iter()
+                    .map(|d| {
+                        if d == n {
+                            format!("CASE WHEN {d} = {k} THEN NULL ELSE {d} END AS {d}")
+                        } else {
+                            d.to_string()
+                        }
+                    })
+                    .collect();
+                let dv = if tan { ", dv" } else { "" };
+                format!("(SELECT {}, v{dv} FROM §{c}§ c)", cols.join(", "))
+            }
+        };
+        let from = |tan: bool| {
+            format!(
+                "{} a JOIN {} b ON {}",
+                side(a, &na.dims, tan),
+                side(b, &nb.dims, tan),
+                on.join(" AND ")
+            )
+        };
+        // Each factor is the value itself or a smooth map of it, sometimes
+        // NULL on the rows of one key though the value isn't: those rows
+        // send no gradient, which a NULL value's partial can't show.
+        let mut factor = |side: &str, dims: &[&'static str]| -> (String, String) {
+            let v = format!("{side}.v");
+            let dv = format!("{side}.dv");
+            let (f, t) = if self.rng.below(2) == 0 {
+                (v, dv)
+            } else {
+                let k = self.rng.below(11) as usize;
+                (
+                    UNARY[k].replace("{v}", &v),
+                    UNARY_TAN[k].replace("{v}", &v).replace("{dv}", &dv),
+                )
+            };
+            if dims.is_empty() || self.rng.below(100) >= 50 {
+                return (f, t);
+            }
+            let d = *self.rng.pick(dims);
+            let k = self.key_type.lit(self.rng.below(self.dom.size(d) as u64));
+            (
+                format!("({f} + CASE WHEN {side}.{d} = {k} THEN NULL ELSE 0.0 END)"),
+                t,
+            )
+        };
+        let (fa, ta) = factor("a", &na.dims);
+        let (fb, tb) = factor("b", &nb.dims);
+        let product = format!("({fa}) * ({fb})");
+        let dproduct = masked(&product, &format!("({ta}) * ({fb}) + ({fa}) * ({tb})"));
+        let lead_keys = if select.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", select.join(", "))
+        };
+        let group = if grouped.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {}", grouped.join(", "))
+        };
+        let body = format!(
+            "SELECT {lead_keys}SUM({product}) AS v FROM {}{group}",
+            from(false)
+        );
+        let tan = format!(
+            "SELECT {lead_keys}SUM({product}) AS v, SUM({dproduct}) AS dv FROM {}{group}",
+            from(true)
+        );
+        let mut kinds: BTreeSet<&'static str> = na.kinds.union(&nb.kinds).copied().collect();
+        kinds.insert("contraction");
+        let reads = na.reads.union(&nb.reads).cloned().collect();
+        let n = self.push_u(body, keys, reads, kinds, true);
+        self.nodes[n].tan = (na.tan.is_some() && nb.tan.is_some()).then_some(tan);
+        // A sum adds in the order partitions arrive.
+        self.nodes[n].jitter = true;
+        n
     }
 
     fn filter(&mut self, depth: u32) -> usize {

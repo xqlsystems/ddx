@@ -40,35 +40,29 @@ DF = "crates/ddx-datafusion/src"
 # (name, file, text, replacement, what it breaks)
 MUTANTS = [
     ("sum-halved", f"{AD}/transpose.rs",
-     "Rule::Sum => cot,",
-     "Rule::Sum => call(divide, vec![cot, lit_f64(2.0)]),",
+     "            None => cotangent,",
+     "            None => call(divide, vec![cotangent, lit_f64(2.0)]),",
      "SUM's transpose gives each row half the group's cotangent"),
-    ("mean-undivided", f"{AD}/transpose.rs",
-     "Rule::Mean => call(divide, vec![cot, field(stat_at[&arg_col])]),",
-     "Rule::Mean => cot,",
-     "AVG's transpose forgets to divide by the count"),
+    ("mean-undivided", f"{AD}/reduce.rs",
+     '"avg" | "mean" => (None, true),',
+     '"avg" | "mean" => (None, false),',
+     "AVG's rules forget to divide by the count"),
     ("mean-over-sum", f"{AD}/transpose.rs",
-     "windows.push(window(count, vec![field(arg_col)], keys.clone()));",
-     "windows.push(window(sum, vec![field(arg_col)], keys.clone()));",
+     "None => window(count, vec![field(r.arg)], keys.to_vec()),",
+     "None => window(sum, vec![field(r.arg)], keys.to_vec()),",
      "AVG divides by the sum of its argument, not the count"),
-    ("tie-unshared", f"{AD}/transpose.rs",
-     "jitters(self.f, &region, arg_col),\n"
-     "                        ),\n"
-     "                        call(divide, vec![cot, field(stat_at[&arg_col])]),",
-     "jitters(self.f, &region, arg_col),\n"
-     "                        ),\n"
-     "                        cot,",
-     "MAX/MIN give every tied row the whole cotangent (wrong only at ties)"),
+    ("tie-unshared", f"{AD}/reduce.rs",
+     '"max" => (Some(Function::Max), true),',
+     '"max" => (Some(Function::Max), false),',
+     "MAX gives every tied row the whole cotangent (wrong only at ties)"),
     ("extreme-everyone", f"{AD}/transpose.rs",
-     "                    )],\n                    null_f64(),\n                ),\n            };",
-     "                    )],\n                    field(cotangent_at + i),\n                ),\n            };",
+     "vec![(self.attains(r.arg, extreme, r.tolerant), share)],\n                null_f64(),",
+     "vec![(self.attains(r.arg, extreme, r.tolerant), share.clone())],\n                share,",
      "MAX/MIN send the cotangent to rows that do not attain the extreme too"),
     ("null-skip-leaks", f"{AD}/transpose.rs",
-     "vec![(call(is_null, vec![field(arg_col)]), null_f64())],",
-     "vec![(call(is_null, vec![lit_f64(0.0)]), null_f64())],",
+     "if_then(vec![(call(is_null, vec![field(arg)]), null_f64())], seed)",
+     "if_then(vec![(call(is_null, vec![lit_f64(0.0)]), null_f64())], seed)",
      "a row an aggregate skips as NULL still sends gradient to its other inputs"),
-    # The two contraction mutants survive the soak until its generator writes
-    # the rule's shape (#127); contraction_transpose.rs kills both.
     ("contraction-wrong-cotangent", f"{AD}/contraction.rs",
      "vec![field(ywidth + ndims + cot_col), ys.factor.clone()],",
      "vec![field(ywidth + cot_col), ys.factor.clone()],",
@@ -77,6 +71,10 @@ MUTANTS = [
      "let seed = self.skips_null(factor_col, field(t_at + t_value));",
      "let seed = field(t_at + t_value);",
      "the contraction rule sends gradient through a row whose own factor is NULL"),
+    ("contraction-null-keys-kept", f"{AD}/contraction.rs",
+     ".filter(|(k, _)| !k.not_distinct)",
+     ".filter(|(k, _)| false && !k.not_distinct)",
+     "the contraction rule pairs NULL keys a join with `=` never matched"),
     ("partial-is-one", f"{AD}/transpose.rs",
      "if as_number(&d) == Some(1.0) {",
      "if as_number(&d).is_some() {",
@@ -109,18 +107,17 @@ MUTANTS = [
      'format!("{namespace}grad_{i}_{}", readable(table))',
      'format!("{namespace}grad_{}", readable(table))',
      "two wrt tables with one readable name share a gradient step"),
-    ("release-keeps-value", f"{DF}/ad.rs",
+    ("release-keeps-a-step", f"{DF}/engine.rs",
      "    for i in 0..program.step_count() {\n"
      "        let step = program.step(i);\n"
      "        ctx.deregister_table(step.name.as_str())?;",
-     "    for i in 0..program.step_count() {\n"
+     "    for i in 0..program.step_count() - 1 {\n"
      "        let step = program.step(i);\n"
-     "        if program.is_result(&step.name) { continue; }\n"
      "        ctx.deregister_table(step.name.as_str())?;",
-     "release leaves the value table on the context"),
-    ("sql-case-sensitive", f"{AD}/sql.rs",
-     "table_matches(&w.table, table) && w.column.eq_ignore_ascii_case(c)",
-     "table_matches(&w.table, table) && w.column == *c",
+     "release leaves the program's last step on the context"),
+    ("sql-case-sensitive", f"{AD}/sql/plan.rs",
+     ".any(|w| table_matches(&w.table, names) && w.column.eq_ignore_ascii_case(c))",
+     ".any(|w| table_matches(&w.table, names) && w.column == c)",
      "grad in SQL treats W.VAL and w.val as different columns"),
 ]
 
@@ -182,6 +179,9 @@ def main():
         if args.only and name not in args.only:
             continue
         file = pathlib.Path(path)
+        if not file.exists():
+            rows.append((name, what, f"STALE: no file {path}", "", ""))
+            continue
         original = file.read_text()
         n = original.count(text)
         if n != 1:
