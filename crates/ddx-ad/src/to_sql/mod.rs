@@ -155,6 +155,7 @@ pub fn to_sql(plan: &Plan, dialect: Dialect) -> Result<String> {
     let mut reader = Reader {
         plan,
         functions: &functions,
+        null_type: null_type(plan),
         aliases: 0,
         ctes: Vec::new(),
         shared: HashMap::new(),
@@ -264,6 +265,10 @@ impl Env<'_> {
 struct Reader<'p> {
     plan: &'p Plan,
     functions: &'p Functions,
+    /// The anchor of the plan's type of NULLs with no type, if it declares
+    /// one: DataFusion's producer writes DataType::Null as a user-defined
+    /// type named `null`.
+    null_type: Option<u32>,
     aliases: usize,
     ctes: Vec<Select>,
     /// The CTE of each shared relation read so far (its index, width and
@@ -274,6 +279,24 @@ struct Reader<'p> {
 }
 
 impl Reader<'_> {
+    /// [`ty`], or `None` for the plan's `null` type: NULLs of no type.
+    fn ty_or_none(&self, t: &SubstraitType) -> Result<Option<Type>> {
+        match &t.kind {
+            Some(Kind::UserDefined(u)) if Some(u.type_reference) == self.null_type => Ok(None),
+            _ => ty(t).map(Some),
+        }
+    }
+
+    /// [`literal`], with a NULL of the plan's `null` type as one of no type.
+    fn literal(&self, l: &SubstraitLiteral) -> Result<Literal> {
+        if let Some(LiteralType::Null(t)) = &l.literal_type {
+            if self.ty_or_none(t)?.is_none() {
+                return Ok(Literal::UntypedNull);
+            }
+        }
+        literal(l)
+    }
+
     fn alias(&mut self) -> Alias {
         self.aliases += 1;
         Alias(self.aliases - 1)
@@ -661,9 +684,10 @@ impl Reader<'_> {
                 (from, columns)
             }
             Some(ReadType::VirtualTable(v)) => {
-                let types: Vec<Type> = types
+                // A column of NULLs of no type has none to cast to.
+                let types: Vec<Option<Type>> = types
                     .iter()
-                    .map(|t| ty(required(*t, "a virtual table's column type")?))
+                    .map(|t| self.ty_or_none(required(*t, "a virtual table's column type")?))
                     .collect::<Result<_>>()?;
                 let empty = Env {
                     columns: Vec::new(),
@@ -675,7 +699,7 @@ impl Reader<'_> {
                     let values = row
                         .fields
                         .iter()
-                        .map(|l| literal(l).map(Expr::Literal))
+                        .map(|l| self.literal(l).map(Expr::Literal))
                         .collect::<Result<_>>()?;
                     rows.push(values);
                 }
@@ -689,17 +713,23 @@ impl Reader<'_> {
                 }
                 // Each value cast to its column's type, which VALUES would
                 // otherwise infer from the rows.
-                let typed = |value: Expr, ty: Type| Expr::Cast {
-                    expr: Box::new(value),
-                    ty,
-                    fallible: false,
+                let typed = |value: Expr, ty: Option<Type>| match ty {
+                    Some(ty) => Expr::Cast {
+                        expr: Box::new(value),
+                        ty,
+                        fallible: false,
+                    },
+                    None => value,
                 };
                 let from = if rows.is_empty() {
                     // VALUES cannot write no rows: one row of typed NULLs,
                     // filtered out.
                     let nulls = types
                         .iter()
-                        .map(|t| typed(Expr::Literal(Literal::Null(*t)), *t))
+                        .map(|t| match t {
+                            Some(t) => typed(Expr::Literal(Literal::Null(*t)), Some(*t)),
+                            None => Expr::Literal(Literal::UntypedNull),
+                        })
                         .collect();
                     let query = Box::new(Select {
                         columns: nulls,
@@ -1000,7 +1030,7 @@ impl Reader<'_> {
     fn expr(&mut self, e: &Expression, env: &Env) -> Result<Expr> {
         let rex = required(e.rex_type.as_ref(), "an expression's type")?;
         Ok(match rex {
-            RexType::Literal(l) => Expr::Literal(literal(l)?),
+            RexType::Literal(l) => Expr::Literal(self.literal(l)?),
             RexType::Selection(r) => {
                 let field = match &r.reference_type {
                     Some(ReferenceType::DirectReference(s)) => match &s.reference_type {
@@ -1087,7 +1117,7 @@ impl Reader<'_> {
                     .map(|c| {
                         let when = required(c.r#if.as_ref(), "a switch clause's value")?;
                         let then = required(c.then.as_ref(), "a switch clause's result")?;
-                        Ok((Expr::Literal(literal(when)?), self.expr(then, env)?))
+                        Ok((Expr::Literal(self.literal(when)?), self.expr(then, env)?))
                     })
                     .collect::<Result<_>>()?;
                 let otherwise = s
@@ -1646,6 +1676,17 @@ fn literal(l: &SubstraitLiteral) -> Result<Literal> {
                 literal_name(other)
             )))
         }
+    })
+}
+
+/// The anchor of `plan`'s user-defined type `null`, if it declares one.
+/// Matched by name, as DataFusion's consumer does: its producer declares
+/// its types with no extension URN (apache/datafusion#11545).
+fn null_type(plan: &Plan) -> Option<u32> {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    plan.extensions.iter().find_map(|d| match &d.mapping_type {
+        Some(MappingType::ExtensionType(t)) if t.name == "null" => Some(t.type_anchor),
+        _ => None,
     })
 }
 

@@ -255,6 +255,9 @@ pub(super) enum Literal {
         scale: i32,
     },
     Null(Type),
+    /// NULL of no type, which DataFusion gives an unannotated `NULL` in a
+    /// plan it hasn't optimized: SQL types it from where it is.
+    UntypedNull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

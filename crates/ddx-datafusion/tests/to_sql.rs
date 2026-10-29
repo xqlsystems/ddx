@@ -221,8 +221,38 @@ async fn expressions_and_literals() {
         "SELECT CAST(12.345 AS DECIMAL(10, 3)) AS d, CAST(-0.5 AS DECIMAL(4, 2)) AS e",
         "SELECT DATE '2024-02-29' AS d, TIMESTAMP '1969-12-31 23:59:59.25' AS ts",
         "SELECT 'it''s' AS s, CAST(NULL AS DOUBLE) AS n, TRUE AS b",
+        // Unoptimized, the NULL has no type: DataFusion writes it as its
+        // user-defined `null` (found by the soak's contractions).
+        UNTYPED_NULLS[0],
+        UNTYPED_NULLS[1],
+        UNTYPED_NULLS[2],
     ] {
         round_trips(&ctx, sql, false).await;
+    }
+}
+
+/// Statements whose unoptimized plan has an untyped NULL.
+const UNTYPED_NULLS: [&str; 3] = [
+    "SELECT k, x + CASE WHEN k = 2 THEN NULL ELSE 0.0 END AS v FROM t",
+    "SELECT a, b FROM (VALUES (1, NULL), (2, NULL)) v(a, b)",
+    "SELECT a, b FROM (VALUES (1, NULL)) v(a, b) WHERE a > 5",
+];
+
+#[tokio::test]
+async fn an_untyped_null_is_written_as_a_bare_null() {
+    // `round_trips` skips an unoptimized plan DataFusion cannot write, and
+    // compares rendered rows, in which a typed NULL looks the same.
+    let ctx = fixture().await;
+    for sql in UNTYPED_NULLS {
+        let lp = ctx.sql(sql).await.unwrap().into_unoptimized_plan();
+        let plan =
+            datafusion_substrait::logical_plan::producer::to_substrait_plan(&lp, &ctx.state())
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        let written = to_sql(&plan, Dialect::DataFusion).unwrap();
+        assert!(
+            written.contains("NULL") && !written.contains("CAST(NULL"),
+            "an untyped NULL should be written bare: {sql}\nwritten as\n{written}"
+        );
     }
 }
 
