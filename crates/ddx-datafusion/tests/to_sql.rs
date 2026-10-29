@@ -224,6 +224,8 @@ async fn expressions_and_literals() {
         // Unoptimized, the NULL has no type: DataFusion writes it as its
         // user-defined `null` (found by the soak's contractions).
         "SELECT k, x + CASE WHEN k = 2 THEN NULL ELSE 0.0 END AS v FROM t",
+        "SELECT a, b FROM (VALUES (1, NULL), (2, NULL)) v(a, b)",
+        "SELECT a, b FROM (VALUES (1, NULL)) v(a, b) WHERE a > 5",
     ] {
         round_trips(&ctx, sql, false).await;
     }

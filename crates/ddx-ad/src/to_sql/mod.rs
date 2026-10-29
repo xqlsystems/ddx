@@ -279,13 +279,18 @@ struct Reader<'p> {
 }
 
 impl Reader<'_> {
+    /// [`ty`], or `None` for the plan's `null` type: NULLs of no type.
+    fn ty_or_none(&self, t: &SubstraitType) -> Result<Option<Type>> {
+        match &t.kind {
+            Some(Kind::UserDefined(u)) if Some(u.type_reference) == self.null_type => Ok(None),
+            _ => ty(t).map(Some),
+        }
+    }
+
     /// [`literal`], with a NULL of the plan's `null` type as one of no type.
     fn literal(&self, l: &SubstraitLiteral) -> Result<Literal> {
-        if let Some(LiteralType::Null(SubstraitType {
-            kind: Some(Kind::UserDefined(u)),
-        })) = &l.literal_type
-        {
-            if Some(u.type_reference) == self.null_type {
+        if let Some(LiteralType::Null(t)) = &l.literal_type {
+            if self.ty_or_none(t)?.is_none() {
                 return Ok(Literal::UntypedNull);
             }
         }
@@ -679,9 +684,10 @@ impl Reader<'_> {
                 (from, columns)
             }
             Some(ReadType::VirtualTable(v)) => {
-                let types: Vec<Type> = types
+                // A column of NULLs of no type has none to cast to.
+                let types: Vec<Option<Type>> = types
                     .iter()
-                    .map(|t| ty(required(*t, "a virtual table's column type")?))
+                    .map(|t| self.ty_or_none(required(*t, "a virtual table's column type")?))
                     .collect::<Result<_>>()?;
                 let empty = Env {
                     columns: Vec::new(),
@@ -707,17 +713,23 @@ impl Reader<'_> {
                 }
                 // Each value cast to its column's type, which VALUES would
                 // otherwise infer from the rows.
-                let typed = |value: Expr, ty: Type| Expr::Cast {
-                    expr: Box::new(value),
-                    ty,
-                    fallible: false,
+                let typed = |value: Expr, ty: Option<Type>| match ty {
+                    Some(ty) => Expr::Cast {
+                        expr: Box::new(value),
+                        ty,
+                        fallible: false,
+                    },
+                    None => value,
                 };
                 let from = if rows.is_empty() {
                     // VALUES cannot write no rows: one row of typed NULLs,
                     // filtered out.
                     let nulls = types
                         .iter()
-                        .map(|t| typed(Expr::Literal(Literal::Null(*t)), *t))
+                        .map(|t| match t {
+                            Some(t) => typed(Expr::Literal(Literal::Null(*t)), Some(*t)),
+                            None => Expr::Literal(Literal::UntypedNull),
+                        })
                         .collect();
                     let query = Box::new(Select {
                         columns: nulls,
@@ -1668,6 +1680,8 @@ fn literal(l: &SubstraitLiteral) -> Result<Literal> {
 }
 
 /// The anchor of `plan`'s user-defined type `null`, if it declares one.
+/// Matched by name, as DataFusion's consumer does: its producer declares
+/// its types with no extension URN (apache/datafusion#11545).
 fn null_type(plan: &Plan) -> Option<u32> {
     use substrait::proto::extensions::simple_extension_declaration::MappingType;
     plan.extensions.iter().find_map(|d| match &d.mapping_type {
