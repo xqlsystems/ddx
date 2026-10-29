@@ -786,7 +786,10 @@ impl ddx_ad::Backend for PyBackend {
         compiled: &Py<PyAny>,
     ) -> impl Future<Output = PyResult<()>> + Send {
         self.call(|b| {
-            b.call_method1("materialize_compiled", (name, bytes(b.py(), plan), compiled))?;
+            b.call_method1(
+                "materialize_compiled",
+                (name, bytes(b.py(), plan), compiled),
+            )?;
             Ok(())
         })
     }

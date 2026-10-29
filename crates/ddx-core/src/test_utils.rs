@@ -44,15 +44,15 @@ pub struct Rng(u64);
 impl Rng {
     /// Seed the generator.
     pub fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+        Rng(seed.wrapping_add(0x9e37_79b9_7f4a_7c15))
     }
 
     /// The next raw 64-bit output.
     pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
 
@@ -76,7 +76,7 @@ impl Rng {
 /// The seed schedule the bounded suites share, so a seed index means the same
 /// thing everywhere and a `salt` keeps different properties on different ground.
 pub fn seeded(seed: u64, salt: u64) -> Rng {
-    Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ salt)
+    Rng::new(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ salt)
 }
 
 /// The differentiation variable a check runs against.

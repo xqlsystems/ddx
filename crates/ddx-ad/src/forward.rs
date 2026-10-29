@@ -280,7 +280,10 @@ impl Region {
     fn detached_cuts(&self) -> Vec<Cut> {
         let mut cuts = self.cuts.clone();
         for (c, d) in self.defs.iter().enumerate() {
-            if let Def::Window { keys: Some(keys), .. } = d {
+            if let Def::Window {
+                keys: Some(keys), ..
+            } = d
+            {
                 cuts.push(self.cut(Some(keys.clone()), c));
             }
         }
@@ -625,7 +628,9 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
             path.pop();
             return Ok(());
         }
-        RelKind.then(Inputs).try_modify(rel, &mut |input| inline(input, relations, path))
+        RelKind
+            .then(Inputs)
+            .try_modify(rel, &mut |input| inline(input, relations, path))
     }
     let mut out = root.clone();
     inline(&mut out, relations, &mut Vec::new())?;
@@ -639,7 +644,8 @@ pub(crate) fn inline_references(root: &Rel, relations: &[PlanRel]) -> Result<Rel
 
 /// Does `rel` still hold a `ReferenceRel` anywhere, subqueries included?
 fn mentions_reference(rel: &Rel) -> bool {
-    Deep.then(RelKind).any(rel, |k| matches!(k, RelType::Reference(_)))
+    Deep.then(RelKind)
+        .any(rel, |k| matches!(k, RelType::Reference(_)))
 }
 
 /// A structural id for each aggregate of a plan: equal ids for equal
@@ -812,7 +818,10 @@ fn take_input_slots(kind: &mut RelType) -> Vec<Option<Rel>> {
         RelType::ExtensionSingle(r) => vec![take(&mut r.input)],
         RelType::Join(r) => vec![take(&mut r.left), take(&mut r.right)],
         RelType::Cross(r) => vec![take(&mut r.left), take(&mut r.right)],
-        RelType::Set(r) => std::mem::take(&mut r.inputs).into_iter().map(Some).collect(),
+        RelType::Set(r) => std::mem::take(&mut r.inputs)
+            .into_iter()
+            .map(Some)
+            .collect(),
         RelType::ExtensionMulti(r) => std::mem::take(&mut r.inputs)
             .into_iter()
             .map(Some)
@@ -904,7 +913,6 @@ impl Builder<'_> {
         }
         Ok(s)
     }
-
 
     /// Lower `rel`, which reads a `wrt` table, over `below`, its input's
     /// region, if it is a single-input relation [`Builder::lower`] walked
@@ -1191,14 +1199,15 @@ impl Builder<'_> {
                              and MIN windows; a rank or row number has none)"
                         )),
                     ),
-                    Ok(Some(Reduce::Of(form, _))) if form.extreme.is_some() && !reduces => s.refuse(
-                        col,
-                        AdError::NotImplemented(format!(
-                            "a running `{name}` (a window whose frame is narrower than its \
+                    Ok(Some(Reduce::Of(form, _))) if form.extreme.is_some() && !reduces => s
+                        .refuse(
+                            col,
+                            AdError::NotImplemented(format!(
+                                "a running `{name}` (a window whose frame is narrower than its \
                              partition) is used as a value that carries gradient; ddx \
                              differentiates a MAX or MIN window over each whole partition"
-                        )),
-                    ),
+                            )),
+                        ),
                     Ok(Some(_)) => {}
                 }
                 col
@@ -1384,7 +1393,13 @@ impl Builder<'_> {
             let row = rels
                 .iter()
                 .enumerate()
-                .map(|(j, r)| if j == k { r.clone() } else { emit::no_rows(r.clone()) })
+                .map(|(j, r)| {
+                    if j == k {
+                        r.clone()
+                    } else {
+                        emit::no_rows(r.clone())
+                    }
+                })
                 .reduce(|l, r| emit::join(l, r, lit_bool(true), JoinType::Outer))
                 .expect("at least one input");
             let row = emit::project(row, outputs.iter().map(|&c| field(offset + c)).collect());
@@ -1551,7 +1566,9 @@ impl Builder<'_> {
 
     /// Does anything in `rel` call a volatile function?
     fn volatile_under(&self, rel: &Rel) -> bool {
-        Tree.then(RelKind).then(Exprs).any(rel, |e| self.calls_volatile(e))
+        Tree.then(RelKind)
+            .then(Exprs)
+            .any(rel, |e| self.calls_volatile(e))
     }
 
     /// Does anything under `rel` read a `wrt` table? Records every table name
@@ -1594,10 +1611,12 @@ impl Builder<'_> {
                 below.push(referenced(self.relations, r.subtree_ordinal)?);
             }
             let mut correlated = false;
-            Exprs.then(subqueries()).each(kind, |sq| match uncorrelated_scalar(sq) {
-                Some(inner) => below.push(inner),
-                None => correlated = true,
-            });
+            Exprs
+                .then(subqueries())
+                .each(kind, |sq| match uncorrelated_scalar(sq) {
+                    Some(inner) => below.push(inner),
+                    None => correlated = true,
+                });
             if ready {
                 let found = correlated
                     || below
@@ -1654,9 +1673,7 @@ pub(crate) fn check_every_wrt_was_read(
                 w.table
             )));
         }
-        let read = tables
-            .iter()
-            .any(|t| table_matches(&w.table, &t.names));
+        let read = tables.iter().any(|t| table_matches(&w.table, &t.names));
         if !read {
             // A producer may drop a schema qualifier (Ibis writes `s.t`
             // as `t`), and then only the bare name can match.
@@ -1679,7 +1696,11 @@ pub(crate) fn check_every_wrt_was_read(
 /// The `wrt` table `names` (with `schema`): its values are the columns `wrt`
 /// names, its dims the rest. Refused unless every value is floating point and
 /// some column is a dim.
-pub(crate) fn wrt_table(names: &[String], schema: &NamedStruct, wrt: &[ColumnRef]) -> Result<Table> {
+pub(crate) fn wrt_table(
+    names: &[String],
+    schema: &NamedStruct,
+    wrt: &[ColumnRef],
+) -> Result<Table> {
     if schema.r#struct.as_ref().map(|s| s.types.len()) != Some(schema.names.len()) {
         return Err(AdError::NotImplemented(format!(
             "table `{}` has nested columns",
@@ -1713,10 +1734,7 @@ pub(crate) fn wrt_table(names: &[String], schema: &NamedStruct, wrt: &[ColumnRef
     for &v in &values {
         let float = matches!(
             types.get(v).and_then(|t| t.kind.as_ref()),
-            Some(
-                substrait::proto::r#type::Kind::Fp32(_)
-                    | substrait::proto::r#type::Kind::Fp64(_)
-            )
+            Some(substrait::proto::r#type::Kind::Fp32(_) | substrait::proto::r#type::Kind::Fp64(_))
         );
         if !float {
             return Err(AdError::InvalidWrt(format!(
@@ -1775,7 +1793,10 @@ fn rename_in_place(rel: Rel, width: usize, cols: &[usize]) -> Rel {
 fn is_ordered(rel: &Rel) -> bool {
     Tree.then(RelKind).any(rel, |kind| {
         matches!(kind, RelType::Fetch(_) | RelType::Window(_))
-            || Exprs.then(Cosmos).then(Rex).any(kind, |x| matches!(x, RexType::WindowFunction(_)))
+            || Exprs
+                .then(Cosmos)
+                .then(Rex)
+                .any(kind, |x| matches!(x, RexType::WindowFunction(_)))
     })
 }
 
@@ -2030,10 +2051,12 @@ pub(crate) fn rounds_under(functions: &Functions, rel: &Rel) -> Result<bool> {
         }
         Ok(false)
     };
-    match Tree.then(RelKind).try_each(rel, &mut |kind| match here(kind) {
-        Ok(false) => ControlFlow::Continue(()),
-        found => ControlFlow::Break(found),
-    }) {
+    match Tree
+        .then(RelKind)
+        .try_each(rel, &mut |kind| match here(kind) {
+            Ok(false) => ControlFlow::Continue(()),
+            found => ControlFlow::Break(found),
+        }) {
         ControlFlow::Break(found) => found,
         ControlFlow::Continue(()) => Ok(false),
     }
@@ -2160,10 +2183,12 @@ mod tests {
     fn table(name: &str) -> Rel {
         Rel {
             rel_type: Some(RelType::Read(Box::new(ReadRel {
-                read_type: Some(ReadType::NamedTable(substrait::proto::read_rel::NamedTable {
-                    names: vec![name.into()],
-                    advanced_extension: None,
-                })),
+                read_type: Some(ReadType::NamedTable(
+                    substrait::proto::read_rel::NamedTable {
+                        names: vec![name.into()],
+                        advanced_extension: None,
+                    },
+                )),
                 ..Default::default()
             }))),
         }
@@ -2207,27 +2232,56 @@ mod tests {
         };
         let r = || Some(Box::new(crate::emit::read_step("t", vec!["c".into()])));
         let kinds = vec![
-            RelType::Filter(Box::new(FilterRel { input: r(), ..Default::default() })),
-            RelType::Fetch(Box::new(FetchRel { input: r(), ..Default::default() })),
-            RelType::Aggregate(Box::new(AggregateRel { input: r(), ..Default::default() })),
-            RelType::Sort(Box::new(SortRel { input: r(), ..Default::default() })),
-            RelType::Project(Box::new(ProjectRel { input: r(), ..Default::default() })),
+            RelType::Filter(Box::new(FilterRel {
+                input: r(),
+                ..Default::default()
+            })),
+            RelType::Fetch(Box::new(FetchRel {
+                input: r(),
+                ..Default::default()
+            })),
+            RelType::Aggregate(Box::new(AggregateRel {
+                input: r(),
+                ..Default::default()
+            })),
+            RelType::Sort(Box::new(SortRel {
+                input: r(),
+                ..Default::default()
+            })),
+            RelType::Project(Box::new(ProjectRel {
+                input: r(),
+                ..Default::default()
+            })),
             RelType::Window(Box::new(ConsistentPartitionWindowRel {
                 input: r(),
                 ..Default::default()
             })),
-            RelType::Join(Box::new(JoinRel { left: r(), right: None, ..Default::default() })),
-            RelType::Cross(Box::new(CrossRel { left: r(), right: r(), ..Default::default() })),
+            RelType::Join(Box::new(JoinRel {
+                left: r(),
+                right: None,
+                ..Default::default()
+            })),
+            RelType::Cross(Box::new(CrossRel {
+                left: r(),
+                right: r(),
+                ..Default::default()
+            })),
             RelType::Set(SetRel {
                 inputs: vec![*r().unwrap(), *r().unwrap()],
                 ..Default::default()
             }),
         ];
         for mut kind in kinds {
-            let slots: Vec<*const Rel> =
-                input_slots(&kind).into_iter().flatten().map(|r| r as *const Rel).collect();
-            let inputs: Vec<*const Rel> =
-                Inputs.to_vec(&kind).into_iter().map(|r| r as *const Rel).collect();
+            let slots: Vec<*const Rel> = input_slots(&kind)
+                .into_iter()
+                .flatten()
+                .map(|r| r as *const Rel)
+                .collect();
+            let inputs: Vec<*const Rel> = Inputs
+                .to_vec(&kind)
+                .into_iter()
+                .map(|r| r as *const Rel)
+                .collect();
             assert_eq!(slots, inputs, "{}", rel_name(&kind));
             let taken = take_input_slots(&mut kind).into_iter().flatten().count();
             assert_eq!(taken, inputs.len(), "{}", rel_name(&kind));
@@ -2312,7 +2366,10 @@ mod tests {
         };
         // The top aggregate has one id either way, and the shared plan
         // interns no relation the written-out one does not.
-        assert_eq!(shapes.aggregates[&top(&dag)], written.aggregates[&top(&tree)]);
+        assert_eq!(
+            shapes.aggregates[&top(&dag)],
+            written.aggregates[&top(&tree)]
+        );
         assert_eq!(shapes.ids.len(), written.ids.len());
     }
 

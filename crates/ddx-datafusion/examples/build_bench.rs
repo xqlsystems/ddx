@@ -22,7 +22,8 @@
 //! `DDX_BENCH=depth,attn` runs only the cases whose names start so.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use datafusion::prelude::SessionContext;

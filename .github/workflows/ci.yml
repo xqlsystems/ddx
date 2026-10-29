@@ -41,8 +41,16 @@ jobs:
       # at build time.
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # rustfmt.toml's settings need a nightly rustfmt, pinned so a nightly
+      # change doesn't fail a PR.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-10-10
+          components: rustfmt
       - name: rustfmt (check only)
-        run: cargo fmt --all --check
+        run: |
+          cargo +nightly-2026-10-10 fmt --all --check
+          cargo +nightly-2026-10-10 fmt --manifest-path python/ddxdb/Cargo.toml --check
       - name: clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: docs (warnings are errors — keeps docs.rs clean)

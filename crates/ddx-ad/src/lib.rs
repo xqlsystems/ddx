@@ -73,17 +73,6 @@
 
 #![forbid(unsafe_code)]
 
-/// Modules public only with the `internals` feature (see the crate docs).
-macro_rules! internal {
-    ($(mod $m:ident;)*) => {$(
-        #[cfg(feature = "internals")]
-        #[doc(hidden)]
-        pub mod $m;
-        #[cfg(not(feature = "internals"))]
-        mod $m;
-    )*};
-}
-
 mod compose;
 mod contraction;
 mod elementwise;
@@ -101,12 +90,28 @@ mod tables;
 mod tangent;
 mod to_sql;
 mod transpose;
-internal! {
-    mod emit;
-    mod expr;
-    mod forward;
-    mod relation;
-}
+
+// Public only with the `internals` feature (see the crate docs).
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod emit;
+#[cfg(not(feature = "internals"))]
+mod emit;
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod expr;
+#[cfg(not(feature = "internals"))]
+mod expr;
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod forward;
+#[cfg(not(feature = "internals"))]
+mod forward;
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod relation;
+#[cfg(not(feature = "internals"))]
+mod relation;
 
 pub use compose::Differentiable;
 pub use emit::{rename_tables, tables_read};

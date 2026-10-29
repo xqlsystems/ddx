@@ -220,7 +220,7 @@ fn grad_in_sql_means_the_same_whatever_the_spelling() {
     let mut loud: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut same = 0u64;
     for seed in 0..n {
-        let mut rng = seeded(seed, 0x5711_7E47);
+        let mut rng = seeded(seed, 0x5711_7e47);
         let k = rng.below(STATEMENTS.len() as u64) as usize;
         let sql = variant(&mut rng, STATEMENTS[k]);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

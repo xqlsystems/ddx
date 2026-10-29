@@ -1128,9 +1128,8 @@ mod tests {
     fn a_case_on_a_value_takes_the_branch_it_matches() {
         // CASE c1 WHEN 0 THEN c0 * c0 ELSE 3 * c0 END, which DataFusion
         // writes as a switch (#98).
-        use substrait::proto::expression::{
-            if_then, switch_expression::IfValue, IfThen, SwitchExpression,
-        };
+        use substrait::proto::expression::switch_expression::IfValue;
+        use substrait::proto::expression::{if_then, IfThen, SwitchExpression};
         let fx = fixture();
         let Some(RexType::Literal(zero)) = lit_f64(0.0).rex_type else {
             unreachable!()
