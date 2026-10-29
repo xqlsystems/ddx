@@ -11,7 +11,8 @@ use std::future::Future;
 use ddx_core::sqlparser::dialect::Dialect;
 
 use super::plan::{self, Built};
-use super::{run_all, Programs, Rewritten};
+use super::rewritten::run_all;
+use super::{Programs, Rewritten};
 use crate::run::{Backend, Drops, Plans, RunError, Traced};
 
 /// What a job's run did on the engine, beyond what its program says: the
