@@ -684,10 +684,16 @@ async fn check(seed: u64) -> Vec<String> {
                     .map(|mut w| w.remove(0))
             }
         };
-        let refusal = |e: &str| e.contains("share their dims") || e.contains("unknown wrt column");
+        // The same kind of refusal on both sides: one for another would be
+        // a table resolved to the wrong one.
+        let refusal = |e: &str| {
+            ["share their dims", "unknown wrt column"]
+                .into_iter()
+                .find(|kind| e.contains(kind))
+        };
         match (&got, &want) {
             (Ok(g), Ok(w)) if close(g, w) => {}
-            (Err(g), Err(w)) if refusal(g) && refusal(w) => {}
+            (Err(g), Err(w)) if refusal(g).is_some() && refusal(g) == refusal(w) => {}
             _ => report.push(format!(
                 "loss {k}'s grad in SQL for {}: {got:?}, alone: {want:?}",
                 case.tables[t].sql()
