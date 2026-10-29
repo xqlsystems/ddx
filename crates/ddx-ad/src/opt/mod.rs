@@ -9,12 +9,15 @@
 //!   program's steps.
 //! - [`fuse`]: fold a projection that only picks columns into its
 //!   neighbour.
+//! - [`inline`]: compute a step that one later step reads, once, inside
+//!   that step.
 //! - [`split`]: split a step too deep for a consumer into steps.
 //!
 //! Every plan ddx writes goes through [`plan`]; every program's steps,
 //! through [`steps`] once they are final.
 
 pub(crate) mod fuse;
+pub(crate) mod inline;
 pub(crate) mod prune;
 pub(crate) mod split;
 
@@ -37,8 +40,9 @@ pub(crate) fn steps(steps: &mut Vec<Step>) {
 
 /// Optimize a backward program: prune each plan, then across steps, from the
 /// last back, so each step keeps only the columns some later step reads (the
-/// value and the gradients keep all theirs); fuse each; then split the
-/// steps too deep for a consumer.
+/// value and the gradients keep all theirs); fuse each; inline each step
+/// that one later step reads once; then split the steps too deep for a
+/// consumer.
 pub(crate) fn backward_program(program: &mut BackwardProgram) {
     for c in program.checks.iter_mut() {
         plan(&mut c.plan.0);
@@ -77,6 +81,27 @@ pub(crate) fn backward_program(program: &mut BackwardProgram) {
         }
         note_reads(&step.plan, &mut read);
     }
+    inline_program(program, &keep);
     steps(&mut program.forward_steps);
     steps(&mut program.backward_steps);
+}
+
+/// [`inline::inline_steps`] over a program's forward and backward steps,
+/// in the order they run; each step that stays keeps its place.
+fn inline_program(program: &mut BackwardProgram, keep: &BTreeSet<String>) {
+    let forward: BTreeSet<String> = program
+        .forward_steps
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    let mut all = std::mem::take(&mut program.forward_steps);
+    all.append(&mut program.backward_steps);
+    inline::inline_steps(&mut all, keep);
+    for s in all {
+        if forward.contains(&s.name) {
+            program.forward_steps.push(s);
+        } else {
+            program.backward_steps.push(s);
+        }
+    }
 }

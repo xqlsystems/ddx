@@ -80,6 +80,11 @@ fn split_plan(plan: &mut Plan, name: &str, parts: &mut Vec<Step>) {
     }
 }
 
+/// How many relations deep `plan`'s root is; 0 if it has none.
+pub(crate) fn depth_of(plan: &Plan) -> usize {
+    root_of(plan).map_or(0, |(root, _)| depth(root))
+}
+
 /// How many relations deep `rel` is, walked with a loop.
 fn depth(rel: &Rel) -> usize {
     let mut deepest = 0;
