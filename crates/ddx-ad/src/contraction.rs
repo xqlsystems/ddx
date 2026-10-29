@@ -871,6 +871,15 @@ fn slice(region: &Region, leaf: &Leaf) -> Result<Option<Region>> {
                 }
             }
             Def::Const => Def::Const,
+            Def::Branch => Def::Branch,
+            Def::Union(arms) => match arms
+                .iter()
+                .map(|&(b, c)| Ok((local(b)?, local(c)?)))
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(arms) => Def::Union(arms),
+                Err(_) => return Ok(None),
+            },
         };
         defs.push(def);
     }

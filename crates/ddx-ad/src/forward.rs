@@ -53,9 +53,10 @@ use substrait::proto::plan_rel::RelType as PlanRelType;
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::EmitKind;
+use substrait::proto::set_rel::SetOp;
 use substrait::proto::{
     AggregateFunction, AggregateRel, ConsistentPartitionWindowRel, CrossRel, Expression, FetchRel,
-    JoinRel, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, SortRel,
+    JoinRel, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, SetRel, SortRel,
 };
 
 use crate::elementwise::depends;
@@ -158,6 +159,21 @@ pub enum Def {
     },
     /// A column of a constant input.
     Const,
+    /// TRUE in the rows one input of a `UNION ALL` gave, NULL in the rows
+    /// the others gave. See [`Def::Union`].
+    Branch,
+    /// A column of a `UNION ALL`: in the rows each input gave, that input's
+    /// column. Each pair is an input's [`Def::Branch`] column and its column.
+    ///
+    /// A union is rebuilt as one relation that holds every input's columns:
+    /// each input's rows carry its own columns and NULL in every other
+    /// input's. So the row-local rules apply above and beneath it, and its
+    /// transpose is a select: a row's cotangent goes to the column of the
+    /// input that gave the row, and NULL, no cotangent, to the others'.
+    /// Everything beneath an input is computed from its own columns, so its
+    /// cotangents are NULL in the rows other inputs gave, and those rows
+    /// send it no gradient.
+    Union(Vec<(usize, usize)>),
 }
 
 /// A rebuilt, recomputed region of row-local work.
@@ -214,6 +230,12 @@ impl Region {
                     offset: offset + shift,
                 },
                 Def::Const => Def::Const,
+                Def::Branch => Def::Branch,
+                Def::Union(arms) => Def::Union(
+                    arms.into_iter()
+                        .map(|(b, c)| (b + shift, c + shift))
+                        .collect(),
+                ),
             });
         }
         self.varied.extend(other.varied);
@@ -1003,6 +1025,10 @@ impl Builder<'_> {
                 let (s, direct) = self.cross(c)?;
                 (s, direct, c.common.as_ref())
             }
+            RelType::Set(u) => {
+                let (s, direct) = self.union_all(u)?;
+                (s, direct, u.common.as_ref())
+            }
             RelType::Aggregate(a) => {
                 let n = self.read_saved(a, below.take())?;
                 let width = self.saved[n].outputs.len();
@@ -1303,6 +1329,90 @@ impl Builder<'_> {
             }))),
         };
         Ok((s, direct))
+    }
+
+    /// A `UNION ALL`, rebuilt as one relation that holds every input's
+    /// columns (see [`Def::Union`]): each input's columns, then its
+    /// [`Def::Branch`]; after them all, the union's columns.
+    fn union_all(&mut self, u: &SetRel) -> Result<(Region, Vec<usize>)> {
+        if SetOp::try_from(u.op) != Ok(SetOp::UnionAll) {
+            return Err(AdError::NotImplemented(
+                "a set operation other than UNION ALL on the path from a wrt table to the \
+                 output"
+                    .into(),
+            ));
+        }
+        let mut inputs = Vec::with_capacity(u.inputs.len());
+        for r in &u.inputs {
+            let mut s = self.lower(r)?;
+            s.rel = emit::project(s.rel, vec![lit_bool(true)]);
+            s.push(Def::Branch, false);
+            inputs.push(s);
+        }
+        let rels: Vec<Rel> = inputs.iter().map(|s| s.rel.clone()).collect();
+        let mut inputs = inputs.into_iter();
+        let mut s = inputs
+            .next()
+            .ok_or_else(|| AdError::InvalidPlan("a set operation with no inputs".into()))?;
+        // Each input's first column here, its outputs, and its branch column.
+        let mut blocks = vec![(0, s.outputs.clone(), s.width() - 1)];
+        for r in inputs {
+            let outputs = r.outputs.clone();
+            let w = r.width();
+            let shift = s.append(r)?;
+            blocks.push((shift, outputs, shift + w - 1));
+        }
+        let width = blocks[0].1.len();
+        if blocks.iter().any(|(_, outputs, _)| outputs.len() != width) {
+            return Err(AdError::InvalidPlan(
+                "a UNION ALL whose inputs have different numbers of columns".into(),
+            ));
+        }
+        // Each input's rows, with every other input's columns NULL: FULL
+        // JOINed to none of the others' rows, so the engine types the NULLs
+        // as it types the columns.
+        //
+        // DataFusion names a union's columns after its first input's,
+        // without their tables, and suffixes a repeated name: a second `x`
+        // is `x_1`, though a table may already have an `x_1`, and the union
+        // is refused. So each input's columns are renamed first, each after
+        // its own table and column, which no other has.
+        let w = s.width() + width;
+        let all: Vec<usize> = (0..w).collect();
+        let mut rows = Vec::with_capacity(rels.len());
+        for (k, (offset, outputs, _)) in blocks.iter().enumerate() {
+            let row = rels
+                .iter()
+                .enumerate()
+                .map(|(j, r)| if j == k { r.clone() } else { emit::no_rows(r.clone()) })
+                .reduce(|l, r| emit::join(l, r, lit_bool(true), JoinType::Outer))
+                .expect("at least one input");
+            let row = emit::project(row, outputs.iter().map(|&c| field(offset + c)).collect());
+            rows.push(match rels.len() {
+                1 => row,
+                _ => rename_in_place(row, w, &all),
+            });
+        }
+        s.rel = match rows.len() {
+            1 => rows.pop().expect("one input"),
+            _ => emit::union_all(rows),
+        };
+        let base = s.width();
+        for c in 0..width {
+            let arms: Vec<(usize, usize)> = blocks
+                .iter()
+                .map(|(offset, outputs, branch)| (*branch, offset + outputs[c]))
+                .collect();
+            let varied = arms.iter().any(|&(_, a)| s.varied[a]);
+            s.push(Def::Union(arms), varied);
+        }
+        // The union has every input's rows: one row from each is several.
+        if blocks.len() > 1 {
+            for slot in &mut s.slots {
+                slot.at_most_one_row = false;
+            }
+        }
+        Ok((s, (base..base + width).collect()))
     }
 
     /// The saved relation for aggregate `a`, read on first sight.

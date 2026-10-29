@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Gradients of whole queries against `jax.grad` and `jax.jvp`: an MLP,
-attention, max-pooling, and the example network's own SQL.
+attention, message passing, max-pooling, and the example network's own SQL.
 
 The first three fixtures come from the small Python programs that tested
 ddx's design before it was built (`docs/spikes/relational_ad_spike.py`,
@@ -315,6 +315,46 @@ def test_attention_matches_jax_grad(env):
         return 0.5 * ((A @ V - jnp.array(tgt)) ** 2).sum()
 
     expected = jax.grad(jax_loss, argnums=(0, 1, 2, 3))(*map(jnp.array, inputs.values()))
+    for name, want in zip(inputs, expected):
+        np.testing.assert_allclose(got[name], np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=name)
+
+
+def test_message_passing_matches_jax_grad(env):
+    jax, ad, ctx = env
+    jnp = jax.numpy
+    # GraphCast's message passing: each edge's MLP reads its own features,
+    # its sender's and its receiver's, concatenated: in SQL a UNION ALL at
+    # offset feature indices, in JAX jnp.concatenate.
+    rng = np.random.default_rng(3)
+    n_edges, n_nodes, de, dv, dh = 6, 4, 3, 2, 5
+    E = rng.standard_normal((n_edges, de))
+    H = rng.standard_normal((n_nodes, dv))
+    W = rng.standard_normal((de + 2 * dv, dh)) * 0.5
+    snd = rng.integers(0, n_nodes, n_edges)
+    rcv = rng.integers(0, n_nodes, n_edges)
+
+    inputs = {"e": E, "h": H, "w": W}
+    register(ctx, "e", E, ("t", "d"))
+    register(ctx, "h", H, ("n", "d"))
+    register(ctx, "w", W, ("d", "o"))
+    edges = pa.table({"t": pa.array(range(n_edges), pa.int64()), "snd": snd, "rcv": rcv})
+    ctx.register_record_batches("edges", [edges.to_batches()])
+    with_loss = f"""
+    WITH x AS (SELECT t, d, val FROM e
+               UNION ALL SELECT edges.t, h.d + {de} AS d, h.val
+                         FROM edges JOIN h ON edges.snd = h.n
+               UNION ALL SELECT edges.t, h.d + {de + dv} AS d, h.val
+                         FROM edges JOIN h ON edges.rcv = h.n),
+         y AS (SELECT x.t, w.o, SUM(x.val * w.val) AS val
+               FROM x JOIN w ON x.d = w.d GROUP BY x.t, w.o),
+         loss AS (SELECT SUM(tanh(val) * tanh(val)) AS loss FROM y)"""
+    got = gradients(ad, ctx, with_loss, inputs)
+
+    def jax_loss(E, H, W):
+        X = jnp.concatenate([E, H[snd], H[rcv]], axis=1)
+        return (jnp.tanh(X @ W) ** 2).sum()
+
+    expected = jax.grad(jax_loss, argnums=(0, 1, 2))(*map(jnp.array, inputs.values()))
     for name, want in zip(inputs, expected):
         np.testing.assert_allclose(got[name], np.asarray(want), rtol=0, atol=TOLERANCE, err_msg=name)
 
