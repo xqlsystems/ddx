@@ -53,7 +53,9 @@ jobs:
           cargo +nightly-2026-10-10 fmt --all --check
           cargo +nightly-2026-10-10 fmt --manifest-path python/ddxdb/Cargo.toml --check
       - name: clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path python/ddxdb/Cargo.toml --all-targets -- -D warnings
       - name: docs (warnings are errors — keeps docs.rs clean)
         run: cargo doc --workspace --no-deps
         env:

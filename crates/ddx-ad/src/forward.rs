@@ -163,7 +163,7 @@ pub enum Def {
     /// the others gave. See [`Def::Union`].
     Branch,
     /// A column of a `UNION ALL`: in the rows each input gave, that input's
-    /// column. Each pair is an input's [`Def::Branch`] column and its column.
+    /// column, one [`Arm`] per input.
     ///
     /// A union is rebuilt as one relation that holds every input's columns:
     /// each input's rows carry its own columns and NULL in every other
@@ -173,7 +173,16 @@ pub enum Def {
     /// Everything beneath an input is computed from its own columns, so its
     /// cotangents are NULL in the rows other inputs gave, and those rows
     /// send it no gradient.
-    Union(Vec<(usize, usize)>),
+    Union(Vec<Arm>),
+}
+
+/// An input of a `UNION ALL`, for one of its columns ([`Def::Union`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm {
+    /// The input's [`Def::Branch`] column.
+    pub branch: usize,
+    /// The input's column.
+    pub column: usize,
 }
 
 /// A rebuilt, recomputed region of row-local work.
@@ -233,7 +242,10 @@ impl Region {
                 Def::Branch => Def::Branch,
                 Def::Union(arms) => Def::Union(
                     arms.into_iter()
-                        .map(|(b, c)| (b + shift, c + shift))
+                        .map(|a| Arm {
+                            branch: a.branch + shift,
+                            column: a.column + shift,
+                        })
                         .collect(),
                 ),
             });
@@ -365,6 +377,7 @@ pub struct Forward {
 }
 
 /// The name of saved aggregate `n`'s table, in a program's `namespace`.
+#[must_use]
 pub fn saved_name(namespace: &str, n: usize) -> String {
     format!("{namespace}saved_{n}")
 }
@@ -387,6 +400,7 @@ pub fn new_namespace() -> String {
 }
 
 /// The column names of a saved relation or its cotangent, `width` wide.
+#[must_use]
 pub fn step_columns(width: usize) -> Vec<String> {
     (0..width).map(|i| format!("c{i}")).collect()
 }
@@ -1363,6 +1377,7 @@ impl Builder<'_> {
         let mut s = inputs
             .next()
             .ok_or_else(|| AdError::InvalidPlan("a set operation with no inputs".into()))?;
+        let width = s.outputs.len();
         // Each input's first column here, its outputs, and its branch column.
         let mut blocks = vec![(0, s.outputs.clone(), s.width() - 1)];
         for r in inputs {
@@ -1371,7 +1386,6 @@ impl Builder<'_> {
             let shift = s.append(r)?;
             blocks.push((shift, outputs, shift + w - 1));
         }
-        let width = blocks[0].1.len();
         if blocks.iter().any(|(_, outputs, _)| outputs.len() != width) {
             return Err(AdError::InvalidPlan(
                 "a UNION ALL whose inputs have different numbers of columns".into(),
@@ -1414,11 +1428,14 @@ impl Builder<'_> {
         };
         let base = s.width();
         for c in 0..width {
-            let arms: Vec<(usize, usize)> = blocks
+            let arms: Vec<Arm> = blocks
                 .iter()
-                .map(|(offset, outputs, branch)| (*branch, offset + outputs[c]))
+                .map(|(offset, outputs, branch)| Arm {
+                    branch: *branch,
+                    column: offset + outputs[c],
+                })
                 .collect();
-            let varied = arms.iter().any(|&(_, a)| s.varied[a]);
+            let varied = arms.iter().any(|a| s.varied[a.column]);
             s.push(Def::Union(arms), varied);
         }
         // The union has every input's rows: one row from each is several.

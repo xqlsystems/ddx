@@ -9,6 +9,11 @@
 //! Python caller can actually branch on. Nothing here decides anything about
 //! differentiation, and nothing here should grow to.
 
+// The Google Rust style guide's rules that clippy checks
+// (https://google.github.io/styleguide/rustguide.html).
+// (`needless_pass_by_value` is left out: pyo3 hands functions owned values.)
+#![warn(clippy::unwrap_used, clippy::wildcard_imports)]
+
 use std::future::{ready, Future, Ready};
 use std::pin::pin;
 use std::sync::Mutex;
@@ -885,7 +890,7 @@ fn _rewrite(
     statements: Vec<String>,
     dialect: &str,
     programs: Option<Py<Programs>>,
-) -> PyResult<(Vec<String>, Vec<String>, Release)> {
+) -> PyResult<Statements> {
     let parser = parser_for(dialect)?;
     let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
     let mut backend = PyBackend(backend.unbind());
@@ -927,10 +932,7 @@ impl Prepared {
     /// the same `backend`: returns what `_rewrite` returns, or `None`, and
     /// runs nothing, if the backend's views are not as `_prepare` found
     /// them.
-    fn run(
-        &self,
-        backend: Bound<'_, PyAny>,
-    ) -> PyResult<Option<(Vec<String>, Vec<String>, Release)>> {
+    fn run(&self, backend: Bound<'_, PyAny>) -> PyResult<Option<Statements>> {
         let Some(out) = now(self.0.run(&mut PyBackend(backend.unbind()))).map_err(run_err)? else {
             return Ok(None);
         };
@@ -941,6 +943,10 @@ impl Prepared {
         format!("{:?}", self.0)
     }
 }
+
+/// What `_rewrite` returns to Python: the rewritten statements, the tables
+/// they read, and what releases those tables.
+type Statements = (Vec<String>, Vec<String>, Release);
 
 /// What `_rewrite` left for the caller to release: the tables its
 /// statements read, and the programs that wrote them, kept only once the
@@ -955,10 +961,7 @@ struct Release {
 impl Release {
     /// `out`'s statements and tables, and what releases them, then keeps
     /// `programs`' programs.
-    fn of(
-        out: ddx_ad::Rewritten,
-        programs: Option<Py<Programs>>,
-    ) -> (Vec<String>, Vec<String>, Release) {
+    fn of(out: ddx_ad::Rewritten, programs: Option<Py<Programs>>) -> Statements {
         let (statements, tables) = (out.statements.clone(), out.tables.clone());
         let release = Release {
             rewritten: Mutex::new(Some(out)),
@@ -977,7 +980,7 @@ impl Release {
         let taken = self
             .rewritten
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .map_err(|_| DdxError::new_err("a panic interrupted an earlier release"))?
             .take();
         let Some(rewritten) = taken else {
             return Ok(());

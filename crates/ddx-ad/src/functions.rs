@@ -108,6 +108,7 @@ functions! {
 impl Function {
     /// The function named `name`, compared as [`normalize`] does; `None` if
     /// it is not one ddx may write.
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Function> {
         let name = normalize(name);
         Function::ALL.iter().copied().find(|f| f.name() == name)
@@ -120,6 +121,7 @@ pub const STOP_GRADIENT: &str = "ddx_stop_gradient";
 
 /// A function name as ddx compares it: lower-cased, without a `:signature`
 /// suffix.
+#[must_use]
 pub fn normalize(name: &str) -> String {
     let base = name.split(':').next().unwrap_or(name);
     base.to_ascii_lowercase()
@@ -245,6 +247,7 @@ impl Functions {
     }
 
     /// The declarations, as the plan gave them.
+    #[must_use]
     pub fn declarations(&self) -> &[ExtensionFunction] {
         &self.declarations
     }
@@ -268,6 +271,7 @@ pub struct Extensions {
 
 impl Extensions {
     /// Start from `functions`' declarations.
+    #[must_use]
     pub fn new(functions: &Functions) -> Self {
         let mut by_name = HashMap::new();
         for d in functions.declarations() {
@@ -320,6 +324,7 @@ impl Extensions {
 
     /// The declarations, for a plan's `extensions` list: the input plan's,
     /// functions and otherwise, then those ddx added.
+    #[must_use]
     pub fn declarations(&self) -> Vec<SimpleExtensionDeclaration> {
         self.declarations
             .iter()
@@ -332,6 +337,7 @@ impl Extensions {
 
     /// The input plan's extension URNs, for a plan's `extension_urns` list,
     /// so a declaration copied from it still points at its URN.
+    #[must_use]
     pub fn urns(&self) -> Vec<SimpleExtensionUrn> {
         self.urns.clone()
     }

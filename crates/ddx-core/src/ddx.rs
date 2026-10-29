@@ -51,6 +51,7 @@ impl Ddx {
     /// A new engine with the built-in rule set and the generic
     /// (`FoldUnquoted`) identifier policy — the DataFusion/Postgres rule
     /// (unquoted identifiers fold to lowercase, quoted keep case).
+    #[must_use]
     pub fn new() -> Self {
         Ddx {
             rules: RuleRegistry::new(),
@@ -59,6 +60,7 @@ impl Ddx {
     }
 
     /// A new engine with the built-in rules and an explicit identifier policy.
+    #[must_use]
     pub fn with_casing(casing: IdentCasing) -> Self {
         Ddx {
             rules: RuleRegistry::new(),
@@ -71,11 +73,13 @@ impl Ddx {
     /// Read from the rule registry, so it reflects what is implemented rather
     /// than a list kept in step by hand — and it includes anything registered
     /// through [`Ddx::register`].
+    #[must_use]
     pub fn unary_rule_names(&self) -> Vec<String> {
         self.rules.unary_names()
     }
 
     /// The identifier-folding policy this engine compares columns under.
+    #[must_use]
     pub fn casing(&self) -> IdentCasing {
         self.casing
     }

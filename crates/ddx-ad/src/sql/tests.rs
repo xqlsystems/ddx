@@ -5,9 +5,9 @@
 //! Unit tests of the SQL layer: finding calls, planning derivatives,
 //! rewriting statements.
 
-use super::find::*;
-use super::plan::*;
-use super::rewrite::*;
+use super::find::{Calls, Derivative, Site, Tangent, Transform};
+use super::plan::{Derivatives, Job, Restriction};
+use super::rewrite::Answer;
 use crate::error::AdError;
 use crate::relation::ColumnRef;
 use crate::tables::{InputTable, OutputTable};

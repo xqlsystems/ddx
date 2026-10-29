@@ -66,6 +66,7 @@ impl RuleRegistry {
     /// A registry populated with the built-in rule set: `+ - * /`, the unary
     /// chain rule for the trig / inverse-trig / exp / log / hyperbolic set plus
     /// `abs`, and `power` with a constant base or exponent.
+    #[must_use]
     pub fn new() -> Self {
         let mut unary: HashMap<String, Rule> = HashMap::new();
 
@@ -128,6 +129,7 @@ impl RuleRegistry {
     /// what is implemented — and so a test asking "is every rule covered?" is
     /// asking the engine instead of a second list that has to be maintained
     /// alongside the first. Includes rules a caller registered.
+    #[must_use]
     pub fn unary_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.unary.keys().cloned().collect();
         names.sort();

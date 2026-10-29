@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -66,15 +66,21 @@ pub(crate) async fn ready(
     compiled: &Compiled,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let state = ctx.state();
-    let physical = Arc::clone(&compiled.0.lock().unwrap_or_else(PoisonError::into_inner));
-    if let Some(ready) = with_scans(&state, &physical).await? {
-        return Ok(ready);
+    // A poisoned lock (a panic while it was held) is read as no plan:
+    // `plan` is planned again each run.
+    let kept = compiled.0.lock().ok().map(|p| Arc::clone(&p));
+    if let Some(physical) = kept {
+        if let Some(ready) = with_scans(&state, &physical).await? {
+            return Ok(ready);
+        }
     }
     let physical = self::physical(ctx, plan).await?;
     let ready = with_scans(&state, &physical).await?.ok_or_else(|| {
         DataFusionError::Internal("a compiled plan's scans changed as it was built".into())
     })?;
-    *compiled.0.lock().unwrap_or_else(PoisonError::into_inner) = physical;
+    if let Ok(mut kept) = compiled.0.lock() {
+        *kept = physical;
+    }
     Ok(ready)
 }
 

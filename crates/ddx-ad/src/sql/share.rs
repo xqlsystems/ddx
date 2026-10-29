@@ -332,7 +332,7 @@ fn replace<V: VisitMut>(node: &mut V, ctes: &[Cte], placeholders: &HashMap<usize
 /// after the root, and each read of its placeholder a `ReferenceRel` to it,
 /// with the read's filter and projection kept. Functions are declared
 /// again from one set, as a program's plans are.
-pub(super) fn stitch(split: &Split, pieces: Vec<Plan>, root: &Plan) -> Result<Plan> {
+pub(super) fn stitch(split: &Split, pieces: &[Plan], root: &Plan) -> Result<Plan> {
     let mut ext = Extensions::new(&Functions::from_plan(&Plan::default())?);
     let ordinals: HashMap<&str, i32> = split
         .ctes
@@ -341,7 +341,7 @@ pub(super) fn stitch(split: &Split, pieces: Vec<Plan>, root: &Plan) -> Result<Pl
         .map(|(i, p)| (p.placeholder.as_str(), i as i32 + 1))
         .collect();
     let mut relations = Vec::with_capacity(pieces.len());
-    for plan in &pieces {
+    for plan in pieces {
         relations.push(PlanRel {
             rel_type: Some(substrait::proto::plan_rel::RelType::Rel(one(
                 plan, &ordinals, &mut ext,

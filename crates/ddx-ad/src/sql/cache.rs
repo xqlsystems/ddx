@@ -38,44 +38,53 @@ const CAPACITY: usize = 16;
 #[derive(Default)]
 pub struct Programs {
     /// Least recently used first.
-    kept: Mutex<Vec<(Key, Box<dyn Built>)>>,
+    kept: Mutex<Vec<Kept>>,
+}
+
+/// A program, and the key it is kept under.
+struct Kept {
+    key: Key,
+    program: Box<dyn Built>,
 }
 
 impl Programs {
     /// None kept yet.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The program kept under `key`, taken out.
     pub(super) fn take(&self, key: &Key) -> Option<Box<dyn Built>> {
-        let mut kept = self.lock();
-        let i = kept.iter().position(|(k, _)| k == key)?;
-        Some(kept.remove(i).1)
+        let mut kept = self.lock()?;
+        let i = kept.iter().position(|k| k.key == *key)?;
+        Some(kept.remove(i).program)
     }
 
     /// Keep `program` under `key`, as the most recently used, in place of
     /// one kept under it.
     pub(super) fn keep(&self, key: Key, program: Box<dyn Built>) {
-        let mut kept = self.lock();
-        kept.retain(|(k, _)| *k != key);
-        kept.push((key, program));
+        let Some(mut kept) = self.lock() else {
+            return;
+        };
+        kept.retain(|k| k.key != key);
+        kept.push(Kept { key, program });
         if kept.len() > CAPACITY {
             kept.remove(0);
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(Key, Box<dyn Built>)>> {
-        // A panic while the lock was held left the list whole: every change
-        // to it is one call that does not panic.
-        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    /// The kept programs, or `None` once a panic has poisoned the lock: then
+    /// nothing more is kept, and every program is built again.
+    fn lock(&self) -> Option<MutexGuard<'_, Vec<Kept>>> {
+        self.kept.lock().ok()
     }
 }
 
 impl fmt::Debug for Programs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Programs")
-            .field("kept", &self.lock().len())
+            .field("kept", &self.lock().map(|kept| kept.len()))
             .finish()
     }
 }

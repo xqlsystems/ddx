@@ -169,6 +169,7 @@ impl<C: Send + Sync> Prepared<C> {
     }
 
     /// The statements, rewritten as every run gives them.
+    #[must_use]
     pub fn statements(&self) -> &[String] {
         &self.statements
     }
