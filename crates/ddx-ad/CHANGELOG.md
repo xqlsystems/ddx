@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.1...ddx-ad-v0.3.2) - 2026-10-29
+
+### Added
+
+- *(ddx-ad)* differentiate through UNION ALL in reverse mode ([#229](https://github.com/xqlsystems/ddx/pull/229))
+
+### Other
+
+- *(ddx-ad)* move code out of the to_sql and sql non-leaf modules ([#240](https://github.com/xqlsystems/ddx/pull/240))
+- check the Google Rust style guide's rules with clippy, and follow them ([#239](https://github.com/xqlsystems/ddx/pull/239))
+- format every file with the Google Rust style guide's rustfmt settings ([#234](https://github.com/xqlsystems/ddx/pull/234))
+- the soak writes contractions; the mutation test's mutants fit the code ([#232](https://github.com/xqlsystems/ddx/pull/232))
+- *(ddx-ad)* compute a step that one later step reads once inside it ([#231](https://github.com/xqlsystems/ddx/pull/231))
+- a property test for identity; a one-row join of constant data ([#230](https://github.com/xqlsystems/ddx/pull/230))
+
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.0...ddx-ad-v0.3.1) - 2026-10-28
 
 ### Added

@@ -9,6 +9,19 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.1...ddx-datafusion-v0.4.2) - 2026-10-29
+
+### Added
+
+- *(ddx-ad)* differentiate through UNION ALL in reverse mode ([#229](https://github.com/xqlsystems/ddx/pull/229))
+
+### Other
+
+- check the Google Rust style guide's rules with clippy, and follow them ([#239](https://github.com/xqlsystems/ddx/pull/239))
+- format every file with the Google Rust style guide's rustfmt settings ([#234](https://github.com/xqlsystems/ddx/pull/234))
+- the soak writes contractions; the mutation test's mutants fit the code ([#232](https://github.com/xqlsystems/ddx/pull/232))
+- a property test for identity; a one-row join of constant data ([#230](https://github.com/xqlsystems/ddx/pull/230))
+
 ## [0.4.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.0...ddx-datafusion-v0.4.1) - 2026-10-28
 
 ### Changed
