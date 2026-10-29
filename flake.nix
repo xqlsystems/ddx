@@ -23,7 +23,9 @@
             cargo
             rustc
             clippy
-            rustfmt
+            # rustfmt.toml's import settings are nightly-only; this is the
+            # same rustfmt with them enabled.
+            (rustfmt.override { asNightly = true; })
             rust-analyzer
             # Python: uv drives the venvs (python/ddxdb and tests/); maturin is
             # for `maturin develop`. python312 is what CI and the docs use.

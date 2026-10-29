@@ -374,7 +374,7 @@ struct Modes {
 
 impl Modes {
     fn draw(seed: u64) -> (Modes, Rng) {
-        let mut r = seeded(seed, 0xD47A_5EED);
+        let mut r = seeded(seed, 0xd47a_5eed);
         let extreme = |r: &mut Rng| {
             *r.pick(&[
                 Extreme::Huge,
@@ -1667,7 +1667,7 @@ const HEADS: &[&str] = &[
 /// from another. The first stream is returned for the properties to go on
 /// drawing from, so a seed replays its checks exactly.
 fn case_for(seed: u64) -> (Case, Rng) {
-    let mut rng = seeded(seed, 0xAD_5EED_0002);
+    let mut rng = seeded(seed, 0xad_5eed_0002);
     let (modes, mut mrng) = Modes::draw(seed);
     let case = gen_case(&mut rng, modes, &mut mrng);
     (case, rng)

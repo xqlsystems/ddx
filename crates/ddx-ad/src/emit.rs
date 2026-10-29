@@ -33,14 +33,14 @@ use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::{Emit, EmitKind};
 use substrait::proto::set_rel::SetOp;
 use substrait::proto::{
-    r#type, AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel,
-    NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, RelRoot, SetRel,
+    r#type, AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, FunctionArgument,
+    JoinRel, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, RelRoot, SetRel,
 };
 
 use crate::error::{AdError, Result};
 use crate::expr::lit_bool;
-use crate::optics::{AsJoin, AsRead, Compose, Deep, Fold, RelKind, PlanRels, Setter};
 use crate::functions::Extensions;
+use crate::optics::{AsJoin, AsRead, Compose, Deep, Fold, PlanRels, RelKind, Setter};
 
 /// A read of every column of a table whose schema is known.
 pub fn read_table(names: Vec<String>, schema: NamedStruct) -> Rel {
@@ -401,8 +401,8 @@ mod tests {
 
     #[test]
     fn a_join_but_an_inner_one_with_no_condition_is_given_true_subqueries_included() {
-        use substrait::proto::expression::subquery::{InPredicate, Scalar, SubqueryType};
         use substrait::proto::expression::nested::{self, NestedType};
+        use substrait::proto::expression::subquery::{InPredicate, Scalar, SubqueryType};
         use substrait::proto::expression::{Nested, RexType, Subquery};
         use substrait::proto::function_argument::ArgType;
         let subquery = |t: SubqueryType| Expression {

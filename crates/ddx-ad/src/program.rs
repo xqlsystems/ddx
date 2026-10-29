@@ -56,8 +56,7 @@ use crate::expr::{call, cast, field, if_then, lit_f64, map_fields, null_f64};
 use crate::forward::{saved_name, step_columns, Forward, Input};
 use crate::functions::{Extensions, Function, Functions};
 use crate::optics::{Cosmos, Setter};
-use crate::relation::ColumnRef;
-use crate::relation::Table;
+use crate::relation::{ColumnRef, Table};
 use crate::tables::{InputTable, Of, OutputTable};
 use crate::transpose::{Contribution, Transposer};
 

@@ -48,7 +48,8 @@ protobuf`); the Nix shell below already has it.
 
 ```bash
 rustup toolchain install stable      # for day-to-day work
-rustup component add rustfmt clippy
+rustup component add clippy
+rustup toolchain install nightly --component rustfmt   # rustfmt.toml needs it
 git clone https://github.com/xqlsystems/ddx
 cd ddx
 cargo build --workspace
@@ -215,8 +216,12 @@ with a **minimal failing SQL input** and the expected vs. actual output.
 These are exactly what CI gates on — running them first saves a round-trip:
 
 ```bash
-# formatting and lints (CI treats warnings as errors)
-cargo fmt --all
+# formatting and lints (CI treats warnings as errors). rustfmt.toml follows
+# the Google Rust style guide, whose settings need a nightly rustfmt. In the
+# Nix shell, drop `+nightly`: its rustfmt has them, and its cargo is not
+# rustup's.
+cargo +nightly fmt --all
+cargo +nightly fmt --manifest-path python/ddxdb/Cargo.toml
 cargo clippy --workspace --all-targets -- -D warnings
 
 # tests — the full suite (deterministic tests + the bounded property fuzz)

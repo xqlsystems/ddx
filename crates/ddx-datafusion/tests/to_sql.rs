@@ -350,7 +350,8 @@ async fn a_mark_join_runs() {
 async fn a_virtual_table_of_rows_with_no_columns_keeps_its_rows() {
     use ddx_ad::substrait::proto::expression::nested::Struct as Row;
     use ddx_ad::substrait::proto::read_rel::{ReadType, VirtualTable};
-    use ddx_ad::substrait::proto::{rel::RelType, NamedStruct, ReadRel, Rel};
+    use ddx_ad::substrait::proto::rel::RelType;
+    use ddx_ad::substrait::proto::{NamedStruct, ReadRel, Rel};
     // `SELECT count(*)` over three rows of nothing: the plan of a count
     // over VALUES whose columns were all pruned, with its read replaced.
     let ctx = fixture().await;

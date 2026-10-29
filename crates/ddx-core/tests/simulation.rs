@@ -501,7 +501,7 @@ fn render_reparse_is_value_preserving() {
     let mut failures: Vec<String> = Vec::new();
 
     for seed in 0..5000u64 {
-        let mut rng = seeded(seed, 0xDEAD_BEEF);
+        let mut rng = seeded(seed, 0xdead_beef);
         let depth = 2 + (seed % 4) as u32;
         let text = gen_expr(&mut rng, depth);
         let parsed = parse_expr(&text);
@@ -558,7 +558,7 @@ fn higher_order_self_consumption_is_stable() {
 #[test]
 fn jvp_equals_tangent_times_grad() {
     let ddx = Ddx::new();
-    run_bounded("jvp↔grad consistency fuzz", 4000, 0x0F5E_ED00, |rng| {
+    run_bounded("jvp↔grad consistency fuzz", 4000, 0x0f5e_ed00, |rng| {
         let (text, wrt) = gen_expr_and_wrt(rng);
         jvp_consistency_failure(rng, &ddx, &text, wrt)
     });
@@ -567,7 +567,7 @@ fn jvp_equals_tangent_times_grad() {
 #[test]
 fn derivative_of_absent_variable_is_zero() {
     let ddx = Ddx::new();
-    run_bounded("zero-derivative fuzz", 4000, 0x2E50_1000, |rng| {
+    run_bounded("zero-derivative fuzz", 4000, 0x2e50_1000, |rng| {
         let depth = 2 + rng.below(4) as u32;
         let text = gen_expr(rng, depth);
         zero_derivative_failure(rng, &ddx, &text)
@@ -577,7 +577,7 @@ fn derivative_of_absent_variable_is_zero() {
 #[test]
 fn no_inf_or_nan_token_is_ever_emitted() {
     let ddx = Ddx::new();
-    run_bounded("inf/nan-token fuzz", 4000, 0x1FFF_F000, |rng| {
+    run_bounded("inf/nan-token fuzz", 4000, 0x1fff_f000, |rng| {
         let (text, wrt) = gen_expr_and_wrt(rng);
         let d = ddx
             .differentiate(&parse_expr(&text), &ColRef::bare(wrt.name()))
@@ -589,7 +589,7 @@ fn no_inf_or_nan_token_is_ever_emitted() {
 #[test]
 fn differentiation_is_linear_and_obeys_the_product_rule() {
     let ddx = Ddx::new();
-    run_bounded("linearity/product-rule fuzz", 4000, 0x114E_A200, |rng| {
+    run_bounded("linearity/product-rule fuzz", 4000, 0x114e_a200, |rng| {
         let (text, wrt) = gen_expr_and_wrt(rng);
         linearity_failure(rng, &ddx, &text, wrt)
     });
@@ -736,7 +736,7 @@ fn soak_continuous_property_fuzz() {
 
         // A fresh, reproducible seed for this iteration.
         let seed = base.wrapping_add(iters);
-        let mut rng = seeded(seed, 0xA5A5_5A5A);
+        let mut rng = seeded(seed, 0xa5a5_5a5a);
         // Deeper trees than the bounded tests, to reach rarer shapes.
         let depth = 2 + (rng.below(5) as u32); // 2..=6
         let wrt = if rng.below(2) == 0 { Var::X } else { Var::Y };

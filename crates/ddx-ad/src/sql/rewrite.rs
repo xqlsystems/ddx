@@ -8,10 +8,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
-use ddx_core::sqlparser::ast::visit_relations;
 use ddx_core::sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, ExactNumberInfo, ExcludeSelectItem, Expr, Ident, Join,
-    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
+    visit_relations, BinaryOperator, CastKind, DataType, ExactNumberInfo, ExcludeSelectItem, Expr,
+    Ident, Join, JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Spanned, TableFactor, TableWithJoins, Value, Visit, VisitMut,
     VisitorMut, WildcardAdditionalOptions,
 };
