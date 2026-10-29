@@ -1856,7 +1856,10 @@ pub(crate) fn read_outputs(r: &ReadRel) -> Result<Vec<usize>> {
 
 /// Does the plan guarantee `rel` has at most one row? True for an aggregate
 /// with no grouping, a one-row `VALUES`, and anything that only filters,
-/// projects, sorts, limits or cross-joins such relations. False when unsure.
+/// projects, sorts, limits or joins such relations (DataFusion writes a
+/// `CROSS JOIN` as a join on `true`). A full outer join of two can give
+/// two rows; a semi- or anti-join gives at most its kept side's. False when
+/// unsure.
 fn at_most_one_row(rel: &Rel) -> bool {
     let Some(kind) = &rel.rel_type else {
         return false;
@@ -1869,6 +1872,14 @@ fn at_most_one_row(rel: &Rel) -> bool {
         RelType::Sort(s) => below(&s.input),
         RelType::Fetch(f) => below(&f.input),
         RelType::Cross(c) => below(&c.left) && below(&c.right),
+        RelType::Join(j) => match JoinType::try_from(j.r#type) {
+            Ok(JoinType::Inner | JoinType::Left | JoinType::Right) => {
+                below(&j.left) && below(&j.right)
+            }
+            Ok(JoinType::LeftSemi | JoinType::LeftAnti) => below(&j.left),
+            Ok(JoinType::RightSemi | JoinType::RightAnti) => below(&j.right),
+            _ => false,
+        },
         RelType::Read(r) => match &r.read_type {
             Some(ReadType::VirtualTable(v)) => {
                 // Older producers fill the deprecated `values`.

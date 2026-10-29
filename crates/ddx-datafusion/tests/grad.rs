@@ -143,6 +143,24 @@ async fn a_loss_may_divide_by_a_one_row_constant() {
 }
 
 #[tokio::test]
+async fn a_loss_of_one_row_aggregates_joined_is_one_row_when_one_is_constant() {
+    // Found by the identity property test (identity.rs). DataFusion writes
+    // a CROSS JOIN as a join on `true`, and the two aggregates that read no
+    // wrt table are copied in as one constant input, whose join ddx did not
+    // see is one row: the loss was refused as not scalar.
+    check_gradients(
+        &ctx(),
+        "SELECT a0.l + a1.l + a2.l AS loss \
+         FROM (SELECT SUM(w.val * x.v) AS l FROM w JOIN x ON w.i = x.i) a0 \
+         CROSS JOIN (SELECT SUM(val) AS l FROM w) a1 \
+         CROSS JOIN (SELECT SUM(val * val) AS l FROM b) a2",
+        &[w(), x(), b()],
+        &[wrt("b", "val")],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_wrt_table_the_loss_does_not_depend_on_gets_zeros() {
     let grads = check_gradients(
         &ctx(),
