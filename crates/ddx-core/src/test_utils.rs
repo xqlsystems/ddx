@@ -20,6 +20,13 @@
 //! Everything is dependency-free and seed-reproducible: a failure reported with
 //! its seed replays exactly.
 
+// A test harness: a panic is how it reports a failure.
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::unwrap_used
+)]
+
 use std::ops::ControlFlow;
 
 use crate::sqlparser::ast::{

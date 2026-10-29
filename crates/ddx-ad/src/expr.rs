@@ -24,6 +24,7 @@ use crate::error::{AdError, Result};
 use crate::optics::{AsField, Compose, Cosmos, Exprs, Fold, RelKind, Rex, Setter, Tree};
 
 /// A reference to field `i` of the input row.
+#[must_use]
 pub fn field(i: usize) -> Expression {
     Expression {
         rex_type: Some(RexType::Selection(Box::new(FieldReference {
@@ -63,6 +64,7 @@ fn plain_field(r: &FieldReference) -> Option<usize> {
 }
 
 /// The DOUBLE literal `v`.
+#[must_use]
 pub fn lit_f64(v: f64) -> Expression {
     Expression {
         rex_type: Some(RexType::Literal(Literal {
@@ -74,6 +76,7 @@ pub fn lit_f64(v: f64) -> Expression {
 }
 
 /// The BOOLEAN literal `v`.
+#[must_use]
 pub fn lit_bool(v: bool) -> Expression {
     Expression {
         rex_type: Some(RexType::Literal(Literal {
@@ -85,6 +88,7 @@ pub fn lit_bool(v: bool) -> Expression {
 }
 
 /// A NULL of type DOUBLE.
+#[must_use]
 pub fn null_f64() -> Expression {
     Expression {
         rex_type: Some(RexType::Literal(Literal {
@@ -115,6 +119,7 @@ pub fn as_number(e: &Expression) -> Option<f64> {
 }
 
 /// The nullable DOUBLE type.
+#[must_use]
 pub fn fp64() -> Type {
     Type {
         kind: Some(Kind::Fp64(Fp64 {
@@ -300,6 +305,7 @@ fn followed(x: &Expression) -> Result<()> {
 
 /// The relation of `sq`, if it is a scalar subquery that refers to nothing
 /// outside itself: no outer-row field, and no subquery of its own that might.
+#[must_use]
 pub fn uncorrelated_scalar(
     sq: &substrait::proto::expression::Subquery,
 ) -> Option<&substrait::proto::Rel> {

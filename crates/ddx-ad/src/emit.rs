@@ -71,6 +71,7 @@ pub fn read(
 
 /// An unbound read of the step `name`, whose columns are `columns`. See the
 /// module docs: its types are filled in by [`bind_reads`] once the step exists.
+#[must_use]
 pub fn read_step(name: &str, columns: Vec<String>) -> Rel {
     read_table(
         vec![name.to_string()],
@@ -191,6 +192,7 @@ pub fn aggregate(
 }
 
 /// `UNION ALL` of `inputs`, which must have the same columns.
+#[must_use]
 pub fn union_all(inputs: Vec<Rel>) -> Rel {
     Rel {
         rel_type: Some(RelType::Set(SetRel {

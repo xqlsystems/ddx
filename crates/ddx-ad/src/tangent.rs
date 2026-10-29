@@ -541,8 +541,8 @@ impl<'a> Dualizer<'a> {
         &self,
         common: Option<&RelCommon>,
         width: usize,
-        tans: Vec<Tan>,
-        jitters: Vec<bool>,
+        tans: &[Tan],
+        jitters: &[bool],
         build: impl FnOnce(Option<RelCommon>) -> Rel,
         direct_of: &dyn Fn(usize) -> usize,
     ) -> Result<Dual> {
@@ -758,7 +758,7 @@ impl<'a> Dualizer<'a> {
         tans.extend(expr_tans);
         let direct_of = |o: usize| if o < w_in { o } else { big + (o - w_in) };
         let common = p.common.as_ref();
-        self.emitted(common, w_in + m, tans, jitters, |_| rel, &direct_of)
+        self.emitted(common, w_in + m, &tans, &jitters, |_| rel, &direct_of)
     }
 
     /// A window function's tangent, in a projection over a dual whose
@@ -871,8 +871,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             f.common.as_ref(),
             w,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Filter(Box::new(FilterRel {
                     common,
@@ -891,8 +891,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             s.common.as_ref(),
             w,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Sort(Box::new(SortRel {
                     common,
@@ -910,8 +910,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             f.common.as_ref(),
             w,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Fetch(Box::new(FetchRel {
                     common,
@@ -976,8 +976,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             j.common.as_ref(),
             width,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Join(Box::new(JoinRel {
                     common,
@@ -1008,8 +1008,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             c.common.as_ref(),
             wl + wr,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Cross(Box::new(CrossRel {
                     common,
@@ -1114,8 +1114,8 @@ impl<'a> Dualizer<'a> {
         self.emitted(
             a.common.as_ref(),
             g + m,
-            tans,
-            jitters,
+            &tans,
+            &jitters,
             |common| Rel {
                 rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
                     common,
@@ -1311,7 +1311,7 @@ impl<'a> Dualizer<'a> {
                 advanced_extension: None,
             })),
         };
-        self.emitted(s.common.as_ref(), w, out, jitters, |_| set, &|o| o)
+        self.emitted(s.common.as_ref(), w, &out, &jitters, |_| set, &|o| o)
     }
 }
 

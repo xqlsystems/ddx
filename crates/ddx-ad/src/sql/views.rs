@@ -278,6 +278,7 @@ impl Views {
 /// made with (as DataFusion does) would keep for the view if it were made
 /// now; a backend compares the two to tell whether the SQL still means what
 /// the engine runs. `None` if the SQL is not a view's.
+#[must_use]
 pub fn view_probe(sql: &str) -> Option<String> {
     let (query, columns) = definition(sql)?;
     let alias = TableAlias {

@@ -423,7 +423,9 @@ fn refuse_what_substrait_loses(plan: &LogicalPlan) -> Result<()> {
 /// query reads every one of its columns.
 pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
     let mut frames = sql_all(ctx, &[sql]).await?;
-    Ok(frames.pop().expect("one statement in, one frame out"))
+    frames
+        .pop()
+        .ok_or_else(|| DataFusionError::Internal("one statement gave no frame".into()))
 }
 
 /// [`sql`] for several statements at once. Statements whose calls need the
@@ -482,6 +484,7 @@ pub async fn sql_all(ctx: &SessionContext, statements: &[&str]) -> Result<Vec<Da
 /// prepared with, and prepares the statements again once one has changed.
 /// The caveat [`sql`] gives holds here too: a `now()` in a loss keeps the
 /// time of the run that prepared it.
+#[must_use]
 pub fn prepare(ctx: &SessionContext, statements: &[&str]) -> Prepared {
     Prepared {
         ctx: ctx.clone(),

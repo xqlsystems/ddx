@@ -658,11 +658,11 @@ impl<'a> Transposer<'a> {
                     // gave, and NULL, none, in the others'. An input whose
                     // column reads no wrt table gets none, as a map's
                     // constant operand does.
-                    for &(branch, col) in arms.iter().filter(|&&(_, col)| region.varied[col]) {
+                    for arm in arms.iter().filter(|a| region.varied[a.column]) {
                         pending
-                            .entry(col)
+                            .entry(arm.column)
                             .or_default()
-                            .push(if_then(vec![(field(branch), field(here))], null_f64()));
+                            .push(if_then(vec![(field(arm.branch), field(here))], null_f64()));
                     }
                 }
                 Def::Const | Def::Branch => {
@@ -713,12 +713,12 @@ impl<'a> Transposer<'a> {
                     .expect("a column materialized above")
             };
             for (slot, cols) in at_inputs {
-                self.broadcast(region, &read, slot, cols, &at)?;
+                self.broadcast(region, &read, slot, &cols, &at)?;
             }
             return Ok(());
         }
         for (slot, cols) in at_inputs {
-            self.broadcast(region, &rel, slot, cols, &|c| c)?;
+            self.broadcast(region, &rel, slot, &cols, &|c| c)?;
         }
         Ok(())
     }
@@ -878,7 +878,7 @@ impl<'a> Transposer<'a> {
         region: &Region,
         rel: &Rel,
         slot: usize,
-        cols: BTreeMap<usize, usize>,
+        cols: &BTreeMap<usize, usize>,
         at: &dyn Fn(usize) -> usize,
     ) -> Result<()> {
         let s = &region.slots[slot];
@@ -1001,7 +1001,7 @@ fn jitters(f: &Forward, region: &Region, col: usize) -> bool {
             }
             Def::Window { .. } => return true,
             Def::Branch => {}
-            Def::Union(arms) => stack.extend(arms.iter().map(|&(_, col)| col)),
+            Def::Union(arms) => stack.extend(arms.iter().map(|a| a.column)),
         }
     }
     false

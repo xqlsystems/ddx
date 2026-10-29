@@ -72,6 +72,17 @@
 //! re-export.
 
 #![forbid(unsafe_code)]
+// The Google Rust style guide's rules that clippy checks
+// (https://google.github.io/styleguide/rustguide.html).
+#![warn(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::needless_pass_by_value,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::return_self_not_must_use,
+    clippy::wildcard_imports
+)]
 
 mod compose;
 mod contraction;

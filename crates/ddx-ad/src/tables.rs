@@ -35,6 +35,7 @@ pub enum Of {
 
 impl Of {
     /// The `wrt` table's name parts, if it is of one.
+    #[must_use]
     pub fn table(&self) -> Option<&[String]> {
         match self {
             Of::Table(names) => Some(names),
@@ -96,6 +97,7 @@ impl OutputTable {
     /// its own columns, then each tangent, named `{column}_tangent` (or
     /// `{column}_tangent_{n}`, for the first free `n`, if that name is
     /// taken), as an unnamed `jvp` of a column in SQL names its tangent.
+    #[must_use]
     pub fn query(&self) -> String {
         use crate::sql::quote;
         let own = &self.columns[..self.columns.len() - self.tangents.len()];
@@ -103,10 +105,13 @@ impl OutputTable {
         let mut picked: Vec<String> = own.iter().map(|c| quote(c)).collect();
         for t in &self.tangents {
             let base = format!("{}_tangent", t.column);
-            let name = std::iter::once(base.clone())
-                .chain((2..).map(|n| format!("{base}_{n}")))
-                .find(|n| !taken.contains(&n.to_ascii_lowercase()))
-                .expect("a free name");
+            let mut name = base.clone();
+            for n in 2.. {
+                if !taken.contains(&name.to_ascii_lowercase()) {
+                    break;
+                }
+                name = format!("{base}_{n}");
+            }
             taken.push(name.to_ascii_lowercase());
             picked.push(format!("{} AS {}", quote(&t.tangent), quote(&name)));
         }

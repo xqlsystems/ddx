@@ -223,6 +223,7 @@ These are exactly what CI gates on — running them first saves a round-trip:
 cargo +nightly fmt --all
 cargo +nightly fmt --manifest-path python/ddxdb/Cargo.toml
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --manifest-path python/ddxdb/Cargo.toml --all-targets -- -D warnings
 
 # tests — the full suite (deterministic tests + the bounded property fuzz)
 cargo test --workspace

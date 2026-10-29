@@ -75,6 +75,7 @@ pub struct Table {
 
 impl Table {
     /// The column names.
+    #[must_use]
     pub fn columns(&self) -> &[String] {
         &self.schema.names
     }

@@ -50,6 +50,7 @@ impl ScalarUDFImpl for StopGradient {
 }
 
 /// The `ddx_stop_gradient` UDF.
+#[must_use]
 pub fn stop_gradient_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(StopGradient {
         // `any` accepts the argument at whatever type it arrives in, so no

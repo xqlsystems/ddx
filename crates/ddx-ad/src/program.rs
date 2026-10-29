@@ -174,6 +174,11 @@ impl BackwardProgram {
     }
 
     /// Step `i` of [`BackwardProgram::steps`], in the order they run.
+    ///
+    /// # Panics
+    ///
+    /// If the program has no step `i`.
+    #[must_use]
     pub fn step(&self, i: usize) -> &Step {
         self.steps().nth(i).expect("a step index from this program")
     }
@@ -249,12 +254,14 @@ pub struct Options {
 
 impl Options {
     /// The defaults: [`Ddx::new`], and a fresh namespace per program.
+    #[must_use]
     pub fn new() -> Self {
         Options::default()
     }
 
     /// Differentiate elementwise expressions with `ddx`, which may carry a
     /// caller's own scalar rules.
+    #[must_use]
     pub fn ddx(mut self, ddx: Ddx) -> Self {
         self.ddx = Some(ddx);
         self
@@ -268,6 +275,7 @@ impl Options {
     /// and hold only lower-case ASCII letters, digits and `_` (an engine folds
     /// an unquoted name to lower case). Two programs on one engine must not
     /// share a namespace: they would write the same tables.
+    #[must_use]
     pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
@@ -281,6 +289,7 @@ impl Options {
     /// them. Rows outside it are left out of the gradient step, and every
     /// contribution to it is filtered before it is summed, which an engine
     /// pushes down into the region beneath.
+    #[must_use]
     pub fn restrict(mut self, table: impl Into<String>, select: Plan) -> Self {
         self.restrict.push((table.into(), select));
         self
@@ -418,6 +427,7 @@ fn backward<D: Differentiable + ?Sized>(
     }
 }
 
+#[derive(Clone, Copy)]
 enum Seed {
     One,
     Cotangent,
@@ -814,7 +824,7 @@ fn combine(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let mut aligned: Vec<Rel> = contribs
+    let aligned: Vec<Rel> = contribs
         .into_iter()
         .map(|c| {
             // Pad the columns this contribution lacks with zeros.
@@ -833,9 +843,10 @@ fn combine(
             project_emit(c.rel, zeros, Some(emit))
         })
         .collect();
-    if aligned.len() == 1 {
-        return Ok((aligned.pop().unwrap(), cols));
-    }
+    let aligned = match <[Rel; 1]>::try_from(aligned) {
+        Ok([one]) => return Ok((one, cols)),
+        Err(aligned) => aligned,
+    };
     let sum = t.ext.anchor(Function::Sum);
     let rel = aggregate(
         union_all(aligned),

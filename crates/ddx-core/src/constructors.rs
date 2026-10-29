@@ -106,11 +106,13 @@ pub fn finite_num(v: f64) -> Result<Expr> {
 }
 
 /// The constant `0.0` — the derivative of anything independent of `wrt`.
+#[must_use]
 pub fn zero() -> Expr {
     num(0.0)
 }
 
 /// The constant `1.0` — the derivative of `wrt` itself.
+#[must_use]
 pub fn one() -> Expr {
     num(1.0)
 }
@@ -243,6 +245,7 @@ fn binary(left: Expr, op: BinaryOperator, right: Expr) -> Expr {
 
 /// Wrap `e` in a `CAST(... AS DOUBLE)`. Self-delimiting, so it never needs
 /// precedence parentheses as an operand.
+#[must_use]
 pub fn cast_double(e: Expr) -> Expr {
     Expr::Cast {
         kind: CastKind::Cast,
@@ -258,6 +261,7 @@ pub fn cast_double(e: Expr) -> Expr {
 // ---------------------------------------------------------------------------
 
 /// `a + b`, dropping a structurally-zero operand.
+#[must_use]
 pub fn add(a: Expr, b: Expr) -> Expr {
     if is_zero(&a) {
         b
@@ -269,6 +273,7 @@ pub fn add(a: Expr, b: Expr) -> Expr {
 }
 
 /// `a - b`, dropping a zero right operand and turning `0 - b` into `-b`.
+#[must_use]
 pub fn sub(a: Expr, b: Expr) -> Expr {
     if is_zero(&b) {
         a
@@ -280,6 +285,7 @@ pub fn sub(a: Expr, b: Expr) -> Expr {
 }
 
 /// `a * b`, folding `0 * _ = 0` and `1 * b = b` (and the mirror cases).
+#[must_use]
 pub fn mul(a: Expr, b: Expr) -> Expr {
     if is_zero(&a) || is_zero(&b) {
         zero()
@@ -300,6 +306,7 @@ pub fn mul(a: Expr, b: Expr) -> Expr {
 /// column silently wrong. Casting one operand promotes the whole division;
 /// casting the *numerator* (not the result) is essential — `CAST(a/b AS DOUBLE)`
 /// would truncate before the cast.
+#[must_use]
 pub fn div(a: Expr, b: Expr) -> Expr {
     if is_zero(&a) {
         zero()
@@ -312,6 +319,7 @@ pub fn div(a: Expr, b: Expr) -> Expr {
 
 /// `-a`, folding `-0 = 0` and `-(-e) = e`, and parenthesizing a binary operand
 /// (`-(a + b)`, `-(a / b)`), since unary minus binds tighter than either.
+#[must_use]
 pub fn neg(a: Expr) -> Expr {
     if is_zero(&a) {
         return zero();
@@ -333,6 +341,7 @@ pub fn neg(a: Expr) -> Expr {
 }
 
 /// `e * e`.
+#[must_use]
 pub fn square(e: Expr) -> Expr {
     mul(e.clone(), e)
 }
@@ -366,6 +375,11 @@ pub fn square(e: Expr) -> Expr {
 ///   the branches are decimals, and DuckDB types the whole `CASE`
 ///   `DECIMAL(2,1)` — so this one derivative would arrive in a different type,
 ///   with different arithmetic under it, from every other derivative ddx emits.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "takes its operand as every other constructor does"
+)]
 pub fn sign(u: Expr) -> Expr {
     let compare = |op: BinaryOperator| Expr::BinaryOp {
         left: Box::new(u.clone()),
@@ -404,6 +418,7 @@ pub fn sign(u: Expr) -> Expr {
 // ---------------------------------------------------------------------------
 
 /// Build an unqualified scalar function call `name(args...)`.
+#[must_use]
 pub fn func(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
         name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
@@ -425,6 +440,7 @@ pub fn func(name: &str, args: Vec<Expr>) -> Expr {
 }
 
 /// `f(x)` — a unary call, the common case for chain-rule outer derivatives.
+#[must_use]
 pub fn func1(name: &str, x: Expr) -> Expr {
     func(name, vec![x])
 }

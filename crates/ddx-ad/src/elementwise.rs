@@ -70,6 +70,7 @@ pub struct Elementwise<'a> {
 impl<'a> Elementwise<'a> {
     /// Differentiate with `ddx`'s rules, reading function names from
     /// `functions`, the table of the plan the expressions come from.
+    #[must_use]
     pub fn new(ddx: &'a Ddx, functions: &'a Functions) -> Self {
         Elementwise { ddx, functions }
     }
@@ -452,27 +453,31 @@ impl ToSql<'_> {
                             .into(),
                     ));
                 }
-                let mut sql = args
+                let sql = args
                     .into_iter()
                     .map(|a| self.expr(a))
                     .collect::<Result<Vec<_>>>()?;
-                if let Some(op) = binary_op(&name) {
-                    if sql.len() == 2 {
-                        let right = sql.pop().unwrap();
-                        let left = sql.pop().unwrap();
+                let sql = match (binary_op(&name), <[Sql; 2]>::try_from(sql)) {
+                    (Some(op), Ok([left, right])) => {
                         return Ok(Sql::BinaryOp {
                             left: Box::new(left),
                             op,
                             right: Box::new(right),
                         });
                     }
-                }
-                if matches!(name.as_str(), "negate" | "negative") && sql.len() == 1 {
-                    return Ok(Sql::UnaryOp {
-                        op: UnaryOperator::Minus,
-                        expr: Box::new(sql.pop().unwrap()),
-                    });
-                }
+                    (_, Ok(two)) => Vec::from(two),
+                    (_, Err(sql)) => sql,
+                };
+                let sql = match <[Sql; 1]>::try_from(sql) {
+                    Ok([expr]) if matches!(name.as_str(), "negate" | "negative") => {
+                        return Ok(Sql::UnaryOp {
+                            op: UnaryOperator::Minus,
+                            expr: Box::new(expr),
+                        });
+                    }
+                    Ok(one) => Vec::from(one),
+                    Err(sql) => sql,
+                };
                 if is_logical(&name) {
                     return Err(AdError::NotImplemented(format!(
                         "`{name}` of a value that carries gradient is not differentiable; if \

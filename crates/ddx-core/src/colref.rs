@@ -51,6 +51,7 @@ impl IdentCasing {
     /// *to* is arbitrary, so long as an unquoted identifier and a quoted one
     /// land on the same key exactly when the engine would resolve them to the
     /// same column.
+    #[must_use]
     pub fn fold(self, id: &Ident) -> String {
         match (self, id.quote_style) {
             // Case-insensitive throughout: quoting changes nothing.
@@ -104,6 +105,7 @@ impl ColRef {
     /// Read a `ColRef` from a column-reference expression
     /// (`Identifier`/`CompoundIdentifier`, seeing through a `Nested` wrapper).
     /// Returns `None` for any expression that is not a column reference.
+    #[must_use]
     pub fn from_expr(e: &Expr) -> Option<ColRef> {
         match e {
             Expr::Identifier(id) => Some(ColRef {
@@ -133,6 +135,7 @@ impl ColRef {
     /// occurrence of the `wrt` base name; a non-matching name is always
     /// [`Match::Not`], and a fully-qualified unambiguous match (e.g. `a.x`
     /// against `a.x`) is [`Match::Is`] with no error.
+    #[must_use]
     pub fn classify(&self, wrt: &ColRef, casing: IdentCasing) -> Match {
         if casing.fold(&self.name) != casing.fold(&wrt.name) {
             // Different base name — unrelated column, no ambiguity possible.
@@ -156,6 +159,7 @@ impl ColRef {
     }
 
     /// Render for error messages (e.g. `a.x` or `x`).
+    #[must_use]
     pub fn display(&self) -> String {
         match &self.qualifier {
             Some(q) => format!("{q}.{}", self.name),

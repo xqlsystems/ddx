@@ -98,7 +98,7 @@ use crate::elementwise::depends;
 use crate::emit::{aggregate, filter, join, project};
 use crate::error::Result;
 use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, map_fields, scalar_args};
-use crate::forward::{subquery_rounds, width, Def, Output, Region, Saved, Slot};
+use crate::forward::{subquery_rounds, width, Arm, Def, Output, Region, Saved, Slot};
 use crate::functions::Function;
 use crate::optics::{subqueries, Fold};
 use crate::transpose::Transposer;
@@ -160,13 +160,19 @@ impl Classes {
     }
 }
 
+/// A grouping key of a contraction: its side, and its column there.
+struct Group {
+    side: usize,
+    column: usize,
+}
+
 /// A contraction's shape, in each side's own column numbers.
 struct Shape {
     sides: [Side; 2],
     /// The conditions between the sides.
     keys: Vec<Key>,
-    /// Each grouping key: its side and column.
-    groups: Vec<(usize, usize)>,
+    /// The grouping keys.
+    groups: Vec<Group>,
     /// The conditions that read only grouping keys, over the cotangent's
     /// columns.
     masks: Vec<Expression>,
@@ -197,7 +203,7 @@ impl Transposer<'_> {
             // The cotangent meets the other side on its grouping keys; with
             // none there, it would meet every row of it, a cross join, which
             // the general rule handles instead.
-            if moves[x] && !shape.groups.iter().any(|&(s, _)| s != x) {
+            if moves[x] && !shape.groups.iter().any(|g| g.side != x) {
                 return Ok(false);
             }
         }
@@ -476,8 +482,11 @@ impl Transposer<'_> {
         let groups = group_cols
             .iter()
             .map(|&c| {
-                let s = side_of_col(c).expect("a column beneath the projections");
-                (s, [&left, &right][s].at[c].expect("on its side"))
+                let side = side_of_col(c).expect("a column beneath the projections");
+                Group {
+                    side,
+                    column: [&left, &right][side].at[c].expect("on its side"),
+                }
             })
             .collect();
         Ok(Some(Shape {
@@ -575,8 +584,8 @@ impl Transposer<'_> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, (s, _))| *s == y)
-            .map(|(g, &(_, c))| (c, g));
+            .filter(|(_, group)| group.side == y)
+            .map(|(g, group)| (group.column, g));
         let key_groups = shape
             .keys
             .iter()
@@ -618,7 +627,7 @@ impl Transposer<'_> {
             None => cotangent.clone(),
         };
         let yc = join(y_rel, cotangent, on_y, JoinType::Inner);
-        let x_groups: Vec<usize> = (0..ndims).filter(|&g| shape.groups[g].0 == x).collect();
+        let x_groups: Vec<usize> = (0..ndims).filter(|&g| shape.groups[g].side == x).collect();
         // t's keys, each column once: a plan may repeat a join key (DuckDB's
         // does), and an aggregate's output has each distinct key once.
         let mut t_cols: Vec<usize> = Vec::new();
@@ -676,7 +685,10 @@ impl Transposer<'_> {
         let t_at = factor_col + 1;
         let mut on_x: Vec<(usize, usize)> = Vec::new();
         let key_pairs = shape.keys.iter().map(|k| k.cols[x]).zip(y_at);
-        let group_pairs = x_groups.iter().map(|&g| shape.groups[g].1).zip(group_at);
+        let group_pairs = x_groups
+            .iter()
+            .map(|&g| shape.groups[g].column)
+            .zip(group_at);
         for pair in key_pairs.chain(group_pairs) {
             if !on_x.contains(&pair) {
                 on_x.push(pair);
@@ -874,7 +886,12 @@ fn slice(region: &Region, leaf: &Leaf) -> Result<Option<Region>> {
             Def::Branch => Def::Branch,
             Def::Union(arms) => match arms
                 .iter()
-                .map(|&(b, c)| Ok((local(b)?, local(c)?)))
+                .map(|a| {
+                    Ok(Arm {
+                        branch: local(a.branch)?,
+                        column: local(a.column)?,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()
             {
                 Ok(arms) => Def::Union(arms),

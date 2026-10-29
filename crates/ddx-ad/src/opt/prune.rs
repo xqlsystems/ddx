@@ -309,12 +309,13 @@ fn finish(
     dmap: Map,
     narrow: bool,
 ) -> (Rel, Map) {
-    let outputs: Vec<usize> = match &emit {
-        Some(m) => m.clone(),
+    let narrow = narrow || emit.is_some();
+    let outputs: Vec<usize> = match emit {
+        Some(m) => m,
         None => (0..dmap.len()).collect(),
     };
     let new_direct = dmap.iter().flatten().count();
-    if emit.is_some() || narrow {
+    if narrow {
         // Emit exactly the needed outputs, in their order.
         let kept: Vec<usize> = (0..outputs.len()).filter(|o| need.contains(o)).collect();
         let mapping: Vec<usize> = kept

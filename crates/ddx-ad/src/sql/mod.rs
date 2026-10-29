@@ -414,7 +414,7 @@ async fn program_of_split<B: Backend>(
             .plan_sql(&split.root)
             .await
             .map_err(RunError::Engine)?;
-        let plan = share::stitch(split, pieces, &root).map_err(RunError::Refused)?;
+        let plan = share::stitch(split, &pieces, &root).map_err(RunError::Refused)?;
         build(backend, planned, job, &plan).await?;
         Ok(key)
     }
