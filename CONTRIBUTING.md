@@ -217,8 +217,9 @@ These are exactly what CI gates on — running them first saves a round-trip:
 
 ```bash
 # formatting and lints (CI treats warnings as errors). rustfmt.toml follows
-# the Google Rust style guide, whose import settings need a nightly rustfmt
-# (the Nix shell's `cargo fmt` already is one).
+# the Google Rust style guide, whose settings need a nightly rustfmt. In the
+# Nix shell, drop `+nightly`: its rustfmt has them, and its cargo is not
+# rustup's.
 cargo +nightly fmt --all
 cargo +nightly fmt --manifest-path python/ddxdb/Cargo.toml
 cargo clippy --workspace --all-targets -- -D warnings

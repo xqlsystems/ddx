@@ -32,21 +32,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # rustfmt.toml's settings need a nightly rustfmt, pinned so a nightly
+      # change doesn't fail a PR. Installed first, so stable, installed
+      # next, stays the default for clippy and docs.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-10-10
+          components: rustfmt
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # ddx-ad's `substrait` dependency generates its types from .proto files
       # at build time.
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      # rustfmt.toml's settings need a nightly rustfmt, pinned so a nightly
-      # change doesn't fail a PR.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: nightly-2026-10-10
-          components: rustfmt
       - name: rustfmt (check only)
         run: |
           cargo +nightly-2026-10-10 fmt --all --check
