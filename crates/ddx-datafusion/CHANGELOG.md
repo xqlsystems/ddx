@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.1...ddx-datafusion-v0.4.2) - 2026-10-29
+
+### Added
+
+- `grad` and `vjp` differentiate through `UNION ALL` (ddx-ad 0.3.2) ([#229](https://github.com/xqlsystems/ddx/pull/229))
+
+### Changed
+
+- A compiled plan whose lock a panic poisoned is planned again. The code otherwise follows the Google Rust style guide, with no change in behaviour or speed ([#234](https://github.com/xqlsystems/ddx/pull/234), [#239](https://github.com/xqlsystems/ddx/pull/239))
+
 ## [0.4.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.0...ddx-datafusion-v0.4.1) - 2026-10-28
 
 ### Changed

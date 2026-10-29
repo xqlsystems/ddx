@@ -4,7 +4,7 @@ description = "The scalar derivative rules of ddx: partial derivatives of SQL sc
 # Versioned independently of the workspace (unpublished crates stay at the
 # workspace 0.0.0). This was the first publishable crate; release-plz manages
 # bumps from here (SemVer). See CONTRIBUTING.md → Releases.
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

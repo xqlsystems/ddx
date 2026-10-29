@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.3.0...ddx-core-v0.3.1) - 2026-10-29
+
+### Changed
+
+- The code follows the Google Rust style guide, with no change in behaviour ([#234](https://github.com/xqlsystems/ddx/pull/234), [#239](https://github.com/xqlsystems/ddx/pull/239))
+
 ## [0.3.0](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.2.2...ddx-core-v0.3.0) - 2026-10-17
 
 ### Added
