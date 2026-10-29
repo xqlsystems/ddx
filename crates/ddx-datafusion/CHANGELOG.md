@@ -9,6 +9,14 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.0...ddx-datafusion-v0.4.1) - 2026-10-28
+
+### Changed
+
+- Batched, multi-head attention's backward no longer pairs every two sequences and heads: the transpose of a contraction joins the cotangent on the keys its join holds equal to a grouping key, transitively. At xarray-sql's GPT size, the contraction of `v` with the output's cotangent has 196,608 rows rather than 9.4 million (ddx-ad 0.3.1, [#220](https://github.com/xqlsystems/ddx/pull/220))
+- A contraction's side is rebuilt with the equalities its join implies between that side's own columns, so a query that joins attention's softmax normalizer to the weights only through `v` joins each score to its own normalizer, not every sequence's (ddx-ad 0.3.1, [#225](https://github.com/xqlsystems/ddx/pull/225))
+- `ad::run`, `ad::sql`, `ad::sql_all` and a prepared statement's calls drop each intermediate table once the last step that reads it has run, rather than all of them at the end, so a run holds only the tables later steps still read. A failed drop now fails the run, which drops every table left (ddx-ad 0.3.1, [#223](https://github.com/xqlsystems/ddx/pull/223))
+
 ## [0.4.0](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.3.3...ddx-datafusion-v0.4.0) - 2026-10-28
 
 ### Added
