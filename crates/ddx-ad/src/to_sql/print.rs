@@ -482,6 +482,7 @@ impl Printer {
                 self.ty(*ty);
                 self.sql.push(')');
             }
+            Literal::UntypedNull => self.sql.push_str("NULL"),
         }
     }
 
