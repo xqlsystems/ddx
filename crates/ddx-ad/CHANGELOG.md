@@ -11,16 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(ddx-ad)* differentiate through UNION ALL in reverse mode ([#229](https://github.com/xqlsystems/ddx/pull/229))
+- `grad` and `vjp` differentiate through `UNION ALL`, as `jvp` already did. Each input's rows carry its own columns, and a union column's cotangent goes to the input that gave the row, as `jnp.concatenate`'s transpose is a slice. `UNION` (distinct) is still refused ([#229](https://github.com/xqlsystems/ddx/pull/229))
 
-### Other
+### Fixed
 
-- *(ddx-ad)* move code out of the to_sql and sql non-leaf modules ([#240](https://github.com/xqlsystems/ddx/pull/240))
-- check the Google Rust style guide's rules with clippy, and follow them ([#239](https://github.com/xqlsystems/ddx/pull/239))
-- format every file with the Google Rust style guide's rustfmt settings ([#234](https://github.com/xqlsystems/ddx/pull/234))
-- the soak writes contractions; the mutation test's mutants fit the code ([#232](https://github.com/xqlsystems/ddx/pull/232))
-- *(ddx-ad)* compute a step that one later step reads once inside it ([#231](https://github.com/xqlsystems/ddx/pull/231))
-- a property test for identity; a one-row join of constant data ([#230](https://github.com/xqlsystems/ddx/pull/230))
+- A loss that joins one-row aggregates is taken as a scalar loss when some of them read only constant data. DataFusion writes a `CROSS JOIN` as a join on true, and only a cross join was read as one row; inner, left, right, semi- and anti-joins of one-row inputs now are too ([#230](https://github.com/xqlsystems/ddx/pull/230))
+
+### Changed
+
+- A step that exactly one later step reads, once, is computed inside that step rather than written as a table: xarray-sql's GPT training step has 64 steps rather than 77, about 1.5% faster on DuckDB ([#231](https://github.com/xqlsystems/ddx/pull/231))
+- The program cache treats a lock that a panic poisoned as empty, rather than reading what the panic left. The code otherwise follows the Google Rust style guide, with no change in behaviour or speed ([#234](https://github.com/xqlsystems/ddx/pull/234), [#239](https://github.com/xqlsystems/ddx/pull/239), [#240](https://github.com/xqlsystems/ddx/pull/240))
 
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.0...ddx-ad-v0.3.1) - 2026-10-28
 
