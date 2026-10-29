@@ -13,6 +13,7 @@
 //! | **map** | a projected expression `y = f(x₁, x₂, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row ([`crate::elementwise::Elementwise`]) |
 //! | **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
 //! | **broadcast** | a join, which pairs each row with every row it matches | sum the cotangent back over the rows each input row was copied to |
+//! | **concatenate** | `UNION ALL` | each row's cotangent to the input that gave the row |
 //! | **reduce** | a grouped `SUM` | broadcast the group's cotangent to every row that was summed |
 //! | | `AVG` | the same, divided by the group's count |
 //! | | `MAX`, `MIN` | the group's cotangent to the rows that attain it, shared evenly at a tie (`jax.grad`'s convention for `jnp.max`) |
@@ -313,6 +314,8 @@ impl<'a> Transposer<'a> {
                 }
             }
         }
+        // A UNION ALL's inputs can give rows with the same dims.
+        keys.extend((0..beneath.defs.len()).filter(|&c| matches!(beneath.defs[c], Def::Branch)));
         Ok(keys)
     }
 
@@ -650,7 +653,17 @@ impl<'a> Transposer<'a> {
                     rel = project(rel, std::mem::take(&mut batch));
                     self.gather(beneath, *offset, function, &rel, here)?;
                 }
-                Def::Const => {
+                Def::Union(arms) => {
+                    // Each input's column gets the cotangent in the rows it
+                    // gave, and NULL, none, in the others'.
+                    for &(branch, col) in arms {
+                        pending
+                            .entry(col)
+                            .or_default()
+                            .push(if_then(vec![(field(branch), field(here))], null_f64()));
+                    }
+                }
+                Def::Const | Def::Branch => {
                     return Err(AdError::Internal(format!(
                         "gradient reached column {c}, a {:?}, with no refusal recorded",
                         region.defs[c]
@@ -985,6 +998,8 @@ fn jitters(f: &Forward, region: &Region, col: usize) -> bool {
                 }
             }
             Def::Window { .. } => return true,
+            Def::Branch => {}
+            Def::Union(arms) => stack.extend(arms.iter().map(|&(_, col)| col)),
         }
     }
     false

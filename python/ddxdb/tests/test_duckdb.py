@@ -100,6 +100,24 @@ def test_windows_differentiate(ad, con):
     assert dict(pairs(rel)) == pytest.approx({0: 1 / 3 + 1.0, 1: 1 / 3, 2: 1 / 3})
 
 
+
+def test_grad_through_a_union_all(ad, con):
+    # Each row of the union sends its gradient to the table it came from;
+    # the rows of i that both tables have land in one group.
+    loss = """WITH u AS (SELECT i, val FROM w UNION ALL SELECT i + 1 AS i, 2 * val AS val FROM b),
+              s AS (SELECT i, SUM(val) AS t FROM u GROUP BY i),
+              loss AS (SELECT SUM(t * t) AS l FROM s) """
+    gw, gb = ad.sql_all(
+        con,
+        [loss + "SELECT i, grad(loss, val) FROM w", loss + "SELECT i, grad(loss, val) FROM b"],
+    )
+    w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
+    t = {i: w[i] if i < 3 else 0.0 for i in range(4)}
+    for i in range(3):
+        t[i + 1] += 2 * b[i]
+    assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
+    assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
+
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, con):
     full = pairs(ad.sql(con, GRAD))
     some = pairs(ad.sql(con, GRAD + " WHERE i >= 1"))

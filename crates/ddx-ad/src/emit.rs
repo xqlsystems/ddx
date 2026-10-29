@@ -5,8 +5,8 @@
 //! Writing the plans of a backward program.
 //!
 //! Every step ddx emits is an ordinary Substrait plan, with nothing in it only
-//! ddx understands, built from six relations: read, project, filter, join,
-//! aggregate and union. The builders here produce them in the shapes
+//! ddx understands, built from seven relations: read, project, filter, join,
+//! aggregate, union and fetch. The builders here produce them in the shapes
 //! DataFusion's own producer does, since that is the consumer they are tested
 //! against.
 //!
@@ -25,6 +25,7 @@
 use substrait::proto::aggregate_function::AggregationInvocation;
 use substrait::proto::aggregate_rel::{Grouping, Measure};
 use substrait::proto::expression::MaskExpression;
+use substrait::proto::fetch_rel::CountMode;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
 use substrait::proto::read_rel::{NamedTable, ReadType};
@@ -32,7 +33,7 @@ use substrait::proto::rel::RelType;
 use substrait::proto::rel_common::{Emit, EmitKind};
 use substrait::proto::set_rel::SetOp;
 use substrait::proto::{
-    r#type, AggregateFunction, AggregateRel, Expression, FilterRel, FunctionArgument, JoinRel,
+    r#type, AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel,
     NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelCommon, RelRoot, SetRel,
 };
 
@@ -198,6 +199,20 @@ pub fn union_all(inputs: Vec<Rel>) -> Rel {
             op: SetOp::UnionAll as i32,
             advanced_extension: None,
         })),
+    }
+}
+
+/// None of `input`'s rows: its columns, typed as the engine types them,
+/// with nothing in them. Joined to with a FULL JOIN, it gives another
+/// relation's rows NULL in those columns.
+pub fn no_rows(input: Rel) -> Rel {
+    Rel {
+        rel_type: Some(RelType::Fetch(Box::new(FetchRel {
+            input: Some(Box::new(input)),
+            #[allow(deprecated)]
+            count_mode: Some(CountMode::Count(0)),
+            ..Default::default()
+        }))),
     }
 }
 

@@ -377,6 +377,24 @@ def test_not_in_over_a_subquery_is_refused(ad, ctx):
 
 
 
+
+def test_grad_through_a_union_all(ad, ctx):
+    # Each row of the union sends its gradient to the table it came from;
+    # the rows of i that both tables have land in one group.
+    loss = """WITH u AS (SELECT i, val FROM w UNION ALL SELECT i + 1 AS i, 2 * val AS val FROM b),
+              s AS (SELECT i, SUM(val) AS t FROM u GROUP BY i),
+              loss AS (SELECT SUM(t * t) AS l FROM s) """
+    gw, gb = ad.sql_all(
+        ctx,
+        [loss + "SELECT i, grad(loss, val) FROM w", loss + "SELECT i, grad(loss, val) FROM b"],
+    )
+    w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
+    t = {i: w[i] if i < 3 else 0.0 for i in range(4)}
+    for i in range(3):
+        t[i + 1] += 2 * b[i]
+    assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
+    assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
+
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
     # The WHERE on w's dims is pushed into the program (ddx_ad::Options::restrict);
     # the rows read are the unrestricted gradient's.

@@ -90,7 +90,7 @@ kept as the record of how that differentiator was designed.
   writes Substrait, or SQL where an engine's Substrait consumer falls short
   (§4.2).
 - Not a derivative where none is defined. An unsupported construct (a rank
-  used as a value, a running `MAX`, a `UNION ALL` in reverse mode for now) is
+  used as a value, a running `MAX`, a `UNION` that removes duplicates) is
   a typed error, never a silently wrong gradient (§4.6).
 - Not every engine at once. DataFusion first, then DuckDB-Python; a DuckDB
   extension, and Postgres (which needs array/XQL support first, via `pgrx`),
@@ -823,6 +823,7 @@ and v2 does the same:
 | **map** | a projected expression `y = f(x₁, …)` | `x̄ᵢ += ȳ · ∂f/∂xᵢ`, row by row, the partials from `ddx-core`; for `CASE`, `greatest` and `least`, the derivative of the branch the row takes |
 | **select** | `WHERE`, a join condition, a semi-join, a filter on a rank | the cotangent stays on the rows that were kept |
 | **broadcast** | a join | sum the cotangent back over the rows each input row was copied to |
+| **concatenate** | `UNION ALL` | each row's cotangent to the input that gave the row |
 | **reduce** | grouped `SUM` | broadcast the group's cotangent to every row summed |
 | | `AVG` | the same, divided by the group's count |
 | | `MAX`, `MIN` | the group's cotangent to the rows attaining it, shared evenly at a tie |
@@ -850,6 +851,17 @@ its counts, its ties or its frames. Those sums are materialized as a step, and
 a window read along several paths is transposed once, from all of their sums:
 a stack of windows, each layer reading the last both directly and through a
 window, then costs the square of its depth rather than a power of it.
+
+**A union is rebuilt as one relation.** The rows of `UNION ALL` come from
+different inputs, each with its own columns, but every rule here is row-local.
+So ddx rebuilds a union as one relation that holds every input's columns:
+each input's rows carry its own columns, a column that is TRUE in them, and
+NULL in every other input's columns. (An input's rows are FULL JOINed to none
+of the others' rows, so the engine types those NULLs as it types the
+columns.) Each column of the union reads, in each row, the column of the input
+that gave the row. Its transpose is a select, as `jnp.concatenate`'s is a
+slice: the cotangent goes to that input's column, and NULL, no cotangent, to
+the others'. So a row sends gradient only through the input that gave it.
 
 **Map is the seam between v1 and v2.** A projected column is a scalar function
 of other columns of the same row, and its local derivatives are one call into
@@ -1173,9 +1185,7 @@ on 13 aggregates and 12 windows; a softmax written with windows equals
   non-spec-conformant extension-URI form DataFusion emits, and ddx keeps for
   the functions it adds, is untested and only matters if/when a third engine
   is targeted.
-- `UNION ALL` in reverse mode is refused (forward mode has its rule), which
-  blocks the gradient of a GraphCast-shaped model in xarray-sql's ML demos.
-  A `GROUP BY` key computed from a `wrt` value is refused too, even when the
+- A `GROUP BY` key computed from a `wrt` value is refused, even when the
   other keys determine it.
 - Windows on an engine whose Substrait consumer rejects them. ddx's rules
   write windows: the `AVG`, `MAX` and `MIN` rules' counts and extremes over
