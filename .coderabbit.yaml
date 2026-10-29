@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Every setting not named here comes from the CodeRabbit UI.
+inheritance: true
+reviews:
+  auto_review:
+    # Review every PR, including one stacked on another PR's branch, not
+    # only those that target main.
+    base_branches:
+      - ".*"
