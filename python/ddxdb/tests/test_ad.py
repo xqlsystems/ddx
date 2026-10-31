@@ -395,6 +395,7 @@ def test_grad_through_a_union_all(ad, ctx):
     assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
     assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
 
+
 def test_a_union_all_beneath_a_union_read_through_a_join(ad, ctx):
     # n1's UNION is a distinct over a UNION ALL, inside n2 and u2; read
     # through a join, DataFusion's optimizer failed to splice them (#249).

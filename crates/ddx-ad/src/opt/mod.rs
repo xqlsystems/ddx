@@ -217,11 +217,12 @@ mod tests {
             flatten_unions(&mut plan);
             plan
         };
-        let mut picking = union_all(vec![t("d"), t("e")]);
+        let xy = |name: &str| read_step(name, vec!["x".into(), "y".into()]);
+        let mut picking = union_all(vec![xy("d"), xy("e")]);
         if let Some(RelType::Set(s)) = &mut picking.rel_type {
             s.common = Some(RelCommon {
                 emit_kind: Some(EmitKind::Emit(Emit {
-                    output_mapping: vec![0],
+                    output_mapping: vec![1],
                 })),
                 ..Default::default()
             });
@@ -233,7 +234,7 @@ mod tests {
             picking,
             doubled(union_all(vec![t("f"), t("g")])),
         ]);
-        let picked = |name: &str| project_emit(t(name), vec![], Some(vec![0]));
+        let picked = |name: &str| project_emit(xy(name), vec![], Some(vec![1]));
         let flat = union_all(vec![
             t("a"),
             t("b"),
