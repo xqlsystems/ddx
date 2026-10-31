@@ -515,6 +515,33 @@ def test_a_window_over_an_aggregate_is_differentiated(ad):
 # Refusals.
 
 
+@pytest.mark.parametrize(
+    "u, loss, source",
+    [
+        ("SELECT CASE WHEN i = 1 THEN NULL ELSE i END AS k, val FROM w", "SUM(val * val * k)", "u"),
+        ("SELECT i AS k, CASE WHEN i = 1 THEN NULL ELSE val END AS val FROM w", "SUM(val * val)", "u"),
+        (
+            "SELECT CASE WHEN i = 1 THEN CAST(NULL AS BIGINT) ELSE i END AS k, val FROM w",
+            "SUM(u.val * b.val)",
+            "u JOIN b ON u.k = b.i",
+        ),
+    ],
+)
+def test_a_bare_null_is_differentiated(ad, con, u, loss, source):
+    # DuckDB's producer gives a bare NULL a type of no kind, and folds a
+    # CAST(NULL AS ...) into one; the step's SQL writes it as a bare NULL.
+    # The gradient is DataFusion's for the same SQL.
+    from datafusion import SessionContext
+    from ddxdb import ad as df
+
+    sql = f"WITH u AS ({u}), loss AS (SELECT {loss} AS l FROM {source}) SELECT i, grad(loss, val) AS g FROM w"
+    ctx = SessionContext()
+    for name in ("w", "b"):
+        ctx.from_arrow(con.execute(f"SELECT * FROM {name}").arrow(), name)
+    want = {r["i"]: r["g"] for r in df.sql(ctx, sql).to_arrow_table().to_pylist()}
+    assert dict(pairs(ad.sql(con, sql))) == pytest.approx(want)
+
+
 def test_a_repeated_column_is_refused_with_a_reason(ad, con):
     # DuckDB's producer drops a column that repeats another; ddx cannot tell
     # which is which, and says so rather than guess.
