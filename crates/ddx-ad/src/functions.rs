@@ -26,7 +26,9 @@
 
 use std::collections::HashMap;
 
-use substrait::proto::extensions::simple_extension_declaration::{ExtensionFunction, MappingType};
+use substrait::proto::extensions::simple_extension_declaration::{
+    ExtensionFunction, ExtensionType, MappingType,
+};
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
 use substrait::proto::Plan;
 
@@ -137,6 +139,8 @@ pub struct Functions {
     others: Vec<SimpleExtensionDeclaration>,
     /// The extension URNs the plan's declarations point into.
     urns: Vec<SimpleExtensionUrn>,
+    /// The anchor of the type of NULLs with no type ([`Functions::null_type`]).
+    null_type: u32,
 }
 
 impl Functions {
@@ -164,12 +168,24 @@ impl Functions {
                 )));
             }
         }
+        let null_type = declare_null_type(&mut others);
         Ok(Functions {
             names,
             declarations,
             others,
             urns: plan.extension_urns.clone(),
+            null_type,
         })
+    }
+
+    /// The anchor of the type of NULLs with no type, which every plan ddx
+    /// writes declares: DataFusion's user-defined type `null`, which its
+    /// consumer reads as `DataType::Null` and [`crate::to_sql`] as a bare
+    /// `NULL`. The engine types such a NULL where it meets a typed value, as
+    /// in a `UNION ALL`.
+    #[must_use]
+    pub fn null_type(&self) -> u32 {
+        self.null_type
     }
 
     /// The declarations of every plan in `plans`, which must agree: an anchor
@@ -343,6 +359,37 @@ impl Extensions {
     }
 }
 
+/// The anchor of the type `null` among `others`, declared as DataFusion's
+/// producer declares it (with no extension URN), at the first anchor no
+/// other type has, if it isn't.
+fn declare_null_type(others: &mut Vec<SimpleExtensionDeclaration>) -> u32 {
+    let types = || {
+        others.iter().filter_map(|d| match &d.mapping_type {
+            Some(MappingType::ExtensionType(t)) => Some(t),
+            _ => None,
+        })
+    };
+    // By its exact name, as DataFusion's consumer and `to_sql` read it.
+    if let Some(t) = types().find(|t| t.name == NULL_TYPE) {
+        return t.type_anchor;
+    }
+    let used: std::collections::HashSet<u32> = types().map(|t| t.type_anchor).collect();
+    let anchor = (0..=u32::MAX)
+        .find(|a| !used.contains(a))
+        .expect("a plan declares fewer than 2^32 types");
+    others.push(SimpleExtensionDeclaration {
+        mapping_type: Some(MappingType::ExtensionType(ExtensionType {
+            extension_urn_reference: u32::MAX,
+            type_anchor: anchor,
+            name: NULL_TYPE.into(),
+        })),
+    });
+    anchor
+}
+
+/// DataFusion's name for the type of NULLs with no type.
+const NULL_TYPE: &str = "null";
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -394,7 +441,43 @@ pub(crate) mod tests {
         let declared = ext.declarations();
         assert_eq!(declared[0], plan.extensions[0]);
         assert!(declared.contains(&ty));
-        assert_eq!(declared.len(), 3);
+        // The function ddx added, and the type of NULLs with no type.
+        assert_eq!(declared.len(), 4);
+        assert_eq!(functions.null_type(), 0);
+    }
+
+    #[test]
+    fn the_type_of_untyped_nulls_is_the_plan_s_own_if_it_declares_one() {
+        let mut plan = Plan::default();
+        assert_eq!(Functions::from_plan(&plan).unwrap().null_type(), 0);
+        plan.extensions.push(SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionType(ExtensionType {
+                extension_urn_reference: u32::MAX,
+                type_anchor: 3,
+                name: "null".into(),
+            })),
+        });
+        let functions = Functions::from_plan(&plan).unwrap();
+        assert_eq!(functions.null_type(), 3);
+        assert_eq!(Extensions::new(&functions).declarations(), plan.extensions);
+    }
+
+    #[test]
+    fn the_type_of_untyped_nulls_takes_the_first_anchor_no_type_has() {
+        // Neither a type named `NULL`, which is not DataFusion's, nor a type
+        // at the last anchor gets in the way.
+        let declare = |anchor, name: &str| SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionType(ExtensionType {
+                extension_urn_reference: u32::MAX,
+                type_anchor: anchor,
+                name: name.into(),
+            })),
+        };
+        let plan = Plan {
+            extensions: vec![declare(0, "NULL"), declare(u32::MAX, "point")],
+            ..Default::default()
+        };
+        assert_eq!(Functions::from_plan(&plan).unwrap().null_type(), 1);
     }
 
     #[test]
