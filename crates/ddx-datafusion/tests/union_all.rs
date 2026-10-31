@@ -358,6 +358,34 @@ async fn a_union_of_data_two_levels_beneath_a_union() {
     );
 }
 
+#[tokio::test]
+async fn a_union_all_beneath_a_union_beneath_a_union_all_read_through_a_join() {
+    // n1's UNION is a distinct over a UNION ALL, and n2's first input is
+    // computed; read through a join, DataFusion's optimizer failed to splice
+    // the unions (#249).
+    let grads = check_gradients(
+        &ctx(),
+        "WITH u AS (SELECT i AS k, 2.0 * x AS v FROM a) \
+         SELECT SUM(u.v * u2.v) AS l FROM u JOIN ( \
+           SELECT k, v FROM (SELECT i + 1 AS k, 2.0 * x AS v FROM b \
+                             UNION ALL SELECT k, v FROM (SELECT i AS k, x AS v FROM b \
+                                                         UNION SELECT i AS k, x AS v FROM b) n1) n2 \
+           UNION ALL SELECT i AS k, x AS v FROM a) u2 ON u.k = u2.k",
+        &[a(), b()],
+        &[wrt("a", "x")],
+    )
+    .await;
+    // l = Σ_k 2 a_k (Σ of u2's v at k), u2 at key 0: b_0 + a_0, at key 1:
+    // 2 b_0 + b_1 + a_1. So ∂l/∂a_k = 2 (u2 at k) + 2 a_k.
+    assert_eq!(
+        sorted(&grads["a"]),
+        vec![
+            vec![0.0, 2.0 * (3.0 + 1.0) + 2.0],
+            vec![1.0, 2.0 * (6.0 - 0.5 + 2.0) + 4.0]
+        ]
+    );
+}
+
 async fn refusal(sql: &str) -> AdError {
     let ctx = ctx();
     a().create(&ctx).await;
