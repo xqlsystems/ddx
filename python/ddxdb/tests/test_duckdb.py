@@ -554,6 +554,36 @@ def test_a_repeated_column_is_refused_with_a_reason(ad, con):
     assert ddx_tables(con) == []
 
 
+@pytest.mark.parametrize(
+    "u, loss",
+    [
+        (
+            "SELECT i AS k, x AS v FROM ta UNION ALL SELECT k, v FROM "
+            "(SELECT i AS k, i AS v FROM tb UNION ALL SELECT i AS k, i AS v FROM tb) n",
+            "SELECT SUM(u.v * w.val * u.v) AS l FROM u JOIN w ON u.k = w.i",
+        ),
+        (
+            "SELECT k, v FROM (SELECT i AS k, i AS v FROM tb UNION ALL SELECT i AS k, i AS v FROM ta) n "
+            "UNION ALL SELECT i AS k, x AS v FROM ta",
+            "SELECT SUM(t * t) AS l FROM (SELECT k, SUM(v) AS t FROM u GROUP BY k) g",
+        ),
+        (
+            "SELECT i AS k, x AS v, x AS v2 FROM ta UNION ALL SELECT i AS k, x AS v, 1.0 AS v2 FROM tb",
+            "SELECT SUM(v * v2) AS l FROM u",
+        ),
+    ],
+)
+def test_a_repeated_column_beneath_a_union_is_refused_with_a_reason(ad, con, u, loss):
+    # Beneath the root, the column DuckDB's producer drops leaves a union's
+    # inputs unequal, or an emit naming a column that isn't there. The first
+    # panicked (#237).
+    con.execute("CREATE TABLE ta AS SELECT * FROM (VALUES (1, 0.5::DOUBLE), (2, -1.0::DOUBLE)) t(i, x)")
+    con.execute("CREATE TABLE tb AS SELECT * FROM (VALUES (1, 2.0::DOUBLE), (3, 1.5::DOUBLE)) t(i, x)")
+    with pytest.raises(Exception, match="dropped a column"):
+        ad.sql(con, f"WITH u AS ({u}), loss AS ({loss}) SELECT i, grad(loss, x) FROM ta")
+    assert ddx_tables(con) == []
+
+
 def test_a_floor_division_of_floats_is_refused(ad, con):
     # DuckDB's `//` of floats floors; ddx writes only the integer one.
     with pytest.raises(Exception, match="`//`"):
