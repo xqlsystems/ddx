@@ -95,13 +95,17 @@ use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Rel};
 
 use crate::elementwise::depends;
-use crate::emit::{aggregate, filter, join, project};
+use crate::emit::{aggregate, filter, join, project, read_step, select};
 use crate::error::Result;
-use crate::expr::{as_field, call, field, fields_of, if_then, lit_bool, map_fields, scalar_args};
-use crate::forward::{subquery_rounds, width, Arm, Def, Output, Region, Saved, Slot};
+use crate::expr::{
+    as_field, call, field, fields_of, if_then, lit_bool, lit_f64, map_fields, scalar_args,
+};
+use crate::forward::{
+    saved_name, step_columns, subquery_rounds, width, Arm, Def, Input, Output, Region, Saved, Slot,
+};
 use crate::functions::Function;
 use crate::optics::{subqueries, Fold};
-use crate::transpose::Transposer;
+use crate::transpose::{Contribution, Transposer};
 
 /// A subtree of a region's join tree that is not itself an inner join: its
 /// relation, and its columns, `start..start + width` of the region.
@@ -118,6 +122,26 @@ struct Side {
     at: Vec<Option<usize>>,
     /// The side's factor of the product, over its own columns.
     factor: Expression,
+    /// The normalizers its factor divides by (see [`Normalizer`]).
+    normalizers: Vec<Normalizer>,
+}
+
+/// A saved aggregate `z` that a side's factor divides by, as attention's
+/// `w.w / n.z` divides by the softmax's normalizer, where each group of the
+/// contraction joins one row of `z`: `z`'s dims are all held equal to
+/// grouping keys. Then `z` divides every term of its group, so `∂o/∂z =
+/// −o/z`, and `z̄ = −Σ ō·o / z` summed by `z`'s dims (FlashAttention's
+/// `D`), read from the saved output and its cotangent. The side is
+/// transposed holding `z` constant, so `z̄` is never a sum over the region.
+struct Normalizer {
+    /// Its column in the side's region.
+    col: usize,
+    /// The saved aggregate.
+    saved: usize,
+    /// Its output column that is divided by.
+    value: usize,
+    /// For each of its dims, the grouping key held equal to it.
+    groups: Vec<usize>,
 }
 
 /// A condition between a contraction's sides, `=` or IS NOT DISTINCT FROM.
@@ -181,14 +205,15 @@ struct Shape {
 impl Transposer<'_> {
     /// The transpose of saved aggregate `n` by the contraction rule, if its
     /// shape allows (see the module docs). `arg` is the argument of its one
-    /// measure with a cotangent, a `SUM`, whose cotangent is column `cot_col`
-    /// of `cotangent`.
+    /// measure with a cotangent, a `SUM`, output column `col`, whose
+    /// cotangent is column `cot_col` of `cotangent`.
     ///
     /// Returns `false`, having changed nothing, if the shape doesn't allow.
     pub(crate) fn contraction(
         &mut self,
         n: usize,
         arg: &Expression,
+        col: usize,
         cotangent: &Rel,
         cot_col: usize,
     ) -> Result<bool> {
@@ -213,6 +238,9 @@ impl Transposer<'_> {
         self.check_rankings_are_total(&saved.input)?;
         for x in (0..2).filter(|&x| moves[x]) {
             self.side(&shape, x, cotangent, cot_col)?;
+            for z in &shape.sides[x].normalizers {
+                self.normalizer(n, col, z, cotangent, cot_col)?;
+            }
         }
         self.windows()?;
         Ok(true)
@@ -435,7 +463,15 @@ impl Transposer<'_> {
         }
         // Each side, rebuilt from its leaves.
         let mut product: [Option<Expression>; 2] = [None, None];
+        let mut normalizers: [Vec<Normalizer>; 2] = [Vec::new(), Vec::new()];
         let mul = self.ext.anchor(Function::Multiply);
+        let mut held = Classes::new(region.defs.len());
+        self.held_equal(&region.rel, 0, &mut held)?;
+        for (f, ls) in factors.iter().zip(&factor_leaves) {
+            if let Some(z) = self.normalizer_of(region, f, &factors, &group_cols, &mut held)? {
+                normalizers[ls.first().map_or(0, |&l| side_of_leaf[l])].push(z);
+            }
+        }
         for (f, ls) in factors.into_iter().zip(&factor_leaves) {
             // A factor that reads no input is a constant; it goes with side 0.
             let s = ls.first().map_or(0, |&l| side_of_leaf[l]);
@@ -460,6 +496,13 @@ impl Transposer<'_> {
             };
             let at = side.at.clone();
             side.factor = map_fields(&f, &mut |c| Ok(at[c].expect("a factor of this side")))?;
+            side.normalizers = std::mem::take(&mut normalizers[s])
+                .into_iter()
+                .map(|z| Normalizer {
+                    col: at[z.col].expect("a factor of this side"),
+                    ..z
+                })
+                .collect();
             sides.push(side);
         }
         let [left, right]: [Side; 2] = sides.try_into().ok().expect("two sides");
@@ -553,6 +596,174 @@ impl Transposer<'_> {
             }
         }
         out.push(e.clone());
+        Ok(())
+    }
+
+    /// `f`, a factor of the contraction's product among `factors` (over
+    /// `region`'s columns), as a [`Normalizer`] if it is, or computes, `a /
+    /// z` for a varied value `z` of a saved input that neither `a` nor any
+    /// other factor reads, and whose dims `held` holds equal to grouping
+    /// keys (`group_cols`). A saved aggregate has one row per value of its
+    /// dims, and a region only copies and drops rows, so each group then
+    /// joins one row of `z`. Its `col` is `region`'s.
+    fn normalizer_of(
+        &self,
+        region: &Region,
+        f: &Expression,
+        factors: &[Expression],
+        group_cols: &[usize],
+        held: &mut Classes,
+    ) -> Result<Option<Normalizer>> {
+        let mut e = f;
+        while let Some(Def::Expr(def)) = as_field(e).map(|c| &region.defs[c]) {
+            e = def;
+        }
+        let Some(RexType::ScalarFunction(div)) = &e.rex_type else {
+            return Ok(None);
+        };
+        if self.f.functions.name(div.function_reference)? != "divide" {
+            return Ok(None);
+        }
+        let [a, b] = scalar_args(div)?[..] else {
+            return Ok(None);
+        };
+        let Some(col) = as_field(b) else {
+            return Ok(None);
+        };
+        let Def::Input { slot, col: value } = region.defs[col] else {
+            return Ok(None);
+        };
+        let (Input::Saved(n), Some(offset)) = (region.slots[slot].input, region.slots[slot].offset)
+        else {
+            return Ok(None);
+        };
+        let saved = &self.f.saved[n];
+        if !region.varied[col] || !matches!(saved.outputs[value], Output::Value(_)) {
+            return Ok(None);
+        }
+        let others = factors.iter().filter(|g| !std::ptr::eq(*g, f));
+        for g in std::iter::once(a).chain(others) {
+            if reads(region, g, col)? {
+                return Ok(None);
+            }
+        }
+        let mut groups = Vec::new();
+        for d in saved.dims() {
+            match group_cols.iter().position(|&g| held.same(g, offset + d)) {
+                Some(g) => groups.push(g),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(Normalizer {
+            col,
+            saved: n,
+            value,
+            groups,
+        }))
+    }
+
+    /// Join in `held` each two columns of `rel` (whose columns start at
+    /// region column `start`) that every row of it holds equal, by an `=`
+    /// or IS NOT DISTINCT FROM of an inner join or a filter, beneath
+    /// relations that only append columns or drop rows.
+    fn held_equal(&self, rel: &Rel, start: usize, held: &mut Classes) -> Result<()> {
+        let mut conds = Vec::new();
+        match &rel.rel_type {
+            Some(RelType::Join(j)) if j.r#type == JoinType::Inner as i32 => {
+                let (Some(l), Some(r)) = (j.left.as_deref(), j.right.as_deref()) else {
+                    return Ok(());
+                };
+                conds.extend(j.expression.as_deref());
+                conds.extend(j.post_join_filter.as_deref());
+                self.held_equal(l, start, held)?;
+                self.held_equal(r, start + width(l)?, held)?;
+            }
+            Some(RelType::Filter(f)) => {
+                conds.extend(f.condition.as_deref());
+                if let Some(input) = f.input.as_deref() {
+                    self.held_equal(input, start, held)?;
+                }
+            }
+            Some(RelType::Project(p)) if p.common.is_none() => {
+                if let Some(input) = p.input.as_deref() {
+                    self.held_equal(input, start, held)?;
+                }
+            }
+            _ => {}
+        }
+        for c in conds {
+            for conjunct in self.conjuncts(c)? {
+                if let Some((_, a, b)) = self.equality(&conjunct)? {
+                    held.join(start + a, start + b);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalizer `z`'s contribution from saved contraction `n` (its output
+    /// column `col`, with cotangent column `cot_col` of `cotangent`):
+    ///
+    /// ```sql
+    /// SELECT s.k, -s.v / z.value
+    /// FROM (SELECT o.k, SUM(o.col * c.v) AS v
+    ///       FROM saved_n o JOIN cotangent c ON o.g IS NOT DISTINCT FROM c.g
+    ///       GROUP BY o.k) s                 -- k: the keys held equal to z's dims
+    /// JOIN z ON s.k IS NOT DISTINCT FROM z.dims
+    /// ```
+    fn normalizer(
+        &mut self,
+        n: usize,
+        col: usize,
+        z: &Normalizer,
+        cotangent: &Rel,
+        cot_col: usize,
+    ) -> Result<()> {
+        let saved = &self.f.saved[n];
+        let width = saved.outputs.len();
+        let dims = saved.dims();
+        let mul = self.ext.anchor(Function::Multiply);
+        let divide = self.ext.anchor(Function::Divide);
+        let sum = self.ext.anchor(Function::Sum);
+        let o = read_step(&saved_name(&self.f.namespace, n), step_columns(width));
+        let keys = dims.iter().map(|&d| field(d)).collect();
+        let positions: Vec<usize> = (0..dims.len()).collect();
+        let oc = self.join_on(
+            o,
+            cotangent.clone(),
+            keys,
+            &positions,
+            width,
+            JoinType::Inner,
+        )?;
+        let term = call(mul, vec![field(col), field(width + dims.len() + cot_col)]);
+        let k = z.groups.len();
+        let groups = z.groups.iter().map(|&g| field(dims[g])).collect();
+        let summed = aggregate(oc, groups, vec![(sum, vec![term])]);
+        let zs = &self.f.saved[z.saved];
+        let zwidth = zs.outputs.len();
+        let zr = read_step(
+            &saved_name(&self.f.namespace, z.saved),
+            step_columns(zwidth),
+        );
+        let keys = (0..k).map(field).collect();
+        let joined = self.join_on(summed, zr, keys, &zs.dims(), k + 1, JoinType::Inner)?;
+        let value = call(
+            mul,
+            vec![
+                lit_f64(-1.0),
+                call(divide, vec![field(k), field(k + 1 + z.value)]),
+            ],
+        );
+        let at = k + 1 + zwidth;
+        let rel = select(project(joined, vec![value]), (0..k).chain([at]).collect());
+        self.contributions
+            .entry(Input::Saved(z.saved))
+            .or_default()
+            .push(Contribution {
+                rel,
+                cols: vec![z.value],
+            });
         Ok(())
     }
 
@@ -654,10 +865,17 @@ impl Transposer<'_> {
         let t_value = t_cols.len();
         let t_keys = t_cols.iter().map(|&c| field(c)).collect();
         let mut t = aggregate(yc, t_keys, vec![(sum, vec![term])]);
-        // t is most of the work. A side of one input and no window reads it
-        // once; any other reads it once per input and once per window, so it
-        // is materialized, as a window's summed cotangent is.
-        let several = xs.region.slots.len() > 1
+        // t is most of the work. A side with one input that gradient reaches
+        // (a normalizer's comes from the saved output instead) and no window
+        // reads it once; any other reads it once per such input and once per
+        // window, so it is materialized, as a window's summed cotangent is.
+        let reached = |slot: &Slot| {
+            slot.offset.is_some_and(|o| {
+                (o..o + slot.width)
+                    .any(|c| xs.region.varied[c] && !xs.normalizers.iter().any(|z| z.col == c))
+            })
+        };
+        let several = xs.region.slots.iter().filter(|s| reached(s)).count() > 1
             || xs
                 .region
                 .defs
@@ -673,6 +891,9 @@ impl Transposer<'_> {
         // X, its factor a column of its own, joined to t on the join keys and
         // X's grouping keys.
         let mut region = xs.region.clone();
+        for z in &xs.normalizers {
+            region.varied[z.col] = false;
+        }
         let factor_col = region.defs.len();
         let varied = depends(&self.f.functions, &xs.factor, &|c| region.varied[c])?;
         region
@@ -822,7 +1043,30 @@ fn rebuild(
         region,
         at,
         factor: lit_bool(true),
+        normalizers: Vec::new(),
     }))
+}
+
+/// Whether `e`, over `region`'s columns, reads column `col`, directly or
+/// through the columns it reads.
+fn reads(region: &Region, e: &Expression, col: usize) -> Result<bool> {
+    let mut pending = fields_of(e)?;
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(c) = pending.pop() {
+        if c == col {
+            return Ok(true);
+        }
+        if !seen.insert(c) {
+            continue;
+        }
+        match &region.defs[c] {
+            Def::Expr(d) => pending.extend(fields_of(d)?),
+            Def::Window { function, .. } => pending.extend(fields_of(function)?),
+            Def::Union(arms) => pending.extend(arms.iter().flat_map(|a| [a.branch, a.column])),
+            Def::Input { .. } | Def::Const | Def::Branch => {}
+        }
+    }
+    Ok(false)
 }
 
 /// `leaf`'s columns of `region`, as a region of their own. `None` if one of

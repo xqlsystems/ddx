@@ -100,3 +100,55 @@ async fn a_cte_read_twice_is_saved_once() {
         assert_eq!(program.forward_steps.len(), 8 + 1);
     }
 }
+
+#[tokio::test]
+async fn the_normalizers_cotangent_reads_no_score() {
+    // The normalizer z divides every term of o's sum, so its cotangent is
+    // -Σ ō·o / z (FlashAttention's D), from o and o's cotangent, never a
+    // sum over the scores. So every table it reads, directly or through
+    // other backward steps, has at most one row per position and feature
+    // (6), where the scores have one per pair of positions (9).
+    let ctx = SessionContext::new();
+    ddx_datafusion::register_stop_gradient(&ctx);
+    for t in tables() {
+        t.create(&ctx).await;
+    }
+    let wrt = [ColumnRef::new("x", "val")];
+    let plan = common::substrait_of(&ctx, ATTENTION, true).await;
+    let f = ddx_ad::Forward::new(&plan, &wrt).unwrap();
+    // The normalizer: the one SUM grouped by one key.
+    let z = (0..f.saved.len())
+        .find(|&n| {
+            let s = &f.saved[n];
+            s.dims().len() == 1
+                && f.functions.name(s.measures[0].function_reference).unwrap() == "sum"
+        })
+        .unwrap();
+    let program = ddx_ad::grad(&plan, &wrt).unwrap();
+    for step in program.steps() {
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+    }
+    let backward = &program.backward_steps;
+    let start = backward
+        .iter()
+        .find(|s| s.name.ends_with(&format!("cotangent_{z}")))
+        .expect("the normalizer has a cotangent");
+    let mut pending = vec![start];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(step) = pending.pop() {
+        if !seen.insert(step.name.clone()) {
+            continue;
+        }
+        for read in ddx_ad::tables_read(&step.plan) {
+            let rows = ctx
+                .table(format!("\"{read}\""))
+                .await
+                .unwrap()
+                .count()
+                .await
+                .unwrap();
+            assert!(rows <= 6, "{} reads {read}, of {rows} rows", step.name);
+            pending.extend(backward.iter().find(|s| s.name == read));
+        }
+    }
+}

@@ -154,7 +154,7 @@ impl<'a> Transposer<'a> {
                     extreme: None,
                     shared: false,
                 })
-                && self.contraction(n, arg, &cotangent, *i)?
+                && self.contraction(n, arg, cols[*i], &cotangent, *i)?
             {
                 return Ok(());
             }
