@@ -67,8 +67,8 @@ use crate::expr::{
 };
 use crate::functions::Functions;
 use crate::optics::{
-    subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs, PlanRels,
-    RelKind, Rex, Setter, Tree,
+    cata, subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs,
+    PlanRels, RelKind, Rex, Setter, Tree,
 };
 use crate::reduce::{reduce_rule, whole_partition, Reduce};
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
@@ -477,19 +477,99 @@ pub(crate) fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
 /// drops the repeat and keeps both names.
 pub(crate) fn checked_root(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
     let (root, names) = root_of(plan)?;
-    if let Ok(w) = width(root) {
+    for rel in PlanRels.to_vec(plan) {
+        if !std::ptr::eq(rel, root) {
+            checked_width(rel)?;
+        }
+    }
+    if let Some(w) = checked_width(root)? {
         if w != names.len() {
             return Err(AdError::InvalidPlan(format!(
-                "the plan's root names {} columns ({}), but its relation has {w}: the \
-                 producer dropped a column (DuckDB's drops one that repeats another; \
-                 write each output once), or the output has nested columns, which ddx \
-                 does not differentiate",
+                "the plan's root names {} columns ({}), but its relation has {w}: {DROPPED}, \
+                 or the output has nested columns, which ddx does not differentiate",
                 names.len(),
                 names.join(", ")
             )));
         }
     }
     Ok((root, names))
+}
+
+/// Why a relation has fewer columns than what reads it expects, in a plan a
+/// producer wrote.
+const DROPPED: &str = "the producer dropped a column (DuckDB's drops one that repeats another; \
+                       write each column once)";
+
+/// `rel`'s width, checked bottom up: each emit names only columns its
+/// relation has, and a set operation's inputs have one width. A producer
+/// that drops a column gives a plan that fails these somewhere beneath its
+/// root, and ddx copies the relations it doesn't differentiate into the
+/// steps it writes as they are, so it checks them all here. `None` for a
+/// relation whose width it can't tell (one it doesn't read), and for
+/// everything above one; subqueries aren't checked.
+fn checked_width(rel: &Rel) -> Result<Option<usize>> {
+    cata(
+        rel,
+        |rel, found| {
+            RelKind.then(Inputs).each(rel, |input| found.push(input));
+            Ok::<_, AdError>(())
+        },
+        |rel, widths| {
+            let Some(kind) = &rel.rel_type else {
+                return Ok(None);
+            };
+            let first = widths.first().copied().flatten();
+            let all = || widths.iter().copied().collect::<Option<Vec<usize>>>();
+            let (direct, common) = match kind {
+                RelType::Read(r) => (Some(read_width(r)), r.common.as_ref()),
+                RelType::Project(p) => (first.map(|w| w + p.expressions.len()), p.common.as_ref()),
+                RelType::Filter(f) => (first, f.common.as_ref()),
+                RelType::Sort(s) => (first, s.common.as_ref()),
+                RelType::Fetch(f) => (first, f.common.as_ref()),
+                RelType::Window(w) => (
+                    first.map(|n| n + w.window_functions.len()),
+                    w.common.as_ref(),
+                ),
+                RelType::Join(j) => (
+                    all().map(|w| join_width(j.r#type, w[0], w[1])),
+                    j.common.as_ref(),
+                ),
+                RelType::Cross(c) => (all().map(|w| w[0] + w[1]), c.common.as_ref()),
+                RelType::Aggregate(a) if a.groupings.len() <= 1 => (
+                    grouping_expressions(a)
+                        .ok()
+                        .map(|g| g.len() + a.measures.len()),
+                    a.common.as_ref(),
+                ),
+                RelType::Set(set) => {
+                    if let Some(widths) = all() {
+                        if let Some(&w) = widths.iter().find(|&&w| w != widths[0]) {
+                            return Err(AdError::InvalidPlan(format!(
+                                "a set operation's inputs have {} and {w} columns: {DROPPED}",
+                                widths[0]
+                            )));
+                        }
+                    }
+                    (first, set.common.as_ref())
+                }
+                _ => return Ok(None),
+            };
+            match common.and_then(|c| c.emit_kind.as_ref()) {
+                Some(EmitKind::Emit(e)) => {
+                    if let (Some(direct), Some(&i)) = (direct, e.output_mapping.iter().max()) {
+                        if i as usize >= direct {
+                            return Err(AdError::InvalidPlan(format!(
+                                "a relation's emit names its column {i}, past its {direct}: \
+                                 {DROPPED}"
+                            )));
+                        }
+                    }
+                    Ok(Some(e.output_mapping.len()))
+                }
+                _ => Ok(direct),
+            }
+        },
+    )
 }
 
 /// `plan` with each window relation written as the projection of its
@@ -1964,15 +2044,7 @@ pub fn width(rel: &Rel) -> Result<usize> {
         .ok_or_else(|| AdError::InvalidPlan("an empty relation".into()))?;
     let (direct, common) =
         match kind {
-            RelType::Read(r) => {
-                let n = match &r.projection.as_ref().and_then(|m| m.select.as_ref()) {
-                    Some(sel) => sel.struct_items.len(),
-                    None => r.base_schema.as_ref().map_or(0, |s| {
-                        s.r#struct.as_ref().map_or(s.names.len(), |t| t.types.len())
-                    }),
-                };
-                (n, r.common.as_ref())
-            }
+            RelType::Read(r) => (read_width(r), r.common.as_ref()),
             RelType::Project(p) => (
                 width(input(&p.input)?)? + p.expressions.len(),
                 p.common.as_ref(),
@@ -1980,17 +2052,10 @@ pub fn width(rel: &Rel) -> Result<usize> {
             RelType::Filter(f) => (width(input(&f.input)?)?, f.common.as_ref()),
             RelType::Sort(s) => (width(input(&s.input)?)?, s.common.as_ref()),
             RelType::Fetch(f) => (width(input(&f.input)?)?, f.common.as_ref()),
-            RelType::Join(j) => {
-                let (l, r) = (width(input(&j.left)?)?, width(input(&j.right)?)?);
-                let n = match JoinType::try_from(j.r#type).unwrap_or(JoinType::Unspecified) {
-                    JoinType::LeftSemi | JoinType::LeftAnti => l,
-                    JoinType::RightSemi | JoinType::RightAnti => r,
-                    JoinType::LeftMark => l + 1,
-                    JoinType::RightMark => r + 1,
-                    _ => l + r,
-                };
-                (n, j.common.as_ref())
-            }
+            RelType::Join(j) => (
+                join_width(j.r#type, width(input(&j.left)?)?, width(input(&j.right)?)?),
+                j.common.as_ref(),
+            ),
             RelType::Cross(c) => (
                 width(input(&c.left)?)? + width(input(&c.right)?)?,
                 c.common.as_ref(),
@@ -2027,6 +2092,27 @@ pub fn width(rel: &Rel) -> Result<usize> {
     match common.and_then(|c| c.emit_kind.as_ref()) {
         Some(EmitKind::Emit(e)) => Ok(e.output_mapping.len()),
         _ => Ok(direct),
+    }
+}
+
+/// A read's direct width: its projection mask's, or its schema's.
+fn read_width(r: &ReadRel) -> usize {
+    match &r.projection.as_ref().and_then(|m| m.select.as_ref()) {
+        Some(sel) => sel.struct_items.len(),
+        None => r.base_schema.as_ref().map_or(0, |s| {
+            s.r#struct.as_ref().map_or(s.names.len(), |t| t.types.len())
+        }),
+    }
+}
+
+/// A join's direct width, of type `join_type`, from its inputs' widths.
+fn join_width(join_type: i32, left: usize, right: usize) -> usize {
+    match JoinType::try_from(join_type).unwrap_or(JoinType::Unspecified) {
+        JoinType::LeftSemi | JoinType::LeftAnti => left,
+        JoinType::RightSemi | JoinType::RightAnti => right,
+        JoinType::LeftMark => left + 1,
+        JoinType::RightMark => right + 1,
+        _ => left + right,
     }
 }
 
@@ -2121,6 +2207,33 @@ pub(crate) fn rel_name(kind: &RelType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_column_a_producer_dropped_beneath_the_root_is_refused() {
+        // DuckDB's producer writes a projection of plain columns as its
+        // read's columns, so it drops one that repeats another, leaving
+        // nothing to tell which (#237). Beneath the root, a union's inputs
+        // then disagree, or an emit names a column that isn't there; ddx
+        // copies such a relation into its steps as it is, and panicked.
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let two = || emit::read_step("a", vec!["i".into(), "x".into()]);
+        let one = || emit::read_step("b", vec!["i".into()]);
+        let names = |n: usize| (0..n).map(|c| format!("c{c}")).collect();
+        let unequal = emit::union_all(vec![two(), one()]);
+        let past = emit::union_all(vec![
+            two(),
+            emit::project_emit(one(), vec![lit_bool(true)], Some(vec![0, 2])),
+        ]);
+        for root in [unequal, past] {
+            let plan = emit::plan(emit::project(root, vec![field(0)]), names(3), &ext);
+            let e = checked_root(&plan).expect_err("refused");
+            assert!(e.to_string().contains("dropped a column"), "{e}");
+        }
+        let fine = emit::union_all(vec![two(), emit::project(one(), vec![lit_bool(true)])]);
+        let plan = emit::plan(emit::project(fine, vec![field(0)]), names(3), &ext);
+        checked_root(&plan).unwrap();
+    }
 
     #[test]
     fn a_window_relation_is_read_as_the_projection_of_its_functions() {
