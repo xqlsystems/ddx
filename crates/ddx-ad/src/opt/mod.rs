@@ -12,8 +12,8 @@
 //! - [`inline`]: compute a step that one later step reads, once, inside
 //!   that step.
 //! - [`split`]: split a step too deep for a consumer into steps.
-//! - [`flatten_unions`]: splice a `UNION ALL` that is an input of a
-//!   `UNION ALL` into it.
+//! - [`flatten_unions`]: splice a `UNION ALL` that is an input of a union,
+//!   beneath only projections, into it.
 //!
 //! Every plan ddx writes goes through [`plan`]; every program's steps,
 //! through [`steps`] once they are final.
@@ -25,9 +25,10 @@ pub(crate) mod split;
 
 use std::collections::{BTreeSet, HashMap};
 
+use substrait::proto::expression::RexType;
 use substrait::proto::rel::RelType;
 use substrait::proto::set_rel::SetOp;
-use substrait::proto::{Plan, Rel, SetRel};
+use substrait::proto::{Plan, ProjectRel, Rel};
 
 use crate::optics::{Compose, Deep, PlanRels, RelKind, Setter};
 use crate::program::{BackwardProgram, Step};
@@ -49,38 +50,83 @@ pub(crate) fn steps(steps: &mut Vec<Step>) {
     }
 }
 
-/// `plan` with each `UNION ALL` that is an input of a `UNION ALL`, and picks
-/// no columns of its own (has no emit), spliced into it: the same rows, in
-/// the columns of the outer union's first input, which name a union's
-/// columns.
+/// `plan` with each `UNION ALL` that is an input of a union (`UNION ALL` or
+/// `UNION`), beneath only projections computed row by row, spliced into it:
+/// each of its inputs, with its emit and those projections over it, is an
+/// input of the union above. The same rows, since such a projection of a
+/// `UNION ALL` is the `UNION ALL` of the projection of each input.
 ///
-/// Pruning and inlining can leave one union directly beneath another,
-/// where the plan an engine gave had a projection between them. DataFusion's
+/// Pruning and inlining can leave one union directly beneath another, and
+/// the plans engines give have them beneath a projection. DataFusion's
 /// optimizer splices them itself (`optimize_unions`), and fails when the
-/// inner union names its columns otherwise than the outer one: it looks the
-/// outer names up in the inner union (ddx issue #236).
+/// inner union's inputs name their columns otherwise than its first does:
+/// it looks the union's names up in each input, both for a union directly
+/// beneath (ddx issue #236) and for a projection it pushes onto each input
+/// (#249).
 pub(crate) fn flatten_unions(plan: &mut Plan) {
-    fn union_all(set: &SetRel) -> bool {
-        set.op == SetOp::UnionAll as i32
-            && set.common.as_ref().is_none_or(|c| c.emit_kind.is_none())
-    }
-    let spliced = |rel: &Rel| matches!(&rel.rel_type, Some(RelType::Set(s)) if union_all(s));
     PlanRels.then(Deep).then(RelKind).modify(plan, |kind| {
         let RelType::Set(set) = kind else { return };
-        if set.op != SetOp::UnionAll as i32 || !set.inputs.iter().any(spliced) {
+        let union = [SetOp::UnionAll as i32, SetOp::UnionDistinct as i32];
+        if !union.contains(&set.op) || !set.inputs.iter().any(spliced) {
             return;
         }
         let mut pending = std::mem::take(&mut set.inputs);
         pending.reverse();
         while let Some(input) = pending.pop() {
-            match input.rel_type {
-                Some(RelType::Set(inner)) if union_all(&inner) => {
-                    pending.extend(inner.inputs.into_iter().rev());
-                }
-                rel_type => set.inputs.push(Rel { rel_type }),
+            if spliced(&input) {
+                pending.extend(splice(input).into_iter().rev());
+            } else {
+                set.inputs.push(input);
             }
         }
     });
+}
+
+/// Whether `rel` is a `UNION ALL` beneath only projections computed row by
+/// row, which a union above splices.
+fn spliced(rel: &Rel) -> bool {
+    let window =
+        |e: &substrait::proto::Expression| matches!(e.rex_type, Some(RexType::WindowFunction(_)));
+    match &rel.rel_type {
+        Some(RelType::Set(set)) => set.op == SetOp::UnionAll as i32,
+        Some(RelType::Project(p)) => {
+            !p.expressions
+                .iter()
+                .any(|e| crate::expr::contains(e, &window))
+                && p.input.as_deref().is_some_and(spliced)
+        }
+        _ => false,
+    }
+}
+
+/// The inputs of the `UNION ALL` that `rel` ([`spliced`]) is, each with the
+/// union's emit and the projections above it over it.
+fn splice(rel: Rel) -> Vec<Rel> {
+    let over = |input: Rel, p: &ProjectRel| Rel {
+        rel_type: Some(RelType::Project(Box::new(ProjectRel {
+            common: p.common.clone(),
+            input: Some(Box::new(input)),
+            expressions: p.expressions.clone(),
+            advanced_extension: p.advanced_extension.clone(),
+        }))),
+    };
+    match rel.rel_type {
+        Some(RelType::Set(set)) if set.common.as_ref().is_none_or(|c| c.emit_kind.is_none()) => {
+            set.inputs
+        }
+        Some(RelType::Set(set)) => {
+            let picks = ProjectRel {
+                common: set.common,
+                ..Default::default()
+            };
+            set.inputs.into_iter().map(|i| over(i, &picks)).collect()
+        }
+        Some(RelType::Project(mut p)) => {
+            let input = p.input.take().expect("a spliced projection has an input");
+            splice(*input).into_iter().map(|i| over(i, &p)).collect()
+        }
+        _ => unreachable!("only a spliced relation is spliced"),
+    }
 }
 
 /// Optimize a backward program: prune each plan, then across steps, from the
@@ -158,10 +204,19 @@ mod tests {
     use crate::functions::{Extensions, Functions};
 
     #[test]
-    fn a_union_all_beneath_a_union_all_is_spliced_into_it_unless_it_picks_columns() {
+    fn a_union_all_beneath_projections_in_a_union_is_spliced_into_it() {
+        use crate::emit::project_emit;
+        use crate::expr::{field, window};
         use substrait::proto::rel_common::{Emit, EmitKind};
         use substrait::proto::RelCommon;
         let t = |name: &str| read_step(name, vec!["x".into()]);
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = Extensions::new(&functions);
+        let flattened = |rel: Rel| {
+            let mut plan = crate::emit::plan(rel, vec!["x".into()], &ext);
+            flatten_unions(&mut plan);
+            plan
+        };
         let mut picking = union_all(vec![t("d"), t("e")]);
         if let Some(RelType::Set(s)) = &mut picking.rel_type {
             s.common = Some(RelCommon {
@@ -171,16 +226,55 @@ mod tests {
                 ..Default::default()
             });
         }
+        let doubled = |rel: Rel| project_emit(rel, vec![field(0)], Some(vec![1]));
         let nested = union_all(vec![
             t("a"),
             union_all(vec![t("b"), union_all(vec![t("c")])]),
-            picking.clone(),
+            picking,
+            doubled(union_all(vec![t("f"), t("g")])),
         ]);
-        let functions = Functions::from_plan(&Plan::default()).unwrap();
-        let ext = Extensions::new(&functions);
-        let mut plan = crate::emit::plan(nested, vec!["x".into()], &ext);
-        flatten_unions(&mut plan);
-        let flat = union_all(vec![t("a"), t("b"), t("c"), picking]);
-        assert_eq!(plan, crate::emit::plan(flat, vec!["x".into()], &ext));
+        let picked = |name: &str| project_emit(t(name), vec![], Some(vec![0]));
+        let flat = union_all(vec![
+            t("a"),
+            t("b"),
+            t("c"),
+            picked("d"),
+            picked("e"),
+            doubled(t("f")),
+            doubled(t("g")),
+        ]);
+        assert_eq!(
+            flattened(nested),
+            crate::emit::plan(flat, vec!["x".into()], &ext)
+        );
+        // A window over a union isn't the union of the window over each.
+        let windowed = project_emit(
+            union_all(vec![t("f"), t("g")]),
+            vec![window(0, vec![field(0)], vec![])],
+            Some(vec![1]),
+        );
+        let kept = union_all(vec![t("a"), windowed]);
+        assert_eq!(
+            flattened(kept.clone()),
+            crate::emit::plan(kept, vec!["x".into()], &ext)
+        );
+        // A UNION ALL in a UNION is spliced too; a UNION is not.
+        let distinct = |inputs: Vec<Rel>| {
+            let mut u = union_all(inputs);
+            if let Some(RelType::Set(s)) = &mut u.rel_type {
+                s.op = SetOp::UnionDistinct as i32;
+            }
+            u
+        };
+        let nested = distinct(vec![
+            t("a"),
+            union_all(vec![t("b"), t("c")]),
+            distinct(vec![t("d"), t("e")]),
+        ]);
+        let flat = distinct(vec![t("a"), t("b"), t("c"), distinct(vec![t("d"), t("e")])]);
+        assert_eq!(
+            flattened(nested),
+            crate::emit::plan(flat, vec!["x".into()], &ext)
+        );
     }
 }
