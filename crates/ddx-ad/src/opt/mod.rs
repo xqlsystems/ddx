@@ -12,6 +12,8 @@
 //! - [`inline`]: compute a step that one later step reads, once, inside
 //!   that step.
 //! - [`split`]: split a step too deep for a consumer into steps.
+//! - [`flatten_unions`]: splice a `UNION ALL` that is an input of a
+//!   `UNION ALL` into it.
 //!
 //! Every plan ddx writes goes through [`plan`]; every program's steps,
 //! through [`steps`] once they are final.
@@ -23,19 +25,62 @@ pub(crate) mod split;
 
 use std::collections::{BTreeSet, HashMap};
 
-use substrait::proto::Plan;
+use substrait::proto::rel::RelType;
+use substrait::proto::set_rel::SetOp;
+use substrait::proto::{Plan, Rel, SetRel};
 
+use crate::optics::{Compose, Deep, PlanRels, RelKind, Setter};
 use crate::program::{BackwardProgram, Step};
 
-/// Optimize one plan: prune it to its output, then fuse its projections.
+/// Optimize one plan: prune it to its output, then fuse its projections,
+/// then flatten its unions.
 pub(crate) fn plan(plan: &mut Plan) {
     prune::prune_plan(plan);
     fuse::fuse_plan(plan);
+    flatten_unions(plan);
 }
 
-/// Optimize a program's final steps: split each too deep for a consumer.
+/// Optimize a program's final steps: split each too deep for a consumer,
+/// then flatten their unions.
 pub(crate) fn steps(steps: &mut Vec<Step>) {
     split::split_steps(steps);
+    for step in steps.iter_mut() {
+        flatten_unions(&mut step.plan.0);
+    }
+}
+
+/// `plan` with each `UNION ALL` that is an input of a `UNION ALL`, and picks
+/// no columns of its own (has no emit), spliced into it: the same rows, in
+/// the columns of the outer union's first input, which name a union's
+/// columns.
+///
+/// Pruning and inlining can leave one union directly beneath another,
+/// where the plan an engine gave had a projection between them. DataFusion's
+/// optimizer splices them itself (`optimize_unions`), and fails when the
+/// inner union names its columns otherwise than the outer one: it looks the
+/// outer names up in the inner union (ddx issue #236).
+pub(crate) fn flatten_unions(plan: &mut Plan) {
+    fn union_all(set: &SetRel) -> bool {
+        set.op == SetOp::UnionAll as i32
+            && set.common.as_ref().is_none_or(|c| c.emit_kind.is_none())
+    }
+    let spliced = |rel: &Rel| matches!(&rel.rel_type, Some(RelType::Set(s)) if union_all(s));
+    PlanRels.then(Deep).then(RelKind).modify(plan, |kind| {
+        let RelType::Set(set) = kind else { return };
+        if set.op != SetOp::UnionAll as i32 || !set.inputs.iter().any(spliced) {
+            return;
+        }
+        let mut pending = std::mem::take(&mut set.inputs);
+        pending.reverse();
+        while let Some(input) = pending.pop() {
+            match input.rel_type {
+                Some(RelType::Set(inner)) if union_all(&inner) => {
+                    pending.extend(inner.inputs.into_iter().rev());
+                }
+                rel_type => set.inputs.push(Rel { rel_type }),
+            }
+        }
+    });
 }
 
 /// Optimize a backward program: prune each plan, then across steps, from the
@@ -103,5 +148,39 @@ fn inline_program(program: &mut BackwardProgram, keep: &BTreeSet<String>) {
         } else {
             program.backward_steps.push(s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::{read_step, union_all};
+    use crate::functions::{Extensions, Functions};
+
+    #[test]
+    fn a_union_all_beneath_a_union_all_is_spliced_into_it_unless_it_picks_columns() {
+        use substrait::proto::rel_common::{Emit, EmitKind};
+        use substrait::proto::RelCommon;
+        let t = |name: &str| read_step(name, vec!["x".into()]);
+        let mut picking = union_all(vec![t("d"), t("e")]);
+        if let Some(RelType::Set(s)) = &mut picking.rel_type {
+            s.common = Some(RelCommon {
+                emit_kind: Some(EmitKind::Emit(Emit {
+                    output_mapping: vec![0],
+                })),
+                ..Default::default()
+            });
+        }
+        let nested = union_all(vec![
+            t("a"),
+            union_all(vec![t("b"), union_all(vec![t("c")])]),
+            picking.clone(),
+        ]);
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = Extensions::new(&functions);
+        let mut plan = crate::emit::plan(nested, vec!["x".into()], &ext);
+        flatten_unions(&mut plan);
+        let flat = union_all(vec![t("a"), t("b"), t("c"), picking]);
+        assert_eq!(plan, crate::emit::plan(flat, vec!["x".into()], &ext));
     }
 }
