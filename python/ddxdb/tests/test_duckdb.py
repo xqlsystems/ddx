@@ -118,6 +118,17 @@ def test_grad_through_a_union_all(ad, con):
     assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
     assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
 
+def test_a_union_of_many_inputs_is_differentiated(ad, con):
+    # Its SQL is the size of its inputs: written as n² relations, it was past
+    # DuckDB's max_expression_depth from 16 inputs on (#238).
+    n = 24
+    union = " UNION ALL ".join(f"SELECT i, {c}.0 * val AS val FROM w" for c in range(1, n + 1))
+    loss = f"WITH u AS ({union}), loss AS (SELECT SUM(val * val) AS l FROM u) "
+    k = sum(c * c for c in range(1, n + 1))
+    want = {i: 2 * k * v for i, v in enumerate([1.0, -2.0, 0.5])}
+    assert dict(pairs(ad.sql(con, loss + "SELECT i, grad(loss, val) FROM w"))) == pytest.approx(want)
+
+
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, con):
     full = pairs(ad.sql(con, GRAD))
     some = pairs(ad.sql(con, GRAD + " WHERE i >= 1"))

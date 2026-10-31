@@ -307,6 +307,34 @@ async fn a_group_whose_key_is_null_keeps_its_gradient() {
     );
 }
 
+#[tokio::test]
+async fn a_union_of_many_inputs_reads_each_one_once() {
+    // Each input's rows carry every other input's columns as NULLs of no
+    // type, which the engine types as it types the union. Joined to empty
+    // copies of every other input, a union of n inputs was n² relations:
+    // DuckDB refused its SQL from 16 inputs on, for its 1,000 CTEs (#238).
+    let n = 32;
+    let union = (1..=n)
+        .map(|c| format!("SELECT i, {c}.0 * x AS x FROM a"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!("WITH u AS ({union}) SELECT SUM(x * x) AS l FROM u");
+    let ctx = ctx();
+    let grads = check_gradients(&ctx, &sql, &[a()], &[wrt("a", "x")]).await;
+    // d/dx Σ_c (c x)² = 2 x Σ_c c².
+    let k: f64 = (1..=n).map(|c| f64::from(c * c)).sum();
+    assert_eq!(
+        sorted(&grads["a"]),
+        vec![vec![0.0, 2.0 * k], vec![1.0, 4.0 * k]]
+    );
+    let program = grad(&substrait_of(&ctx, &sql, true).await, &[wrt("a", "x")]).unwrap();
+    let reads: usize = program
+        .steps()
+        .map(|s| format!("{:?}", *s.plan).matches(r#"names: ["a"]"#).count())
+        .sum();
+    assert!(reads <= 3 * n as usize, "{reads} reads of a for {n} inputs");
+}
+
 async fn refusal(sql: &str) -> AdError {
     let ctx = ctx();
     a().create(&ctx).await;

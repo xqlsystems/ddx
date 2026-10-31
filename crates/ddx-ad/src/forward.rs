@@ -64,6 +64,7 @@ use crate::emit;
 use crate::error::{AdError, Result};
 use crate::expr::{
     as_field, contains, field, fields_of, if_then, lit_bool, map_fields, uncorrelated_scalar,
+    untyped_null,
 };
 use crate::functions::Functions;
 use crate::optics::{
@@ -1378,46 +1379,49 @@ impl Builder<'_> {
             .next()
             .ok_or_else(|| AdError::InvalidPlan("a set operation with no inputs".into()))?;
         let width = s.outputs.len();
-        // Each input's first column here, its outputs, and its branch column.
-        let mut blocks = vec![(0, s.outputs.clone(), s.width() - 1)];
+        // Each input's first column here, its width, its outputs, and its
+        // branch column.
+        let mut blocks = vec![(0, s.width(), s.outputs.clone(), s.width() - 1)];
         for r in inputs {
             let outputs = r.outputs.clone();
             let w = r.width();
             let shift = s.append(r)?;
-            blocks.push((shift, outputs, shift + w - 1));
+            blocks.push((shift, w, outputs, shift + w - 1));
         }
-        if blocks.iter().any(|(_, outputs, _)| outputs.len() != width) {
+        if blocks
+            .iter()
+            .any(|(_, _, outputs, _)| outputs.len() != width)
+        {
             return Err(AdError::InvalidPlan(
                 "a UNION ALL whose inputs have different numbers of columns".into(),
             ));
         }
-        // Each input's rows, with every other input's columns NULL: FULL
-        // JOINed to none of the others' rows, so the engine types the NULLs
-        // as it types the columns.
+        // Each input's rows, with every other input's columns a NULL of no
+        // type, which the engine types as the union's other inputs type
+        // that column. Each input is read once, so the union is the size of
+        // its inputs, however many there are.
         //
         // DataFusion names a union's columns after its first input's,
         // without their tables, and suffixes a repeated name: a second `x`
         // is `x_1`, though a table may already have an `x_1`, and the union
         // is refused. So each input's columns are renamed first, each after
         // its own table and column, which no other has.
+        let null = untyped_null(self.functions.null_type());
         let w = s.width() + width;
         let all: Vec<usize> = (0..w).collect();
         let mut rows = Vec::with_capacity(rels.len());
-        for (k, (offset, outputs, _)) in blocks.iter().enumerate() {
-            let row = rels
-                .iter()
-                .enumerate()
-                .map(|(j, r)| {
-                    if j == k {
-                        r.clone()
-                    } else {
-                        emit::no_rows(r.clone())
-                    }
-                })
-                .reduce(|l, r| emit::join(l, r, lit_bool(true), JoinType::Outer))
-                .expect("at least one input");
-            let row = emit::project(row, outputs.iter().map(|&c| field(offset + c)).collect());
-            rows.push(match rels.len() {
+        for (k, (rel, (_, own, outputs, _))) in rels.into_iter().zip(&blocks).enumerate() {
+            let mut exprs = Vec::with_capacity(w);
+            for (j, (_, width_j, _, _)) in blocks.iter().enumerate() {
+                if j == k {
+                    exprs.extend((0..*own).map(field));
+                } else {
+                    exprs.extend(std::iter::repeat_n(&null, *width_j).cloned());
+                }
+            }
+            exprs.extend(outputs.iter().map(|&c| field(c)));
+            let row = emit::project_emit(rel, exprs, Some((*own..own + w).collect()));
+            rows.push(match blocks.len() {
                 1 => row,
                 _ => rename_in_place(row, w, &all),
             });
@@ -1430,7 +1434,7 @@ impl Builder<'_> {
         for c in 0..width {
             let arms: Vec<Arm> = blocks
                 .iter()
-                .map(|(offset, outputs, branch)| Arm {
+                .map(|(offset, _, outputs, branch)| Arm {
                     branch: *branch,
                     column: offset + outputs[c],
                 })
