@@ -176,6 +176,45 @@ async fn a_window_over_each_whole_partition_has_its_group_by_forms_gradient() {
 }
 
 #[tokio::test]
+async fn a_window_over_rows_that_may_differ_when_recomputed_stays_a_window() {
+    // A window over each whole partition is read as its GROUP BY joined
+    // back, which computes the rows beneath it twice: so not over a LIMIT,
+    // whose rows may differ the second time, nor a volatile function.
+    let ctx = ctx();
+    let x = Table {
+        name: "wx",
+        columns: vec![("i", "BIGINT"), ("g", "BIGINT"), ("val", "DOUBLE")],
+        rows: vec![
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 0.0, -2.0],
+            vec![2.0, 1.0, 0.5],
+        ],
+    };
+    x.create(&ctx).await;
+    async fn saved(ctx: &SessionContext, sql: String) -> usize {
+        let plan = substrait_of(ctx, &sql, true).await;
+        let wrt = [ColumnRef::new("wx", "val")];
+        ddx_ad::Forward::new(&plan, &wrt).unwrap().saved.len()
+    }
+    let over = |rows: &str| {
+        format!(
+            "SELECT SUM(val * s) AS l FROM \
+             (SELECT val, SUM(val) OVER (PARTITION BY g) AS s FROM {rows}) w"
+        )
+    };
+    // The window's aggregate and the loss.
+    assert_eq!(saved(&ctx, over("wx")).await, 2);
+    assert_eq!(
+        saved(&ctx, over("(SELECT * FROM wx ORDER BY i LIMIT 2) c")).await,
+        1
+    );
+    assert_eq!(
+        saved(&ctx, over("(SELECT g, val * random() AS val FROM wx) c")).await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn a_window_sees_every_row_beneath_it_whatever_happens_to_them_above() {
     // The window's transpose runs over the rows the window read, not the rows
     // that reach the loss: a group with no cotangent, a filter after the

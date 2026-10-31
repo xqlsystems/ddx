@@ -93,6 +93,7 @@ mod inlined;
 mod jvp;
 mod opt;
 mod optics;
+mod partition;
 mod program;
 mod reduce;
 mod run;
