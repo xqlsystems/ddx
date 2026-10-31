@@ -184,10 +184,13 @@ struct Reader<'p> {
 }
 
 impl Reader<'_> {
-    /// [`ty`], or `None` for the plan's `null` type: NULLs of no type.
+    /// [`ty`], or `None` for NULLs of no type: the plan's `null` type, as
+    /// DataFusion's producer writes it, or a type with no kind, as DuckDB's
+    /// writes it for a bare `NULL`.
     fn ty_or_none(&self, t: &SubstraitType) -> Result<Option<Type>> {
         match &t.kind {
             Some(Kind::UserDefined(u)) if Some(u.type_reference) == self.null_type => Ok(None),
+            None => Ok(None),
             _ => ty(t).map(Some),
         }
     }
@@ -1701,6 +1704,32 @@ fn literal_name(l: &LiteralType) -> &'static str {
 mod tests {
     use super::*;
     use crate::to_sql::{to_sql, Dialect};
+
+    #[test]
+    fn a_null_whose_type_has_no_kind_is_written_bare() {
+        // DuckDB's producer writes a bare NULL so, and folds a
+        // `CAST(NULL AS BIGINT)` into one (#235).
+        use crate::functions::Extensions;
+        let null = substrait::proto::Expression {
+            rex_type: Some(RexType::Literal(SubstraitLiteral {
+                nullable: true,
+                type_variation_reference: 0,
+                literal_type: Some(LiteralType::Null(SubstraitType { kind: None })),
+            })),
+        };
+        let rel = crate::emit::project(crate::emit::read_step("t", vec!["a".into()]), vec![null]);
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let plan = crate::emit::plan(
+            rel,
+            vec!["a".into(), "n".into()],
+            &Extensions::new(&functions),
+        );
+        let written = to_sql(&plan, Dialect::DuckDb).unwrap();
+        assert!(
+            written.contains("NULL AS") && !written.contains("CAST(NULL"),
+            "{written}"
+        );
+    }
 
     #[test]
     fn every_canonical_name_is_one_ddx_writes() {
