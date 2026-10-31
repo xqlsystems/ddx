@@ -335,6 +335,29 @@ async fn a_union_of_many_inputs_reads_each_one_once() {
     assert!(reads <= 3 * n as usize, "{reads} reads of a for {n} inputs");
 }
 
+#[tokio::test]
+async fn a_union_of_data_two_levels_beneath_a_union() {
+    // The data's unions are copied into the step as they are: in
+    // DataFusion's plan one sits directly beneath the other, its columns
+    // named after `x - 0.5`. DataFusion's optimizer, splicing them, looked
+    // the outer union's names up in the inner one and failed (#236).
+    let grads = check_gradients(
+        &ctx(),
+        "WITH u AS (SELECT k, v FROM (SELECT i AS k, x AS v FROM a \
+                    UNION ALL SELECT k, v FROM (SELECT i AS k, x - 0.5 AS v FROM a \
+                                                UNION ALL SELECT i AS k, x AS v FROM a) n1) n2 \
+                    UNION ALL SELECT i AS k, x AS v FROM b) \
+         SELECT SUM(v * v) AS l FROM u",
+        &[a(), b()],
+        &[wrt("b", "x")],
+    )
+    .await;
+    assert_eq!(
+        sorted(&grads["b"]),
+        vec![vec![0.0, 6.0], vec![1.0, -1.0], vec![2.0, 1.5]]
+    );
+}
+
 async fn refusal(sql: &str) -> AdError {
     let ctx = ctx();
     a().create(&ctx).await;
