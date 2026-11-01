@@ -10,7 +10,6 @@ mod common;
 
 use common::ad::{check_gradients, Table};
 use datafusion::prelude::SessionContext;
-use ddx_ad::forward::Input;
 use ddx_ad::ColumnRef;
 
 fn value(seed: usize) -> f64 {
@@ -103,86 +102,6 @@ async fn a_cte_read_twice_is_saved_once() {
 }
 
 #[tokio::test]
-async fn the_normalizers_cotangent_reads_no_score() {
-    // The normalizer z divides every term of o's sum, so its cotangent is
-    // -Σ ō·o / z (FlashAttention's D), from o and o's cotangent, never a
-    // sum over the scores. So every table it reads, directly or through
-    // other backward steps, has at most one row per position and feature
-    // (6), where the scores have one per pair of positions (9); and none
-    // reads both q and k, from which the scores would be computed again.
-    let ctx = SessionContext::new();
-    ddx_datafusion::register_stop_gradient(&ctx);
-    for t in tables() {
-        t.create(&ctx).await;
-    }
-    let wrt = [ColumnRef::new("x", "val")];
-    let plan = common::substrait_of(&ctx, ATTENTION, true).await;
-    let f = ddx_ad::Forward::new(&plan, &wrt).unwrap();
-    // The normalizer: the one SUM grouped by one key.
-    let z = (0..f.saved.len())
-        .find(|&n| {
-            let s = &f.saved[n];
-            s.dims().len() == 1
-                && f.functions.name(s.measures[0].function_reference).unwrap() == "sum"
-        })
-        .unwrap();
-    // q and k: the inputs of the scores, the aggregate of two saved inputs
-    // grouped by two keys.
-    let scores = (0..f.saved.len())
-        .find(|&n| {
-            let s = &f.saved[n];
-            let saved = s
-                .input
-                .slots
-                .iter()
-                .filter(|s| matches!(s.input, Input::Saved(_)));
-            s.dims().len() == 2 && saved.count() == 2 && s.input.slots.len() == 2
-        })
-        .unwrap();
-    let qk: Vec<String> = f.saved[scores]
-        .input
-        .slots
-        .iter()
-        .map(|s| match s.input {
-            Input::Saved(n) => format!("saved_{n}"),
-            _ => unreachable!(),
-        })
-        .collect();
-    let program = ddx_ad::grad(&plan, &wrt).unwrap();
-    for step in program.steps() {
-        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
-    }
-    let backward = &program.backward_steps;
-    let start = backward
-        .iter()
-        .find(|s| s.name.ends_with(&format!("cotangent_{z}")))
-        .expect("the normalizer has a cotangent");
-    let mut pending = vec![start];
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(step) = pending.pop() {
-        if !seen.insert(step.name.clone()) {
-            continue;
-        }
-        let reads = ddx_ad::tables_read(&step.plan);
-        let both = qk
-            .iter()
-            .all(|t| reads.iter().any(|r| r.ends_with(t.as_str())));
-        assert!(!both, "{} reads q and k", step.name);
-        for read in reads {
-            let rows = ctx
-                .table(format!("\"{read}\""))
-                .await
-                .unwrap()
-                .count()
-                .await
-                .unwrap();
-            assert!(rows <= 6, "{} reads {read}, of {rows} rows", step.name);
-            pending.extend(backward.iter().find(|s| s.name == read));
-        }
-    }
-}
-
-#[tokio::test]
 async fn a_softmax_written_with_windows_gets_the_group_by_program() {
     // Each window over a whole partition is read as its GROUP BY joined
     // back, so both spellings of causal attention save the same aggregates
@@ -224,4 +143,82 @@ async fn a_softmax_written_with_windows_gets_the_group_by_program() {
         shapes.push(program.steps().map(|s| s.name.clone()).collect::<Vec<_>>());
     }
     assert_eq!(shapes[0], shapes[1]);
+}
+
+/// Causal attention over `q`, `k` and `v` (4 positions, 2 features), its
+/// softmax written as `softmax`.
+fn causal(softmax: &str) -> String {
+    format!(
+        "WITH s AS (SELECT q.t AS i, k.t AS j, SUM(q.val * k.val) AS s \
+                    FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t), \
+              {softmax}, \
+              o AS (SELECT p.i AS t, v.d, SUM(p.p * v.val) AS x \
+                    FROM p JOIN v ON p.j = v.t GROUP BY p.i, v.d) \
+         SELECT SUM(x * x) AS l FROM o"
+    )
+}
+
+const WINDOWS: &str = "w AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS e FROM s), \
+                       p AS (SELECT i, j, e / SUM(e) OVER (PARTITION BY i) AS p FROM w)";
+
+const GROUPED: &str = "m AS (SELECT i, MAX(s) AS m FROM s GROUP BY i), \
+                       e AS (SELECT s.i, s.j, exp(s.s - m.m) AS e FROM s JOIN m ON s.i = m.i), \
+                       z AS (SELECT i, SUM(e) AS z FROM e GROUP BY i), \
+                       p AS (SELECT e.i, e.j, e.e / z.z AS p FROM e JOIN z ON e.i = z.i)";
+
+fn qkv() -> Vec<Table> {
+    [("q", 1), ("k", 30), ("v", 60)]
+        .into_iter()
+        .map(|(name, seed)| matrix(name, ["t", "d"], [4, 2], seed))
+        .collect()
+}
+
+#[tokio::test]
+async fn attentions_backward_writes_one_table_of_scores() {
+    // The normalizer's cotangent comes from o (FlashAttention's D), and the
+    // max, which cancels, is held constant: so the one backward step with
+    // a row per score is dS. Every other has at most a row per position and
+    // feature (8), where the causal scores have 10.
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    for softmax in [WINDOWS, GROUPED] {
+        let ctx = SessionContext::new();
+        for t in qkv() {
+            t.create(&ctx).await;
+        }
+        let plan = common::substrait_of(&ctx, &causal(softmax), true).await;
+        let program = ddx_ad::grad(&plan, &wrt).unwrap();
+        let mut large = Vec::new();
+        for step in program.steps() {
+            ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+        }
+        for step in &program.backward_steps {
+            let name = format!("\"{}\"", step.name);
+            if ctx.table(name).await.unwrap().count().await.unwrap() > 8 {
+                large.push(step.name.clone());
+            }
+        }
+        assert_eq!(large.len(), 1, "{large:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_max_used_beyond_its_softmax_keeps_its_gradient() {
+    // The loss reads the max itself, so it doesn't cancel, and its gradient
+    // goes through the max as before.
+    let ctx = SessionContext::new();
+    let loss = causal(GROUPED).replace(
+        "SELECT SUM(x * x) AS l FROM o",
+        "SELECT SUM(x * x + m.m) AS l FROM o JOIN m ON o.t = m.i",
+    );
+    check_gradients(
+        &ctx,
+        &loss,
+        &qkv(),
+        &[ColumnRef::new("q", "val"), ColumnRef::new("k", "val")],
+    )
+    .await;
 }

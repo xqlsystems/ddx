@@ -87,6 +87,7 @@
 mod compose;
 mod contraction;
 mod elementwise;
+mod equal;
 mod error;
 mod functions;
 mod inlined;
@@ -97,6 +98,7 @@ mod partition;
 mod program;
 mod reduce;
 mod run;
+mod shift;
 mod sql;
 mod tables;
 mod tangent;
