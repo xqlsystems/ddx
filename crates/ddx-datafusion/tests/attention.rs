@@ -10,6 +10,7 @@ mod common;
 
 use common::ad::{check_gradients, Table};
 use datafusion::prelude::SessionContext;
+use ddx_ad::forward::Input;
 use ddx_ad::ColumnRef;
 
 fn value(seed: usize) -> f64 {
@@ -107,7 +108,8 @@ async fn the_normalizers_cotangent_reads_no_score() {
     // -Σ ō·o / z (FlashAttention's D), from o and o's cotangent, never a
     // sum over the scores. So every table it reads, directly or through
     // other backward steps, has at most one row per position and feature
-    // (6), where the scores have one per pair of positions (9).
+    // (6), where the scores have one per pair of positions (9); and none
+    // reads both q and k, from which the scores would be computed again.
     let ctx = SessionContext::new();
     ddx_datafusion::register_stop_gradient(&ctx);
     for t in tables() {
@@ -124,6 +126,28 @@ async fn the_normalizers_cotangent_reads_no_score() {
                 && f.functions.name(s.measures[0].function_reference).unwrap() == "sum"
         })
         .unwrap();
+    // q and k: the inputs of the scores, the aggregate of two saved inputs
+    // grouped by two keys.
+    let scores = (0..f.saved.len())
+        .find(|&n| {
+            let s = &f.saved[n];
+            let saved = s
+                .input
+                .slots
+                .iter()
+                .filter(|s| matches!(s.input, Input::Saved(_)));
+            s.dims().len() == 2 && saved.count() == 2 && s.input.slots.len() == 2
+        })
+        .unwrap();
+    let qk: Vec<String> = f.saved[scores]
+        .input
+        .slots
+        .iter()
+        .map(|s| match s.input {
+            Input::Saved(n) => format!("saved_{n}"),
+            _ => unreachable!(),
+        })
+        .collect();
     let program = ddx_ad::grad(&plan, &wrt).unwrap();
     for step in program.steps() {
         ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
@@ -139,7 +163,12 @@ async fn the_normalizers_cotangent_reads_no_score() {
         if !seen.insert(step.name.clone()) {
             continue;
         }
-        for read in ddx_ad::tables_read(&step.plan) {
+        let reads = ddx_ad::tables_read(&step.plan);
+        let both = qk
+            .iter()
+            .all(|t| reads.iter().any(|r| r.ends_with(t.as_str())));
+        assert!(!both, "{} reads q and k", step.name);
+        for read in reads {
             let rows = ctx
                 .table(format!("\"{read}\""))
                 .await
