@@ -8,7 +8,7 @@
 use substrait::proto::expression::RexType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::rel::RelType;
-use substrait::proto::{Expression, Rel};
+use substrait::proto::{Expression, Rel, RelCommon};
 
 use crate::error::Result;
 use crate::expr::{as_field, scalar_args};
@@ -46,7 +46,8 @@ impl Classes {
 /// Join in `held` each two columns of `rel` (whose columns start at region
 /// column `start`) that every row of it holds equal, by an `=` or IS NOT
 /// DISTINCT FROM of an inner join or a filter, beneath relations that only
-/// append columns or drop rows.
+/// append columns or drop rows. A relation with an emit, whose conditions
+/// name columns it may drop or reorder, adds nothing.
 pub(crate) fn held_equal(
     functions: &Functions,
     rel: &Rel,
@@ -55,7 +56,7 @@ pub(crate) fn held_equal(
 ) -> Result<()> {
     let mut conds = Vec::new();
     match &rel.rel_type {
-        Some(RelType::Join(j)) if j.r#type == JoinType::Inner as i32 => {
+        Some(RelType::Join(j)) if j.r#type == JoinType::Inner as i32 && !emits(&j.common) => {
             let (Some(l), Some(r)) = (j.left.as_deref(), j.right.as_deref()) else {
                 return Ok(());
             };
@@ -64,13 +65,13 @@ pub(crate) fn held_equal(
             held_equal(functions, l, start, held)?;
             held_equal(functions, r, start + width(l)?, held)?;
         }
-        Some(RelType::Filter(f)) => {
+        Some(RelType::Filter(f)) if !emits(&f.common) => {
             conds.extend(f.condition.as_deref());
             if let Some(input) = f.input.as_deref() {
                 held_equal(functions, input, start, held)?;
             }
         }
-        Some(RelType::Project(p)) if p.common.is_none() => {
+        Some(RelType::Project(p)) if !emits(&p.common) => {
             if let Some(input) = p.input.as_deref() {
                 held_equal(functions, input, start, held)?;
             }
@@ -85,6 +86,11 @@ pub(crate) fn held_equal(
         }
     }
     Ok(())
+}
+
+/// Does a relation with this `common` emit, dropping or reordering columns?
+fn emits(common: &Option<RelCommon>) -> bool {
+    common.as_ref().is_some_and(|c| c.emit_kind.is_some())
 }
 
 /// The conjuncts of `e`, flattening `and`.
@@ -122,4 +128,52 @@ pub(crate) fn equality(
         (Some(a), Some(b)) => Some((not_distinct, a, b)),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::{filter, join, plan, read_step};
+    use crate::expr::{call, field};
+    use crate::forward::root_of;
+    use crate::functions::Extensions;
+    use substrait::proto::rel_common::{Emit, EmitKind};
+
+    #[test]
+    fn a_relation_with_an_emit_holds_nothing_equal() {
+        // Its condition names columns its emit may drop or reorder, so read
+        // as region columns they may name the wrong ones, or none.
+        let mut ext = Extensions::new(&Functions::default());
+        let eq = ext.anchor_named("equal");
+        let emitting = |mut rel: Rel| {
+            let common = match &mut rel.rel_type {
+                Some(RelType::Join(j)) => &mut j.common,
+                Some(RelType::Filter(f)) => &mut f.common,
+                _ => unreachable!(),
+            };
+            *common = Some(RelCommon {
+                emit_kind: Some(EmitKind::Emit(Emit {
+                    output_mapping: vec![1],
+                })),
+                ..Default::default()
+            });
+            rel
+        };
+        let a = || read_step("a", vec!["i".into(), "x".into()]);
+        let b = || read_step("b", vec!["j".into()]);
+        let joined = join(
+            a(),
+            b(),
+            call(eq, vec![field(0), field(2)]),
+            JoinType::Inner,
+        );
+        let filtered = filter(a(), call(eq, vec![field(0), field(1)]));
+        for rel in [emitting(joined), emitting(filtered)] {
+            let p = plan(rel, vec!["c".into()], &ext);
+            let functions = Functions::from_plan(&p).unwrap();
+            let (root, _) = root_of(&p).unwrap();
+            let mut held = Classes::new(1);
+            held_equal(&functions, root, 0, &mut held).unwrap();
+        }
+    }
 }
