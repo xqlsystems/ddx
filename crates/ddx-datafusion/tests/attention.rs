@@ -10,6 +10,7 @@ mod common;
 
 use common::ad::{check_gradients, Table};
 use datafusion::prelude::SessionContext;
+use ddx_ad::forward::Input;
 use ddx_ad::ColumnRef;
 
 fn value(seed: usize) -> f64 {
@@ -98,5 +99,85 @@ async fn a_cte_read_twice_is_saved_once() {
         assert_eq!(g.saved.len(), 8, "optimized: {optimized}");
         let program = ddx_ad::grad(&plan, &[ColumnRef::new("x", "val")]).unwrap();
         assert_eq!(program.forward_steps.len(), 8 + 1);
+    }
+}
+
+#[tokio::test]
+async fn the_normalizers_cotangent_reads_no_score() {
+    // The normalizer z divides every term of o's sum, so its cotangent is
+    // -Σ ō·o / z (FlashAttention's D), from o and o's cotangent, never a
+    // sum over the scores. So every table it reads, directly or through
+    // other backward steps, has at most one row per position and feature
+    // (6), where the scores have one per pair of positions (9); and none
+    // reads both q and k, from which the scores would be computed again.
+    let ctx = SessionContext::new();
+    ddx_datafusion::register_stop_gradient(&ctx);
+    for t in tables() {
+        t.create(&ctx).await;
+    }
+    let wrt = [ColumnRef::new("x", "val")];
+    let plan = common::substrait_of(&ctx, ATTENTION, true).await;
+    let f = ddx_ad::Forward::new(&plan, &wrt).unwrap();
+    // The normalizer: the one SUM grouped by one key.
+    let z = (0..f.saved.len())
+        .find(|&n| {
+            let s = &f.saved[n];
+            s.dims().len() == 1
+                && f.functions.name(s.measures[0].function_reference).unwrap() == "sum"
+        })
+        .unwrap();
+    // q and k: the inputs of the scores, the aggregate of two saved inputs
+    // grouped by two keys.
+    let scores = (0..f.saved.len())
+        .find(|&n| {
+            let s = &f.saved[n];
+            let saved = s
+                .input
+                .slots
+                .iter()
+                .filter(|s| matches!(s.input, Input::Saved(_)));
+            s.dims().len() == 2 && saved.count() == 2 && s.input.slots.len() == 2
+        })
+        .unwrap();
+    let qk: Vec<String> = f.saved[scores]
+        .input
+        .slots
+        .iter()
+        .map(|s| match s.input {
+            Input::Saved(n) => format!("saved_{n}"),
+            _ => unreachable!(),
+        })
+        .collect();
+    let program = ddx_ad::grad(&plan, &wrt).unwrap();
+    for step in program.steps() {
+        ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+    }
+    let backward = &program.backward_steps;
+    let start = backward
+        .iter()
+        .find(|s| s.name.ends_with(&format!("cotangent_{z}")))
+        .expect("the normalizer has a cotangent");
+    let mut pending = vec![start];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(step) = pending.pop() {
+        if !seen.insert(step.name.clone()) {
+            continue;
+        }
+        let reads = ddx_ad::tables_read(&step.plan);
+        let both = qk
+            .iter()
+            .all(|t| reads.iter().any(|r| r.ends_with(t.as_str())));
+        assert!(!both, "{} reads q and k", step.name);
+        for read in reads {
+            let rows = ctx
+                .table(format!("\"{read}\""))
+                .await
+                .unwrap()
+                .count()
+                .await
+                .unwrap();
+            assert!(rows <= 6, "{} reads {read}, of {rows} rows", step.name);
+            pending.extend(backward.iter().find(|s| s.name == read));
+        }
     }
 }

@@ -773,6 +773,71 @@ async fn a_divisor_constant_within_a_group_matches_the_general_rule() {
 }
 
 #[tokio::test]
+async fn a_saved_normalizer_matches_the_general_rule() {
+    // A normalizer that is itself saved, n.z = SUM(p.val) by i: where each
+    // group joins one row of it (grouped by i, or n has no keys at all),
+    // its cotangent comes from the output and the output's cotangent; where
+    // a group joins several (grouped by j and d), from the sum over the
+    // region.
+    let cases = [
+        (
+            "GROUP BY i",
+            "JOIN n ON p.i = n.i",
+            "GROUP BY p.i, v.d",
+            true,
+        ),
+        (
+            "GROUP BY i",
+            "JOIN n ON n.i = p.i",
+            "GROUP BY p.j, v.d",
+            true,
+        ),
+        ("", "CROSS JOIN n", "GROUP BY p.i, v.d", false),
+    ];
+    let (p, v) = (named("p"), named("v"));
+    let checked: [Join; 1] = [(&p, &v)];
+    for (c, (norm, join, group, check)) in cases.into_iter().enumerate() {
+        let keys = if norm.is_empty() { "" } else { "i, " };
+        let loss = |filter: &str| {
+            format!(
+                "WITH n AS (SELECT {keys}SUM(val) AS z FROM p {norm}), \
+                 o AS (SELECT v.d, SUM(p.val / n.z * v.val) AS x \
+                 FROM p JOIN v ON p.j = v.t {join} {filter} {group}) \
+                 SELECT SUM(tanh(x) * tanh(x)) AS l FROM o"
+            )
+        };
+        let wrt = [ColumnRef::new("p", "val"), ColumnRef::new("v", "val")];
+        let make = |rng: &mut Rng, ctx: &SessionContext| {
+            let (ni, nj, nd) = (
+                1 + rng.below(4) as usize,
+                1 + rng.below(3) as usize,
+                1 + rng.below(3) as usize,
+            );
+            register(
+                ctx,
+                "p",
+                table(rng, &[("i", ni), ("j", nj)], &["val"], 0.0, None),
+            );
+            register(
+                ctx,
+                "v",
+                table(rng, &[("t", nj), ("d", nd)], &["val"], 0.0, None),
+            );
+        };
+        cases_of(
+            0x2510 + c as u64,
+            60,
+            &loss(""),
+            &loss("WHERE v.t IS NULL OR v.t + p.i >= 0"),
+            &wrt,
+            if check { &checked } else { &[] },
+            &make,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn causal_attention_matches_the_general_rule() {
     // The query of issue #153: a causal mask on the scores, a softmax
     // through a MAX window, and the normalizer joined on a grouping key.
