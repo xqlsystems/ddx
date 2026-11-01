@@ -191,10 +191,13 @@ async fn a_window_over_rows_that_may_differ_when_recomputed_stays_a_window() {
         ],
     };
     x.create(&ctx).await;
-    async fn saved(ctx: &SessionContext, sql: String) -> usize {
-        let plan = substrait_of(ctx, &sql, true).await;
+    async fn saved_of(ctx: &SessionContext, sql: String, optimized: bool) -> usize {
+        let plan = substrait_of(ctx, &sql, optimized).await;
         let wrt = [ColumnRef::new("wx", "val")];
         ddx_ad::Forward::new(&plan, &wrt).unwrap().saved.len()
+    }
+    async fn saved(ctx: &SessionContext, sql: String) -> usize {
+        saved_of(ctx, sql, true).await
     }
     let over = |rows: &str| {
         format!(
@@ -212,6 +215,9 @@ async fn a_window_over_rows_that_may_differ_when_recomputed_stays_a_window() {
         saved(&ctx, over("(SELECT g, val * random() AS val FROM wx) c")).await,
         1
     );
+    // Nor one called in a scalar subquery, which the unoptimized plan keeps.
+    let sub = over("(SELECT g, val * (SELECT random()) AS val FROM wx) c");
+    assert_eq!(saved_of(&ctx, sub, false).await, 1);
 }
 
 #[tokio::test]

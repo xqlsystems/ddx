@@ -35,8 +35,8 @@ use substrait::proto::{
 };
 
 use crate::emit::{aggregate, join};
-use crate::error::Result;
-use crate::expr::{call, field};
+use crate::error::{AdError, Result};
+use crate::expr::{call, field, uncorrelated_scalar};
 use crate::forward::{inline_references, referenced, width};
 use crate::functions::{Extensions, Function, Functions};
 use crate::optics::{Compose, Cosmos, Deep, Exprs, Fold, PlanRels, RelKind, Setter, Tree};
@@ -198,8 +198,12 @@ fn regrouped(
         Some(EmitKind::Emit(e)) => e
             .output_mapping
             .iter()
-            .map(|&i| usize::try_from(i).unwrap_or(usize::MAX))
-            .collect(),
+            .map(|&i| {
+                usize::try_from(i).map_err(|_| {
+                    AdError::InvalidPlan(format!("a relation's emit names column {i}"))
+                })
+            })
+            .collect::<Result<_>>()?,
         _ => (0..width).collect(),
     };
     let output_mapping = old
@@ -221,7 +225,8 @@ fn regrouped(
 }
 
 /// Can `rel` be computed twice and give the same rows? Not if it calls a
-/// volatile function, cuts rows with a `LIMIT`, computes a window other
+/// volatile function (in a scalar subquery too; a correlated one can't be
+/// checked), cuts rows with a `LIMIT`, computes a window other
 /// than one `rewritten` accepts (a rank may order ties differently each
 /// time; a rewritten window becomes a saved aggregate, computed once). A
 /// shared relation of `relations` it reads is checked too, each once
@@ -262,6 +267,14 @@ fn twice(
                         return Ok(false)
                     }
                     Some(RexType::WindowFunction(w)) if !rewritten(w)? => return Ok(false),
+                    Some(RexType::Subquery(sq)) => {
+                        let Some(inner) = uncorrelated_scalar(sq) else {
+                            return Ok(false);
+                        };
+                        if !twice(inner, relations, functions, rewritten, seen)? {
+                            return Ok(false);
+                        }
+                    }
                     _ => {}
                 }
             }
