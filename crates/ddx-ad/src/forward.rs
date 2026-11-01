@@ -415,7 +415,9 @@ impl Forward {
     /// [`Forward::new`], naming every table the program writes under
     /// `namespace` rather than a fresh one.
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
-        let plan = &*windows_as_projections(plan);
+        let projected = windows_as_projections(plan);
+        let grouped = crate::partition::windows_as_aggregates(&projected)?;
+        let plan = &*grouped;
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = checked_root(plan)?;
         let order = shared_relations(root, &plan.relations)?;

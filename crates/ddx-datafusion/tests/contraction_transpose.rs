@@ -109,14 +109,15 @@ fn register(ctx: &SessionContext, name: &str, t: Table) {
     ctx.register_batch(name, batch).unwrap();
 }
 
-/// Does any gradient step join a scan whose table `left` accepts directly
-/// with one `right` accepts, that is, rebuild the forward join? Runs the
-/// steps again first: `ad::run` releases the tables a step's plan reads.
+/// Does any gradient step join rows `left` accepts with rows `right`
+/// accepts, that is, rebuild the forward join? Each judges a side of a join
+/// by the tables it scans. Runs the steps again first: `ad::run` releases
+/// the tables a step's plan reads.
 async fn rebuilds(
     ctx: &SessionContext,
     program: &BackwardProgram,
-    left: &dyn Fn(&str) -> bool,
-    right: &dyn Fn(&str) -> bool,
+    left: &dyn Fn(&[String]) -> bool,
+    right: &dyn Fn(&[String]) -> bool,
 ) -> bool {
     for step in program.steps() {
         ddx_datafusion::engine::run_step(ctx, step).await.unwrap();
@@ -140,9 +141,7 @@ async fn rebuilds(
                     names
                 };
                 let (l, r) = (scans(&j.left), scans(&j.right));
-                let one =
-                    |names: &[String], f: &dyn Fn(&str) -> bool| names.len() == 1 && f(&names[0]);
-                if (one(&l, left) && one(&r, right)) || (one(&l, right) && one(&r, left)) {
+                if (left(&l) && right(&r)) || (left(&r) && right(&l)) {
                     found = true;
                     return Ok(TreeNodeRecursion::Stop);
                 }
@@ -235,12 +234,20 @@ fn agree(a: &[Rows], b: &[Rows]) -> Result<(), String> {
     Ok(())
 }
 
-/// Two predicates on table names: a join the general rule rebuilds and the
-/// contraction rule must not.
-type Join<'p> = (&'p dyn Fn(&str) -> bool, &'p dyn Fn(&str) -> bool);
+/// Two predicates on the tables a side of a join scans: a join the general
+/// rule rebuilds and the contraction rule must not.
+type Join<'p> = (&'p dyn Fn(&[String]) -> bool, &'p dyn Fn(&[String]) -> bool);
 
-fn named(name: &'static str) -> impl Fn(&str) -> bool {
-    move |t: &str| t == name
+/// A side that scans table `name` alone.
+fn named(name: &'static str) -> impl Fn(&[String]) -> bool {
+    move |scans: &[String]| scans.len() == 1 && scans[0] == name
+}
+
+/// A side that scans attention's scores, the first saved aggregate, alone
+/// or joined to other saved aggregates: the rows its softmax's windows,
+/// read as GROUP BYs joined back, make of them.
+fn scores(scans: &[String]) -> bool {
+    scans.iter().all(|t| t.contains("_saved_")) && scans.iter().any(|t| t.ends_with("saved_0"))
 }
 
 /// Runs `loss` and `general` (the same loss, written so the general rule
@@ -489,7 +496,7 @@ async fn a_second_layer_through_tanh_matches_the_general_rule() {
         "WHERE x.k IS NULL OR x.k + w1.j >= 0",
         "WHERE h.j IS NULL OR h.j + w2.o >= 0",
     );
-    let saved = |t: &str| t.ends_with("saved_0");
+    let saved = |scans: &[String]| scans.len() == 1 && scans[0].ends_with("saved_0");
     let mut rng = Rng::new(0x7a17);
     let (mut compared, mut failed) = (0, Vec::new());
     for case in 0..60 {
@@ -868,7 +875,6 @@ async fn causal_attention_matches_the_general_rule() {
             );
         }
     };
-    let scores = |t: &str| t.ends_with("saved_0");
     cases_of(
         0xa77e,
         60,
@@ -921,7 +927,6 @@ async fn batched_attention_matches_the_general_rule() {
             register(ctx, name, table(rng, &dims, &["val"], 0.0, null));
         }
     };
-    let scores = |t: &str| t.ends_with("saved_0");
     cases_of(
         0xba7c,
         60,
@@ -982,7 +987,6 @@ async fn batched_attention_joined_through_v_matches_the_general_rule() {
         ColumnRef::new("k", "val"),
         ColumnRef::new("v", "val"),
     ];
-    let scores = |t: &str| t.ends_with("saved_0");
     for (seed, eq) in [(0x222a, "="), (0x222b, "IS NOT DISTINCT FROM")] {
         let make = |rng: &mut Rng, ctx: &SessionContext| {
             let (ns, nh) = (1 + rng.below(3) as usize, 1 + rng.below(2) as usize);
@@ -1041,7 +1045,6 @@ async fn batched_attention_s_normalizer_joins_each_score_once() {
         ColumnRef::new("v", "val"),
     ];
     let program = ad::grad(&ctx, &loss, &wrt).await.unwrap();
-    let scores = |t: &str| t.ends_with("saved_0");
     assert!(
         !rebuilds(&ctx, &program, &scores, &named("v")).await,
         "the contraction rule did not apply"
