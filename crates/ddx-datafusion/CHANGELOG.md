@@ -9,6 +9,20 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.2...ddx-datafusion-v0.4.3) - 2026-11-01
+
+### Fixed
+
+- *(ddx-ad)* splice a UNION ALL beneath projections into the union above ([#252](https://github.com/xqlsystems/ddx/pull/252))
+- *(ddx-ad)* splice a UNION ALL beneath a UNION ALL into it ([#246](https://github.com/xqlsystems/ddx/pull/246))
+- *(ddx-ad)* a union's gradient reads each input once ([#242](https://github.com/xqlsystems/ddx/pull/242))
+
+### Other
+
+- *(ddx-ad)* hold a softmax's or log-sum-exp's max constant, as its gradient is zero ([#255](https://github.com/xqlsystems/ddx/pull/255))
+- *(ddx-ad)* read a window aggregate over each whole partition as a GROUP BY joined back ([#254](https://github.com/xqlsystems/ddx/pull/254))
+- *(ddx-ad)* a normalizer's cotangent from the saved output, not a sum over the region ([#253](https://github.com/xqlsystems/ddx/pull/253))
+
 ## [0.4.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.1...ddx-datafusion-v0.4.2) - 2026-10-29
 
 ### Added

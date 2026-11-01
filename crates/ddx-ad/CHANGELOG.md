@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.2...ddx-ad-v0.3.3) - 2026-11-01
+
+### Fixed
+
+- *(ddx-ad)* splice a UNION ALL beneath projections into the union above ([#252](https://github.com/xqlsystems/ddx/pull/252))
+- *(ddx-ad)* splice a UNION ALL beneath a UNION ALL into it ([#246](https://github.com/xqlsystems/ddx/pull/246))
+- *(ddx-ad)* refuse a plan whose producer dropped a column beneath its root ([#245](https://github.com/xqlsystems/ddx/pull/245))
+- *(ddx-ad)* to_sql writes a NULL whose type has no kind as a bare NULL ([#244](https://github.com/xqlsystems/ddx/pull/244))
+- *(ddx-ad)* a union's gradient reads each input once ([#242](https://github.com/xqlsystems/ddx/pull/242))
+
+### Other
+
+- *(ddx-ad)* hold a softmax's or log-sum-exp's max constant, as its gradient is zero ([#255](https://github.com/xqlsystems/ddx/pull/255))
+- *(ddx-ad)* read a window aggregate over each whole partition as a GROUP BY joined back ([#254](https://github.com/xqlsystems/ddx/pull/254))
+- *(ddx-ad)* a normalizer's cotangent from the saved output, not a sum over the region ([#253](https://github.com/xqlsystems/ddx/pull/253))
+
 ## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.1...ddx-ad-v0.3.2) - 2026-10-29
 
 ### Added
