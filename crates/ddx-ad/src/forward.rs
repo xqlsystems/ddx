@@ -415,6 +415,25 @@ impl Forward {
     /// [`Forward::new`], naming every table the program writes under
     /// `namespace` rather than a fresh one.
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
+        // Read once, then again holding the shifts that cancel constant
+        // (see `crate::shift`): which saved values they are is known only
+        // once every use of them has been read.
+        let forward = Forward::read(plan, wrt, namespace.clone(), BTreeSet::new())?;
+        let held = crate::shift::cancelling(&forward)?;
+        if held.is_empty() {
+            return Ok(forward);
+        }
+        Forward::read(plan, wrt, namespace, held)
+    }
+
+    /// [`Forward::in_namespace`], reading the saved values in `held` as
+    /// constants.
+    fn read(
+        plan: &Plan,
+        wrt: &[ColumnRef],
+        namespace: String,
+        held: BTreeSet<(usize, usize)>,
+    ) -> Result<Forward> {
         let projected = windows_as_projections(plan);
         let grouped = crate::partition::windows_as_aggregates(&projected)?;
         let plan = &*grouped;
@@ -438,6 +457,7 @@ impl Forward {
             shared: HashMap::new(),
             seen: BTreeSet::new(),
             reads: HashMap::new(),
+            held,
         };
         let output = b.lower(root)?;
         b.check_every_wrt_was_read()?;
@@ -965,6 +985,9 @@ struct Builder<'a> {
     /// [`Builder::reads_wrt`]'s answers, by relation: the plan is borrowed for
     /// the whole read, so its relations stay put.
     reads: HashMap<*const Rel, bool>,
+    /// The saved values `(aggregate, output column)` read as constants:
+    /// shifts that cancel (see `crate::shift`).
+    held: BTreeSet<(usize, usize)>,
 }
 
 impl Builder<'_> {
@@ -1166,7 +1189,7 @@ impl Builder<'_> {
                     rounds: false,
                 });
                 for c in 0..width {
-                    let v = self.saved[n].varied[c];
+                    let v = self.saved[n].varied[c] && !self.held.contains(&(n, c));
                     s.push(Def::Input { slot: 0, col: c }, v);
                 }
                 (s, (0..width).collect(), None)

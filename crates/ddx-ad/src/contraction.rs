@@ -96,6 +96,7 @@ use substrait::proto::{Expression, Rel};
 
 use crate::elementwise::depends;
 use crate::emit::{aggregate, filter, join, project, read_step, select};
+use crate::equal::{conjuncts, equality, held_equal, Classes};
 use crate::error::Result;
 use crate::expr::{
     as_field, call, field, fields_of, if_then, lit_bool, lit_f64, map_fields, scalar_args,
@@ -154,34 +155,6 @@ struct Key {
     /// equalities, if one does: attention's `a.seq = v.seq`, whose `a.seq`
     /// is grouped by.
     group: [Option<usize>; 2],
-}
-
-/// Disjoint sets of `0..n`, joined a pair at a time: a union-find.
-struct Classes(Vec<usize>);
-
-impl Classes {
-    fn new(n: usize) -> Classes {
-        Classes((0..n).collect())
-    }
-
-    /// The root of `a`'s set, which names it.
-    fn root(&mut self, a: usize) -> usize {
-        let mut r = a;
-        while self.0[r] != r {
-            r = self.0[r];
-        }
-        self.0[a] = r;
-        r
-    }
-
-    fn join(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.root(a), self.root(b));
-        self.0[ra] = rb;
-    }
-
-    fn same(&mut self, a: usize, b: usize) -> bool {
-        self.root(a) == self.root(b)
-    }
 }
 
 /// A grouping key of a contraction: its side, and its column there.
@@ -368,7 +341,7 @@ impl Transposer<'_> {
         let mut class = Classes::new(below);
         let mut null_safe = Vec::new();
         for c in &conds {
-            if let Some((not_distinct, a, b)) = self.equality(c)? {
+            if let Some((not_distinct, a, b)) = equality(&self.f.functions, c)? {
                 if a < below && b < below {
                     class.join(a, b);
                     if not_distinct {
@@ -397,7 +370,7 @@ impl Transposer<'_> {
                 within[sides.first().copied().unwrap_or(0)].push((c, ls));
                 continue;
             }
-            if let Some((not_distinct, a, b)) = self.equality(&c)? {
+            if let Some((not_distinct, a, b)) = equality(&self.f.functions, &c)? {
                 match (side_of_col(a), side_of_col(b)) {
                     (Some(0), Some(1)) => {
                         keys.push((a, b, not_distinct));
@@ -437,7 +410,7 @@ impl Transposer<'_> {
         for (s, within) in within.iter_mut().enumerate() {
             let mut local = Classes::new(below);
             for (c, _) in within.iter() {
-                if let Some((_, a, b)) = self.equality(c)? {
+                if let Some((_, a, b)) = equality(&self.f.functions, c)? {
                     if a < below && b < below {
                         local.join(a, b);
                     }
@@ -466,7 +439,7 @@ impl Transposer<'_> {
         let mut normalizers: [Vec<Normalizer>; 2] = [Vec::new(), Vec::new()];
         let mul = self.ext.anchor(Function::Multiply);
         let mut held = Classes::new(region.defs.len());
-        self.held_equal(&region.rel, 0, &mut held)?;
+        held_equal(&self.f.functions, &region.rel, 0, &mut held)?;
         for (f, ls) in factors.iter().zip(&factor_leaves) {
             if let Some(z) = self.normalizer_of(region, f, &factors, &group_cols, &mut held)? {
                 normalizers[ls.first().map_or(0, |&l| side_of_leaf[l])].push(z);
@@ -559,7 +532,7 @@ impl Transposer<'_> {
                     return Ok(false);
                 };
                 if let Some(c) = j.expression.as_deref() {
-                    for conjunct in self.conjuncts(c)? {
+                    for conjunct in conjuncts(&self.f.functions, c)? {
                         conds.push(map_fields(&conjunct, &mut |f| Ok(f + start))?);
                     }
                 }
@@ -660,45 +633,6 @@ impl Transposer<'_> {
             value,
             groups,
         }))
-    }
-
-    /// Join in `held` each two columns of `rel` (whose columns start at
-    /// region column `start`) that every row of it holds equal, by an `=`
-    /// or IS NOT DISTINCT FROM of an inner join or a filter, beneath
-    /// relations that only append columns or drop rows.
-    fn held_equal(&self, rel: &Rel, start: usize, held: &mut Classes) -> Result<()> {
-        let mut conds = Vec::new();
-        match &rel.rel_type {
-            Some(RelType::Join(j)) if j.r#type == JoinType::Inner as i32 => {
-                let (Some(l), Some(r)) = (j.left.as_deref(), j.right.as_deref()) else {
-                    return Ok(());
-                };
-                conds.extend(j.expression.as_deref());
-                conds.extend(j.post_join_filter.as_deref());
-                self.held_equal(l, start, held)?;
-                self.held_equal(r, start + width(l)?, held)?;
-            }
-            Some(RelType::Filter(f)) => {
-                conds.extend(f.condition.as_deref());
-                if let Some(input) = f.input.as_deref() {
-                    self.held_equal(input, start, held)?;
-                }
-            }
-            Some(RelType::Project(p)) if p.common.is_none() => {
-                if let Some(input) = p.input.as_deref() {
-                    self.held_equal(input, start, held)?;
-                }
-            }
-            _ => {}
-        }
-        for c in conds {
-            for conjunct in self.conjuncts(c)? {
-                if let Some((_, a, b)) = self.equality(&conjunct)? {
-                    held.join(start + a, start + b);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Normalizer `z`'s contribution from saved contraction `n` (its output
@@ -929,40 +863,6 @@ impl Transposer<'_> {
         // the general rule applies to each joined row, once per row of x.
         let seed = self.skips_null(factor_col, field(t_at + t_value));
         self.region_once(&region, base, vec![(factor_col, seed)])
-    }
-
-    /// The conjuncts of `e`, flattening `and`.
-    fn conjuncts(&self, e: &Expression) -> Result<Vec<Expression>> {
-        if let Some(RexType::ScalarFunction(f)) = &e.rex_type {
-            if self.f.functions.name(f.function_reference)? == "and" {
-                let mut out = Vec::new();
-                for a in scalar_args(f)? {
-                    out.extend(self.conjuncts(a)?);
-                }
-                return Ok(out);
-            }
-        }
-        Ok(vec![e.clone()])
-    }
-
-    /// `(is_not_distinct_from, a, b)` if `e` is `field(a) = field(b)` or `field(a) IS
-    /// NOT DISTINCT FROM field(b)`.
-    fn equality(&self, e: &Expression) -> Result<Option<(bool, usize, usize)>> {
-        let Some(RexType::ScalarFunction(f)) = &e.rex_type else {
-            return Ok(None);
-        };
-        let not_distinct = match self.f.functions.name(f.function_reference)? {
-            "equal" => false,
-            "is_not_distinct_from" => true,
-            _ => return Ok(None),
-        };
-        let [a, b] = scalar_args(f)?[..] else {
-            return Ok(None);
-        };
-        Ok(match (as_field(a), as_field(b)) {
-            (Some(a), Some(b)) => Some((not_distinct, a, b)),
-            _ => None,
-        })
     }
 }
 

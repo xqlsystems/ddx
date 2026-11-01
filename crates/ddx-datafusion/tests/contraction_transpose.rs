@@ -845,6 +845,83 @@ async fn a_saved_normalizer_matches_the_general_rule() {
 }
 
 #[tokio::test]
+async fn a_shift_that_cancels_matches_its_gradient() {
+    // A softmax's or a log-sum-exp's max is read as a constant, since its
+    // gradient is zero. Each loss is compared with the same loss written so
+    // the max isn't recognized (times exp(m - m), which is 1), whose
+    // gradient goes through the max. Values are finite here, with NULLs and
+    // many ties: exp(m - m) is NaN at an infinite max.
+    let softmax = |m: &str, shift: &str| {
+        format!(
+            "WITH {m}, \
+             e AS (SELECT p.i, p.j, {shift} AS e FROM p JOIN m ON p.i = m.i), \
+             z AS (SELECT i, SUM(e) AS z FROM e GROUP BY i), \
+             o AS (SELECT e.i, v.d, SUM(e.e / z.z * v.val) AS x \
+                   FROM e JOIN z ON e.i = z.i JOIN v ON e.j = v.t GROUP BY e.i, v.d) \
+             SELECT SUM(tanh(x) * tanh(x)) AS l FROM o"
+        )
+    };
+    let grouped = "m AS (SELECT i, MAX(val) AS m FROM p GROUP BY i)";
+    let shift = "exp(p.val - m.m)";
+    let opaque = "exp(p.val - m.m) * exp(m.m - m.m)";
+    // The GPT's loss: the max as a window, then MAX(m) + ln(SUM(exp(val - m))).
+    let lse = |shift: &str| {
+        format!(
+            "WITH m AS (SELECT i, j, val, MAX(val) OVER (PARTITION BY i) AS m FROM p), \
+             l AS (SELECT i, MAX(m) + ln(SUM({shift})) AS l FROM m GROUP BY i) \
+             SELECT SUM(l * l) AS l FROM l"
+        )
+    };
+    let both = [ColumnRef::new("p", "val"), ColumnRef::new("v", "val")];
+    let cases = [
+        (softmax(grouped, shift), softmax(grouped, opaque), &both[..]),
+        (
+            lse("exp(val - m)"),
+            lse("exp(val - m) * exp(m - m)"),
+            &both[..1],
+        ),
+    ];
+    let finite = |mut t: Table| {
+        for (_, vs) in t.values.iter_mut() {
+            for v in vs.iter_mut() {
+                *v = v.map(|x| if x.is_finite() { x } else { 0.5 });
+            }
+        }
+        t
+    };
+    let make = |rng: &mut Rng, ctx: &SessionContext| {
+        let (ni, nj, nd) = (
+            1 + rng.below(4) as usize,
+            1 + rng.below(4) as usize,
+            1 + rng.below(3) as usize,
+        );
+        let p = table(rng, &[("i", ni), ("j", nj)], &["val"], 0.0, None);
+        register(ctx, "p", finite(p));
+        let v = table(rng, &[("t", nj), ("d", nd)], &["val"], 0.0, None);
+        register(ctx, "v", finite(v));
+    };
+    for (c, (loss, general, wrt)) in cases.iter().enumerate() {
+        // Held, the max has no gradient, so no backward step transposes it.
+        let ctx = SessionContext::new();
+        make(&mut Rng::new(c as u64), &ctx);
+        let transposes_max = |sql: &str| {
+            let ctx = &ctx;
+            let sql = sql.to_string();
+            async move {
+                let program = ad::grad(ctx, sql.as_str(), wrt).await.unwrap();
+                program.backward_steps.iter().any(|s| {
+                    let sql = ddx_ad::to_sql(&s.plan, ddx_ad::Dialect::DataFusion).unwrap();
+                    sql.to_uppercase().contains("MAX(")
+                })
+            }
+        };
+        assert!(!transposes_max(loss).await, "the max was not held: {loss}");
+        assert!(transposes_max(general).await, "the max was held: {general}");
+        cases_of(0x5417 + c as u64, 60, loss, general, wrt, &[], &make).await;
+    }
+}
+
+#[tokio::test]
 async fn causal_attention_matches_the_general_rule() {
     // The query of issue #153: a causal mask on the scores, a softmax
     // through a MAX window, and the normalizer joined on a grouping key.
