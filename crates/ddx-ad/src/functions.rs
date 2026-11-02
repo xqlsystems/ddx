@@ -85,6 +85,7 @@ functions! {
     Sqrt => "sqrt",
     Ln => "ln",
     Exp => "exp",
+    Erf => "erf",
     Sin => "sin",
     Cos => "cos",
     Tan => "tan",
