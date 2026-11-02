@@ -116,3 +116,8 @@ the repository-pinned nightly formatter and warning-free Rust docs. Its
 rebuilt wheel passed the combined ddx/EinFold Python binding suite
 (126 passed, 6 optional skips). Rebuilt persistent dependency wheels also
 passed xarray-sql's full 714-test non-integration suite.
+
+After integrating EinFold's newer upstream runtime changes, a final wheel
+rebuild/recheck passed 128 combined binding tests (6 optional skips) and
+again all 714 downstream tests. The two additional binding tests came
+from upstream EinFold; ddx numerical code was unchanged.
