@@ -109,3 +109,10 @@ primal-output API. Neither requires an MLX dependency or relaxed derivative
 checks in ddx. Run the Rust workspace checks per `CONTRIBUTING.md`, then
 build the Python extension and run its tests, including the new lifetime
 and current-input test.
+
+The persistent checkout passed the Rust workspace suite (535 passed,
+10 ignored), workspace and Python-extension Clippy with warnings denied,
+the repository-pinned nightly formatter and warning-free Rust docs. Its
+rebuilt wheel passed the combined ddx/EinFold Python binding suite
+(126 passed, 6 optional skips). Rebuilt persistent dependency wheels also
+passed xarray-sql's full 714-test non-integration suite.
