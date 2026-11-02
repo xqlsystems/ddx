@@ -169,6 +169,16 @@ impl<C: Send + Sync> Prepared<C> {
         }
     }
 
+    /// The primal outputs of the prepared derivative programs, in job order.
+    /// Their tables are available during a successful run until it is released.
+    #[must_use]
+    pub fn values(&self) -> Vec<crate::tables::OutputTable> {
+        self.jobs
+            .iter()
+            .map(|(program, _)| program.value().clone())
+            .collect()
+    }
+
     /// The statements, rewritten as every run gives them.
     #[must_use]
     pub fn statements(&self) -> &[String] {
