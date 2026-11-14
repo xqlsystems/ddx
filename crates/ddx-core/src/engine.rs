@@ -15,7 +15,7 @@
 //! only in their *leaf rule* — the tangent assigned to each column.
 
 use std::collections::HashMap;
-use std::f64::consts::{LN_10, LN_2};
+use std::f64::consts::{LN_10, LN_2, PI};
 use std::sync::Arc;
 
 use sqlparser::ast::{
@@ -33,7 +33,7 @@ use crate::error::{DiffError, Result};
 /// A one-line summary of what ddx-core differentiates, appended to "unsupported"
 /// errors so a user reading the message learns what *is* supported and can act.
 const SUPPORTED: &str = "ddx differentiates the operators + - * /, unary calls to \
-sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs, power(...) with a \
+sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs/erf, power(...) with a \
 constant base or exponent, casts to a numeric type, and column/literal leaves";
 
 /// A differentiation rule for a unary primitive `f(u)`: given the argument
@@ -104,6 +104,11 @@ impl RuleRegistry {
         unary.insert(
             "sqrt".into(),
             rule(|u| div(one(), mul(num(2.0), func1("sqrt", u.clone())))),
+        );
+        // Error function, including the chain rule through exact GELU.
+        unary.insert(
+            "erf".into(),
+            rule(|u| mul(num(2.0 / PI.sqrt()), func1("exp", neg(square(u.clone()))))),
         );
         // Hyperbolic.
         unary.insert("sinh".into(), rule(|u| func1("cosh", u.clone())));

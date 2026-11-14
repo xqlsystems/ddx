@@ -1491,10 +1491,10 @@ fn syntax(name: &str) -> Option<Syntax> {
 
 /// Scalar functions named alike in every dialect, by their canonical names.
 const SCALARS: &[&str] = &[
-    "abs", "sqrt", "cbrt", "exp", "ln", "log10", "log2", "power", "sin", "cos", "tan", "asin",
-    "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "floor", "ceil",
-    "round", "trunc", "greatest", "least", "coalesce", "nullif", "pi", "degrees", "radians",
-    "random",
+    "erf", "abs", "sqrt", "cbrt", "exp", "ln", "log10", "log2", "power", "sin", "cos", "tan",
+    "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "floor",
+    "ceil", "round", "trunc", "greatest", "least", "coalesce", "nullif", "pi", "degrees",
+    "radians", "random",
 ];
 
 /// Aggregate functions named alike in every dialect.
