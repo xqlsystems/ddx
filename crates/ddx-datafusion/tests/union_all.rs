@@ -307,6 +307,85 @@ async fn a_group_whose_key_is_null_keeps_its_gradient() {
     );
 }
 
+#[tokio::test]
+async fn a_union_of_many_inputs_reads_each_one_once() {
+    // Each input's rows carry every other input's columns as NULLs of no
+    // type, which the engine types as it types the union. Joined to empty
+    // copies of every other input, a union of n inputs was n² relations:
+    // DuckDB refused its SQL from 16 inputs on, for its 1,000 CTEs (#238).
+    let n = 32;
+    let union = (1..=n)
+        .map(|c| format!("SELECT i, {c}.0 * x AS x FROM a"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!("WITH u AS ({union}) SELECT SUM(x * x) AS l FROM u");
+    let ctx = ctx();
+    let grads = check_gradients(&ctx, &sql, &[a()], &[wrt("a", "x")]).await;
+    // d/dx Σ_c (c x)² = 2 x Σ_c c².
+    let k: f64 = (1..=n).map(|c| f64::from(c * c)).sum();
+    assert_eq!(
+        sorted(&grads["a"]),
+        vec![vec![0.0, 2.0 * k], vec![1.0, 4.0 * k]]
+    );
+    let program = grad(&substrait_of(&ctx, &sql, true).await, &[wrt("a", "x")]).unwrap();
+    let reads: usize = program
+        .steps()
+        .map(|s| format!("{:?}", *s.plan).matches(r#"names: ["a"]"#).count())
+        .sum();
+    assert!(reads <= 3 * n as usize, "{reads} reads of a for {n} inputs");
+}
+
+#[tokio::test]
+async fn a_union_of_data_two_levels_beneath_a_union() {
+    // The data's unions are copied into the step as they are: in
+    // DataFusion's plan one sits directly beneath the other, its columns
+    // named after `x - 0.5`. DataFusion's optimizer, splicing them, looked
+    // the outer union's names up in the inner one and failed (#236).
+    let grads = check_gradients(
+        &ctx(),
+        "WITH u AS (SELECT k, v FROM (SELECT i AS k, x AS v FROM a \
+                    UNION ALL SELECT k, v FROM (SELECT i AS k, x - 0.5 AS v FROM a \
+                                                UNION ALL SELECT i AS k, x AS v FROM a) n1) n2 \
+                    UNION ALL SELECT i AS k, x AS v FROM b) \
+         SELECT SUM(v * v) AS l FROM u",
+        &[a(), b()],
+        &[wrt("b", "x")],
+    )
+    .await;
+    assert_eq!(
+        sorted(&grads["b"]),
+        vec![vec![0.0, 6.0], vec![1.0, -1.0], vec![2.0, 1.5]]
+    );
+}
+
+#[tokio::test]
+async fn a_union_all_beneath_a_union_beneath_a_union_all_read_through_a_join() {
+    // n1's UNION is a distinct over a UNION ALL, and n2's first input is
+    // computed; read through a join, DataFusion's optimizer failed to splice
+    // the unions (#249).
+    let grads = check_gradients(
+        &ctx(),
+        "WITH u AS (SELECT i AS k, 2.0 * x AS v FROM a) \
+         SELECT SUM(u.v * u2.v) AS l FROM u JOIN ( \
+           SELECT k, v FROM (SELECT i + 1 AS k, 2.0 * x AS v FROM b \
+                             UNION ALL SELECT k, v FROM (SELECT i AS k, x AS v FROM b \
+                                                         UNION SELECT i AS k, x AS v FROM b) n1) n2 \
+           UNION ALL SELECT i AS k, x AS v FROM a) u2 ON u.k = u2.k",
+        &[a(), b()],
+        &[wrt("a", "x")],
+    )
+    .await;
+    // l = Σ_k 2 a_k (Σ of u2's v at k), u2 at key 0: b_0 + a_0, at key 1:
+    // 2 b_0 + b_1 + a_1. So ∂l/∂a_k = 2 (u2 at k) + 2 a_k.
+    assert_eq!(
+        sorted(&grads["a"]),
+        vec![
+            vec![0.0, 2.0 * (3.0 + 1.0) + 2.0],
+            vec![1.0, 2.0 * (6.0 - 0.5 + 2.0) + 4.0]
+        ]
+    );
+}
+
 async fn refusal(sql: &str) -> AdError {
     let ctx = ctx();
     a().create(&ctx).await;

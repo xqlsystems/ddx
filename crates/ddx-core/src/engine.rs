@@ -25,8 +25,8 @@ use sqlparser::ast::{
 
 use crate::colref::{ColRef, IdentCasing, Match};
 use crate::constructors::{
-    add, as_const, div, finite_num, func, func1, is_zero, mul, neg, num, one, sign, square, sub,
-    zero,
+    add, as_const, cast_double, div, finite_num, func, func1, is_zero, mul, neg, num, one, sign,
+    square, sub, zero,
 };
 use crate::error::{DiffError, Result};
 
@@ -105,10 +105,16 @@ impl RuleRegistry {
             "sqrt".into(),
             rule(|u| div(one(), mul(num(2.0), func1("sqrt", u.clone())))),
         );
-        // Error function, including the chain rule through exact GELU.
+        // The error function, as in exact GELU. The argument is cast to DOUBLE
+        // before squaring, so an integer argument can't overflow.
         unary.insert(
             "erf".into(),
-            rule(|u| mul(num(2.0 / PI.sqrt()), func1("exp", neg(square(u.clone()))))),
+            rule(|u| {
+                mul(
+                    num(2.0 / PI.sqrt()),
+                    func1("exp", neg(square(cast_double(u.clone())))),
+                )
+            }),
         );
         // Hyperbolic.
         unary.insert("sinh".into(), rule(|u| func1("cosh", u.clone())));

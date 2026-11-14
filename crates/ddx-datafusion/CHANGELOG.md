@@ -9,6 +9,22 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.2...ddx-datafusion-v0.4.3) - 2026-11-06
+
+### Fixed
+
+- `grad` and `vjp` through a `UNION ALL` of many inputs: the union's gradient reads each input once, so a union of 32 inputs reads its table 65 times rather than 2,049 ([#242](https://github.com/xqlsystems/ddx/pull/242))
+- A `UNION ALL` nested in another, directly or beneath projections, no longer fails to plan on DataFusion ([#246](https://github.com/xqlsystems/ddx/pull/246), [#252](https://github.com/xqlsystems/ddx/pull/252))
+
+### Changed
+
+- Attention's backward pass writes one table with a row per score (`dS`), where it wrote two in the `GROUP BY` spelling and three in the window spelling, and both spellings now get the same program. Three rules do it:
+  - a softmax's normalizer gets its cotangent from the saved output, `z̄ = −Σ ō·o / z` (FlashAttention's `D`), rather than from a sum over every score ([#253](https://github.com/xqlsystems/ddx/pull/253));
+  - a window aggregate over each whole partition is computed as its `GROUP BY` joined back, so it is saved and differentiated like any other aggregate ([#254](https://github.com/xqlsystems/ddx/pull/254));
+  - a softmax's or log-sum-exp's max is held constant, as its gradient is zero ([#255](https://github.com/xqlsystems/ddx/pull/255)).
+
+  Gradients change only by rounding. On DataFusion, xarray-sql's GPT training step takes 72 ms rather than 82, its 4,096-sample network 188 ms rather than 267, and causal attention at 256 tokens 273 ms rather than 321.
+
 ## [0.4.2](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.1...ddx-datafusion-v0.4.2) - 2026-10-29
 
 ### Added

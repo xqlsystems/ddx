@@ -118,6 +118,17 @@ def test_grad_through_a_union_all(ad, con):
     assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
     assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
 
+def test_a_union_of_many_inputs_is_differentiated(ad, con):
+    # Its SQL is the size of its inputs: written as n² relations, it was past
+    # DuckDB's max_expression_depth from 16 inputs on (#238).
+    n = 24
+    union = " UNION ALL ".join(f"SELECT i, {c}.0 * val AS val FROM w" for c in range(1, n + 1))
+    loss = f"WITH u AS ({union}), loss AS (SELECT SUM(val * val) AS l FROM u) "
+    k = sum(c * c for c in range(1, n + 1))
+    want = {i: 2 * k * v for i, v in enumerate([1.0, -2.0, 0.5])}
+    assert dict(pairs(ad.sql(con, loss + "SELECT i, grad(loss, val) FROM w"))) == pytest.approx(want)
+
+
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, con):
     full = pairs(ad.sql(con, GRAD))
     some = pairs(ad.sql(con, GRAD + " WHERE i >= 1"))
@@ -504,6 +515,33 @@ def test_a_window_over_an_aggregate_is_differentiated(ad):
 # Refusals.
 
 
+@pytest.mark.parametrize(
+    "u, loss, source",
+    [
+        ("SELECT CASE WHEN i = 1 THEN NULL ELSE i END AS k, val FROM w", "SUM(val * val * k)", "u"),
+        ("SELECT i AS k, CASE WHEN i = 1 THEN NULL ELSE val END AS val FROM w", "SUM(val * val)", "u"),
+        (
+            "SELECT CASE WHEN i = 1 THEN CAST(NULL AS BIGINT) ELSE i END AS k, val FROM w",
+            "SUM(u.val * b.val)",
+            "u JOIN b ON u.k = b.i",
+        ),
+    ],
+)
+def test_a_bare_null_is_differentiated(ad, con, u, loss, source):
+    # DuckDB's producer gives a bare NULL a type of no kind, and folds a
+    # CAST(NULL AS ...) into one; the step's SQL writes it as a bare NULL.
+    # The gradient is DataFusion's for the same SQL.
+    from datafusion import SessionContext
+    from ddxdb import ad as df
+
+    sql = f"WITH u AS ({u}), loss AS (SELECT {loss} AS l FROM {source}) SELECT i, grad(loss, val) AS g FROM w"
+    ctx = SessionContext()
+    for name in ("w", "b"):
+        ctx.from_arrow(con.execute(f"SELECT * FROM {name}").arrow(), name)
+    want = {r["i"]: r["g"] for r in df.sql(ctx, sql).to_arrow_table().to_pylist()}
+    assert dict(pairs(ad.sql(con, sql))) == pytest.approx(want)
+
+
 def test_a_repeated_column_is_refused_with_a_reason(ad, con):
     # DuckDB's producer drops a column that repeats another; ddx cannot tell
     # which is which, and says so rather than guess.
@@ -513,6 +551,36 @@ def test_a_repeated_column_is_refused_with_a_reason(ad, con):
             """WITH v AS (SELECT i, 1.0 AS val FROM w)
                SELECT jvp(SUM(val), w.val, v) AS t, SUM(val) AS a, SUM(val) AS b FROM w""",
         )
+    assert ddx_tables(con) == []
+
+
+@pytest.mark.parametrize(
+    "u, loss",
+    [
+        (
+            "SELECT i AS k, x AS v FROM ta UNION ALL SELECT k, v FROM "
+            "(SELECT i AS k, i AS v FROM tb UNION ALL SELECT i AS k, i AS v FROM tb) n",
+            "SELECT SUM(u.v * w.val * u.v) AS l FROM u JOIN w ON u.k = w.i",
+        ),
+        (
+            "SELECT k, v FROM (SELECT i AS k, i AS v FROM tb UNION ALL SELECT i AS k, i AS v FROM ta) n "
+            "UNION ALL SELECT i AS k, x AS v FROM ta",
+            "SELECT SUM(t * t) AS l FROM (SELECT k, SUM(v) AS t FROM u GROUP BY k) g",
+        ),
+        (
+            "SELECT i AS k, x AS v, x AS v2 FROM ta UNION ALL SELECT i AS k, x AS v, 1.0 AS v2 FROM tb",
+            "SELECT SUM(v * v2) AS l FROM u",
+        ),
+    ],
+)
+def test_a_repeated_column_beneath_a_union_is_refused_with_a_reason(ad, con, u, loss):
+    # Beneath the root, the column DuckDB's producer drops leaves a union's
+    # inputs unequal, or an emit naming a column that isn't there. The first
+    # panicked (#237).
+    con.execute("CREATE TABLE ta AS SELECT * FROM (VALUES (1, 0.5::DOUBLE), (2, -1.0::DOUBLE)) t(i, x)")
+    con.execute("CREATE TABLE tb AS SELECT * FROM (VALUES (1, 2.0::DOUBLE), (3, 1.5::DOUBLE)) t(i, x)")
+    with pytest.raises(Exception, match="dropped a column"):
+        ad.sql(con, f"WITH u AS ({u}), loss AS ({loss}) SELECT i, grad(loss, x) FROM ta")
     assert ddx_tables(con) == []
 
 

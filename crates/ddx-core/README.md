@@ -21,7 +21,10 @@ The rules work on [`sqlparser::ast::Expr`](https://docs.rs/sqlparser),
 ## What it supports
 
 `+ - * /`; the unary chain rule for the trig / inverse-trig / exp / log /
-hyperbolic set plus `abs`; `power` with a constant base or exponent. Custom
+hyperbolic set plus `abs` and `erf`; `power` with a constant base or exponent.
+`erf` gives exact GELU, `x * (1 + erf(x / sqrt(2))) / 2`. Neither DataFusion
+nor DuckDB defines `erf`, so the caller registers it as a function on the
+engine; its derivative, `2/sqrt(pi) * exp(-x²)`, needs only `exp`. Custom
 unary rules are registrable (`ddx.register("myfn", rule)`: the rule supplies
 `f'(u)`, the engine applies the chain rule). Anything else is a typed
 `DiffError`, never a silently-wrong number.

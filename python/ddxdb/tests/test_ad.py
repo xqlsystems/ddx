@@ -395,6 +395,27 @@ def test_grad_through_a_union_all(ad, ctx):
     assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
     assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
 
+
+def test_a_union_all_beneath_a_union_read_through_a_join(ad, ctx):
+    # n1's UNION is a distinct over a UNION ALL, inside n2 and u2; read
+    # through a join, DataFusion's optimizer failed to splice them (#249).
+    loss = """WITH u AS (SELECT i AS k, 2.0 * val AS v FROM w),
+              loss AS (SELECT SUM(u.v * u2.v) AS l FROM u JOIN (
+                SELECT k, v FROM (SELECT i + 1 AS k, 2.0 * val AS v FROM b
+                                  UNION ALL SELECT k, v FROM (SELECT i AS k, val AS v FROM b
+                                                              UNION SELECT i AS k, val AS v FROM b) n1) n2
+                UNION ALL SELECT i AS k, val AS v FROM w) u2 ON u.k = u2.k),
+              t AS (SELECT i, 1.0 AS val FROM w) """
+    g = pairs(ad.sql(ctx, loss + "SELECT i, grad(loss, val) FROM w"))
+    j = ad.sql(ctx, loss + "SELECT jvp(l, w.val, t) AS j FROM loss").to_pydict()["j"]
+    # l = Σ_k 2 w_k s_k, where s_k sums u2's rows at k: 2 b_{k-1} + b_k + w_k.
+    w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
+    s = [(2 * b[k - 1] if k else 0.0) + b[k] + w[k] for k in range(3)]
+    want = {k: 2 * s[k] + 2 * w[k] for k in range(3)}
+    assert dict(g) == pytest.approx(want)
+    assert j == pytest.approx([sum(want.values())])
+
+
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
     # The WHERE on w's dims is pushed into the program (ddx_ad::Options::restrict);
     # the rows read are the unrestricted gradient's.

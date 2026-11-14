@@ -64,11 +64,12 @@ use crate::emit;
 use crate::error::{AdError, Result};
 use crate::expr::{
     as_field, contains, field, fields_of, if_then, lit_bool, map_fields, uncorrelated_scalar,
+    untyped_null,
 };
 use crate::functions::Functions;
 use crate::optics::{
-    subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs, PlanRels,
-    RelKind, Rex, Setter, Tree,
+    cata, subqueries, subquery_rels, AsWindow, Compose, Cosmos, Deep, Exprs, Fold, Inputs,
+    PlanRels, RelKind, Rex, Setter, Tree,
 };
 use crate::reduce::{reduce_rule, whole_partition, Reduce};
 use crate::relation::{find_column, table_matches, ColumnRef, Table};
@@ -414,7 +415,28 @@ impl Forward {
     /// [`Forward::new`], naming every table the program writes under
     /// `namespace` rather than a fresh one.
     pub fn in_namespace(plan: &Plan, wrt: &[ColumnRef], namespace: String) -> Result<Forward> {
-        let plan = &*windows_as_projections(plan);
+        // Read once, then again holding the shifts that cancel constant
+        // (see `crate::shift`): which saved values they are is known only
+        // once every use of them has been read.
+        let forward = Forward::read(plan, wrt, namespace.clone(), BTreeSet::new())?;
+        let held = crate::shift::cancelling(&forward)?;
+        if held.is_empty() {
+            return Ok(forward);
+        }
+        Forward::read(plan, wrt, namespace, held)
+    }
+
+    /// [`Forward::in_namespace`], reading the saved values in `held` as
+    /// constants.
+    fn read(
+        plan: &Plan,
+        wrt: &[ColumnRef],
+        namespace: String,
+        held: BTreeSet<(usize, usize)>,
+    ) -> Result<Forward> {
+        let projected = windows_as_projections(plan);
+        let grouped = crate::partition::windows_as_aggregates(&projected)?;
+        let plan = &*grouped;
         let functions = Functions::from_plan(plan)?;
         let (root, output_names) = checked_root(plan)?;
         let order = shared_relations(root, &plan.relations)?;
@@ -435,6 +457,7 @@ impl Forward {
             shared: HashMap::new(),
             seen: BTreeSet::new(),
             reads: HashMap::new(),
+            held,
         };
         let output = b.lower(root)?;
         b.check_every_wrt_was_read()?;
@@ -477,19 +500,115 @@ pub(crate) fn root_of(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
 /// drops the repeat and keeps both names.
 pub(crate) fn checked_root(plan: &Plan) -> Result<(&Rel, Vec<String>)> {
     let (root, names) = root_of(plan)?;
-    if let Ok(w) = width(root) {
+    for rel in PlanRels.to_vec(plan) {
+        if !std::ptr::eq(rel, root) {
+            checked_width(rel)?;
+        }
+    }
+    if let Some(w) = checked_width(root)? {
         if w != names.len() {
             return Err(AdError::InvalidPlan(format!(
-                "the plan's root names {} columns ({}), but its relation has {w}: the \
-                 producer dropped a column (DuckDB's drops one that repeats another; \
-                 write each output once), or the output has nested columns, which ddx \
-                 does not differentiate",
+                "the plan's root names {} columns ({}), but its relation has {w}: {DROPPED}, \
+                 or the output has nested columns, which ddx does not differentiate",
                 names.len(),
                 names.join(", ")
             )));
         }
     }
     Ok((root, names))
+}
+
+/// Why a relation has fewer columns than what reads it expects, in a plan a
+/// producer wrote.
+const DROPPED: &str = "the producer dropped a column (DuckDB's drops one that repeats another; \
+                       write each column once)";
+
+/// `rel`'s width, checked bottom up: each emit names only columns its
+/// relation has, and a set operation's inputs have one width. A producer
+/// that drops a column gives a plan that fails these somewhere beneath its
+/// root, and ddx copies the relations it doesn't differentiate into the
+/// steps it writes as they are, so it checks them all here. `None` for a
+/// relation whose width it can't tell (one it doesn't read), and for
+/// everything above one; subqueries aren't checked.
+fn checked_width(rel: &Rel) -> Result<Option<usize>> {
+    cata(
+        rel,
+        |rel, found| {
+            RelKind.then(Inputs).each(rel, |input| found.push(input));
+            Ok::<_, AdError>(())
+        },
+        |rel, widths| {
+            let Some(kind) = &rel.rel_type else {
+                return Ok(None);
+            };
+            let first = widths.first().copied().flatten();
+            let all = || widths.iter().copied().collect::<Option<Vec<usize>>>();
+            let (direct, common) = match kind {
+                RelType::Read(r) => (Some(read_width(r)), r.common.as_ref()),
+                RelType::Project(p) => (first.map(|w| w + p.expressions.len()), p.common.as_ref()),
+                RelType::Filter(f) => (first, f.common.as_ref()),
+                RelType::Sort(s) => (first, s.common.as_ref()),
+                RelType::Fetch(f) => (first, f.common.as_ref()),
+                RelType::Window(w) => (
+                    first.map(|n| n + w.window_functions.len()),
+                    w.common.as_ref(),
+                ),
+                RelType::Join(j) => (
+                    two(&widths)?.map(|(l, r)| join_width(j.r#type, l, r)),
+                    j.common.as_ref(),
+                ),
+                RelType::Cross(c) => (two(&widths)?.map(|(l, r)| l + r), c.common.as_ref()),
+                RelType::Aggregate(a) if a.groupings.len() <= 1 => (
+                    grouping_expressions(a)
+                        .ok()
+                        .map(|g| g.len() + a.measures.len()),
+                    a.common.as_ref(),
+                ),
+                RelType::Set(set) => {
+                    if let Some(widths) = all() {
+                        if let Some(&w) = widths.iter().find(|&&w| w != widths[0]) {
+                            return Err(AdError::InvalidPlan(format!(
+                                "a set operation's inputs have {} and {w} columns: {DROPPED}",
+                                widths[0]
+                            )));
+                        }
+                    }
+                    (first, set.common.as_ref())
+                }
+                _ => return Ok(None),
+            };
+            match common.and_then(|c| c.emit_kind.as_ref()) {
+                Some(EmitKind::Emit(e)) => {
+                    for &i in &e.output_mapping {
+                        let Ok(i) = usize::try_from(i) else {
+                            return Err(AdError::InvalidPlan(format!(
+                                "a relation's emit names column {i}"
+                            )));
+                        };
+                        if let Some(direct) = direct.filter(|&direct| i >= direct) {
+                            return Err(AdError::InvalidPlan(format!(
+                                "a relation's emit names its column {i}, past its {direct}: \
+                                 {DROPPED}"
+                            )));
+                        }
+                    }
+                    Ok(Some(e.output_mapping.len()))
+                }
+                _ => Ok(direct),
+            }
+        },
+    )
+}
+
+/// The widths of a join's two inputs, if it can tell both.
+fn two(widths: &[Option<usize>]) -> Result<Option<(usize, usize)>> {
+    match *widths {
+        [l, r] => Ok(l.zip(r)),
+        _ => Err(AdError::InvalidPlan(format!(
+            "a join has {} inputs, not two",
+            widths.len()
+        ))),
+    }
 }
 
 /// `plan` with each window relation written as the projection of its
@@ -866,6 +985,9 @@ struct Builder<'a> {
     /// [`Builder::reads_wrt`]'s answers, by relation: the plan is borrowed for
     /// the whole read, so its relations stay put.
     reads: HashMap<*const Rel, bool>,
+    /// The saved values `(aggregate, output column)` read as constants:
+    /// shifts that cancel (see `crate::shift`).
+    held: BTreeSet<(usize, usize)>,
 }
 
 impl Builder<'_> {
@@ -1067,7 +1189,7 @@ impl Builder<'_> {
                     rounds: false,
                 });
                 for c in 0..width {
-                    let v = self.saved[n].varied[c];
+                    let v = self.saved[n].varied[c] && !self.held.contains(&(n, c));
                     s.push(Def::Input { slot: 0, col: c }, v);
                 }
                 (s, (0..width).collect(), None)
@@ -1378,46 +1500,49 @@ impl Builder<'_> {
             .next()
             .ok_or_else(|| AdError::InvalidPlan("a set operation with no inputs".into()))?;
         let width = s.outputs.len();
-        // Each input's first column here, its outputs, and its branch column.
-        let mut blocks = vec![(0, s.outputs.clone(), s.width() - 1)];
+        // Each input's first column here, its width, its outputs, and its
+        // branch column.
+        let mut blocks = vec![(0, s.width(), s.outputs.clone(), s.width() - 1)];
         for r in inputs {
             let outputs = r.outputs.clone();
             let w = r.width();
             let shift = s.append(r)?;
-            blocks.push((shift, outputs, shift + w - 1));
+            blocks.push((shift, w, outputs, shift + w - 1));
         }
-        if blocks.iter().any(|(_, outputs, _)| outputs.len() != width) {
+        if blocks
+            .iter()
+            .any(|(_, _, outputs, _)| outputs.len() != width)
+        {
             return Err(AdError::InvalidPlan(
                 "a UNION ALL whose inputs have different numbers of columns".into(),
             ));
         }
-        // Each input's rows, with every other input's columns NULL: FULL
-        // JOINed to none of the others' rows, so the engine types the NULLs
-        // as it types the columns.
+        // Each input's rows, with every other input's columns a NULL of no
+        // type, which the engine types as the union's other inputs type
+        // that column. Each input is read once, so the union is the size of
+        // its inputs, however many there are.
         //
         // DataFusion names a union's columns after its first input's,
         // without their tables, and suffixes a repeated name: a second `x`
         // is `x_1`, though a table may already have an `x_1`, and the union
         // is refused. So each input's columns are renamed first, each after
         // its own table and column, which no other has.
+        let null = untyped_null(self.functions.null_type());
         let w = s.width() + width;
         let all: Vec<usize> = (0..w).collect();
         let mut rows = Vec::with_capacity(rels.len());
-        for (k, (offset, outputs, _)) in blocks.iter().enumerate() {
-            let row = rels
-                .iter()
-                .enumerate()
-                .map(|(j, r)| {
-                    if j == k {
-                        r.clone()
-                    } else {
-                        emit::no_rows(r.clone())
-                    }
-                })
-                .reduce(|l, r| emit::join(l, r, lit_bool(true), JoinType::Outer))
-                .expect("at least one input");
-            let row = emit::project(row, outputs.iter().map(|&c| field(offset + c)).collect());
-            rows.push(match rels.len() {
+        for (k, (rel, (_, own, outputs, _))) in rels.into_iter().zip(&blocks).enumerate() {
+            let mut exprs = Vec::with_capacity(w);
+            for (j, (_, width_j, _, _)) in blocks.iter().enumerate() {
+                if j == k {
+                    exprs.extend((0..*own).map(field));
+                } else {
+                    exprs.extend(std::iter::repeat_n(&null, *width_j).cloned());
+                }
+            }
+            exprs.extend(outputs.iter().map(|&c| field(c)));
+            let row = emit::project_emit(rel, exprs, Some((*own..own + w).collect()));
+            rows.push(match blocks.len() {
                 1 => row,
                 _ => rename_in_place(row, w, &all),
             });
@@ -1430,7 +1555,7 @@ impl Builder<'_> {
         for c in 0..width {
             let arms: Vec<Arm> = blocks
                 .iter()
-                .map(|(offset, outputs, branch)| Arm {
+                .map(|(offset, _, outputs, branch)| Arm {
                     branch: *branch,
                     column: offset + outputs[c],
                 })
@@ -1964,15 +2089,7 @@ pub fn width(rel: &Rel) -> Result<usize> {
         .ok_or_else(|| AdError::InvalidPlan("an empty relation".into()))?;
     let (direct, common) =
         match kind {
-            RelType::Read(r) => {
-                let n = match &r.projection.as_ref().and_then(|m| m.select.as_ref()) {
-                    Some(sel) => sel.struct_items.len(),
-                    None => r.base_schema.as_ref().map_or(0, |s| {
-                        s.r#struct.as_ref().map_or(s.names.len(), |t| t.types.len())
-                    }),
-                };
-                (n, r.common.as_ref())
-            }
+            RelType::Read(r) => (read_width(r), r.common.as_ref()),
             RelType::Project(p) => (
                 width(input(&p.input)?)? + p.expressions.len(),
                 p.common.as_ref(),
@@ -1980,17 +2097,10 @@ pub fn width(rel: &Rel) -> Result<usize> {
             RelType::Filter(f) => (width(input(&f.input)?)?, f.common.as_ref()),
             RelType::Sort(s) => (width(input(&s.input)?)?, s.common.as_ref()),
             RelType::Fetch(f) => (width(input(&f.input)?)?, f.common.as_ref()),
-            RelType::Join(j) => {
-                let (l, r) = (width(input(&j.left)?)?, width(input(&j.right)?)?);
-                let n = match JoinType::try_from(j.r#type).unwrap_or(JoinType::Unspecified) {
-                    JoinType::LeftSemi | JoinType::LeftAnti => l,
-                    JoinType::RightSemi | JoinType::RightAnti => r,
-                    JoinType::LeftMark => l + 1,
-                    JoinType::RightMark => r + 1,
-                    _ => l + r,
-                };
-                (n, j.common.as_ref())
-            }
+            RelType::Join(j) => (
+                join_width(j.r#type, width(input(&j.left)?)?, width(input(&j.right)?)?),
+                j.common.as_ref(),
+            ),
             RelType::Cross(c) => (
                 width(input(&c.left)?)? + width(input(&c.right)?)?,
                 c.common.as_ref(),
@@ -2027,6 +2137,27 @@ pub fn width(rel: &Rel) -> Result<usize> {
     match common.and_then(|c| c.emit_kind.as_ref()) {
         Some(EmitKind::Emit(e)) => Ok(e.output_mapping.len()),
         _ => Ok(direct),
+    }
+}
+
+/// A read's direct width: its projection mask's, or its schema's.
+fn read_width(r: &ReadRel) -> usize {
+    match &r.projection.as_ref().and_then(|m| m.select.as_ref()) {
+        Some(sel) => sel.struct_items.len(),
+        None => r.base_schema.as_ref().map_or(0, |s| {
+            s.r#struct.as_ref().map_or(s.names.len(), |t| t.types.len())
+        }),
+    }
+}
+
+/// A join's direct width, of type `join_type`, from its inputs' widths.
+fn join_width(join_type: i32, left: usize, right: usize) -> usize {
+    match JoinType::try_from(join_type).unwrap_or(JoinType::Unspecified) {
+        JoinType::LeftSemi | JoinType::LeftAnti => left,
+        JoinType::RightSemi | JoinType::RightAnti => right,
+        JoinType::LeftMark => left + 1,
+        JoinType::RightMark => right + 1,
+        _ => left + right,
     }
 }
 
@@ -2121,6 +2252,57 @@ pub(crate) fn rel_name(kind: &RelType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_column_a_producer_dropped_beneath_the_root_is_refused() {
+        // DuckDB's producer writes a projection of plain columns as its
+        // read's columns, so it drops one that repeats another, leaving
+        // nothing to tell which (#237). Beneath the root, a union's inputs
+        // then disagree, or an emit names a column that isn't there; ddx
+        // copies such a relation into its steps as it is, and panicked.
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let two = || emit::read_step("a", vec!["i".into(), "x".into()]);
+        let one = || emit::read_step("b", vec!["i".into()]);
+        let names = |n: usize| (0..n).map(|c| format!("c{c}")).collect();
+        let unequal = emit::union_all(vec![two(), one()]);
+        let past = emit::union_all(vec![
+            two(),
+            emit::project_emit(one(), vec![lit_bool(true)], Some(vec![0, 2])),
+        ]);
+        for root in [unequal, past] {
+            let plan = emit::plan(emit::project(root, vec![field(0)]), names(3), &ext);
+            let e = checked_root(&plan).expect_err("refused");
+            assert!(e.to_string().contains("dropped a column"), "{e}");
+        }
+        let fine = emit::union_all(vec![two(), emit::project(one(), vec![lit_bool(true)])]);
+        let plan = emit::plan(emit::project(fine, vec![field(0)]), names(3), &ext);
+        checked_root(&plan).unwrap();
+    }
+
+    #[test]
+    fn a_negative_emit_index_or_a_join_with_one_input_is_refused() {
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let read = || emit::read_step("a", vec!["i".into(), "x".into()]);
+        let mut negative = emit::project_emit(read(), vec![], Some(vec![0, 1]));
+        if let Some(RelType::Project(p)) = &mut negative.rel_type {
+            if let Some(EmitKind::Emit(e)) = p.common.as_mut().and_then(|c| c.emit_kind.as_mut()) {
+                e.output_mapping[1] = -1;
+            }
+        }
+        let lone = Rel {
+            rel_type: Some(RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(read())),
+                r#type: JoinType::Inner as i32,
+                ..Default::default()
+            }))),
+        };
+        for root in [negative, lone] {
+            let plan = emit::plan(root, vec!["i".into(), "x".into()], &ext);
+            checked_root(&plan).expect_err("refused");
+        }
+    }
 
     #[test]
     fn a_window_relation_is_read_as_the_projection_of_its_functions() {
