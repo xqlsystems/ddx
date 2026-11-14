@@ -251,13 +251,12 @@ async fn as_views(
     // Views of the same names in another schema, which no read reaches.
     if rng.below(3) == 0 {
         run(ctx, "CREATE SCHEMA other").await?;
-        for k in 0..c {
-            let dims = case.nodes[k].dims.clone();
+        for (k, node) in case.nodes.iter().enumerate().take(c) {
             run(
                 ctx,
                 &format!(
                     "CREATE VIEW other.r{k} AS SELECT {}v * -0.5 + 0.37 AS v FROM r{k}",
-                    lead(&dims, "")
+                    lead(&node.dims, "")
                 ),
             )
             .await?;
