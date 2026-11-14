@@ -268,11 +268,16 @@ class Prepared:
         self._prepared = None
 
     @property
-    def values(self):
-        """Prepared primal outputs, readable during a run before release."""
+    def primals(self) -> list[OutputTable]:
+        """The value of each derivative's query (a loss, say), which a run
+        computes along with the derivative, so reading it needs no forward
+        query of its own. There is one per distinct derivative, which calls
+        of the same one share, in the order they run: a derivative that
+        reads another comes after it. Each table holds the current run's
+        rows, until the run is released."""
         if self._prepared is None:
-            raise RuntimeError("run the prepared program before reading its values")
-        return self._prepared.values
+            raise RuntimeError("run the prepared statements before reading their primals")
+        return self._prepared.primals
 
     def run(self) -> Rewritten:
         """Compute what the statements' calls read, and the statements

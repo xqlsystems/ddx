@@ -169,10 +169,14 @@ impl<C: Send + Sync> Prepared<C> {
         }
     }
 
-    /// The primal outputs of the prepared derivative programs, in job order.
-    /// Their tables are available during a successful run until it is released.
+    /// The value of each derivative's query (a loss, say), which a run
+    /// computes along with the derivative, so reading it needs no forward
+    /// query of its own. There is one per distinct derivative, which calls
+    /// of the same one share, in the order they run: a derivative that
+    /// reads another comes after it. Each table holds the current run's
+    /// rows, until its [`Rewritten::release`].
     #[must_use]
-    pub fn values(&self) -> Vec<crate::tables::OutputTable> {
+    pub fn primals(&self) -> Vec<crate::tables::OutputTable> {
         self.jobs
             .iter()
             .map(|(program, _)| program.value().clone())

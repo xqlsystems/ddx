@@ -928,10 +928,12 @@ struct Prepared(ddx_ad::Prepared<Py<PyAny>>);
 
 #[pymethods]
 impl Prepared {
-    /// Primal outputs available until the current run is released.
+    /// The value of each derivative's query, in the order the derivatives
+    /// run; each table holds the current run's rows, until the run is
+    /// released.
     #[getter]
-    fn values(&self) -> Vec<OutputTable> {
-        self.0.values().iter().map(OutputTable::from).collect()
+    fn primals(&self) -> Vec<OutputTable> {
+        self.0.primals().iter().map(OutputTable::from).collect()
     }
 
     /// Run again what `_prepare` ran, each plan as it was bound then, on
