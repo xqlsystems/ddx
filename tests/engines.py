@@ -26,6 +26,8 @@ cannot test for it.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pyarrow as pa
 
@@ -58,12 +60,23 @@ def _fixture(xs, ys) -> pa.Table:
     )
 
 
+def _erf(x: pa.Array) -> pa.Array:
+    """The error function, which DataFusion doesn't define."""
+    return pa.array(
+        [None if v is None else math.erf(v) for v in x.to_pylist()], type=pa.float64()
+    )
+
+
 def context(xs, ys):
-    """A DataFusion context with `t(i, x, y)` registered."""
+    """A DataFusion context with `t(i, x, y)` and an `erf` function
+    registered."""
     import datafusion
 
     ctx = datafusion.SessionContext()
     ctx.register_record_batches("t", [_fixture(xs, ys).to_batches()])
+    ctx.register_udf(
+        datafusion.udf(_erf, [pa.float64()], pa.float64(), "immutable", name="erf")
+    )
     return ctx
 
 
