@@ -57,6 +57,7 @@ RULES = [
     ("acos", "acos(x)", lambda x, y: jnp.arccos(x), (-0.9, 0.9)),
     ("atan", "atan(x)", lambda x, y: jnp.arctan(x), (-3.0, 3.0)),
     ("exp", "exp(x)", lambda x, y: jnp.exp(x), (-3.0, 3.0)),
+    ("erf", "erf(x)", lambda x, y: jax.scipy.special.erf(x), (-3.0, 3.0)),
     ("ln", "ln(x)", lambda x, y: jnp.log(x), (0.3, 3.0)),
     ("log2", "log2(x)", lambda x, y: jnp.log2(x), (0.3, 3.0)),
     ("log10", "log10(x)", lambda x, y: jnp.log10(x), (0.3, 3.0)),

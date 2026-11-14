@@ -386,3 +386,12 @@ fn error_function_chain_and_second_derivative() {
         assert!((eval(&second, x, 0.0).unwrap() + 8.0 * x * expected).abs() < 1e-12);
     }
 }
+
+#[test]
+fn error_function_squares_its_argument_as_a_double() {
+    // An INTEGER argument squared as an integer overflows past 46,340.
+    assert_eq!(
+        d("erf(x)", "x"),
+        "1.1283791670955126 * exp(-(CAST(x AS DOUBLE) * CAST(x AS DOUBLE)))"
+    );
+}
