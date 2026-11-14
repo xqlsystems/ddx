@@ -928,6 +928,12 @@ struct Prepared(ddx_ad::Prepared<Py<PyAny>>);
 
 #[pymethods]
 impl Prepared {
+    /// Primal outputs available until the current run is released.
+    #[getter]
+    fn values(&self) -> Vec<OutputTable> {
+        self.0.values().iter().map(OutputTable::from).collect()
+    }
+
     /// Run again what `_prepare` ran, each plan as it was bound then, on
     /// the same `backend`: returns what `_rewrite` returns, or `None`, and
     /// runs nothing, if the backend's views are not as `_prepare` found

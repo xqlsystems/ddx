@@ -267,6 +267,13 @@ class Prepared:
         self.dialect = dialect
         self._prepared = None
 
+    @property
+    def values(self):
+        """Prepared primal outputs, readable during a run before release."""
+        if self._prepared is None:
+            raise RuntimeError("run the prepared program before reading its values")
+        return self._prepared.values
+
     def run(self) -> Rewritten:
         """Compute what the statements' calls read, and the statements
         rewritten to read it, as :func:`rewrite` returns them. The first run
