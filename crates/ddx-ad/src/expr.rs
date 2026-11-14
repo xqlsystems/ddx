@@ -17,7 +17,7 @@ use substrait::proto::expression::{
     cast, if_then, FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
 };
 use substrait::proto::function_argument::ArgType;
-use substrait::proto::r#type::{Fp64, Kind, Nullability};
+use substrait::proto::r#type::{Fp64, Kind, Nullability, UserDefined};
 use substrait::proto::{Expression, FunctionArgument, Type};
 
 use crate::error::{AdError, Result};
@@ -95,6 +95,26 @@ pub fn null_f64() -> Expression {
             nullable: true,
             type_variation_reference: 0,
             literal_type: Some(LiteralType::Null(fp64())),
+        })),
+    }
+}
+
+/// A NULL of no type: of the plan's type `null`, at anchor `null_type`
+/// ([`crate::functions::Functions::null_type`]).
+#[must_use]
+pub fn untyped_null(null_type: u32) -> Expression {
+    Expression {
+        rex_type: Some(RexType::Literal(Literal {
+            nullable: true,
+            type_variation_reference: 0,
+            literal_type: Some(LiteralType::Null(Type {
+                kind: Some(Kind::UserDefined(UserDefined {
+                    type_reference: null_type,
+                    type_variation_reference: 0,
+                    nullability: Nullability::Nullable as i32,
+                    type_parameters: vec![],
+                })),
+            })),
         })),
     }
 }

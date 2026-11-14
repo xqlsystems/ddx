@@ -100,3 +100,125 @@ async fn a_cte_read_twice_is_saved_once() {
         assert_eq!(program.forward_steps.len(), 8 + 1);
     }
 }
+
+#[tokio::test]
+async fn a_softmax_written_with_windows_gets_the_group_by_program() {
+    // Each window over a whole partition is read as its GROUP BY joined
+    // back, so both spellings of causal attention save the same aggregates
+    // and have the same steps.
+    let ctx = SessionContext::new();
+    for (name, seed) in [("q", 1), ("k", 30), ("v", 60)] {
+        matrix(name, ["t", "d"], [3, 2], seed).create(&ctx).await;
+    }
+    let attention = |softmax: &str| {
+        format!(
+            "WITH s AS (SELECT q.t AS i, k.t AS j, SUM(q.val * k.val) AS s \
+                        FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t), \
+                  {softmax}, \
+                  o AS (SELECT p.i AS t, v.d, SUM(p.p * v.val) AS x \
+                        FROM p JOIN v ON p.j = v.t GROUP BY p.i, v.d) \
+             SELECT SUM(x * x) AS l FROM o"
+        )
+    };
+    let windows = attention(
+        "w AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS e FROM s), \
+         p AS (SELECT i, j, e / SUM(e) OVER (PARTITION BY i) AS p FROM w)",
+    );
+    let grouped = attention(
+        "m AS (SELECT i, MAX(s) AS m FROM s GROUP BY i), \
+         e AS (SELECT s.i, s.j, exp(s.s - m.m) AS e FROM s JOIN m ON s.i = m.i), \
+         z AS (SELECT i, SUM(e) AS z FROM e GROUP BY i), \
+         p AS (SELECT e.i, e.j, e.e / z.z AS p FROM e JOIN z ON e.i = z.i)",
+    );
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    let mut shapes = Vec::new();
+    for sql in [&windows, &grouped] {
+        let plan = common::substrait_of(&ctx, sql, true).await;
+        let options = ddx_ad::Options::new().namespace("__ddx_softmax_");
+        let program = ddx_ad::grad_with(&plan, &wrt, &options).unwrap();
+        shapes.push(program.steps().map(|s| s.name.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(shapes[0], shapes[1]);
+}
+
+/// Causal attention over `q`, `k` and `v` (4 positions, 2 features), its
+/// softmax written as `softmax`.
+fn causal(softmax: &str) -> String {
+    format!(
+        "WITH s AS (SELECT q.t AS i, k.t AS j, SUM(q.val * k.val) AS s \
+                    FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t), \
+              {softmax}, \
+              o AS (SELECT p.i AS t, v.d, SUM(p.p * v.val) AS x \
+                    FROM p JOIN v ON p.j = v.t GROUP BY p.i, v.d) \
+         SELECT SUM(x * x) AS l FROM o"
+    )
+}
+
+const WINDOWS: &str = "w AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS e FROM s), \
+                       p AS (SELECT i, j, e / SUM(e) OVER (PARTITION BY i) AS p FROM w)";
+
+const GROUPED: &str = "m AS (SELECT i, MAX(s) AS m FROM s GROUP BY i), \
+                       e AS (SELECT s.i, s.j, exp(s.s - m.m) AS e FROM s JOIN m ON s.i = m.i), \
+                       z AS (SELECT i, SUM(e) AS z FROM e GROUP BY i), \
+                       p AS (SELECT e.i, e.j, e.e / z.z AS p FROM e JOIN z ON e.i = z.i)";
+
+fn qkv() -> Vec<Table> {
+    [("q", 1), ("k", 30), ("v", 60)]
+        .into_iter()
+        .map(|(name, seed)| matrix(name, ["t", "d"], [4, 2], seed))
+        .collect()
+}
+
+#[tokio::test]
+async fn attentions_backward_writes_one_table_of_scores() {
+    // The normalizer's cotangent comes from o (FlashAttention's D), and the
+    // max, which cancels, is held constant: so the one backward step with
+    // a row per score is dS. Every other has at most a row per position and
+    // feature (8), where the causal scores have 10.
+    let wrt = [
+        ColumnRef::new("q", "val"),
+        ColumnRef::new("k", "val"),
+        ColumnRef::new("v", "val"),
+    ];
+    for softmax in [WINDOWS, GROUPED] {
+        let ctx = SessionContext::new();
+        for t in qkv() {
+            t.create(&ctx).await;
+        }
+        let plan = common::substrait_of(&ctx, &causal(softmax), true).await;
+        let program = ddx_ad::grad(&plan, &wrt).unwrap();
+        let mut large = Vec::new();
+        for step in program.steps() {
+            ddx_datafusion::engine::run_step(&ctx, step).await.unwrap();
+        }
+        for step in &program.backward_steps {
+            let name = format!("\"{}\"", step.name);
+            if ctx.table(name).await.unwrap().count().await.unwrap() > 8 {
+                large.push(step.name.clone());
+            }
+        }
+        assert_eq!(large.len(), 1, "{large:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_max_used_beyond_its_softmax_keeps_its_gradient() {
+    // The loss reads the max itself, so it doesn't cancel, and its gradient
+    // goes through the max as before.
+    let ctx = SessionContext::new();
+    let loss = causal(GROUPED).replace(
+        "SELECT SUM(x * x) AS l FROM o",
+        "SELECT SUM(x * x + m.m) AS l FROM o JOIN m ON o.t = m.i",
+    );
+    check_gradients(
+        &ctx,
+        &loss,
+        &qkv(),
+        &[ColumnRef::new("q", "val"), ColumnRef::new("k", "val")],
+    )
+    .await;
+}
