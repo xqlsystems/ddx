@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.4...ddx-ad-v0.3.5) - 2026-11-15
+
+### Fixed
+
+- *(ddx-ad)* round a REAL gradient past REAL's range to an infinity ([#273](https://github.com/xqlsystems/ddx/pull/273))
+
 ## [0.3.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.3...ddx-ad-v0.3.4) - 2026-11-15
 
 ### Added

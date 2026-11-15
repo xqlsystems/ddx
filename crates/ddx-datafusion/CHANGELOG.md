@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.4...ddx-datafusion-v0.4.5) - 2026-11-15
+
+### Other
+
+- updated the following local packages: ddx-ad, ddx-ad
+
 ## [0.4.4](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.3...ddx-datafusion-v0.4.4) - 2026-11-15
 
 ### Added
