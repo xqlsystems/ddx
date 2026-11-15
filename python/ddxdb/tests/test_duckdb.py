@@ -97,6 +97,29 @@ def test_stop_gradient_keeps_a_real_gradient_real(ad):
     assert sorted(rel.fetchall()) == [(0, 1.0, "FLOAT"), (1, 2.0, "FLOAT")]
 
 
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_real_gradient_past_real_s_range_rounds_to_an_infinity(ad, sign):
+    # d(sign / x)/dx at 1e-30, a normal REAL, is -sign * 1e60 (#272).
+    con = duckdb.connect()
+    con.register("h", pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1e-30, 1.0], pa.float32())}))
+    rel = ad.sql(
+        con,
+        f"""WITH loss AS (SELECT SUM(CAST({sign} AS REAL) / x) AS l FROM h)
+            SELECT i, grad(loss, x) AS g, typeof(grad(loss, x)) AS t FROM h""",
+    )
+    assert sorted(rel.fetchall()) == [(0, -sign * math.inf, "FLOAT"), (1, -sign, "FLOAT")]
+
+
+def test_a_real_nan_gradient_stays_nan(ad):
+    # DuckDB orders NaN above every number, so a bound on the gradient alone
+    # would round it to an infinity.
+    con = duckdb.connect()
+    con.register("h", pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([math.nan, 1.0], pa.float32())}))
+    rel = ad.sql(con, "WITH loss AS (SELECT SUM(x * x) AS l FROM h) SELECT i, grad(loss, x) AS g FROM h")
+    [(_, nan), (_, two)] = sorted(rel.fetchall())
+    assert math.isnan(nan) and two == 2.0
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, con):
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 

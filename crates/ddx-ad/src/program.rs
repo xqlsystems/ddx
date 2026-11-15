@@ -931,19 +931,40 @@ fn dense_gradient(
     // simplifier has rewritten it to a CASE, and a context may not run that
     // rule.
     let is_null = t.ext.anchor(Function::IsNull);
+    let (gte, lte, and) = (
+        t.ext.anchor(Function::Gte),
+        t.ext.anchor(Function::Lte),
+        t.ext.anchor(Function::And),
+    );
     let grads: Vec<Expression> = values
         .iter()
         .enumerate()
         .map(|(n, val)| {
             let null_value = (call(is_null, vec![field(k + n)]), null_f64());
             let pinned = match cols.iter().position(|c| c == val) {
-                Some(c) => if_then(
-                    vec![
-                        null_value,
-                        (call(is_null, vec![field(right + c)]), lit_f64(0.0)),
-                    ],
-                    field(right + c),
-                ),
+                Some(c) => {
+                    let g = || field(right + c);
+                    let mut clauses = vec![null_value, (call(is_null, vec![g()]), lit_f64(0.0))];
+                    // A gradient past REAL's range rounds to an infinity,
+                    // as IEEE does: DuckDB's cast raises there instead (#272).
+                    // Both engines order NaN above +inf, so the upper bound
+                    // keeps a NaN out.
+                    if is_fp32(&types[n]) {
+                        let overflows = call(
+                            and,
+                            vec![
+                                call(gte, vec![g(), lit_f64(REAL_OVERFLOW)]),
+                                call(lte, vec![g(), lit_f64(f64::INFINITY)]),
+                            ],
+                        );
+                        clauses.push((overflows, lit_f64(f64::INFINITY)));
+                        clauses.push((
+                            call(lte, vec![g(), lit_f64(-REAL_OVERFLOW)]),
+                            lit_f64(f64::NEG_INFINITY),
+                        ));
+                    }
+                    if_then(clauses, g())
+                }
                 None => if_then(vec![null_value], lit_f64(0.0)),
             };
             cast(pinned, types[n].clone())
@@ -953,6 +974,14 @@ fn dense_gradient(
     let mut emit: Vec<usize> = (0..k).collect();
     emit.extend((0..grads.len()).map(|g| width + g));
     Ok(project_emit(joined, grads, Some(emit)))
+}
+
+/// The least DOUBLE that rounds to REAL's infinity: halfway between REAL's
+/// largest finite value and 2^128, where rounding to even goes up.
+const REAL_OVERFLOW: f64 = (f32::MAX as f64 + 340282366920938463463374607431768211456.0) / 2.0;
+
+fn is_fp32(ty: &substrait::proto::Type) -> bool {
+    matches!(ty.kind, Some(substrait::proto::r#type::Kind::Fp32(_)))
 }
 
 /// Make a type nullable: a gradient is NULL where its value is.
@@ -1033,5 +1062,16 @@ fn lit_true() -> Expression {
             type_variation_reference: 0,
             literal_type: Some(LiteralType::Boolean(true)),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REAL_OVERFLOW;
+
+    #[test]
+    fn real_overflow_is_the_least_double_that_rounds_to_real_s_infinity() {
+        assert_eq!(REAL_OVERFLOW as f32, f32::INFINITY);
+        assert_eq!(REAL_OVERFLOW.next_down() as f32, f32::MAX);
     }
 }
