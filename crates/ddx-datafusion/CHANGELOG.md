@@ -11,9 +11,13 @@ Entries below the first release are maintained automatically by
 
 ## [0.4.4](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.3...ddx-datafusion-v0.4.4) - 2026-11-15
 
-### Other
+### Added
 
-- *(ddx-datafusion)* iterate nodes rather than index them, for clippy 1.100 ([#267](https://github.com/xqlsystems/ddx/pull/267))
+- `erf` is differentiated, for exact GELU, and `Prepared::primals()` returns a prepared run's loss without a forward query of its own (ddx-ad 0.3.4) ([#256](https://github.com/xqlsystems/ddx/pull/256), [#257](https://github.com/xqlsystems/ddx/pull/257))
+
+### Fixed
+
+- `atan`'s gradient on an `INTEGER` column no longer overflows (ddx-core 0.3.2) ([#269](https://github.com/xqlsystems/ddx/pull/269))
 
 ## [0.4.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.2...ddx-datafusion-v0.4.3) - 2026-11-06
 

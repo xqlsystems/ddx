@@ -11,8 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(ddx-ad)* expose a prepared run's primals, so a loss needs no forward query ([#257](https://github.com/xqlsystems/ddx/pull/257))
-- *(ddx-core)* differentiate erf, and keep it in SQL programs ([#256](https://github.com/xqlsystems/ddx/pull/256))
+- `Prepared::primals()` returns the value of each derivative's query (a loss, say), which a prepared run computes along with the derivative, so a training step can report its loss without running the forward query again. Each table holds the current run's rows until the run is released ([#257](https://github.com/xqlsystems/ddx/pull/257))
+- `erf` is differentiated, as `2/sqrt(pi) * exp(-x²)`, and kept in the SQL programs ddx writes. This gives exact GELU, `x * (1 + erf(x / sqrt(2))) / 2`. Neither DataFusion nor DuckDB defines `erf`, so register it on the engine; its derivative needs only `exp` ([#256](https://github.com/xqlsystems/ddx/pull/256))
+
+### Fixed
+
+- `atan`'s derivative squares its argument as a `DOUBLE`. On an `INTEGER` column it overflowed past 46,340: DataFusion returned a wrong, negative gradient, and DuckDB raised an error. From ddx-core 0.3.2 ([#269](https://github.com/xqlsystems/ddx/pull/269))
 
 ## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.2...ddx-ad-v0.3.3) - 2026-11-06
 
