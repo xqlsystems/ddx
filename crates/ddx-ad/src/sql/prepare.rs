@@ -169,6 +169,20 @@ impl<C: Send + Sync> Prepared<C> {
         }
     }
 
+    /// The value of each derivative's query (a loss, say), which a run
+    /// computes along with the derivative, so reading it needs no forward
+    /// query of its own. There is one per distinct derivative, which calls
+    /// of the same one share, in the order they run: a derivative that
+    /// reads another comes after it. Each table holds the current run's
+    /// rows, until its [`Rewritten::release`].
+    #[must_use]
+    pub fn primals(&self) -> Vec<crate::tables::OutputTable> {
+        self.jobs
+            .iter()
+            .map(|(program, _)| program.value().clone())
+            .collect()
+    }
+
     /// The statements, rewritten as every run gives them.
     #[must_use]
     pub fn statements(&self) -> &[String] {
