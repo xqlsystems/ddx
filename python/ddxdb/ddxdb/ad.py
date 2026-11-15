@@ -82,9 +82,11 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.ad needs DataFusion: pip install 'ddxdb[datafusion]'") from e
 
 from ._ddxdb import (
+    STOP_GRADIENT,
     UnsupportedExpression,
     _inlined_size,
     _not_in_subquery,
+    _stop_gradient_udf,
     _view_probe,
     to_sql,
 )
@@ -129,22 +131,16 @@ __all__ = [
     "vjp",
 ]
 
-#: The SQL name of the stop-gradient function.
-STOP_GRADIENT = "ddx_stop_gradient"
-
 
 def register_stop_gradient(ctx: SessionContext) -> None:
-    """Register ``ddx_stop_gradient`` on ``ctx`` as the identity on DOUBLE.
+    """Register ``ddx_stop_gradient`` on ``ctx``: the identity, at its
+    argument's own type, so a ``REAL`` column stays ``REAL``.
 
-    DataFusion keeps one UDF per name, and a Python UDF takes exact types, so
-    this one takes DOUBLE: an argument of another numeric type is cast to
-    DOUBLE, and so is the result. The gradient is unaffected, since ddx treats
-    the argument as a constant whatever it contains, but the type is not:
-    ``val - ddx_stop_gradient(val)`` on a ``REAL`` column is ``DOUBLE`` here,
-    where the Rust UDF (``ddx_datafusion::stop_gradient_udf``), which accepts
-    any type, keeps it ``REAL``. Cast back if the type matters.
+    :class:`ddxdb.Context` registers it itself; a plain ``SessionContext``
+    needs this. It is the Rust UDF ``ddx_datafusion::stop_gradient_udf``
+    registers, passed to DataFusion through its FFI.
     """
-    ctx.register_udf(udf(lambda x: x, [pa.float64()], pa.float64(), "immutable", name=STOP_GRADIENT))
+    ctx.register_udf(udf(_stop_gradient_udf()))
 
 
 def grad(

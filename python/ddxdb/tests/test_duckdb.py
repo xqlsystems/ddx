@@ -52,6 +52,51 @@ def ddx_tables(con):
 GRAD = "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w"
 
 
+def test_stop_gradient_holds_its_argument_constant(ad, con):
+    rel = ad.sql(
+        con,
+        """WITH loss AS (SELECT SUM(ddx_stop_gradient(val) * val * val) AS l FROM w)
+           SELECT i, grad(loss, val) FROM w""",
+    )
+    # d/dv (c * v * v) = 2 c v, with c = v held constant.
+    assert pairs(rel) == [(0, 2.0), (1, 8.0), (2, 0.5)]
+
+
+def test_stop_gradient_runs_where_the_rewrite_keeps_it(ad, con):
+    # No grad at all, and a column beside one: the caller's connection runs both.
+    [total] = ad.sql(con, "SELECT SUM(ddx_stop_gradient(val)) FROM w").fetchone()
+    assert total == pytest.approx(-0.5)
+    rel = ad.sql(
+        con,
+        """WITH loss AS (SELECT SUM(val * val) AS l FROM w)
+           SELECT i, ddx_stop_gradient(val) AS c, grad(loss, val) AS g FROM w""",
+    )
+    assert sorted(rel.fetchall()) == [(0, 1.0, 2.0), (1, -2.0, -4.0), (2, 0.5, 1.0)]
+
+
+def test_stop_gradient_registered_by_the_caller_is_kept(ad):
+    con = duckdb.connect()
+    con.create_function("ddx_stop_gradient", lambda x: x + 0.0, ["DOUBLE"], "DOUBLE")
+    con.register("w", table([0, 1], [1.0, 2.0]))
+    rel = ad.sql(
+        con,
+        """WITH loss AS (SELECT SUM(ddx_stop_gradient(val) * val) AS l FROM w)
+           SELECT i, grad(loss, val) FROM w""",
+    )
+    assert pairs(rel) == [(0, 1.0), (1, 2.0)]
+
+
+def test_stop_gradient_keeps_a_real_gradient_real(ad):
+    con = duckdb.connect()
+    con.register("h", pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.0, 2.0], pa.float32())}))
+    rel = ad.sql(
+        con,
+        """WITH loss AS (SELECT SUM(ddx_stop_gradient(x) * x) AS l FROM h)
+           SELECT i, grad(loss, x) AS g, typeof(grad(loss, x)) AS t FROM h""",
+    )
+    assert sorted(rel.fetchall()) == [(0, 1.0, "FLOAT"), (1, 2.0, "FLOAT")]
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, con):
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 

@@ -29,7 +29,8 @@ class Context(SessionContext):
     """A DataFusion ``SessionContext`` whose ``.sql()`` understands `grad`.
 
     A real subclass, so every ``SessionContext`` method, property and
-    constructor argument works unchanged — only ``sql()`` is overridden::
+    constructor argument works unchanged — only ``sql()`` is overridden. It
+    registers ``ddx_stop_gradient`` (:func:`ddxdb.ad.register_stop_gradient`)::
 
         from ddxdb import Context
 
@@ -43,6 +44,9 @@ class Context(SessionContext):
 
     def __init__(self, *args, dialect: str = "datafusion", **kwargs):
         super().__init__(*args, **kwargs)
+        from . import ad
+
+        ad.register_stop_gradient(self)
         # Bypass __setattr__ on the PyO3 base, which may not accept
         # arbitrary attributes.
         object.__setattr__(self, "_ddx_dialect", dialect)

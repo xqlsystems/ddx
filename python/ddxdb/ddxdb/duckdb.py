@@ -63,7 +63,13 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
 from . import Prepared, Programs, _name_parts, rewrite
-from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
+from ._ddxdb import (
+    STOP_GRADIENT,
+    UnsupportedExpression,
+    _rename_tables,
+    _tables_read,
+    to_sql,
+)
 
 __all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
 
@@ -123,6 +129,32 @@ def _load_substrait(con: "duckdb.DuckDBPyConnection") -> None:
         con.execute("LOAD substrait")
 
 
+def _register_stop_gradient(con: "duckdb.DuckDBPyConnection") -> None:
+    """Register ``ddx_stop_gradient`` on ``con``, unless it has one. The
+    backend registers it on its planner, so a loss calling it plans, and on
+    the caller's connection, which runs the statements: a rewritten
+    statement keeps every call ddx didn't replace (in a statement with no
+    ``grad``, or a loss it reads), though each step ddx writes leaves it out,
+    as the identity it is.
+
+    DuckDB's Python UDFs need numpy, which ``ddxdb[duckdb]`` installs. Its
+    Python API takes one signature per function name, so it takes
+    DOUBLE, and DuckDB casts a ``REAL`` argument to it. A gradient keeps
+    its column's type, but a forward value computed through it is DOUBLE.
+    """
+    from duckdb import sqltypes
+
+    try:
+        con.create_function(
+            STOP_GRADIENT, lambda x: x, [sqltypes.DOUBLE], sqltypes.DOUBLE, type="arrow"
+        )
+    # Registered already: by the caller, or on a cursor of the same
+    # database, whose catalog this one shares (CatalogException), or on
+    # this connection object itself (NotImplementedException).
+    except (duckdb.CatalogException, duckdb.NotImplementedException):
+        pass
+
+
 class DuckDBBackend:
     """A DuckDB connection as a :class:`ddxdb.Backend`: plans with DuckDB's
     Substrait producer on a schema-only mirror of the connection's catalog,
@@ -137,12 +169,14 @@ class DuckDBBackend:
 
     def __init__(self, con: "duckdb.DuckDBPyConnection"):
         self._con = weakref.ref(con)
+        _register_stop_gradient(con)
         self._planner = duckdb.connect()
         _load_substrait(self._planner)
         # The mirror's tables are empty, and DuckDB's statistics would say
         # so: a filter on one's column (`WHERE layer = 0`) would be planned
         # as no rows, and its scan left out of the plan.
         self._planner.execute("SET disabled_optimizers = 'statistics_propagation'")
+        _register_stop_gradient(self._planner)
         # What the planner mirrors: each object's columns or view SQL, as last
         # copied, so an unchanged catalog is not copied again.
         self._mirrored: dict = {}

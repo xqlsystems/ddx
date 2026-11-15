@@ -163,8 +163,17 @@ returns a `Rewritten` like `ddxdb.rewrite`'s.
 ## What you can write
 
 Inside the loss: `+ - * /`; the chain rule for the trig / inverse-trig / exp /
-log / hyperbolic set plus `abs`; `power` with a constant base or exponent;
-joins, `GROUP BY`, `SUM`, `AVG`, `MAX`, `MIN`, `CASE`, `greatest` and `least`.
+log / hyperbolic set plus `abs` and `erf`; `power` with a constant base or
+exponent; joins, `GROUP BY`, `SUM`, `AVG`, `MAX`, `MIN`, `CASE`, `greatest` and
+`least`.
+
+`ddx_stop_gradient(x)` is `x`, held constant by differentiation, as JAX's
+`lax.stop_gradient` is. `Context` registers it, and so does `ddxdb.duckdb`, on
+the connection it's given, unless that already has one. On a plain
+`SessionContext`, call `ddxdb.ad.register_stop_gradient(ctx)`. On DataFusion it
+keeps its argument's type. On DuckDB it takes `DOUBLE`, so a forward value
+computed through it on a `REAL` column is `DOUBLE`, though the gradient stays
+`REAL`.
 
 ```python
 ddxdb.supported_functions()               # ['abs', 'acos', 'asin', ...]

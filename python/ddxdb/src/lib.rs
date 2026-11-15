@@ -14,6 +14,8 @@
 // (`needless_pass_by_value` is left out: pyo3 hands functions owned values.)
 #![warn(clippy::unwrap_used, clippy::wildcard_imports)]
 
+mod stop_gradient;
+
 use std::future::{ready, Future, Ready};
 use std::pin::pin;
 use std::sync::Mutex;
@@ -1062,6 +1064,8 @@ fn base_schema(plan: &Plan) -> Option<NamedStruct> {
 #[pymodule]
 fn _ddxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_functions, m)?)?;
+    m.add("STOP_GRADIENT", ddx_ad::STOP_GRADIENT)?;
+    m.add_function(wrap_pyfunction!(stop_gradient::_stop_gradient_udf, m)?)?;
     m.add_function(wrap_pyfunction!(to_sql, m)?)?;
     m.add_function(wrap_pyfunction!(_inlined_size, m)?)?;
     m.add_function(wrap_pyfunction!(_tables_read, m)?)?;
