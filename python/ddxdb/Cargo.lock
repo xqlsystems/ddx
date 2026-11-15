@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-ad"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "ddx-core",
  "prost",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "datafusion-common",
  "datafusion-expr",

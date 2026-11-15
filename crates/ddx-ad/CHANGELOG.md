@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(ddx-ad)* round a REAL gradient past REAL's range to an infinity ([#273](https://github.com/xqlsystems/ddx/pull/273))
+- A `REAL` column's gradient past `REAL`'s range is now `±inf`, as IEEE rounding gives. DuckDB's cast from `DOUBLE` raised a `ConversionException` there, for example for `1 / x` at `x = 1e-30`. A NaN gradient of either sign stays NaN. This covers `grad` and `vjp` ([#273](https://github.com/xqlsystems/ddx/pull/273), fixing [#272](https://github.com/xqlsystems/ddx/issues/272)).
 
 ## [0.3.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.3...ddx-ad-v0.3.4) - 2026-11-15
 

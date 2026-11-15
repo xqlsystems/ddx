@@ -13,7 +13,7 @@ Entries below the first release are maintained automatically by
 
 ### Other
 
-- updated the following local packages: ddx-ad, ddx-ad
+- Uses ddx-ad 0.3.5, whose fix for a `REAL` gradient past `REAL`'s range ([#273](https://github.com/xqlsystems/ddx/pull/273)) is for DuckDB. DataFusion already gave `±inf` there, so its results are unchanged.
 
 ## [0.4.4](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.3...ddx-datafusion-v0.4.4) - 2026-11-15
 
