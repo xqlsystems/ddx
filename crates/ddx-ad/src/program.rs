@@ -947,19 +947,23 @@ fn dense_gradient(
                     let mut clauses = vec![null_value, (call(is_null, vec![g()]), lit_f64(0.0))];
                     // A gradient past REAL's range rounds to an infinity,
                     // as IEEE does: DuckDB's cast raises there instead (#272).
-                    // Both engines order NaN above +inf, so the upper bound
-                    // keeps a NaN out.
+                    // Each range stops at its infinity, so a NaN stays NaN:
+                    // DuckDB orders every NaN above +inf, and DataFusion
+                    // (IEEE totalOrder) puts a negative NaN below -inf.
                     if is_fp32(&types[n]) {
-                        let overflows = call(
-                            and,
-                            vec![
-                                call(gte, vec![g(), lit_f64(REAL_OVERFLOW)]),
-                                call(lte, vec![g(), lit_f64(f64::INFINITY)]),
-                            ],
-                        );
-                        clauses.push((overflows, lit_f64(f64::INFINITY)));
+                        let within = |lo: f64, hi: f64| {
+                            call(
+                                and,
+                                vec![
+                                    call(gte, vec![g(), lit_f64(lo)]),
+                                    call(lte, vec![g(), lit_f64(hi)]),
+                                ],
+                            )
+                        };
+                        clauses
+                            .push((within(REAL_OVERFLOW, f64::INFINITY), lit_f64(f64::INFINITY)));
                         clauses.push((
-                            call(lte, vec![g(), lit_f64(-REAL_OVERFLOW)]),
+                            within(f64::NEG_INFINITY, -REAL_OVERFLOW),
                             lit_f64(f64::NEG_INFINITY),
                         ));
                     }
