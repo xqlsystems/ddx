@@ -37,5 +37,6 @@ def test_primals_are_readable_until_release_and_follow_the_rows():
             grads = ctx.sql(run.statements[0]).to_arrow_table().to_pydict()
             assert grads == {"i": [0, 1], "g": [2 * v for v in values]}
             query = primal.query()
-        with pytest.raises(Exception):
+        # Released: the primal's table is gone.
+        with pytest.raises(ValueError, match="_value' not found"):
             ctx.sql(query).collect()
