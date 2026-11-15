@@ -9,6 +9,12 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.3...ddx-datafusion-v0.4.4) - 2026-11-15
+
+### Other
+
+- *(ddx-datafusion)* iterate nodes rather than index them, for clippy 1.100 ([#267](https://github.com/xqlsystems/ddx/pull/267))
+
 ## [0.4.3](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.2...ddx-datafusion-v0.4.3) - 2026-11-06
 
 ### Fixed

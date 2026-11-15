@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.3...ddx-ad-v0.3.4) - 2026-11-15
+
+### Added
+
+- *(ddx-ad)* expose a prepared run's primals, so a loss needs no forward query ([#257](https://github.com/xqlsystems/ddx/pull/257))
+- *(ddx-core)* differentiate erf, and keep it in SQL programs ([#256](https://github.com/xqlsystems/ddx/pull/256))
+
 ## [0.3.3](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.2...ddx-ad-v0.3.3) - 2026-11-06
 
 ### Fixed

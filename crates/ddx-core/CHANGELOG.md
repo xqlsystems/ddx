@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.3.1...ddx-core-v0.3.2) - 2026-11-15
+
+### Added
+
+- *(ddx-core)* differentiate erf, and keep it in SQL programs ([#256](https://github.com/xqlsystems/ddx/pull/256))
+
+### Fixed
+
+- *(ddx-core)* square atan's argument as a DOUBLE, so an integer can't overflow ([#269](https://github.com/xqlsystems/ddx/pull/269))
+
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.3.0...ddx-core-v0.3.1) - 2026-10-29
 
 ### Changed
