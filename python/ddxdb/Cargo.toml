@@ -32,6 +32,12 @@ ddx-ad = { path = "../../crates/ddx-ad" }
 # relation, so a query about 48 relations deep could not be differentiated
 # at all. The plans are the caller's own engine's, not untrusted input.
 prost = { version = "0.14", features = ["no-recursion-limit"] }
+# `ddx_stop_gradient` as a Rust UDF, which datafusion-python takes through
+# DataFusion's FFI (`stop_gradient.rs`). Pinned to the datafusion-python
+# release `ddxdb[datafusion]` pins, so both sides of the FFI are one version.
+datafusion-common = { version = "=55.0.0", default-features = false }
+datafusion-expr = { version = "=55.0.0", default-features = false }
+datafusion-ffi = "=55.0.0"
 
 # `abi3-py310` builds a single wheel that works on CPython 3.10+ rather than one
 # wheel per interpreter version. The cost is being limited to the stable ABI,

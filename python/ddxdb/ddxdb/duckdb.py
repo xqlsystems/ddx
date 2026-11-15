@@ -63,7 +63,13 @@ except ImportError as e:  # pragma: no cover - depends on the environment
     raise ImportError("ddxdb.duckdb needs DuckDB: pip install 'ddxdb[duckdb]'") from e
 
 from . import Prepared, Programs, _name_parts, rewrite
-from ._ddxdb import UnsupportedExpression, _rename_tables, _tables_read, to_sql
+from ._ddxdb import (
+    STOP_GRADIENT,
+    UnsupportedExpression,
+    _rename_tables,
+    _tables_read,
+    to_sql,
+)
 
 __all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
 
@@ -123,6 +129,22 @@ def _load_substrait(con: "duckdb.DuckDBPyConnection") -> None:
         con.execute("LOAD substrait")
 
 
+def _register_stop_gradient(planner: "duckdb.DuckDBPyConnection") -> None:
+    """Register ``ddx_stop_gradient`` on the planner, so a loss calling it
+    plans. Only the planner needs it: ddx writes each step's SQL without
+    it, as the identity it is.
+
+    DuckDB's Python API takes one signature per function name, so it takes
+    DOUBLE, and DuckDB casts a ``REAL`` argument to it. A gradient keeps
+    its column's type, but a forward value computed through it is DOUBLE.
+    """
+    from duckdb import sqltypes
+
+    planner.create_function(
+        STOP_GRADIENT, lambda x: x, [sqltypes.DOUBLE], sqltypes.DOUBLE, type="arrow"
+    )
+
+
 class DuckDBBackend:
     """A DuckDB connection as a :class:`ddxdb.Backend`: plans with DuckDB's
     Substrait producer on a schema-only mirror of the connection's catalog,
@@ -143,6 +165,7 @@ class DuckDBBackend:
         # so: a filter on one's column (`WHERE layer = 0`) would be planned
         # as no rows, and its scan left out of the plan.
         self._planner.execute("SET disabled_optimizers = 'statistics_propagation'")
+        _register_stop_gradient(self._planner)
         # What the planner mirrors: each object's columns or view SQL, as last
         # copied, so an unchanged catalog is not copied again.
         self._mirrored: dict = {}

@@ -88,6 +88,25 @@ def test_stop_gradient_on_a_real_column(ad, ctx):
     assert pairs(df) == [(0, 1.5), (1, 2.5), (2, 0.0)]
 
 
+def test_stop_gradient_keeps_its_argument_s_type(ad, ctx):
+    ctx.register_record_batches("h", [pa.table({"x": pa.array([1.5], pa.float32())}).to_batches()])
+    t = ctx.sql("SELECT ddx_stop_gradient(x) AS s, x - ddx_stop_gradient(x) AS d FROM h").to_arrow_table()
+    assert t.schema.field("s").type == pa.float32()
+    assert t.schema.field("d").type == pa.float32()
+    assert t.column("s").to_pylist() == [1.5]
+
+
+def test_context_registers_stop_gradient(ad):
+    pytest.importorskip("datafusion")
+    ctx = ddxdb.Context()
+    ctx.register_record_batches("w", [table([0, 1], [3.0, 4.0]).to_batches()])
+    df = ctx.sql(
+        "WITH loss AS (SELECT SUM(ddx_stop_gradient(val) * val) AS l FROM w) "
+        "SELECT i, grad(loss, val) FROM w"
+    )
+    assert pairs(df) == [(0, 3.0), (1, 4.0)]
+
+
 def test_context_sql_understands_grad(ad):
     pytest.importorskip("datafusion")
     ctx = ddxdb.Context()
