@@ -168,7 +168,8 @@ exponent; joins, `GROUP BY`, `SUM`, `AVG`, `MAX`, `MIN`, `CASE`, `greatest` and
 `least`.
 
 `ddx_stop_gradient(x)` is `x`, held constant by differentiation, as JAX's
-`lax.stop_gradient` is. `Context` and `ddxdb.duckdb` register it. On a plain
+`lax.stop_gradient` is. `Context` registers it, and so does `ddxdb.duckdb`, on
+the connection it's given, unless that already has one. On a plain
 `SessionContext`, call `ddxdb.ad.register_stop_gradient(ctx)`. On DataFusion it
 keeps its argument's type. On DuckDB it takes `DOUBLE`, so a forward value
 computed through it on a `REAL` column is `DOUBLE`, though the gradient stays

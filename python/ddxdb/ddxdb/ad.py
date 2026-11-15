@@ -132,7 +132,6 @@ __all__ = [
 ]
 
 
-
 def register_stop_gradient(ctx: SessionContext) -> None:
     """Register ``ddx_stop_gradient`` on ``ctx``: the identity, at its
     argument's own type, so a ``REAL`` column stays ``REAL``.

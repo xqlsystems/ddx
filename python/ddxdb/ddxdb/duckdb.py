@@ -129,10 +129,13 @@ def _load_substrait(con: "duckdb.DuckDBPyConnection") -> None:
         con.execute("LOAD substrait")
 
 
-def _register_stop_gradient(planner: "duckdb.DuckDBPyConnection") -> None:
-    """Register ``ddx_stop_gradient`` on the planner, so a loss calling it
-    plans. Only the planner needs it: ddx writes each step's SQL without
-    it, as the identity it is.
+def _register_stop_gradient(con: "duckdb.DuckDBPyConnection") -> None:
+    """Register ``ddx_stop_gradient`` on ``con``, unless it has one. The
+    backend registers it on its planner, so a loss calling it plans, and on
+    the caller's connection, which runs the statements: a rewritten
+    statement keeps every call ddx didn't replace (in a statement with no
+    ``grad``, or a loss it reads), though each step ddx writes leaves it out,
+    as the identity it is.
 
     DuckDB's Python UDFs need numpy, which ``ddxdb[duckdb]`` installs. Its
     Python API takes one signature per function name, so it takes
@@ -141,9 +144,15 @@ def _register_stop_gradient(planner: "duckdb.DuckDBPyConnection") -> None:
     """
     from duckdb import sqltypes
 
-    planner.create_function(
-        STOP_GRADIENT, lambda x: x, [sqltypes.DOUBLE], sqltypes.DOUBLE, type="arrow"
-    )
+    try:
+        con.create_function(
+            STOP_GRADIENT, lambda x: x, [sqltypes.DOUBLE], sqltypes.DOUBLE, type="arrow"
+        )
+    # Registered already: by the caller, or on a cursor of the same
+    # database, whose catalog this one shares (CatalogException), or on
+    # this connection object itself (NotImplementedException).
+    except (duckdb.CatalogException, duckdb.NotImplementedException):
+        pass
 
 
 class DuckDBBackend:
@@ -160,6 +169,7 @@ class DuckDBBackend:
 
     def __init__(self, con: "duckdb.DuckDBPyConnection"):
         self._con = weakref.ref(con)
+        _register_stop_gradient(con)
         self._planner = duckdb.connect()
         _load_substrait(self._planner)
         # The mirror's tables are empty, and DuckDB's statistics would say
