@@ -395,3 +395,13 @@ fn error_function_squares_its_argument_as_a_double() {
         "1.1283791670955126 * exp(-(CAST(x AS DOUBLE) * CAST(x AS DOUBLE)))"
     );
 }
+
+#[test]
+fn arctangent_squares_its_argument_as_a_double() {
+    // On DataFusion, an INTEGER 50,000 squared as an integer wraps, and the
+    // derivative comes out negative.
+    assert_eq!(
+        d("atan(x)", "x"),
+        "CAST(1.0 AS DOUBLE) / (1.0 + CAST(x AS DOUBLE) * CAST(x AS DOUBLE))"
+    );
+}

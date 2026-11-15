@@ -86,9 +86,12 @@ impl RuleRegistry {
             "acos".into(),
             rule(|u| neg(div(one(), func1("sqrt", sub(one(), square(u.clone())))))),
         );
+        // The argument is cast to DOUBLE before squaring, so an integer
+        // argument can't overflow. asin's and acos's can't: in their domain,
+        // an integer is -1, 0 or 1.
         unary.insert(
             "atan".into(),
-            rule(|u| div(one(), add(one(), square(u.clone())))),
+            rule(|u| div(one(), add(one(), square(cast_double(u.clone()))))),
         );
         // Exponential / logarithmic.
         unary.insert("exp".into(), rule(|u| func1("exp", u.clone())));
@@ -105,8 +108,8 @@ impl RuleRegistry {
             "sqrt".into(),
             rule(|u| div(one(), mul(num(2.0), func1("sqrt", u.clone())))),
         );
-        // The error function, as in exact GELU. The argument is cast to DOUBLE
-        // before squaring, so an integer argument can't overflow.
+        // The error function, as in exact GELU. Its argument is cast as
+        // atan's is.
         unary.insert(
             "erf".into(),
             rule(|u| {
