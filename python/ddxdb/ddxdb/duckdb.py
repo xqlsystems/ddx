@@ -134,7 +134,8 @@ def _register_stop_gradient(planner: "duckdb.DuckDBPyConnection") -> None:
     plans. Only the planner needs it: ddx writes each step's SQL without
     it, as the identity it is.
 
-    DuckDB's Python API takes one signature per function name, so it takes
+    DuckDB's Python UDFs need numpy, which ``ddxdb[duckdb]`` installs. Its
+    Python API takes one signature per function name, so it takes
     DOUBLE, and DuckDB casts a ``REAL`` argument to it. A gradient keeps
     its column's type, but a forward value computed through it is DOUBLE.
     """
