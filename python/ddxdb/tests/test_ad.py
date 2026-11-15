@@ -9,6 +9,8 @@ The comparison with jax.grad on real models lives in the repo's oracle suite
 (tests/test_query_jax.py); these check the binding.
 """
 
+import math
+
 import pyarrow as pa
 import pytest
 
@@ -94,6 +96,33 @@ def test_stop_gradient_keeps_its_argument_s_type(ad, ctx):
     assert t.schema.field("s").type == pa.float32()
     assert t.schema.field("d").type == pa.float32()
     assert t.column("s").to_pylist() == [1.5]
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_real_gradient_past_real_s_range_rounds_to_an_infinity(ad, ctx, sign):
+    # d(sign / x)/dx at 1e-30, a normal REAL, is -sign * 1e60 (#272).
+    h = pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1e-30, 1.0], pa.float32())})
+    ctx.register_record_batches("h", [h.to_batches()])
+    t = ad.sql(
+        ctx,
+        f"""WITH loss AS (SELECT SUM(CAST({sign} AS REAL) / x) AS l FROM h)
+            SELECT i, grad(loss, x) AS g FROM h ORDER BY i""",
+    ).to_arrow_table()
+    assert t.schema.field("g").type == pa.float32()
+    assert t.column("g").to_pylist() == [-sign * float("inf"), -sign]
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_real_nan_gradient_stays_nan(ad, ctx, sign):
+    # DataFusion orders a NaN by IEEE totalOrder, beyond the infinity of its
+    # sign, so a range that didn't stop at its infinity would round a NaN to
+    # one. x86 arithmetic, as 0 * inf, makes negative NaNs.
+    y = pa.array([math.copysign(math.nan, sign), 1.0], pa.float32())
+    h = pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.0, 1.0], pa.float32()), "y": y})
+    ctx.register_record_batches("h", [h.to_batches()])
+    t = ad.sql(ctx, "WITH loss AS (SELECT SUM(x * y) AS l FROM h) SELECT i, grad(loss, x) AS g FROM h ORDER BY i")
+    [nan, one] = t.to_arrow_table().column("g").to_pylist()
+    assert math.isnan(nan) and one == 1.0
 
 
 def test_context_registers_stop_gradient(ad):
