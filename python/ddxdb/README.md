@@ -175,6 +175,21 @@ keeps its argument's type. On DuckDB it takes `DOUBLE`, so a forward value
 computed through it on a `REAL` column is `DOUBLE`, though the gradient stays
 `REAL`.
 
+A loss may call a function you register, such as `erf`, which ddx
+differentiates and neither engine defines. On DataFusion, register it with
+`ctx.register_udf`. On DuckDB, use `ddxdb.duckdb.create_function(con, name,
+function, parameters, return_type, **kwargs)`, which takes
+`con.create_function`'s arguments. ddx plans on a connection of its own, so
+it can't see a function registered with `con.create_function` alone. For a
+cursor to plan with those functions too, make it with `ddxdb.duckdb.cursor(con)`.
+
+```python
+import math
+from ddxdb import duckdb as ad
+
+ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+```
+
 ```python
 ddxdb.supported_functions()               # ['abs', 'acos', 'asin', ...]
 ```

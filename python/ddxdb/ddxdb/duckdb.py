@@ -31,7 +31,8 @@ How it runs (:class:`DuckDBBackend`):
   types, its ``/``, its functions. The producer refuses a scan of registered
   Arrow data, so it plans on a second connection of its own whose catalog
   mirrors the caller's with schemas only: an empty table for each table or
-  registered object, and each view's SQL.
+  registered object, and each view's SQL. It can't copy the caller's
+  functions, so a loss calls one registered with :func:`create_function`.
 - **Running** writes each step of a program as DuckDB SQL
   (``ddx_ad::to_sql``) and runs it on the caller's connection, as a temporary
   table, so it reads what the caller's queries read. DuckDB's Substrait
@@ -53,6 +54,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import threading
 import weakref
 from typing import Callable, Optional, Sequence
@@ -71,7 +73,7 @@ from ._ddxdb import (
     to_sql,
 )
 
-__all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
+__all__ = ["DuckDBBackend", "create_function", "cursor", "prepare", "sql", "sql_all"]
 
 
 def _per_call(method):
@@ -187,6 +189,9 @@ class DuckDBBackend:
         # one was. A copy is made only when the planner is about to plan.
         self._copied: set = set()
         self._stale: set = set()
+        # The functions of create_function's on the planner, by name: the
+        # registration each was made from.
+        self._functions: dict = {}
         # Within one call (_one_catalog): each _per_call method's result,
         # by its name.
         self._call: Optional[dict] = None
@@ -292,6 +297,16 @@ class DuckDBBackend:
     def _sync(self) -> dict:
         """Make the planner's catalog mirror the caller's, searched as the
         caller's is, and return the caller's."""
+        # Functions first: a view may call one.
+        for name, registered in _functions.get(self.con, {}).items():
+            if self._functions.get(name) is not registered:
+                # The planner may have one of the name: an earlier
+                # registration, or its own ddx_stop_gradient.
+                with contextlib.suppress(duckdb.InvalidInputException):
+                    self._planner.remove_function(name)
+                _, function, parameters, return_type, kwargs = registered
+                self._planner.create_function(name, function, parameters, return_type, **kwargs)
+                self._functions[name] = registered
         self._database, self._schema = self._where()
         catalog = self._catalog()
         if catalog != self._mirrored:
@@ -392,7 +407,7 @@ class DuckDBBackend:
         # reads, which the catalog holds, where names are searched and the
         # settings that change what a query means; not on any values.
         catalog = self._sync()
-        return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items())))
+        return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items()), self._function_key()))
 
     def view_sql(self, name: str) -> Optional[str]:
         """The SQL of the view ``name`` reads, so ddx plans each CTE the
@@ -438,7 +453,13 @@ class DuckDBBackend:
             "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
             [list(_SETTINGS)],
         ).fetchall()
-        return repr((where, settings, sorted(self._catalog().items())))
+        return repr((where, settings, sorted(self._catalog().items()), self._function_key()))
+
+    def _function_key(self) -> list:
+        """Which registration of each :func:`create_function` name the
+        planner plans with: a name registered again, with another
+        signature, say, plans again."""
+        return sorted((name, registered[0]) for name, registered in _functions.get(self.con, {}).items())
 
     def returns_rows(self, plan: bytes) -> bool:
         return self._returns_rows(to_sql(plan, "duckdb"))
@@ -491,6 +512,40 @@ class DuckDBBackend:
 _programs: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 #: Each connection's backend, and so its planner, gone with it.
 _backends: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+#: The functions :func:`create_function` registered on each connection, by
+#: name: the number of its registration, then the arguments it was given.
+_functions: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_registrations = itertools.count()
+
+
+def create_function(
+    con: "duckdb.DuckDBPyConnection", name: str, function: Callable, parameters=None, return_type=None, **kwargs
+) -> None:
+    """Register a Python scalar function on ``con``, as
+    ``con.create_function`` does with the same arguments, for a loss to
+    call: ``erf``, say, which ddx differentiates and DuckDB doesn't define.
+
+    A function registered on ``con`` alone runs, but a loss calling it
+    doesn't plan: ddx plans on a connection of its own (see the module
+    docs), which mirrors ``con``'s tables and views but can't copy its
+    functions. This registers the function on that connection too, for
+    every :class:`DuckDBBackend` of ``con``, made before this call or after.
+    Like ``con.create_function``, it refuses a name ``con`` has already.
+    For a cursor to plan with them too, make it with :func:`cursor`."""
+    con.create_function(name, function, parameters, return_type, **kwargs)
+    # A copy of the parameters, as DuckDB took them: the caller may reuse the list.
+    params = None if parameters is None else list(parameters)
+    _functions.setdefault(con, {})[name] = (next(_registrations), function, params, return_type, kwargs)
+
+
+def cursor(con: "duckdb.DuckDBPyConnection") -> "duckdb.DuckDBPyConnection":
+    """``con.cursor()``, sharing the functions :func:`create_function`
+    registered on ``con``, made before this call or after. A cursor has
+    ``con``'s functions already, as DuckDB shares them, but its loss plans
+    on a planner of its own, which needs them too."""
+    cur = con.cursor()
+    _functions[cur] = _functions.setdefault(con, {})
+    return cur
 
 
 def sql(con: "duckdb.DuckDBPyConnection", statement: str):
