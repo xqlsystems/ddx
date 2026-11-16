@@ -79,7 +79,7 @@ requires-dist = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.9"
+version = "0.4.10"
 source = { directory = "../python/ddxdb" }
 
 [package.metadata]

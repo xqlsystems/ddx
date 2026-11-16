@@ -51,7 +51,7 @@ wheels = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.9"
+version = "0.4.10"
 source = { editable = "." }
 
 [package.optional-dependencies]
