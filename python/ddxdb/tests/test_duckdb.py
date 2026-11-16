@@ -115,6 +115,20 @@ def test_a_view_calling_a_registered_function_is_differentiated(ad, con):
     assert [g for _, g in pairs(rel)] == pytest.approx([d_erf(v) for v in (1.0, -2.0, 0.5)])
 
 
+def test_a_cursor_registers_its_connection_s_function_for_its_own_planner(ad):
+    con = duckdb.connect()
+    # A table, not registered data, which only its own connection object sees.
+    con.execute("CREATE TABLE x AS SELECT * FROM (VALUES (0, 0.5::DOUBLE), (1, -1.0::DOUBLE)) t(i, val)")
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+    cur = con.cursor()
+    ad.create_function(cur, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+    rel = ad.sql(cur, "WITH loss AS (SELECT SUM(erf(val)) AS l FROM x) SELECT i, grad(loss, val) FROM x")
+    assert [g for _, g in pairs(rel)] == pytest.approx([d_erf(v) for v in (0.5, -1.0)])
+    # Another function of the name is refused, as DuckDB refuses it.
+    with pytest.raises(duckdb.CatalogException, match="already exists"):
+        ad.create_function(con.cursor(), "erf", math.sin, ["DOUBLE"], "DOUBLE")
+
+
 def test_stop_gradient_keeps_a_real_gradient_real(ad):
     con = duckdb.connect()
     con.register("h", pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.0, 2.0], pa.float32())}))

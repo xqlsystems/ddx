@@ -520,9 +520,20 @@ def create_function(
     docs), which mirrors ``con``'s tables and views but can't copy its
     functions. This registers the function on that connection too, for
     every :class:`DuckDBBackend` of ``con``, made before this call or after.
-    Like ``con.create_function``, it refuses a name ``con`` has already."""
-    con.create_function(name, function, parameters, return_type, **kwargs)
-    _functions.setdefault(con, {})[name] = (function, parameters, return_type, kwargs)
+
+    A cursor (``con.cursor()``) shares its connection's functions but has a
+    planner of its own, so call this on each cursor that runs a loss, with
+    the same arguments. Otherwise, like ``con.create_function``, it refuses
+    a name ``con`` has already."""
+    registered = (function, parameters, return_type, kwargs)
+    try:
+        con.create_function(name, function, parameters, return_type, **kwargs)
+    except duckdb.CatalogException:
+        # On a cursor, the function is there already, made by this call on
+        # another connection object of its database: the same registration.
+        if not any(fs.get(name) == registered for fs in _functions.values()):
+            raise
+    _functions.setdefault(con, {})[name] = registered
 
 
 def sql(con: "duckdb.DuckDBPyConnection", statement: str):
