@@ -72,7 +72,7 @@ from ._ddxdb import (
     to_sql,
 )
 
-__all__ = ["DuckDBBackend", "create_function", "prepare", "sql", "sql_all"]
+__all__ = ["DuckDBBackend", "create_function", "cursor", "prepare", "sql", "sql_all"]
 
 
 def _per_call(method):
@@ -299,7 +299,9 @@ class DuckDBBackend:
         # Functions first: a view may call one.
         for name, registered in _functions.get(self.con, {}).items():
             if self._functions.get(name) is not registered:
-                if name in self._functions:
+                # The planner may have one of the name: an earlier
+                # registration, or its own ddx_stop_gradient.
+                with contextlib.suppress(duckdb.InvalidInputException):
                     self._planner.remove_function(name)
                 function, parameters, return_type, kwargs = registered
                 self._planner.create_function(name, function, parameters, return_type, **kwargs)
@@ -520,20 +522,22 @@ def create_function(
     docs), which mirrors ``con``'s tables and views but can't copy its
     functions. This registers the function on that connection too, for
     every :class:`DuckDBBackend` of ``con``, made before this call or after.
+    Like ``con.create_function``, it refuses a name ``con`` has already.
+    For a cursor to plan with them too, make it with :func:`cursor`."""
+    con.create_function(name, function, parameters, return_type, **kwargs)
+    # A copy of the parameters, as DuckDB took them: the caller may reuse the list.
+    params = None if parameters is None else list(parameters)
+    _functions.setdefault(con, {})[name] = (function, params, return_type, kwargs)
 
-    A cursor (``con.cursor()``) shares its connection's functions but has a
-    planner of its own, so call this on each cursor that runs a loss, with
-    the same arguments. Otherwise, like ``con.create_function``, it refuses
-    a name ``con`` has already."""
-    registered = (function, parameters, return_type, kwargs)
-    try:
-        con.create_function(name, function, parameters, return_type, **kwargs)
-    except duckdb.CatalogException:
-        # On a cursor, the function is there already, made by this call on
-        # another connection object of its database: the same registration.
-        if not any(fs.get(name) == registered for fs in _functions.values()):
-            raise
-    _functions.setdefault(con, {})[name] = registered
+
+def cursor(con: "duckdb.DuckDBPyConnection") -> "duckdb.DuckDBPyConnection":
+    """``con.cursor()``, sharing the functions :func:`create_function`
+    registered on ``con``, made before this call or after. A cursor has
+    ``con``'s functions already, as DuckDB shares them, but its loss plans
+    on a planner of its own, which needs them too."""
+    cur = con.cursor()
+    _functions[cur] = _functions.setdefault(con, {})
+    return cur
 
 
 def sql(con: "duckdb.DuckDBPyConnection", statement: str):

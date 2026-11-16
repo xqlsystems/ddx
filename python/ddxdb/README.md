@@ -180,7 +180,8 @@ differentiates and neither engine defines. On DataFusion, register it with
 `ctx.register_udf`. On DuckDB, use `ddxdb.duckdb.create_function(con, name,
 function, parameters, return_type, **kwargs)`, which takes
 `con.create_function`'s arguments. ddx plans on a connection of its own, so
-it can't see a function registered with `con.create_function` alone.
+it can't see a function registered with `con.create_function` alone. For a
+cursor to plan with those functions too, make it with `ddxdb.duckdb.cursor(con)`.
 
 ```python
 import math
