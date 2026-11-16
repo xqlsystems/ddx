@@ -137,6 +137,19 @@ def test_create_function_keeps_the_parameters_it_was_given(ad, con):
     assert [g for _, g in pairs(rel)] == pytest.approx([d_erf(v) for v in (1.0, -2.0, 0.5)])
 
 
+def test_a_function_registered_again_changes_the_plan_keys(ad, con):
+    # A plan binds the function's signature, so a program or a prepared
+    # run kept for the old one isn't run with the new one.
+    backend = ad.DuckDBBackend(con)
+    query = "SELECT SUM(erf(val)) AS l FROM w"
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE")
+    keys = backend.plan_key(query), backend.session_key()
+    con.remove_function("erf")
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "FLOAT")
+    new = backend.plan_key(query), backend.session_key()
+    assert keys[0] != new[0] and keys[1] != new[1]
+
+
 def test_stop_gradient_registered_with_create_function_is_kept(ad):
     con = duckdb.connect()
     con.register("w", table([0, 1], [1.0, 2.0]))

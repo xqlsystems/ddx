@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import threading
 import weakref
 from typing import Callable, Optional, Sequence
@@ -303,7 +304,7 @@ class DuckDBBackend:
                 # registration, or its own ddx_stop_gradient.
                 with contextlib.suppress(duckdb.InvalidInputException):
                     self._planner.remove_function(name)
-                function, parameters, return_type, kwargs = registered
+                _, function, parameters, return_type, kwargs = registered
                 self._planner.create_function(name, function, parameters, return_type, **kwargs)
                 self._functions[name] = registered
         self._database, self._schema = self._where()
@@ -406,7 +407,7 @@ class DuckDBBackend:
         # reads, which the catalog holds, where names are searched and the
         # settings that change what a query means; not on any values.
         catalog = self._sync()
-        return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items())))
+        return repr((sql, self._database, self._schema, self._settings, sorted(catalog.items()), self._function_key()))
 
     def view_sql(self, name: str) -> Optional[str]:
         """The SQL of the view ``name`` reads, so ddx plans each CTE the
@@ -452,7 +453,13 @@ class DuckDBBackend:
             "SELECT name, value FROM duckdb_settings() WHERE name IN (SELECT unnest(?)) ORDER BY name",
             [list(_SETTINGS)],
         ).fetchall()
-        return repr((where, settings, sorted(self._catalog().items())))
+        return repr((where, settings, sorted(self._catalog().items()), self._function_key()))
+
+    def _function_key(self) -> list:
+        """Which registration of each :func:`create_function` name the
+        planner plans with: a name registered again, with another
+        signature, say, plans again."""
+        return sorted((name, registered[0]) for name, registered in _functions.get(self.con, {}).items())
 
     def returns_rows(self, plan: bytes) -> bool:
         return self._returns_rows(to_sql(plan, "duckdb"))
@@ -506,8 +513,9 @@ _programs: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 #: Each connection's backend, and so its planner, gone with it.
 _backends: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 #: The functions :func:`create_function` registered on each connection, by
-#: name: the arguments each was registered with.
+#: name: the number of its registration, then the arguments it was given.
 _functions: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_registrations = itertools.count()
 
 
 def create_function(
@@ -527,7 +535,7 @@ def create_function(
     con.create_function(name, function, parameters, return_type, **kwargs)
     # A copy of the parameters, as DuckDB took them: the caller may reuse the list.
     params = None if parameters is None else list(parameters)
-    _functions.setdefault(con, {})[name] = (function, params, return_type, kwargs)
+    _functions.setdefault(con, {})[name] = (next(_registrations), function, params, return_type, kwargs)
 
 
 def cursor(con: "duckdb.DuckDBPyConnection") -> "duckdb.DuckDBPyConnection":
