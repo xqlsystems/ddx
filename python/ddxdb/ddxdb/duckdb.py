@@ -31,7 +31,8 @@ How it runs (:class:`DuckDBBackend`):
   types, its ``/``, its functions. The producer refuses a scan of registered
   Arrow data, so it plans on a second connection of its own whose catalog
   mirrors the caller's with schemas only: an empty table for each table or
-  registered object, and each view's SQL.
+  registered object, and each view's SQL. It can't copy the caller's
+  functions, so a loss calls one registered with :func:`create_function`.
 - **Running** writes each step of a program as DuckDB SQL
   (``ddx_ad::to_sql``) and runs it on the caller's connection, as a temporary
   table, so it reads what the caller's queries read. DuckDB's Substrait
@@ -71,7 +72,7 @@ from ._ddxdb import (
     to_sql,
 )
 
-__all__ = ["DuckDBBackend", "prepare", "sql", "sql_all"]
+__all__ = ["DuckDBBackend", "create_function", "prepare", "sql", "sql_all"]
 
 
 def _per_call(method):
@@ -187,6 +188,9 @@ class DuckDBBackend:
         # one was. A copy is made only when the planner is about to plan.
         self._copied: set = set()
         self._stale: set = set()
+        # The functions of create_function's on the planner, by name: the
+        # registration each was made from.
+        self._functions: dict = {}
         # Within one call (_one_catalog): each _per_call method's result,
         # by its name.
         self._call: Optional[dict] = None
@@ -292,6 +296,14 @@ class DuckDBBackend:
     def _sync(self) -> dict:
         """Make the planner's catalog mirror the caller's, searched as the
         caller's is, and return the caller's."""
+        # Functions first: a view may call one.
+        for name, registered in _functions.get(self.con, {}).items():
+            if self._functions.get(name) is not registered:
+                if name in self._functions:
+                    self._planner.remove_function(name)
+                function, parameters, return_type, kwargs = registered
+                self._planner.create_function(name, function, parameters, return_type, **kwargs)
+                self._functions[name] = registered
         self._database, self._schema = self._where()
         catalog = self._catalog()
         if catalog != self._mirrored:
@@ -491,6 +503,26 @@ class DuckDBBackend:
 _programs: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 #: Each connection's backend, and so its planner, gone with it.
 _backends: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+#: The functions :func:`create_function` registered on each connection, by
+#: name: the arguments each was registered with.
+_functions: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def create_function(
+    con: "duckdb.DuckDBPyConnection", name: str, function: Callable, parameters=None, return_type=None, **kwargs
+) -> None:
+    """Register a Python scalar function on ``con``, as
+    ``con.create_function`` does with the same arguments, for a loss to
+    call: ``erf``, say, which ddx differentiates and DuckDB doesn't define.
+
+    A function registered on ``con`` alone runs, but a loss calling it
+    doesn't plan: ddx plans on a connection of its own (see the module
+    docs), which mirrors ``con``'s tables and views but can't copy its
+    functions. This registers the function on that connection too, for
+    every :class:`DuckDBBackend` of ``con``, made before this call or after.
+    Like ``con.create_function``, it refuses a name ``con`` has already."""
+    con.create_function(name, function, parameters, return_type, **kwargs)
+    _functions.setdefault(con, {})[name] = (function, parameters, return_type, kwargs)
 
 
 def sql(con: "duckdb.DuckDBPyConnection", statement: str):

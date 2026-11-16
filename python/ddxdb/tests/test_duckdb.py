@@ -86,6 +86,35 @@ def test_stop_gradient_registered_by_the_caller_is_kept(ad):
     assert pairs(rel) == [(0, 1.0), (1, 2.0)]
 
 
+def d_erf(v):
+    return 2 / math.sqrt(math.pi) * math.exp(-v * v)
+
+
+def test_a_loss_calls_a_function_create_function_registered(ad, con):
+    # DuckDB doesn't define erf; ddx differentiates it (#275).
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+    rel = ad.sql(con, "WITH loss AS (SELECT SUM(erf(val)) AS l FROM w) SELECT i, grad(loss, val) FROM w")
+    assert [g for _, g in pairs(rel)] == pytest.approx([d_erf(v) for v in (1.0, -2.0, 0.5)])
+
+
+def test_a_function_registered_after_its_backend_is_made_plans(ad):
+    import ddxdb
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE x AS SELECT * FROM (VALUES (0, 0.5::DOUBLE), (1, -1.0::DOUBLE)) t(i0, v)")
+    backend = ad.DuckDBBackend(con)
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+    plan = ddxdb.grad_plan(backend.plan_sql("SELECT SUM(erf(x.v)) AS v FROM x"), ["x.v"])
+    assert plan is not None
+
+
+def test_a_view_calling_a_registered_function_is_differentiated(ad, con):
+    ad.create_function(con, "erf", math.erf, ["DOUBLE"], "DOUBLE", side_effects=False)
+    con.execute("CREATE VIEW e AS SELECT i, erf(val) AS y FROM w")
+    rel = ad.sql(con, "WITH loss AS (SELECT SUM(y) AS l FROM e) SELECT i, grad(loss, val) FROM w")
+    assert [g for _, g in pairs(rel)] == pytest.approx([d_erf(v) for v in (1.0, -2.0, 0.5)])
+
+
 def test_stop_gradient_keeps_a_real_gradient_real(ad):
     con = duckdb.connect()
     con.register("h", pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.0, 2.0], pa.float32())}))
