@@ -252,10 +252,6 @@ def known(refusal, engine):
         # DuckDB's producer drops a column a SELECT repeats, leaving nothing
         # to tell which; ddx refuses that rather than guess (#245).
         return True
-    if engine == "datafusion" and "optimize_unions" in refusal:
-        # DataFusion's optimizer fails on a nested union holding a UNION,
-        # read through a join (#249).
-        pytest.xfail("#249: optimize_unions on a nested union holding a UNION")
     return False
 
 
