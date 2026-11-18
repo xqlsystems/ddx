@@ -1206,6 +1206,19 @@ impl Reader<'_> {
             }
             Syntax::Not => Expr::Not(one(&mut args)?),
             Syntax::Negate => Expr::Negate(one(&mut args)?),
+            Syntax::Between => match <[Expr; 3]>::try_from(args) {
+                Ok([expr, low, high]) => Expr::Between {
+                    expr: Box::new(expr),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                },
+                Err(args) => {
+                    return Err(AdError::InvalidPlan(format!(
+                        "`{name}` takes three arguments, not {}",
+                        args.len()
+                    )))
+                }
+            },
             Syntax::Is(test) => Expr::Is {
                 expr: one(&mut args)?,
                 test,
@@ -1444,6 +1457,7 @@ enum Syntax {
     Operator(Op),
     Not,
     Negate,
+    Between,
     Is(IsTest),
     /// The function's argument itself: ddx's stop-gradient, the identity
     /// at run time.
@@ -1476,6 +1490,12 @@ fn syntax(name: &str) -> Option<Syntax> {
         "is_not_distinct_from" => Operator(ir::Op::IsNotDistinctFrom),
         "not" => Not,
         "negate" | "negative" => Negate,
+        // DuckDB's optimizer derives `between` from a range filter through a
+        // join's equality, and ANDs it with that filter's comparisons; its
+        // producer drops whether each bound is held. Read as holding both,
+        // it is the widest it could mean, and the comparisons beside it
+        // keep the rows exact.
+        "between" => Between,
         "is_null" => Is(IsTest::Null),
         "is_not_null" => Is(IsTest::NotNull),
         "is_true" => Is(IsTest::True),
