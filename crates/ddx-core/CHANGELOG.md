@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.3.1...ddx-core-v0.3.2) - 2026-11-15
+
+### Added
+
+- `erf` is differentiated, as `2/sqrt(pi) * exp(-x²)`, and kept in the SQL programs ddx writes. This gives exact GELU, `x * (1 + erf(x / sqrt(2))) / 2`. Neither DataFusion nor DuckDB defines `erf`, so register it on the engine; its derivative needs only `exp` ([#256](https://github.com/xqlsystems/ddx/pull/256))
+
+### Fixed
+
+- `atan`'s derivative squares its argument as a `DOUBLE`. On an `INTEGER` column it overflowed past 46,340: DataFusion returned a wrong, negative gradient, and DuckDB raised an error. `erf`'s rule does the same ([#269](https://github.com/xqlsystems/ddx/pull/269))
+
 ## [0.3.1](https://github.com/xqlsystems/ddx/compare/ddx-core-v0.3.0...ddx-core-v0.3.1) - 2026-10-29
 
 ### Changed

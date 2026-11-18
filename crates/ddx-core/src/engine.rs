@@ -15,7 +15,7 @@
 //! only in their *leaf rule* — the tangent assigned to each column.
 
 use std::collections::HashMap;
-use std::f64::consts::{LN_10, LN_2};
+use std::f64::consts::{LN_10, LN_2, PI};
 use std::sync::Arc;
 
 use sqlparser::ast::{
@@ -25,15 +25,15 @@ use sqlparser::ast::{
 
 use crate::colref::{ColRef, IdentCasing, Match};
 use crate::constructors::{
-    add, as_const, div, finite_num, func, func1, is_zero, mul, neg, num, one, sign, square, sub,
-    zero,
+    add, as_const, cast_double, div, finite_num, func, func1, is_zero, mul, neg, num, one, sign,
+    square, sub, zero,
 };
 use crate::error::{DiffError, Result};
 
 /// A one-line summary of what ddx-core differentiates, appended to "unsupported"
 /// errors so a user reading the message learns what *is* supported and can act.
 const SUPPORTED: &str = "ddx differentiates the operators + - * /, unary calls to \
-sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs, power(...) with a \
+sin/cos/tan/asin/acos/atan/exp/ln/log2/log10/sqrt/sinh/cosh/tanh/abs/erf, power(...) with a \
 constant base or exponent, casts to a numeric type, and column/literal leaves";
 
 /// A differentiation rule for a unary primitive `f(u)`: given the argument
@@ -86,9 +86,12 @@ impl RuleRegistry {
             "acos".into(),
             rule(|u| neg(div(one(), func1("sqrt", sub(one(), square(u.clone())))))),
         );
+        // The argument is cast to DOUBLE before squaring, so an integer
+        // argument can't overflow. asin's and acos's can't: in their domain,
+        // an integer is -1, 0 or 1.
         unary.insert(
             "atan".into(),
-            rule(|u| div(one(), add(one(), square(u.clone())))),
+            rule(|u| div(one(), add(one(), square(cast_double(u.clone()))))),
         );
         // Exponential / logarithmic.
         unary.insert("exp".into(), rule(|u| func1("exp", u.clone())));
@@ -104,6 +107,17 @@ impl RuleRegistry {
         unary.insert(
             "sqrt".into(),
             rule(|u| div(one(), mul(num(2.0), func1("sqrt", u.clone())))),
+        );
+        // The error function, as in exact GELU. Its argument is cast as
+        // atan's is.
+        unary.insert(
+            "erf".into(),
+            rule(|u| {
+                mul(
+                    num(2.0 / PI.sqrt()),
+                    func1("exp", neg(square(cast_double(u.clone())))),
+                )
+            }),
         );
         // Hyperbolic.
         unary.insert("sinh".into(), rule(|u| func1("cosh", u.clone())));

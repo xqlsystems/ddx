@@ -372,3 +372,36 @@ fn general_power_error_suggests_the_constant_side_and_the_exp_ln_rewrite() {
         "should suggest the u^v rewrite: {m}"
     );
 }
+
+#[test]
+fn error_function_chain_and_second_derivative() {
+    use ddx_core::test_utils::{eval, parse_expr};
+    let first = parse_expr(&d("erf(2 * x)", "x"));
+    let second = Ddx::new()
+        .differentiate(&first, &ColRef::bare("x"))
+        .unwrap();
+    for x in [-2.0_f64, -0.5, 0.0, 0.5, 2.0] {
+        let expected = 4.0 / std::f64::consts::PI.sqrt() * (-4.0 * x * x).exp();
+        assert!((eval(&first, x, 0.0).unwrap() - expected).abs() < 1e-12);
+        assert!((eval(&second, x, 0.0).unwrap() + 8.0 * x * expected).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn error_function_squares_its_argument_as_a_double() {
+    // An INTEGER argument squared as an integer overflows past 46,340.
+    assert_eq!(
+        d("erf(x)", "x"),
+        "1.1283791670955126 * exp(-(CAST(x AS DOUBLE) * CAST(x AS DOUBLE)))"
+    );
+}
+
+#[test]
+fn arctangent_squares_its_argument_as_a_double() {
+    // On DataFusion, an INTEGER 50,000 squared as an integer wraps, and the
+    // derivative comes out negative.
+    assert_eq!(
+        d("atan(x)", "x"),
+        "CAST(1.0 AS DOUBLE) / (1.0 + CAST(x AS DOUBLE) * CAST(x AS DOUBLE))"
+    );
+}

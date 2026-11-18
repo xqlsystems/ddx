@@ -9,6 +9,8 @@ The comparison with jax.grad on real models lives in the repo's oracle suite
 (tests/test_query_jax.py); these check the binding.
 """
 
+import math
+
 import pyarrow as pa
 import pytest
 
@@ -86,6 +88,52 @@ def test_stop_gradient_on_a_real_column(ad, ctx):
            SELECT i, grad(loss, val) FROM w""",
     )
     assert pairs(df) == [(0, 1.5), (1, 2.5), (2, 0.0)]
+
+
+def test_stop_gradient_keeps_its_argument_s_type(ad, ctx):
+    ctx.register_record_batches("h", [pa.table({"x": pa.array([1.5], pa.float32())}).to_batches()])
+    t = ctx.sql("SELECT ddx_stop_gradient(x) AS s, x - ddx_stop_gradient(x) AS d FROM h").to_arrow_table()
+    assert t.schema.field("s").type == pa.float32()
+    assert t.schema.field("d").type == pa.float32()
+    assert t.column("s").to_pylist() == [1.5]
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_real_gradient_past_real_s_range_rounds_to_an_infinity(ad, ctx, sign):
+    # d(sign / x)/dx at 1e-30, a normal REAL, is -sign * 1e60 (#272).
+    h = pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1e-30, 1.0], pa.float32())})
+    ctx.register_record_batches("h", [h.to_batches()])
+    t = ad.sql(
+        ctx,
+        f"""WITH loss AS (SELECT SUM(CAST({sign} AS REAL) / x) AS l FROM h)
+            SELECT i, grad(loss, x) AS g FROM h ORDER BY i""",
+    ).to_arrow_table()
+    assert t.schema.field("g").type == pa.float32()
+    assert t.column("g").to_pylist() == [-sign * float("inf"), -sign]
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_real_nan_gradient_stays_nan(ad, ctx, sign):
+    # DataFusion orders a NaN by IEEE totalOrder, beyond the infinity of its
+    # sign, so a range that didn't stop at its infinity would round a NaN to
+    # one. x86 arithmetic, as 0 * inf, makes negative NaNs.
+    y = pa.array([math.copysign(math.nan, sign), 1.0], pa.float32())
+    h = pa.table({"i": pa.array([0, 1], pa.int64()), "x": pa.array([1.0, 1.0], pa.float32()), "y": y})
+    ctx.register_record_batches("h", [h.to_batches()])
+    t = ad.sql(ctx, "WITH loss AS (SELECT SUM(x * y) AS l FROM h) SELECT i, grad(loss, x) AS g FROM h ORDER BY i")
+    [nan, one] = t.to_arrow_table().column("g").to_pylist()
+    assert math.isnan(nan) and one == 1.0
+
+
+def test_context_registers_stop_gradient(ad):
+    pytest.importorskip("datafusion")
+    ctx = ddxdb.Context()
+    ctx.register_record_batches("w", [table([0, 1], [3.0, 4.0]).to_batches()])
+    df = ctx.sql(
+        "WITH loss AS (SELECT SUM(ddx_stop_gradient(val) * val) AS l FROM w) "
+        "SELECT i, grad(loss, val) FROM w"
+    )
+    assert pairs(df) == [(0, 3.0), (1, 4.0)]
 
 
 def test_context_sql_understands_grad(ad):
@@ -394,6 +442,27 @@ def test_grad_through_a_union_all(ad, ctx):
         t[i + 1] += 2 * b[i]
     assert dict(pairs(gw)) == pytest.approx({i: 2 * t[i] for i in range(3)})
     assert dict(pairs(gb)) == pytest.approx({i: 4 * t[i + 1] for i in range(3)})
+
+
+def test_a_union_all_beneath_a_union_read_through_a_join(ad, ctx):
+    # n1's UNION is a distinct over a UNION ALL, inside n2 and u2; read
+    # through a join, DataFusion's optimizer failed to splice them (#249).
+    loss = """WITH u AS (SELECT i AS k, 2.0 * val AS v FROM w),
+              loss AS (SELECT SUM(u.v * u2.v) AS l FROM u JOIN (
+                SELECT k, v FROM (SELECT i + 1 AS k, 2.0 * val AS v FROM b
+                                  UNION ALL SELECT k, v FROM (SELECT i AS k, val AS v FROM b
+                                                              UNION SELECT i AS k, val AS v FROM b) n1) n2
+                UNION ALL SELECT i AS k, val AS v FROM w) u2 ON u.k = u2.k),
+              t AS (SELECT i, 1.0 AS val FROM w) """
+    g = pairs(ad.sql(ctx, loss + "SELECT i, grad(loss, val) FROM w"))
+    j = ad.sql(ctx, loss + "SELECT jvp(l, w.val, t) AS j FROM loss").to_pydict()["j"]
+    # l = Σ_k 2 w_k s_k, where s_k sums u2's rows at k: 2 b_{k-1} + b_k + w_k.
+    w, b = [1.0, -2.0, 0.5], [0.25, 3.0, -1.0]
+    s = [(2 * b[k - 1] if k else 0.0) + b[k] + w[k] for k in range(3)]
+    want = {k: 2 * s[k] + 2 * w[k] for k in range(3)}
+    assert dict(g) == pytest.approx(want)
+    assert j == pytest.approx([sum(want.values())])
+
 
 def test_a_filter_on_a_gradients_dims_computes_only_those_rows(ad, ctx):
     # The WHERE on w's dims is pushed into the program (ddx_ad::Options::restrict);
