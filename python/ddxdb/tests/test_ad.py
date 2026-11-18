@@ -863,6 +863,44 @@ def test_a_coerced_view_is_optimized_once_while_it_is_unchanged(ad, ctx, monkeyp
     assert len(optimizing) == 6
 
 
+def test_a_view_s_check_is_kept_until_what_it_reads_changes(ad, ctx, monkeypatch):
+    # Planning a model's view and its SQL takes seconds (#248), and a
+    # training loop asks on every step, with a new backend each call.
+    ctx.sql("CREATE VIEW inner_v AS SELECT i, val AS v FROM w").collect()
+    outer = "CREATE OR REPLACE VIEW outer_v AS SELECT i, v * 3.0 AS v FROM inner_v"
+    ctx.sql(outer).collect()
+    real, checks = ad._same_plans, []
+    monkeypatch.setattr(ad, "_same_plans", lambda *a: checks.append(a[1]) or real(*a))
+    assert ad.DataFusionBackend(ctx).view_sql("outer_v") is not None
+    assert ad.DataFusionBackend(ctx).view_sql("outer_v") is not None
+    # Made again from the same SQL, as a loop does after registering new
+    # parameters, it is the same view.
+    ctx.sql(outer).collect()
+    assert ad.DataFusionBackend(ctx).view_sql("outer_v") is not None
+    assert checks == ["outer_v"]
+    # Redefined beneath it, it still reads the first inner_v.
+    ctx.sql("CREATE OR REPLACE VIEW inner_v AS SELECT i, 2.0 * val AS v FROM w").collect()
+    assert ad.DataFusionBackend(ctx).view_sql("outer_v") is None
+    ctx.sql(outer).collect()
+    assert ad.DataFusionBackend(ctx).view_sql("outer_v") is not None
+    assert checks == ["outer_v"] * 3
+
+
+def test_a_view_s_check_is_redone_after_a_function_it_calls_changes_type(ad, ctx):
+    # A view keeps the function it was made with, and its SQL plans with the
+    # one registered now.
+    from datafusion import udf
+
+    def f(x):
+        return x
+
+    ctx.register_udf(udf(f, [pa.float64()], pa.float64(), "immutable", name="f"))
+    ctx.sql("CREATE VIEW fv AS SELECT i, f(val) AS v FROM w").collect()
+    assert ad.DataFusionBackend(ctx).view_sql("fv") is not None
+    ctx.register_udf(udf(f, [pa.float64()], pa.float32(), "immutable", name="f"))
+    assert ad.DataFusionBackend(ctx).view_sql("fv") is None
+
+
 def test_a_view_that_reads_a_redefined_view_is_left_to_the_engine(ad, ctx):
     # DataFusion keeps the plan outer_v was made with, which reads the first
     # inner_v; its SQL now reads the second.

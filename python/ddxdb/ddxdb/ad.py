@@ -249,10 +249,6 @@ class DataFusionBackend:
     def __init__(self, ctx: SessionContext, *, in_place: bool = False):
         self.ctx = ctx
         self.in_place = in_place
-        # Each view's plan and table's schema as session_key last saw them,
-        # and how many times they have changed.
-        self._catalog: list = []
-        self._changes = 0
         # How many times a compiled step's rows replaced the ones it had
         # stored rather than being written there: a plan compiled before
         # then may read the old ones.
@@ -286,7 +282,9 @@ class DataFusionBackend:
         under its name, the view still reads the old one, and ddxdb would
         differentiate the new one. DataFusion's Python API doesn't say which
         table a view reads, so this can't be refused here as it is from
-        Rust: create a view again after registering what it reads."""
+        Rust: create a view again after registering what it reads. The same
+        holds for a function registered again with the same argument and
+        return types; one registered with other types is seen."""
         try:
             # All of them: how the plans compare depends on the optimizer's.
             settings = dict(
@@ -332,21 +330,29 @@ class DataFusionBackend:
         probe = _view_probe(rows[0])
         if probe is None:
             return None
-        try:
-            same = _same_plans(self.ctx, name, probe, settings)
-        except ValueError:
-            # The view's tables, or its SQL's, no longer plan.
-            return None
+        # Planning a model's view and its SQL takes long (their plans repeat
+        # each CTE per read), and a training loop asks on every step, so the
+        # answer is kept: it holds while the probe, the settings and the
+        # catalog's views, schemas and functions' types do.
+        checked = _checked.setdefault(self.ctx, {})
+        key = (probe, settings, _catalog_version(self.ctx))
+        kept = checked.get(name)
+        if kept is not None and kept[0] == key:
+            same = kept[1]
+        else:
+            try:
+                same = _same_plans(self.ctx, name, probe, settings)
+            except ValueError:
+                # The view's tables, or its SQL's, no longer plan.
+                return None
+            checked[name] = (key, same)
         return rows[0] if same else None
 
     def session_key(self) -> Optional[str]:
         """The session's settings, which hold where names are searched and
-        how they are read, and how many times this backend has seen its
-        context's views or tables' schemas change. Each view's plan is the
-        plan DataFusion runs for it, the one it kept when it was made, which
-        reads a view redefined since as it was then. Plans compare in Rust,
-        and a plan unchanged shares its kept part, so the comparison is
-        quick.
+        how they are read, and the version of its catalog: how many times its
+        views' plans, tables' schemas or functions' types have changed
+        (:func:`_catalog_version`).
 
         ``None`` without the information schema, which holds the settings:
         each call then prepares the statements again. Unlike Rust's, this
@@ -362,25 +368,7 @@ class DataFusionBackend:
             # DataFusion raises ValueError for a table it can't find: here,
             # the information schema is off.
             return None
-        # Each view's plan, and every other table's schema, which the plans
-        # were bound to; ddx's own tables come and go with each run.
-        catalog = []
-        for c in sorted(self.ctx.catalog_names()):
-            cat = self.ctx.catalog(c)
-            for s in sorted(cat.schema_names()):
-                if s == "information_schema":
-                    continue
-                schema = cat.schema(s)
-                for t in sorted(schema.table_names()):
-                    table = schema.table(t)
-                    path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
-                    if table.kind == "view":
-                        catalog.append((path, self.ctx.table(path).logical_plan()))
-                    elif not t.startswith("__ddx_"):
-                        catalog.append((path, table.schema))
-        if catalog != self._catalog:
-            self._catalog, self._changes = catalog, self._changes + 1
-        return f"{self._changes} {settings!r}"
+        return f"{_catalog_version(self.ctx)} {settings!r}"
 
     def returns_rows(self, plan: bytes) -> bool:
         return _dataframe(self.ctx, plan).limit(1).count() > 0
@@ -533,6 +521,61 @@ def _values(column: pa.Array) -> memoryview:
     width = column.type.byte_width
     start = column.offset * width
     return memoryview(column.buffers()[1])[start : start + len(column) * width]
+
+
+#: Per context, the catalog as :func:`_catalog_version` last saw it, and its
+#: version.
+_catalogs: "weakref.WeakKeyDictionary[SessionContext, tuple]" = weakref.WeakKeyDictionary()
+
+#: Held while a version is read and moved on: a context's backends, in any
+#: thread, share it.
+_catalogs_lock = threading.Lock()
+
+#: Per context, each view's last check by ``view_sql``: what it was made
+#: under (the probe, the settings and the catalog's version), and its answer.
+_checked: "weakref.WeakKeyDictionary[SessionContext, dict]" = weakref.WeakKeyDictionary()
+
+
+def _catalog_version(ctx: SessionContext) -> int:
+    """How many times ``ctx``'s views' plans, its tables' schemas or its
+    functions' argument and return types have changed, as far as this module
+    has seen. A view's plan is the one
+    DataFusion runs for it, kept when it was made, which reads a view
+    redefined since as it was then. Plans compare in Rust, and a plan
+    unchanged shares its kept part, so the comparison is quick; a view made
+    again from the same SQL is the same plan, and the newest objects are
+    kept so that the next comparison is quick too. ddx's own tables come and
+    go with each run, and aren't counted. A version is given to one catalog
+    only: two threads that see different ones get different versions."""
+    catalog = []
+    for c in sorted(ctx.catalog_names()):
+        cat = ctx.catalog(c)
+        for s in sorted(cat.schema_names()):
+            if s == "information_schema":
+                continue
+            schema = cat.schema(s)
+            for t in sorted(schema.table_names()):
+                table = schema.table(t)
+                path = ".".join('"' + p.replace('"', '""') + '"' for p in (c, s, t))
+                if table.kind == "view":
+                    catalog.append((path, ctx.table(path).logical_plan()))
+                elif not t.startswith("__ddx_"):
+                    catalog.append((path, table.schema))
+    # A view is planned with the functions registered when it was made, and
+    # its SQL with today's. Unordered: their order holds while they do, and
+    # another order only checks again.
+    catalog.append(
+        ctx.sql(
+            "SELECT specific_catalog, specific_schema, specific_name, rid, ordinal_position, "
+            "parameter_mode, data_type, is_variadic FROM information_schema.parameters"
+        ).to_arrow_table()
+    )
+    with _catalogs_lock:
+        seen, version = _catalogs.get(ctx, ([], 0))
+        if catalog != seen:
+            version += 1
+        _catalogs[ctx] = (catalog, version)
+        return version
 
 
 #: Per context, each view's last optimized comparison: the two unoptimized
