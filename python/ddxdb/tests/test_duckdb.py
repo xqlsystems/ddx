@@ -252,6 +252,17 @@ def test_a_table_read_for_its_rows_alone_keeps_the_columns_after_it(tables, loss
     assert con.sql(program.gradients[0].query()).fetchall() == [(0, gradient)]
 
 
+def test_to_sql_writes_a_plan_as_sql_the_engine_runs(con):
+    import ddxdb
+    from ddxdb.duckdb import DuckDBBackend
+
+    query = "SELECT w.i, w.val * b.val AS p FROM w JOIN b ON w.i = b.i WHERE w.val > 0"
+    plan = DuckDBBackend(con).plan_sql(query)
+    assert pairs(con.sql(ddxdb.to_sql(plan, "duckdb"))) == pairs(con.sql(query))
+    with pytest.raises(ValueError, match='not "postgres"'):
+        ddxdb.to_sql(plan, "postgres")
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, con):
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 
