@@ -45,6 +45,20 @@ def pairs(df):
     return sorted(zip(t.column(0).to_pylist(), t.column(1).to_pylist()))
 
 
+@pytest.mark.parametrize(
+    "loss, gradient",
+    [
+        ("SUM(val + CAST('inf' AS DOUBLE))", [(0, 1.0), (1, 1.0), (2, 1.0)]),
+        ("SUM(CASE WHEN val > 0.0e0 THEN val ELSE CAST('NaN' AS DOUBLE) END)", [(0, 1.0), (1, 0.0), (2, 1.0)]),
+        ("SUM(val * CAST('-inf' AS DOUBLE))", [(0, -math.inf), (1, -math.inf), (2, -math.inf)]),
+    ],
+)
+def test_a_non_finite_constant_is_differentiated(ad, ctx, loss, gradient):
+    # SQL has no literal for inf or NaN; the cast is how SQL writes one (#261).
+    statement = f"WITH loss AS (SELECT {loss} AS l FROM w) SELECT i, grad(loss, val) FROM w"
+    assert pairs(ad.sql(ctx, statement)) == gradient
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, ctx):
     df = ad.sql(ctx, "WITH loss AS (SELECT SUM(val * val * val) AS l FROM w) SELECT i, grad(loss, val) FROM w")
     assert pairs(df) == [(0, 3.0), (1, 12.0), (2, 0.75)]

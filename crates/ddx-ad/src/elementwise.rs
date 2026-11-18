@@ -415,7 +415,9 @@ struct ToSql<'a> {
 
 impl ToSql<'_> {
     fn expr(&mut self, e: &Expression) -> Result<Sql> {
-        if let Some((v, _)) = fold(self.functions, e) {
+        // A non-finite constant (`CAST('inf' AS DOUBLE)`) has no SQL literal
+        // for ddx-core to read, and is a placeholder as any other constant.
+        if let Some((v, _)) = fold(self.functions, e).filter(|(v, _)| v.is_finite()) {
             return Ok(finite_num(v)?);
         }
         if !depends(self.functions, e, self.varied)? {
@@ -1286,6 +1288,28 @@ mod tests {
         check(&fx, &e, &[0], &[1.3], &[0]);
         let e = fx.f("power", vec![field(0), fx.f("negate", vec![two])]);
         check(&fx, &e, &[0], &[1.3], &[0]);
+    }
+
+    #[test]
+    fn a_non_finite_constant_is_kept_as_it_is() {
+        // SQL has no literal for inf or NaN, so one is a placeholder, not a
+        // number for ddx-core (#261). Its partials are IEEE's.
+        let fx = fixture();
+        let ddx = Ddx::new();
+        let ew = Elementwise::new(&ddx, &fx.functions);
+        for (v, op, partial) in [
+            (f64::INFINITY, "add", 1.0),
+            (f64::NAN, "subtract", 1.0),
+            (f64::NEG_INFINITY, "multiply", f64::NEG_INFINITY),
+        ] {
+            let mut ext = Extensions::new(&fx.functions);
+            let e = fx.f(op, vec![field(0), lit_f64(v)]);
+            let partials = ew.partials(&e, &|i| i == 0, &mut ext).unwrap();
+            let [(0, d)] = partials.as_slice() else {
+                panic!("{partials:?}")
+            };
+            assert_eq!(eval(d, &[1.5], &names_of(&ext)), partial, "{op} {v}");
+        }
     }
 
     #[test]
