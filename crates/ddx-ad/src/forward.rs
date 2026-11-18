@@ -46,7 +46,8 @@ use std::rc::Rc;
 use prost::Message;
 
 use substrait::proto::aggregate_rel::Grouping;
-use substrait::proto::expression::{RexType, WindowFunction};
+use substrait::proto::expression::mask_expression::{StructItem, StructSelect};
+use substrait::proto::expression::{MaskExpression, RexType, WindowFunction};
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
@@ -434,7 +435,7 @@ impl Forward {
         namespace: String,
         held: BTreeSet<(usize, usize)>,
     ) -> Result<Forward> {
-        let projected = windows_as_projections(plan);
+        let projected = in_read_form(plan);
         let grouped = crate::partition::windows_as_aggregates(&projected)?;
         let plan = &*grouped;
         let functions = Functions::from_plan(plan)?;
@@ -611,24 +612,60 @@ fn two(widths: &[Option<usize>]) -> Result<Option<(usize, usize)>> {
     }
 }
 
-/// `plan` with each window relation written as the projection of its
-/// window functions, the form DataFusion's producer writes and ddx's rules
-/// read; DuckDB's producer writes a `ConsistentPartitionWindowRel`. Both
-/// give their input's columns, then one per function, so the emit carries
-/// over. A plan with none is borrowed as it is.
-pub(crate) fn windows_as_projections(plan: &Plan) -> Cow<'_, Plan> {
-    let windows = PlanRels.then(Deep).then(RelKind);
-    if !windows.any(plan, |kind| matches!(kind, RelType::Window(_))) {
+/// `plan` in the form ddx's rules read, from the forms producers write. A
+/// plan already in it is borrowed as it is.
+/// - **Windows.** Each window relation becomes the projection of its
+///   window functions, as DataFusion's producer writes it; DuckDB's writes
+///   a `ConsistentPartitionWindowRel`. Both give their input's columns,
+///   then one per function, so the emit carries over.
+/// - **DuckDB's reads of no columns.** DuckDB's producer writes a column
+///   mask on each read of a table's columns, even all of them, and none on
+///   a read whose query uses none (`SELECT 2.0 FROM t`, or a cross join's
+///   side that only repeats rows). It counts that read as one column wide,
+///   where Substrait reads every column, so each field after it would land
+///   on the wrong column. Such a read gets a mask of the table's first
+///   column, which nothing reads.
+pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
+    let duckdb = plan
+        .version
+        .as_ref()
+        .is_some_and(|v| v.producer == "DuckDB");
+    let changes = |kind: &RelType| match kind {
+        RelType::Window(_) => true,
+        RelType::Read(r) => duckdb && reads_no_columns(r),
+        _ => false,
+    };
+    if !PlanRels.then(Deep).then(RelKind).any(plan, changes) {
         return Cow::Borrowed(plan);
     }
     let mut plan = plan.clone();
-    PlanRels.then(Deep).modify(&mut plan, |rel| {
-        if let Some(RelType::Window(w)) = &mut rel.rel_type {
-            let w = std::mem::take(&mut **w);
-            rel.rel_type = Some(RelType::Project(Box::new(window_as_projection(w))));
-        }
-    });
+    PlanRels
+        .then(Deep)
+        .modify(&mut plan, |rel| match &mut rel.rel_type {
+            Some(RelType::Window(w)) => {
+                let w = std::mem::take(&mut **w);
+                rel.rel_type = Some(RelType::Project(Box::new(window_as_projection(w))));
+            }
+            Some(RelType::Read(r)) if duckdb && reads_no_columns(r) => {
+                r.projection = Some(MaskExpression {
+                    select: Some(StructSelect {
+                        struct_items: vec![StructItem {
+                            field: 0,
+                            child: None,
+                        }],
+                    }),
+                    maintain_singular_struct: true,
+                });
+            }
+            _ => {}
+        });
     Cow::Owned(plan)
+}
+
+/// Does DuckDB's producer mean `r` to read none of its table's columns: a
+/// read with no mask, of a table that has some.
+fn reads_no_columns(r: &ReadRel) -> bool {
+    r.projection.is_none() && read_width(r) > 0
 }
 
 fn window_as_projection(w: ConsistentPartitionWindowRel) -> ProjectRel {
@@ -2341,7 +2378,7 @@ mod tests {
             }))),
         };
         let plan = rooted(window, vec!["w".into()]);
-        let read = windows_as_projections(&plan);
+        let read = in_read_form(&plan);
         let (root, _) = root_of(&read).unwrap();
         let Some(RelType::Project(p)) = &root.rel_type else {
             panic!("{root:?}")
@@ -2358,7 +2395,74 @@ mod tests {
         assert_eq!(f.partitions, vec![field(0)]);
         // A plan with none is not copied.
         let plain = rooted(emit::read_step("t", vec!["a".into()]), vec!["a".into()]);
-        assert!(matches!(windows_as_projections(&plain), Cow::Borrowed(_)));
+        assert!(matches!(in_read_form(&plain), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn duckdb_s_read_of_no_columns_is_read_as_one_column_wide() {
+        // DuckDB's `SELECT SUM(s.v) FROM x CROSS JOIN s`: `x` is read for
+        // its rows alone, with no mask, and `s` for its `v`. To DuckDB, the
+        // cross join's field 1 is `s.v`.
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let x = emit::read_step("x", vec!["i0".into(), "v".into()]);
+        let mut s = emit::read_step("s", vec!["i".into(), "v".into()]);
+        let mask = MaskExpression {
+            select: Some(StructSelect {
+                struct_items: vec![StructItem {
+                    field: 1,
+                    child: None,
+                }],
+            }),
+            maintain_singular_struct: true,
+        };
+        if let Some(RelType::Read(r)) = &mut s.rel_type {
+            r.projection = Some(mask.clone());
+        }
+        let cross = Rel {
+            rel_type: Some(RelType::Cross(Box::new(CrossRel {
+                left: Some(Box::new(x)),
+                right: Some(Box::new(s)),
+                ..Default::default()
+            }))),
+        };
+        let mut plan = emit::plan(
+            emit::project_emit(cross, vec![], Some(vec![1])),
+            vec!["v".into()],
+            &ext,
+        );
+        let cross_of = |plan: &Plan| -> Rel {
+            let Some(RelType::Project(p)) = &root_of(plan).unwrap().0.rel_type else {
+                panic!("{plan:?}")
+            };
+            input(&p.input).unwrap().clone()
+        };
+        // Substrait's reading, which another producer means: `x.v`.
+        assert_eq!(width(&cross_of(&plan)).unwrap(), 3);
+        assert!(matches!(in_read_form(&plan), Cow::Borrowed(_)));
+        plan.version = Some(substrait::version::version_with_producer("DuckDB"));
+        let cross = cross_of(&in_read_form(&plan));
+        assert_eq!(width(&cross).unwrap(), 2);
+        let Some(RelType::Cross(c)) = &cross.rel_type else {
+            panic!("{cross:?}")
+        };
+        let masks = [&c.left, &c.right].map(|side| {
+            match side.as_deref().and_then(|r| r.rel_type.as_ref()) {
+                Some(RelType::Read(r)) => r.projection.clone(),
+                other => panic!("{other:?}"),
+            }
+        });
+        let first = MaskExpression {
+            select: Some(StructSelect {
+                struct_items: vec![StructItem {
+                    field: 0,
+                    child: None,
+                }],
+            }),
+            maintain_singular_struct: true,
+        };
+        // `x` reads its first column, which nothing reads; `s` is as it was.
+        assert_eq!(masks, [Some(first), Some(mask)]);
     }
 
     #[test]
