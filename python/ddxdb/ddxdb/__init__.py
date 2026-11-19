@@ -51,6 +51,7 @@ from ._ddxdb import (  # noqa: F401  (re-exported)
     grad_plan,
     jvp_plan,
     run,
+    to_sql,
     vjp_plan,
 )
 from ._ddxdb import _prepare, _rewrite
@@ -340,6 +341,7 @@ __all__ = [
     "grad_plan",
     "jvp_plan",
     "run",
+    "to_sql",
     "vjp_plan",
     "__version__",
 ]
