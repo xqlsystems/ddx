@@ -199,6 +199,59 @@ def test_a_real_nan_gradient_stays_nan(ad, sign):
     assert math.isnan(nan) and one == 1.0
 
 
+def ids(n):
+    return pa.array(range(n), pa.int64())
+
+
+# DuckDB reads a table whose query uses none of its columns with no column
+# mask, and counts that read as one column wide; Substrait's reading, every
+# column, put each field after it on the wrong column. Each loss reads such
+# a table: the cross join's side that only repeats rows.
+@pytest.mark.parametrize(
+    "tables, loss, wrt, value, gradient",
+    [
+        # #265: the constant 2.0 was read as x.v, giving 9 and 3.
+        (
+            {"s": {"i": ids(1), "v": [3.0]}, "x": {"i0": ids(2), "v": [1.0, 2.0]}},
+            "WITH c AS (SELECT 2.0e0 AS v FROM x) SELECT SUM(s.v * c.v) AS v FROM s CROSS JOIN c",
+            "s.v",
+            12.0,
+            4.0,
+        ),
+        # #266: w.v was read as r.v, so the loss didn't depend on w.v.
+        (
+            {"w": {"i0": ids(1), "v": [-1.0]}, "r": {"i0": ids(2), "v": [5.0, 7.0]}},
+            "SELECT SUM(w.v) AS v FROM w CROSS JOIN r",
+            "w.v",
+            -2.0,
+            2.0,
+        ),
+        # #264: s.v was read as w.v, so the loss didn't depend on s.v.
+        (
+            {"s": {"i": ids(1), "v": [2.0]}, "w": {"i0": ids(3), "v": [1.0, 2.0, 3.0]}},
+            "WITH a AS (SELECT w.i0 AS i0, s.v AS v FROM w CROSS JOIN s) SELECT SUM(a.v * 3.0e0) AS v FROM a",
+            "s.v",
+            18.0,
+            9.0,
+        ),
+    ],
+    ids=["265", "266", "264"],
+)
+def test_a_table_read_for_its_rows_alone_keeps_the_columns_after_it(tables, loss, wrt, value, gradient):
+    import ddxdb
+    from ddxdb.duckdb import DuckDBBackend
+
+    con = duckdb.connect()
+    for name, columns in tables.items():
+        con.register(name, pa.table(columns))
+    backend = DuckDBBackend(con)
+    program = ddxdb.grad_plan(backend.plan_sql(loss), [wrt])
+    ddxdb.run(backend, program)
+    assert con.sql(loss).fetchall() == [(value,)]
+    assert con.sql(program.value.query()).fetchall() == [(value,)]
+    assert con.sql(program.gradients[0].query()).fetchall() == [(0, gradient)]
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, con):
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 

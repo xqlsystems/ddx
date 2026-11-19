@@ -43,9 +43,7 @@ use super::build::{quoted, rename_reads};
 use crate::compose::redeclare_rel;
 use crate::emit::{filter, plan as plan_of, select};
 use crate::error::{AdError, Result};
-use crate::forward::{
-    apply_emit, inline_references, read_outputs, root_of, windows_as_projections,
-};
+use crate::forward::{apply_emit, in_read_form, inline_references, read_outputs, root_of};
 use crate::functions::{Extensions, Functions};
 use crate::optics::{AsRead, Compose, Deep, Fold, RelKind, Setter, Tree};
 
@@ -360,7 +358,7 @@ pub(super) fn stitch(split: &Split, pieces: &[Plan], root: &Plan) -> Result<Plan
 fn one(plan: &Plan, ordinals: &HashMap<&str, i32>, ext: &mut Extensions) -> Result<Rel> {
     // DuckDB's window relations, as the projections ddx's rules read, so
     // their functions are declared again as a projection's are.
-    let plan = &*windows_as_projections(plan);
+    let plan = &*in_read_form(plan);
     let (root, _) = root_of(plan)?;
     let mut rel = inline_references(root, &plan.relations)?;
     redeclare_rel(&mut rel, &Functions::from_plan(plan)?, &HashMap::new(), ext)?;

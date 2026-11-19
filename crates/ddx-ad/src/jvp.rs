@@ -36,7 +36,7 @@ use crate::emit::{plan as plan_of, project_emit, read_step};
 use crate::error::{AdError, Result};
 use crate::expr::field;
 use crate::forward::{
-    check_every_wrt_was_read, checked_root, inline_references, windows_as_projections, wrt_table,
+    check_every_wrt_was_read, checked_root, in_read_form, inline_references, wrt_table,
 };
 use crate::functions::{Extensions, Functions};
 use crate::program::{
@@ -107,7 +107,7 @@ pub fn jvp_with<D: Differentiable + ?Sized>(
 fn jvp_of_query(plan: &Plan, wrt: &[ColumnRef], options: &Options) -> Result<ForwardProgram> {
     // Before the plan is split at the relations it shares, which may be
     // window relations.
-    let plan = &*windows_as_projections(plan);
+    let plan = &*in_read_form(plan);
     let namespace = options.namespace_or_new()?;
     let ddx = options.ddx_or_default();
     let mut sources = Sources::new(wrt, &namespace)?;
@@ -260,7 +260,7 @@ fn dual_plan(
     ext: Extensions,
     sources: &mut Sources,
 ) -> Result<DualPlan> {
-    let plan = &*windows_as_projections(plan);
+    let plan = &*in_read_form(plan);
     let (root, names) = checked_root(plan)?;
     let root = inline_references(root, &plan.relations)?;
     let mut source = |n: &[String], s: Option<&NamedStruct>| sources.source(n, s);
