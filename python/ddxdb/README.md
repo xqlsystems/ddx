@@ -138,6 +138,11 @@ are the same for the other two. They are ddx-ad's own Rust, the same code the
 Rust adapter runs. Pass `namespace="__ddx_mine_"` to get the
 same program from the same plan every time.
 
+`ddxdb.to_sql(plan_bytes, dialect)` writes a plan, its reads bound, as one
+SQL query in `"duckdb"` or `"datafusion"`: for a backend that runs a
+program's steps as SQL rather than through its engine's Substrait consumer,
+as ddxdb's DuckDB backend does.
+
 The SQL calls run on another engine too: `ddxdb.rewrite(backend, statements)`
 runs the programs the statements' `grad`, `vjp` and `jvp` calls need on a
 backend that also has `plan_sql` (SQL to a serialized Substrait plan), and
