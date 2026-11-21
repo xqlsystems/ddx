@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.5...ddx-ad-v0.3.6) - 2026-11-21
+
+### Fixed
+
+- DuckDB's read of a table for its rows alone, which its producer writes with no column mask and counts as one column wide, is read as DuckDB means it. ddx had read such a read as every column of the table, so each column after it was the wrong one: `SELECT 2.0 AS v FROM x` gave a wrong value and gradient with no error, and a cross join's side that only repeats rows made ddx refuse the loss as not depending on its `wrt` column ([#279](https://github.com/xqlsystems/ddx/pull/279), fixing [#265](https://github.com/xqlsystems/ddx/issues/265), [#264](https://github.com/xqlsystems/ddx/issues/264) and [#266](https://github.com/xqlsystems/ddx/issues/266)). A read of a virtual table, such as the empty one DuckDB plans `LIMIT 0` as, still reads every column ([#290](https://github.com/xqlsystems/ddx/pull/290))
+- Unary minus is differentiated on DuckDB, whose producer writes `-x` as a `subtract` with one argument ([#280](https://github.com/xqlsystems/ddx/pull/280), fixing [#262](https://github.com/xqlsystems/ddx/issues/262))
+- A join to a relation unique on its key, such as `(SELECT DISTINCT i FROM s) a JOIN w ON a.i = w.i`, is differentiated on DataFusion, which plans it as a right semi join ([#287](https://github.com/xqlsystems/ddx/pull/287), fixing [#286](https://github.com/xqlsystems/ddx/issues/286))
+- A constant that is infinite or NaN, such as `CAST('inf' AS DOUBLE)`, is kept as written rather than refused, and its derivatives follow IEEE arithmetic: `x * -inf` has gradient `-inf` ([#284](https://github.com/xqlsystems/ddx/pull/284), fixing part of [#261](https://github.com/xqlsystems/ddx/issues/261))
+- `to_sql` writes `between`, which DuckDB's producer writes for a range it derives through a join's equality. A gradient through such a filter was planned but couldn't run ([#281](https://github.com/xqlsystems/ddx/pull/281), fixing [#263](https://github.com/xqlsystems/ddx/issues/263))
+- `to_sql` reads an engine's plan as ddx reads one to differentiate it, so DuckDB's read for rows alone is written as DuckDB means it. It had given SQL with another result, without an error ([#290](https://github.com/xqlsystems/ddx/pull/290), fixing [#288](https://github.com/xqlsystems/ddx/issues/288))
+
 ## [0.3.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.4...ddx-ad-v0.3.5) - 2026-11-15
 
 ### Fixed

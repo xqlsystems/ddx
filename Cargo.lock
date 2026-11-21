@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-ad"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ddx-core",
  "prost",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "ddx-datafusion"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "async-trait",
  "datafusion",
