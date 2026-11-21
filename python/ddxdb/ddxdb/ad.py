@@ -59,7 +59,7 @@ planning, keying or reading views.
 datafusion-python's Substrait consumer names a computed column by its whole
 expression, so a step whose names would grow large (a deep chain of columns
 that each read the one before twice, as stacked softmaxes do) runs as SQL
-instead (see :func:`_dataframe`). (datafusion-python also decodes a plan with
+instead (see :func:`dataframe`). (datafusion-python also decodes a plan with
 protobuf's default nesting limit; ddx splits every step deeper than it into
 steps, so none reaches it.)
 
@@ -120,6 +120,7 @@ __all__ = [
     "Program",
     "Step",
     "Tangent",
+    "dataframe",
     "grad",
     "jvp",
     "register_stop_gradient",
@@ -371,10 +372,10 @@ class DataFusionBackend:
         return f"{_catalog_version(self.ctx)} {settings!r}"
 
     def returns_rows(self, plan: bytes) -> bool:
-        return _dataframe(self.ctx, plan).limit(1).count() > 0
+        return dataframe(self.ctx, plan).limit(1).count() > 0
 
     def materialize(self, name: str, plan: bytes) -> None:
-        _register(self.ctx, name, _dataframe(self.ctx, plan).to_arrow_table())
+        _register(self.ctx, name, dataframe(self.ctx, plan).to_arrow_table())
 
     def drop_table(self, name: str) -> None:
         self.ctx.deregister_table(name)
@@ -422,7 +423,7 @@ class DataFusionBackend:
 
     def _physical(self, plan: bytes):
         """``plan``'s physical plan, and the schema of its rows."""
-        df = _dataframe(self.ctx, plan)
+        df = dataframe(self.ctx, plan)
         return df.execution_plan(), df.schema()
 
     def _can_compile(self) -> bool:
@@ -732,8 +733,10 @@ def _release(ctx: SessionContext, program: Program) -> None:
 _SQL_ABOVE = 2_000
 
 
-def _dataframe(ctx: SessionContext, plan: bytes):
-    """``plan``, a step or a check, ready to run on ``ctx``.
+def dataframe(ctx: SessionContext, plan: bytes):
+    """``plan``, a step or a check, ready to run on ``ctx``, as
+    :func:`run` runs each one: for a :class:`Backend` of one's own on
+    DataFusion, given ``plan`` bound to ``ctx``'s tables by ``ddxdb.run``.
 
     datafusion-python's Substrait consumer names each computed column after
     its whole expression, so a column computed from computed columns has a

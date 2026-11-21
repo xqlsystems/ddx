@@ -141,7 +141,11 @@ same program from the same plan every time.
 `ddxdb.to_sql(plan_bytes, dialect)` writes a plan, its reads bound, as one
 SQL query in `"duckdb"` or `"datafusion"`: for a backend that runs a
 program's steps as SQL rather than through its engine's Substrait consumer,
-as ddxdb's DuckDB backend does.
+as ddxdb's DuckDB backend does. On DataFusion, a backend of one's own can
+call `ddxdb.ad.dataframe(ctx, plan_bytes)` on each plan `ddxdb.run` hands
+it, to get a DataFrame the way `ddxdb.ad.run` does: as SQL when
+its column names would grow too large for the Substrait consumer, and
+through the consumer otherwise.
 
 The SQL calls run on another engine too: `ddxdb.rewrite(backend, statements)`
 runs the programs the statements' `grad`, `vjp` and `jvp` calls need on a
