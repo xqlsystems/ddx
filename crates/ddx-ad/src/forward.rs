@@ -39,7 +39,7 @@
 //! a refusal that is raised only if gradient actually reaches it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
@@ -48,6 +48,8 @@ use prost::Message;
 use substrait::proto::aggregate_rel::Grouping;
 use substrait::proto::expression::mask_expression::{StructItem, StructSelect};
 use substrait::proto::expression::{MaskExpression, RexType, WindowFunction};
+use substrait::proto::extensions::simple_extension_declaration::{ExtensionFunction, MappingType};
+use substrait::proto::extensions::SimpleExtensionDeclaration;
 use substrait::proto::function_argument::ArgType;
 use substrait::proto::join_rel::JoinType;
 use substrait::proto::plan_rel::RelType as PlanRelType;
@@ -625,6 +627,9 @@ fn two(widths: &[Option<usize>]) -> Result<Option<(usize, usize)>> {
 ///   where Substrait reads every column, so each field after it would land
 ///   on the wrong column. Such a read gets a mask of the table's first
 ///   column, which nothing reads.
+/// - **DuckDB's unary minus.** DuckDB's producer writes `-x` as `subtract`
+///   with one argument, where Substrait's is `negate`. Such a call is
+///   pointed at a declaration of `negate`.
 pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
     let duckdb = plan
         .version
@@ -636,7 +641,19 @@ pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
         RelType::Join(j) => right_kept(j),
         _ => false,
     };
-    if !PlanRels.then(Deep).then(RelKind).any(plan, changes) {
+    let subtracts: HashSet<u32> = if duckdb {
+        function_anchors(plan, "subtract").collect()
+    } else {
+        HashSet::new()
+    };
+    let negation = |e: &Expression| match &e.rex_type {
+        Some(RexType::ScalarFunction(f)) => {
+            f.arguments.len() == 1 && subtracts.contains(&f.function_reference)
+        }
+        _ => false,
+    };
+    let exprs = || PlanRels.then(Deep).then(RelKind).then(Exprs).then(Cosmos);
+    if !PlanRels.then(Deep).then(RelKind).any(plan, changes) && !exprs().any(plan, negation) {
         return Cow::Borrowed(plan);
     }
     let mut plan = plan.clone();
@@ -666,7 +683,58 @@ pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
             keep_on_the_left(j);
         }
     });
+    // After the windows are projections, whose expressions `Exprs` reaches.
+    if exprs().any(&plan, negation) {
+        let negate = declare_function(&mut plan, "negate");
+        exprs().modify(&mut plan, |e| {
+            if negation(e) {
+                if let Some(RexType::ScalarFunction(f)) = &mut e.rex_type {
+                    f.function_reference = negate;
+                }
+            }
+        });
+    }
     Cow::Owned(plan)
+}
+
+/// The anchors of `plan`'s declarations of the function `name`, whatever
+/// their signatures.
+fn function_anchors<'a>(plan: &'a Plan, name: &'a str) -> impl Iterator<Item = u32> + 'a {
+    plan.extensions
+        .iter()
+        .filter_map(move |d| match &d.mapping_type {
+            Some(MappingType::ExtensionFunction(f))
+                if crate::functions::normalize(&f.name) == name =>
+            {
+                Some(f.function_anchor)
+            }
+            _ => None,
+        })
+}
+
+/// A new declaration of the function `name` in `plan`, at its first anchor
+/// no function has, with no extension URN, as DuckDB declares its own.
+fn declare_function(plan: &mut Plan, name: &str) -> u32 {
+    let taken: HashSet<u32> = plan
+        .extensions
+        .iter()
+        .filter_map(|d| match &d.mapping_type {
+            Some(MappingType::ExtensionFunction(f)) => Some(f.function_anchor),
+            _ => None,
+        })
+        .collect();
+    // A plan declares fewer functions than there are anchors.
+    let anchor = (1..=u32::MAX)
+        .find(|a| !taken.contains(a))
+        .expect("an anchor no function has");
+    plan.extensions.push(SimpleExtensionDeclaration {
+        mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+            function_anchor: anchor,
+            name: name.into(),
+            ..Default::default()
+        })),
+    });
+    anchor
 }
 
 /// Does `j` keep its right side's rows alone: a right semi or anti join?
@@ -2556,6 +2624,101 @@ mod tests {
             assert_eq!(j.post_join_filter.as_deref(), Some(&on(1, 2)));
             assert_eq!(width(input(&p.input).unwrap()).unwrap(), 2);
         }
+    }
+
+    #[test]
+    fn duckdb_s_one_argument_subtract_is_read_as_negate() {
+        // DuckDB's `SELECT -v, v - v FROM t`: its unary minus is declared
+        // as a bare `subtract`, at its own anchor. At the last anchors, the
+        // new declaration of `negate` takes the first free one.
+        use substrait::proto::consistent_partition_window_rel::WindowRelFunction;
+        use substrait::proto::FunctionArgument;
+        let (unary, binary) = (u32::MAX - 1, u32::MAX);
+        let declare = |anchor, name: &str| SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                function_anchor: anchor,
+                name: name.into(),
+                ..Default::default()
+            })),
+        };
+        let exprs = vec![
+            crate::expr::call(unary, vec![field(0)]),
+            crate::expr::call(binary, vec![field(0), field(0)]),
+        ];
+        // And `SUM(-v) OVER ()`, read once windows are projections.
+        let read = Rel {
+            rel_type: Some(RelType::Window(Box::new(ConsistentPartitionWindowRel {
+                input: Some(Box::new(emit::read_step("t", vec!["v".into()]))),
+                window_functions: vec![WindowRelFunction {
+                    function_reference: 7,
+                    arguments: vec![FunctionArgument {
+                        arg_type: Some(ArgType::Value(crate::expr::call(unary, vec![field(0)]))),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))),
+        };
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let mut plan = emit::plan(
+            emit::project_emit(read, exprs, Some(vec![2, 3, 1])),
+            vec!["n".into(), "d".into(), "s".into()],
+            &ext,
+        );
+        plan.extensions = vec![
+            declare(unary, "subtract"),
+            declare(binary, "subtract:fp64_fp64"),
+            declare(7, "sum"),
+        ];
+        let window_argument = |plan: &Plan, functions: &Functions| {
+            let (root, _) = root_of(plan).unwrap();
+            let Some(RelType::Project(p)) = &root.rel_type else {
+                panic!("{root:?}")
+            };
+            let Some(RelType::Project(w)) = &input(&p.input).unwrap().rel_type else {
+                panic!("{p:?}")
+            };
+            let Some(RexType::WindowFunction(f)) = &w.expressions[0].rex_type else {
+                panic!("{w:?}")
+            };
+            let Some(ArgType::Value(Expression {
+                rex_type: Some(RexType::ScalarFunction(g)),
+            })) = &f.arguments[0].arg_type
+            else {
+                panic!("{f:?}")
+            };
+            functions.name(g.function_reference).unwrap().to_string()
+        };
+        let other = in_read_form(&plan);
+        assert_eq!(
+            window_argument(&other, &Functions::from_plan(&other).unwrap()),
+            "subtract"
+        );
+        plan.version = Some(substrait::version::version_with_producer("DuckDB"));
+        let read = in_read_form(&plan);
+        let functions = Functions::from_plan(&read).unwrap();
+        let (root, _) = root_of(&read).unwrap();
+        let Some(RelType::Project(p)) = &root.rel_type else {
+            panic!("{root:?}")
+        };
+        let names: Vec<_> = p
+            .expressions
+            .iter()
+            .map(|e| match &e.rex_type {
+                Some(RexType::ScalarFunction(f)) => functions.name(f.function_reference).unwrap(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["negate", "subtract"]);
+        assert_eq!(window_argument(&read, &functions), "negate");
+        let negate = read.extensions.iter().find_map(|d| match &d.mapping_type {
+            Some(MappingType::ExtensionFunction(f)) if f.name == "negate" => {
+                Some(f.function_anchor)
+            }
+            _ => None,
+        });
+        assert_eq!(negate, Some(1));
     }
 
     #[test]

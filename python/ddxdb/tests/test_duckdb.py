@@ -263,6 +263,19 @@ def test_to_sql_writes_a_plan_as_sql_the_engine_runs(con):
         ddxdb.to_sql(plan, "postgres")
 
 
+@pytest.mark.parametrize(
+    "loss, gradient",
+    [
+        ("SELECT SUM(-val) AS l FROM w", [(0, -1.0), (1, -1.0), (2, -1.0)]),
+        ("SELECT SUM(-(-val) * val) AS l FROM w", [(0, 2.0), (1, -4.0), (2, 1.0)]),
+        ("SELECT SUM(s) AS l FROM (SELECT -SUM(val) OVER (ORDER BY i) AS s FROM w)", [(0, -3.0), (1, -2.0), (2, -1.0)]),
+    ],
+)
+def test_unary_minus_is_differentiated(ad, con, loss, gradient):
+    # DuckDB writes `-x` as a one-argument subtract (#262).
+    assert pairs(ad.sql(con, f"WITH loss AS ({loss}) SELECT i, grad(loss, val) FROM w")) == gradient
+
+
 def test_grad_in_sql_is_a_column_of_its_table_s_rows(ad, con):
     assert pairs(ad.sql(con, GRAD)) == [(0, 3.0), (1, 12.0), (2, 0.75)]
 
