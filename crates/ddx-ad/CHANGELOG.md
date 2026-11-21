@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.5...ddx-ad-v0.3.6) - 2026-11-21
+
+### Fixed
+
+- *(ddx-ad)* write a plan as SQL as ddx reads it to differentiate it ([#290](https://github.com/xqlsystems/ddx/pull/290))
+- *(ddx-ad)* keep a non-finite constant as it is, rather than refusing it ([#284](https://github.com/xqlsystems/ddx/pull/284))
+- *(ddx-ad)* write between as SQL's BETWEEN ([#281](https://github.com/xqlsystems/ddx/pull/281))
+- *(ddx-ad)* read DuckDB's one-argument subtract as negate ([#280](https://github.com/xqlsystems/ddx/pull/280))
+- *(ddx-ad)* read a right semi or anti join as the left one of its sides swapped ([#287](https://github.com/xqlsystems/ddx/pull/287))
+- *(ddx-ad)* read DuckDB's read of no columns as one column wide ([#279](https://github.com/xqlsystems/ddx/pull/279))
+
 ## [0.3.5](https://github.com/xqlsystems/ddx/compare/ddx-ad-v0.3.4...ddx-ad-v0.3.5) - 2026-11-15
 
 ### Fixed

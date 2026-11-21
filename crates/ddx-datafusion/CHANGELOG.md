@@ -9,6 +9,16 @@ Entries below the first release are maintained automatically by
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.5...ddx-datafusion-v0.4.6) - 2026-11-21
+
+### Fixed
+
+- *(ddx-ad)* read a right semi or anti join as the left one of its sides swapped ([#287](https://github.com/xqlsystems/ddx/pull/287))
+
+### Other
+
+- *(ddx-datafusion)* fuzz to_sql against DataFusion and DuckDB ([#191](https://github.com/xqlsystems/ddx/pull/191))
+
 ## [0.4.5](https://github.com/xqlsystems/ddx/compare/ddx-datafusion-v0.4.4...ddx-datafusion-v0.4.5) - 2026-11-15
 
 ### Other
