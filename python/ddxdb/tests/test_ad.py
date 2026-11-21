@@ -640,6 +640,35 @@ def test_a_step_whose_names_would_grow_large_runs_as_sql(ad, ctx, monkeypatch):
     assert ran
 
 
+def test_dataframe_runs_a_plan_as_ddx_s_own_backend_does(ad, ctx):
+    # A backend of its own, as an executor that runs a program's steps
+    # writes: ddxdb.run hands it each plan bound to ctx's tables.
+    from datafusion.substrait import Serde
+
+    class Mine:
+        def select_all(self, name):
+            return Serde.serialize_bytes(f'SELECT * FROM "{name}"', ctx)
+
+        def returns_rows(self, plan):
+            return ad.dataframe(ctx, plan).limit(1).count() > 0
+
+        def materialize(self, name, plan):
+            ctx.deregister_table(name)
+            ctx.register_record_batches(name, [ad.dataframe(ctx, plan).to_arrow_table().to_batches()])
+
+        def drop_table(self, name):
+            ctx.deregister_table(name)
+
+    program = ad.grad(ctx, LOSS, "w.val")
+    ddxdb.run(Mine(), program)
+    try:
+        got = pairs(ctx.table(program.gradients[0].step))
+    finally:
+        for step in program.steps():
+            ctx.deregister_table(step.name)
+    assert got == pairs(ad.run(ctx, program).gradients[0])
+
+
 def test_a_large_step_sql_cannot_write_runs_on_substrait(ad, ctx, monkeypatch):
     # to_sql writes only the functions it knows; a step it refuses runs
     # through the consumer, however large its names.
