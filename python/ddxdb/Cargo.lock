@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "ddxdb"
-version = "0.4.11"
+version = "0.4.12"
 dependencies = [
  "datafusion-common",
  "datafusion-expr",
