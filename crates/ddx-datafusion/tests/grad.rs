@@ -77,6 +77,25 @@ async fn a_reduction_joined_to_data() {
 }
 
 #[tokio::test]
+async fn a_join_to_a_relation_unique_on_its_key_is_differentiated() {
+    // DataFusion plans each as a RightSemi join that keeps `w`'s rows (#286).
+    for loss in [
+        "SELECT SUM(b.val * b.val) AS loss FROM (SELECT DISTINCT i FROM x WHERE v > 0.0) a JOIN w b ON a.i = b.i",
+        "SELECT SUM(b.val * b.val) AS loss \
+         FROM (SELECT i, SUM(v) AS v FROM x WHERE v > 0.0 GROUP BY i) a JOIN w b ON a.i = b.i",
+    ] {
+        let ctx = ctx();
+        let (w, x) = (w(), x());
+        w.create(&ctx).await;
+        x.create(&ctx).await;
+        let plan = ctx.sql(loss).await.unwrap().into_optimized_plan().unwrap();
+        let plan = plan.display_indent().to_string();
+        assert!(plan.contains("RightSemi Join"), "{plan}");
+        check_gradients(&ctx, loss, &[w, x], &[wrt("w", "val")]).await;
+    }
+}
+
+#[tokio::test]
 async fn a_grouped_sum_feeds_a_second_aggregate() {
     // Two nodes: the per-i sums, then the loss over them.
     check_gradients(

@@ -279,6 +279,17 @@ def test_sql_leaves_no_tables_behind(ad, ctx):
     assert pairs(df) == [(0, 2.0), (1, -4.0), (2, 1.0)]
 
 
+def test_a_join_to_a_relation_unique_on_its_key_is_differentiated(ad, ctx):
+    # DataFusion plans it as a RightSemi join that keeps w's rows (#286).
+    df = ad.sql(
+        ctx,
+        """WITH loss AS (SELECT SUM(w.val * w.val) AS l
+                         FROM (SELECT DISTINCT i FROM b WHERE val > 0.0) a JOIN w ON a.i = w.i)
+           SELECT i, grad(loss, val) FROM w""",
+    )
+    assert pairs(df) == [(0, 2.0), (1, -4.0), (2, 0.0)]
+
+
 def test_tables_whose_names_join_alike_keep_their_own_gradients(ad):
     import datafusion
 

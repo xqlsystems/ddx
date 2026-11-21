@@ -633,6 +633,7 @@ pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
     let changes = |kind: &RelType| match kind {
         RelType::Window(_) => true,
         RelType::Read(r) => duckdb && reads_no_columns(r),
+        RelType::Join(j) => right_kept(j),
         _ => false,
     };
     if !PlanRels.then(Deep).then(RelKind).any(plan, changes) {
@@ -659,7 +660,58 @@ pub(crate) fn in_read_form(plan: &Plan) -> Cow<'_, Plan> {
             }
             _ => {}
         });
+    // After the reads, whose widths the swap reads.
+    PlanRels.then(Deep).modify(&mut plan, |rel| {
+        if let Some(RelType::Join(j)) = &mut rel.rel_type {
+            keep_on_the_left(j);
+        }
+    });
     Cow::Owned(plan)
+}
+
+/// Does `j` keep its right side's rows alone: a right semi or anti join?
+fn right_kept(j: &JoinRel) -> bool {
+    matches!(
+        JoinType::try_from(j.r#type),
+        Ok(JoinType::RightSemi | JoinType::RightAnti)
+    )
+}
+
+/// Swaps the sides of `j`, a right semi or anti join, to make it the left
+/// one, which keeps the same rows and columns. DataFusion plans a join to a
+/// relation unique on its key as one (#286). Left as it is, to be refused,
+/// where a side's width can't be told or its expressions can't be followed.
+fn keep_on_the_left(j: &mut JoinRel) {
+    let r#type = match JoinType::try_from(j.r#type) {
+        Ok(JoinType::RightSemi) => JoinType::LeftSemi,
+        Ok(JoinType::RightAnti) => JoinType::LeftAnti,
+        _ => return,
+    };
+    let widths = || {
+        Some((
+            width(j.left.as_deref()?).ok()?,
+            width(j.right.as_deref()?).ok()?,
+        ))
+    };
+    let Some((wl, wr)) = widths() else { return };
+    // The expressions read the left's columns, then the right's.
+    let swap = |e: &Option<Box<Expression>>| -> Option<Option<Box<Expression>>> {
+        match e {
+            None => Some(None),
+            Some(e) => map_fields(e, &mut |f| Ok(if f < wl { f + wr } else { f - wl }))
+                .ok()
+                .map(|e| Some(Box::new(e))),
+        }
+    };
+    let (Some(expression), Some(post_join_filter)) =
+        (swap(&j.expression), swap(&j.post_join_filter))
+    else {
+        return;
+    };
+    std::mem::swap(&mut j.left, &mut j.right);
+    j.expression = expression;
+    j.post_join_filter = post_join_filter;
+    j.r#type = r#type as i32;
 }
 
 /// Does DuckDB's producer mean `r` to read none of its table's columns: a
@@ -2289,6 +2341,7 @@ pub(crate) fn rel_name(kind: &RelType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::call;
 
     #[test]
     fn a_column_a_producer_dropped_beneath_the_root_is_refused() {
@@ -2463,6 +2516,46 @@ mod tests {
         };
         // `x` reads its first column, which nothing reads; `s` is as it was.
         assert_eq!(masks, [Some(first), Some(mask)]);
+    }
+
+    #[test]
+    fn a_right_semi_join_is_read_as_the_left_one_of_its_sides_swapped() {
+        // DataFusion's `SELECT b.v FROM (SELECT DISTINCT i FROM s) a JOIN w b
+        // ON a.i = b.i0` (#286): `w`'s rows that match one of `a`'s, with
+        // `w`'s columns.
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let ext = crate::functions::Extensions::new(&functions);
+        let a = emit::read_step("a", vec!["i".into()]);
+        let w = emit::read_step("w", vec!["i0".into(), "v".into()]);
+        let on = |l: usize, r: usize| call(1, vec![field(l), field(r)]);
+        for (right, left) in [
+            (JoinType::RightSemi, JoinType::LeftSemi),
+            (JoinType::RightAnti, JoinType::LeftAnti),
+        ] {
+            let mut join = emit::join(a.clone(), w.clone(), on(0, 1), right);
+            if let Some(RelType::Join(j)) = &mut join.rel_type {
+                j.post_join_filter = Some(Box::new(on(2, 0)));
+            }
+            let plan = emit::plan(
+                emit::project_emit(join, vec![], Some(vec![1])),
+                vec!["v".into()],
+                &ext,
+            );
+            let read = in_read_form(&plan);
+            let Some(RelType::Project(p)) = &root_of(&read).unwrap().0.rel_type else {
+                panic!("{read:?}")
+            };
+            let Some(RelType::Join(j)) = &input(&p.input).unwrap().rel_type else {
+                panic!("{p:?}")
+            };
+            assert_eq!(JoinType::try_from(j.r#type), Ok(left));
+            assert_eq!(j.left.as_deref(), Some(&w));
+            assert_eq!(j.right.as_deref(), Some(&a));
+            // `a.i` is now field 2, and `w`'s fields come first.
+            assert_eq!(j.expression.as_deref(), Some(&on(2, 0)));
+            assert_eq!(j.post_join_filter.as_deref(), Some(&on(1, 2)));
+            assert_eq!(width(input(&p.input).unwrap()).unwrap(), 2);
+        }
     }
 
     #[test]
