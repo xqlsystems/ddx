@@ -1010,3 +1010,21 @@ def test_in_place_is_refused_on_duckdb(con):
 
     with pytest.raises(ValueError, match="in_place"):
         ad.prepare(con, [GRAD], in_place=True)
+
+
+def test_a_range_duckdb_derives_through_a_join_is_written(ad):
+    # Through `a.i1 = b.i1`, DuckDB derives `between(i1 - 2, 0, 2)` for `a`
+    # from `b`'s `i1 >= 0 AND i1 < 2` (#263), beside `a`'s own filter: two
+    # slices of one table, multiplied, as torch-sql's split.
+    con = duckdb.connect()
+    i0, i1 = [i // 6 for i in range(12)], [i % 6 for i in range(12)]
+    con.register("w", pa.table({"i0": i0, "i1": i1, "v": [float(i) for i in range(12)]}))
+    loss = """
+        WITH a AS (SELECT i0, i1 - 2 AS i1, v FROM w WHERE i1 >= 2 AND i1 < 4),
+             c AS (SELECT i0, i1, v FROM w WHERE i1 >= 0 AND i1 < 2),
+             p AS (SELECT a.i0, a.i1, a.v * c.v AS v FROM a JOIN c ON a.i0 = c.i0 AND a.i1 = c.i1)
+        SELECT SUM(v) AS l FROM p"""
+    rel = ad.sql(con, f"WITH loss AS ({loss}) SELECT i0, i1, grad(loss, v) FROM w")
+    # d/dv[i0, j] is v[i0, j + 2] for j < 2, and v[i0, j - 2] for j in 2, 3.
+    expected = [(r, j, float(6 * r + {0: 2, 1: 3, 2: 0, 3: 1}[j]) if j < 4 else 0.0) for r in range(2) for j in range(6)]
+    assert sorted(rel.fetchall()) == expected

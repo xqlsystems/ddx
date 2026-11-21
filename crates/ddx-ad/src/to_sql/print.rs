@@ -255,6 +255,15 @@ impl Printer {
                 self.expr(x);
                 self.sql.push(')');
             }
+            Expr::Between { expr, low, high } => {
+                self.sql.push('(');
+                self.expr(expr);
+                self.sql.push_str(" BETWEEN ");
+                self.expr(low);
+                self.sql.push_str(" AND ");
+                self.expr(high);
+                self.sql.push(')');
+            }
             Expr::Is { expr, test } => {
                 self.sql.push('(');
                 self.expr(expr);
@@ -713,5 +722,26 @@ mod tests {
             divide(Dialect::DataFusion),
             "(CAST(7 AS BIGINT) / CAST(2 AS BIGINT))"
         );
+    }
+
+    #[test]
+    fn between_holds_both_bounds_in_each_dialect() {
+        let int = |i| Box::new(Expr::Literal(Literal::Int(i, Type::BigInt)));
+        let e = Expr::Between {
+            expr: int(1),
+            low: int(0),
+            high: int(2),
+        };
+        for dialect in [Dialect::DuckDb, Dialect::DataFusion] {
+            let mut p = Printer {
+                dialect,
+                sql: String::new(),
+            };
+            p.expr(&e);
+            assert_eq!(
+                p.sql,
+                "(CAST(1 AS BIGINT) BETWEEN CAST(0 AS BIGINT) AND CAST(2 AS BIGINT))"
+            );
+        }
     }
 }

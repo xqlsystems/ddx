@@ -101,6 +101,12 @@ pub(super) enum Expr {
     },
     Not(Box<Expr>),
     Negate(Box<Expr>),
+    /// `expr BETWEEN low AND high`, which holds both bounds.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+    },
     Is {
         expr: Box<Expr>,
         test: IsTest,
