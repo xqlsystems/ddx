@@ -1752,6 +1752,48 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_s_read_of_no_columns_is_written_as_one_column_wide() {
+        // DuckDB's `SELECT s.v FROM x CROSS JOIN s` (#288): `x` is read for
+        // its rows alone, with no mask, and to DuckDB the cross join's
+        // field 1 is `s.v`, not `x.i0`.
+        use crate::functions::Extensions;
+        use substrait::proto::expression::mask_expression::{StructItem, StructSelect};
+        use substrait::proto::expression::MaskExpression;
+        let x = crate::emit::read_step("x", vec!["i0".into(), "w".into()]);
+        let mut s = crate::emit::read_step("s", vec!["i".into(), "v".into()]);
+        if let Some(RelType::Read(r)) = &mut s.rel_type {
+            r.projection = Some(MaskExpression {
+                select: Some(StructSelect {
+                    struct_items: vec![StructItem {
+                        field: 1,
+                        child: None,
+                    }],
+                }),
+                maintain_singular_struct: true,
+            });
+        }
+        let cross = Rel {
+            rel_type: Some(RelType::Cross(Box::new(substrait::proto::CrossRel {
+                left: Some(Box::new(x)),
+                right: Some(Box::new(s)),
+                ..Default::default()
+            }))),
+        };
+        let functions = Functions::from_plan(&Plan::default()).unwrap();
+        let mut plan = crate::emit::plan(
+            crate::emit::project_emit(cross, vec![], Some(vec![1])),
+            vec!["v".into()],
+            &Extensions::new(&functions),
+        );
+        plan.version = Some(substrait::version::version_with_producer("DuckDB"));
+        let written = to_sql(&plan, Dialect::DuckDb).unwrap();
+        assert!(
+            written.contains(r#"."v""#) && !written.contains(r#"."w""#),
+            "{written}"
+        );
+    }
+
+    #[test]
     fn every_canonical_name_is_one_ddx_writes() {
         assert!(syntax("frobnicate").is_none());
         for name in ["sign", "signum", "isnan", "is_nan", "sum", "row_number"] {

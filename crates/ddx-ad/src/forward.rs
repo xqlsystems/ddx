@@ -783,9 +783,12 @@ fn keep_on_the_left(j: &mut JoinRel) {
 }
 
 /// Does DuckDB's producer mean `r` to read none of its table's columns: a
-/// read with no mask, of a table that has some.
+/// read with no mask, of a named table that has some. Its read of a virtual
+/// table, such as the empty one it plans `LIMIT 0` as, reads every column.
 fn reads_no_columns(r: &ReadRel) -> bool {
-    r.projection.is_none() && read_width(r) > 0
+    matches!(r.read_type, Some(ReadType::NamedTable(_)))
+        && r.projection.is_none()
+        && read_width(r) > 0
 }
 
 fn window_as_projection(w: ConsistentPartitionWindowRel) -> ProjectRel {
@@ -2584,6 +2587,14 @@ mod tests {
         };
         // `x` reads its first column, which nothing reads; `s` is as it was.
         assert_eq!(masks, [Some(first), Some(mask)]);
+        // Its empty result of `LIMIT 0` is a virtual table, read whole.
+        let mut empty = emit::read_step("x", vec!["i0".into(), "v".into()]);
+        if let Some(RelType::Read(r)) = &mut empty.rel_type {
+            r.read_type = Some(ReadType::VirtualTable(Default::default()));
+        }
+        let mut plan = emit::plan(empty, vec!["i0".into(), "v".into()], &ext);
+        plan.version = Some(substrait::version::version_with_producer("DuckDB"));
+        assert!(matches!(in_read_form(&plan), Cow::Borrowed(_)));
     }
 
     #[test]
