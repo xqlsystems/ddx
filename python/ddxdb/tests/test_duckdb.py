@@ -76,6 +76,19 @@ def test_stop_gradient_holds_its_argument_constant(ad, con):
     assert pairs(rel) == [(0, 2.0), (1, 8.0), (2, 0.5)]
 
 
+def test_to_sql_writes_a_read_for_rows_alone_as_duckdb_means_it():
+    # DuckDB's producer writes `s`, read inside for its rows alone, with no
+    # column mask; it means none of its columns (#288).
+    import ddxdb
+    from ddxdb.duckdb import DuckDBBackend
+
+    con = duckdb.connect()
+    con.register("x", pa.table({"i0": pa.array([2, 0, 1], pa.int64()), "v": [-1.0, 0.375, 0.25]}))
+    con.register("s", pa.table({"i": pa.array([0], pa.int64()), "v": [0.625]}))
+    q = "SELECT SUM(s.v) AS l FROM (SELECT a.i0 FROM x a CROSS JOIN s GROUP BY a.i0) g CROSS JOIN s"
+    assert con.sql(ddxdb.to_sql(DuckDBBackend(con).plan_sql(q), "duckdb")).fetchall() == [(1.875,)]
+
+
 def test_stop_gradient_runs_where_the_rewrite_keeps_it(ad, con):
     # No grad at all, and a column beside one: the caller's connection runs both.
     [total] = ad.sql(con, "SELECT SUM(ddx_stop_gradient(val)) FROM w").fetchone()

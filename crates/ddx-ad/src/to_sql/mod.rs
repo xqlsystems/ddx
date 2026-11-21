@@ -107,6 +107,10 @@ pub enum Dialect {
 /// program's steps are when [`crate::run`](fn@crate::run) hands them to a [`crate::Backend`].
 /// A table is read by the names the plan gives it, quoted, so the query
 /// must run where those names resolve to the tables the plan was made from.
+/// A plan is read as ddx reads one to differentiate it, its producer's
+/// own meanings included: DuckDB's read with no column mask reads no
+/// columns, not all of them (#288).
 pub fn to_sql(plan: &Plan, dialect: Dialect) -> Result<String> {
-    Ok(print::query(&reader::query(plan)?, dialect))
+    let plan = crate::forward::in_read_form(plan);
+    Ok(print::query(&reader::query(&plan)?, dialect))
 }
